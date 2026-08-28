@@ -1,0 +1,5 @@
+[package]
+name = "gento-image"
+description = "GEN-TO image pipeline"
+version.workspace = true
+edition.workspace = true
