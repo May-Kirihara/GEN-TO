@@ -4,7 +4,7 @@
 //! UIスレッドでファイルI/Oを行わない (走査・プローブは専用スレッド)。
 
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use gento_core::catalog::{
@@ -25,6 +25,8 @@ const ERROR_SAMPLE_LIMIT: usize = 5;
 pub struct AppState {
     pub dataset_path: PathBuf,
     pub catalog: Mutex<CatalogInner>,
+    /// サムネイル生成サービス (WP-3)。setupで生成、Exitでshutdown。
+    pub thumbnails: Option<Arc<crate::thumbnails::ThumbnailService>>,
 }
 
 /// ロック内で保持するカタログ実状態。
@@ -75,7 +77,33 @@ impl AppState {
         Self {
             dataset_path,
             catalog: Mutex::new(CatalogInner::new()),
+            thumbnails: None,
         }
+    }
+
+    /// カタログロックの取得 (poisoning復旧付き)。
+    pub fn lock_catalog(&self) -> MutexGuard<'_, CatalogInner> {
+        lock(&self.catalog)
+    }
+
+    /// サムネイルサービスを取り出す。setup以降は必ず存在する。
+    pub fn thumbnails(&self) -> Arc<crate::thumbnails::ThumbnailService> {
+        self.thumbnails
+            .as_ref()
+            .expect("ThumbnailService is created in setup")
+            .clone()
+    }
+}
+
+impl CatalogInner {
+    /// IDからレコードを引く (線形探索。コマンド単位の規模想定)。
+    pub fn record(&self, id: AssetId) -> Option<&ImageRecord> {
+        self.state.records.iter().find(|r| r.id == id)
+    }
+
+    /// 表示中カタログのレコード列 (スナップショット抽出用)。
+    pub fn records(&self) -> &[ImageRecord] {
+        &self.state.records
     }
 }
 

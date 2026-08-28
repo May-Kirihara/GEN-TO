@@ -2,6 +2,9 @@
 //! (docs/implementation-plan.md §5.1)。
 
 pub mod catalog;
+pub mod jobs;
+
+pub use jobs::{ParsePriorityError, ParseSizeClassError, Priority, SizeClass};
 
 use std::fmt;
 use std::str::FromStr;

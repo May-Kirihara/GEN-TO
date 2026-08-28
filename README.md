@@ -37,6 +37,8 @@ pnpm tauri dev -- -- -- --dataset ../../../sample/dataset
   (pnpmが1個、tauri CLIが1個の `--` を消費するため4個重ねる)
 - `--dataset <PATH>` はアプリのCWD (`apps/desktop/src-tauri`) からの相対パスまたは絶対パス。
   省略時はCWD相対の `sample/dataset` を参照する
+- `--cache-dir <PATH>` はサムネイルキャッシュのルート (WP-3)。
+  省略時は `~/.cache/gento-spike/thumbnails` (XDG準拠)
 - データセットが存在しなくても起動し、UIに「なし」と表示される
   (存在チェックの結果は起動ログ `dataset resolved` の `exists` でも確認できる)
 

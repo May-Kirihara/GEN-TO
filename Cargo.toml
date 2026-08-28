@@ -17,6 +17,10 @@ serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 walkdir = "=2.5.0"
 png = "=0.18.1"
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
+webp = { version = "=0.3.1", default-features = false }
+twox-hash = "=2.1.4"
+dirs = "=6.0.0"
 tauri = "=2.11.5"
 tauri-build = "=2.6.3"
 tracing = "=0.1.44"

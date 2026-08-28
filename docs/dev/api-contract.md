@@ -1,9 +1,13 @@
 # GEN-TO IPC API契約 (Phase 2 / WP-2時点)
 
 - 作成日: 2026-08-28 (WP-2)
+- 最終更新: 2026-08-29 (WP-3: §7〜§11を追加)
 - 目的: Tauri command・イベントの形状をWP-3〜6の契約基準として固定する。
 - 整合性情報: 本書の型は `crates/gento-core/src/catalog.rs`、`apps/desktop/src-tauri/src/catalog.rs`、
-  `apps/desktop/src/lib/catalog-types.ts` の実装と一致する。変更時は本書と実装の両方を更新する。
+  `apps/desktop/src/lib/catalog-types.ts`、およびサムネイル系は
+  `crates/gento-core/src/jobs.rs`、`apps/desktop/src-tauri/src/thumbnails.rs`、
+  `apps/desktop/src/lib/thumbnail-types.ts` の実装と一致する。
+  変更時は本書と実装の両方を更新する。
 
 ## 0. 命名規約 (既知の非統一について)
 
@@ -204,3 +208,176 @@ payload は `CatalogChangedEvent`。
 | 4 | 同一モードへの `set_catalog_mode` はno-op (generation不変) | 冪等性。不要なgeneration更新でUIのページを無駄に破棄させないため |
 | 5 | `start_scan` はモードをRealへ戻しカタログをクリア | 仮想レコードの上に実走査結果が混在する状態を作らないため |
 | 6 | ページDTOはcamelCase、summary/イベントはsnake_caseの混在 | §0 参照 (両仕様の明記に従った) |
+
+---
+
+# サムネイル生成系 (WP-3 / Phase 4 追加分)
+
+§7以降はWP-3で追加した契約。命名はWP-2のsummary・イベント系規約に同じ
+(snake_case。コマンド引数のみTauri規約によりJS側camelCase)。
+
+## 7. 共通文字列型
+
+- サイズクラス (`SizeClass`): `"s256" | "s512" | "preview2048"`
+  (長辺256/512/2048px。`gento_core::jobs::SizeClass`)
+- 優先度 (`Priority`): `"interactive" | "viewport" | "prefetch" | "overscan" | "background"`
+  (この順に低優先。`gento_core::jobs::Priority`)
+- 不正な文字列はcommandがstringでrejectする。
+
+キャッシュキーは「AssetIdではなく」canonicalパス + byte_size + mtime_ms +
+サイズクラス + アルゴリズムバージョン (`gento-image/src/cache.rs`)。
+同一実ファイルを参照する仮想カタログ項目は同一キーにdedupされる。
+
+## 8. Commands
+
+### `request_thumbnails`
+
+```ts
+invoke<RequestAccepted>("request_thumbnails", {
+  ids: string[], sizeClass: SizeClassId, priority: PriorityId
+})
+```
+
+- AssetIdをカタログから解決し、キャッシュlookup → ヒットは即時 `thumb:ready`
+  (バッチングされる)、ミスはワーカープールへ投入 (同一キーは1ジョブに統合)。
+- 戻り値 `RequestAccepted`:
+
+```ts
+type RequestAccepted = {
+  queued: number;          // 新規投入
+  rejected_dup: number;    // 既存ジョブへ統合 (完了時にまとめて通知される)
+  rejected_full: number;   // キュー満杯 (4096) で拒否。UIは再要求しない設計
+  cache_hits: number;      // キャッシュ済みのため即時ready
+  skipped_unreadable: number; // state != ready のレコード
+  skipped_unknown: number;    // カタログに存在しないID
+};
+```
+
+- `cache_hits` は委任仕様の3欄に加えた拡張 (即時ヒット経路の観測用)。
+  後方互換 (追加フィールド) のため逸脱扱いとはしない。
+
+### `reprioritize_thumbnails`
+
+```ts
+invoke<{ updated, not_updated, not_found, skipped_unreadable }>(
+  "reprioritize_thumbnails", { ids: string[], sizeClass, priority })
+```
+
+- 未開始ジョブの優先度更新。`not_updated` は実行中または同一優先度。
+
+### `cancel_thumbnail_requests`
+
+```ts
+invoke<{ cancelled_queued, cancel_requested, not_found, skipped_unreadable }>(
+  "cancel_thumbnail_requests", { ids: string[], sizeClass })
+```
+
+- 未開始=即時除去 (イベントは出ない)。実行中=協調キャンセル要求
+  (ジョブがデコード前/リサイズ前/エンコード前で検査)。
+
+### `generate_all_thumbnails`
+
+```ts
+invoke<RequestAccepted>("generate_all_thumbnails", { sizeClass: SizeClassId })
+```
+
+- 表示中カタログ全体を `background` 優先度で一括登録 (受け入れ条件2/5の検証用)。
+
+### `get_thumbnail_stats`
+
+```ts
+invoke<ThumbnailStats>("get_thumbnail_stats")
+```
+
+```ts
+type ThumbnailStats = {
+  generated: number;
+  hits: number;
+  misses: number;
+  hit_rate: number | null; // hits/(hits+misses)。データなしはnull
+  failures: number;
+  evictions: number;       // 2GiB上限によるLRU退避
+  queue_depth: number;     // 未開始ジョブ数
+  cache_bytes: number;     // 最終ファイル+生成中一時ファイルの会計
+  p50_ms: number | null;   // 生成時間 (データなしはnull)
+  p95_ms: number | null;
+  p99_ms: number | null;
+  paused: boolean;
+};
+```
+
+- 常に成功する (読み取りのみ)。
+
+### `pause_thumbnail_generation`
+
+```ts
+invoke<null>("pause_thumbnail_generation", { paused: boolean })
+```
+
+- 一時停止中は新規ジョブを開始しない。実行中ジョブは完了まで継続。
+
+### `clear_thumbnail_cache`
+
+```ts
+invoke<{ removed_files: number, removed_bytes: number, cache_generation: number }>(
+  "clear_thumbnail_cache")
+```
+
+- 待機中ジョブを全キャンセルしてからキャッシュを全削除し、
+  `cache_generation` を +1 する。実行中ジョブのコミットが追いつく場合、
+  クリア後に正当なサムネイルが再登録されることがある (内容はキーに対応
+  するため無害)。
+- `cache_generation` はWP-4/5のプロトコルURL `?v=` で使用する。
+
+## 9. Events
+
+### `thumb:ready` — 生成完了・キャッシュヒット
+
+- バッチング: 100ms窓 or 最大20項目ごとにemit。
+- payload:
+
+```ts
+type ThumbReadyPayload = { items: ThumbReadyItem[] };
+type ThumbReadyItem = {
+  asset_id: string;        // 要求時のAssetId (10進文字列)
+  size_class: string;      // 要求時のサイズクラスIPC名
+  cache_generation: number; // 要求時点のgeneration
+};
+```
+
+- キャッシュヒット (即時ready) も同じイベントで流れる。
+- キャンセルされたジョブはこのイベントを出さない。
+
+### `thumb:failed` — 生成失敗
+
+- payload: `{ items: { asset_id, size_class, reason }[] }`
+  (reasonは `ThumbnailError` の表示文字列。パスは含まれない)。
+
+## 10. cache_generation semantics
+
+- 初期値1。`clear_thumbnail_cache` 成功時のみ +1。
+- readyイベントの `cache_generation` は**要求時点**の値 (クリア前の要求が
+  クリア後に完了した場合、古いgeneration付きで届く = UIは破棄してよい)。
+
+## 11. 制約・保証 (WP-3)
+
+1. **UIスレッド**: 生成は固定ワーカープール (min(4, available_parallelism))。
+   command本体はロックとメモリ操作のみ。
+2. **dedup**: 同一キャッシュキー (パス+size+mtime+size_class+バージョン) の
+   同時要求は1ジョブに統合し、完了時に全要求者へ通知。
+3. **キュー上限**: 4096件 (未開始)。満杯時は `rejected_full` で拒否
+   (バックプレッシャー。無制限spawnなし)。
+4. **キャッシュ不変条件**: 最終ファイル+生成中一時ファイルの合計 ≤ 2GiB。
+   書き込み成功ごとと起動時に検査、超過時は目標1.9GiB (95%) までLRU削除。
+   実行中ジョブのキーと一時ファイルは削除禁止。アクセス台帳はメモリ内
+   (プロセス再起動で未登録ファイルはmtime順に扱われる)。
+5. **アトミック配置**: 一時ファイル `.tmp-{pid}-{seq}.webp` を最終ディレクトリと
+   同一場所に作成 → fsync → rename。途中ファイルがhitすることはない。
+6. **panic隔離**: ジョブのpanicは失敗扱い (`thumb:failed`) でワーカーは継続。
+7. **シャットダウン**: `RunEvent::Exit` で待機ジョブをキャンセル完了化してから
+   ワーカーをjoinする。
+8. **権限**: 追加なし (`core:default` のみ)。
+9. **キャッシュディレクトリ**: `--cache-dir <PATH>` 起動引数。既定は
+   `dirs::cache_dir()/gento-spike/thumbnails`。
+10. **ページDTOの `thumbnailState`**: WP-3では常に `"missing"` のまま
+    (実状態はイベントとstatsで観測する。WP-4/5でURL表示に切り替える際に更新)。

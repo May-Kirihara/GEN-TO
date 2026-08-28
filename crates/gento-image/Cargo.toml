@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+gento-core = { workspace = true }
 tracing = { workspace = true }
 walkdir = { workspace = true }
 png = { workspace = true }
+image = { workspace = true }
+webp = { workspace = true }
+twox-hash = { workspace = true }

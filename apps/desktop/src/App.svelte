@@ -10,6 +10,14 @@
     type ImageListItem,
     type ScanProgressEvent,
   } from "./lib/catalog";
+  import {
+    ThumbnailStore,
+    formatBytes,
+    formatHitRate,
+    formatMs,
+    type ThumbnailIpc,
+    type ThumbnailStats,
+  } from "./lib/thumbnails";
 
   let healthStatus: HealthUiState | null = $state(null);
   let rawHealth: HealthInfo | null = $state(null);
@@ -28,6 +36,16 @@
   let pageHasMore = $state(false);
   let catalogError: string | null = $state(null);
 
+  // サムネイル開発パネル (WP-3): 統計ポーリング + 全件生成/一時停止/全削除。
+  // 表示本体はWP-4/5。イベントはログ表示のみ。
+  const thumbIpc: ThumbnailIpc = { invoke, listen };
+  const thumbnails = new ThumbnailStore(thumbIpc);
+  let thumbStats: ThumbnailStats | null = $state(null);
+  let thumbNotice = $state("");
+  let thumbError: string | null = $state(null);
+  let thumbEventLog: string[] = $state([]);
+  let thumbBusy = $state(false);
+
   const stopChangeNotification = catalog.onChange(() => {
     summary = catalog.summary;
     progress = catalog.progress;
@@ -37,7 +55,15 @@
     catalogError = catalog.lastError;
   });
 
+  const stopThumbNotification = thumbnails.onChange(() => {
+    thumbStats = thumbnails.stats;
+    thumbNotice = thumbnails.lastNotice;
+    thumbError = thumbnails.lastError;
+    thumbEventLog = thumbnails.eventLog;
+  });
+
   let disposeCatalog: (() => void) | null = null;
+  let disposeThumbnails: (() => void) | null = null;
 
   function toErrorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
@@ -71,11 +97,22 @@
     }
   }
 
-  function formatBytes(bytes: number): string {
-    if (bytes >= 1024 * 1024) {
-      return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
-    }
-    return `${(bytes / 1024).toFixed(0)} KiB`;
+  async function generateAllThumbs(): Promise<void> {
+    thumbBusy = true;
+    await thumbnails.generateAll("s256");
+    thumbBusy = false;
+  }
+
+  async function togglePause(): Promise<void> {
+    thumbBusy = true;
+    await thumbnails.setPaused(!(thumbStats?.paused ?? false));
+    thumbBusy = false;
+  }
+
+  async function clearThumbCache(): Promise<void> {
+    thumbBusy = true;
+    await thumbnails.clearCache();
+    thumbBusy = false;
   }
 
   function formatDimensions(width: number | null, height: number | null): string {
@@ -90,11 +127,16 @@
     void catalog.init().then((dispose) => {
       disposeCatalog = dispose;
     });
+    void thumbnails.init().then((dispose) => {
+      disposeThumbnails = dispose;
+    });
   });
 
   onDestroy(() => {
     stopChangeNotification();
+    stopThumbNotification();
     disposeCatalog?.();
+    disposeThumbnails?.();
   });
 </script>
 
@@ -193,6 +235,58 @@
   </section>
 
   <section>
+    <h2>サムネイル生成 (WP-3検証パネル)</h2>
+    <div class="thumb-buttons">
+      <button onclick={() => void generateAllThumbs()} disabled={thumbBusy}>
+        全件生成 (S256)
+      </button>
+      <button onclick={() => void togglePause()} disabled={thumbBusy}>
+        {thumbStats?.paused ? "再開" : "一時停止"}
+      </button>
+      <button onclick={() => void clearThumbCache()} disabled={thumbBusy}>
+        キャッシュ全削除
+      </button>
+    </div>
+    {#if thumbNotice}
+      <p class="notice">{thumbNotice}</p>
+    {/if}
+    {#if thumbError}
+      <p class="error">{thumbError}</p>
+    {/if}
+    {#if thumbStats}
+      <div class="thumb-stats">
+        <div>
+          生成 <strong>{thumbStats.generated.toLocaleString()}</strong> 件 /
+          ヒット <strong>{thumbStats.hits.toLocaleString()}</strong> /
+          ミス <strong>{thumbStats.misses.toLocaleString()}</strong> /
+          ヒット率 <strong>{formatHitRate(thumbStats.hit_rate)}</strong>
+        </div>
+        <div>
+          失敗 {thumbStats.failures.toLocaleString()} /
+          退避 {thumbStats.evictions.toLocaleString()} /
+          キュー {thumbStats.queue_depth.toLocaleString()} /
+          容量 {formatBytes(thumbStats.cache_bytes)}
+          {thumbStats.paused ? " / 一時停止中" : ""}
+        </div>
+        <div>
+          生成時間 p50 {formatMs(thumbStats.p50_ms)} /
+          p95 {formatMs(thumbStats.p95_ms)} /
+          p99 {formatMs(thumbStats.p99_ms)}
+        </div>
+      </div>
+    {:else}
+      <p>統計未取得</p>
+    {/if}
+    {#if thumbEventLog.length > 0}
+      <div class="event-log">
+        {#each thumbEventLog.slice(0, 8) as line (line)}
+          <div class="log-line">{line}</div>
+        {/each}
+      </div>
+    {/if}
+  </section>
+
+  <section>
     <h2>開発用ステータス</h2>
     <p>取得時刻: {fetchedAt || "-"}</p>
     <pre>{rawHealth ? JSON.stringify(rawHealth, null, 2) : "{}"}</pre>
@@ -258,6 +352,37 @@
   .error {
     color: light-dark(#cf222e, #f85149);
     font-weight: bold;
+  }
+
+  .notice {
+    color: light-dark(#57606a, #8b949e);
+  }
+
+  .thumb-buttons {
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+  }
+
+  .thumb-stats {
+    display: grid;
+    gap: 0.25rem;
+    font-size: 0.875rem;
+  }
+
+  .event-log {
+    margin-top: 0.5rem;
+    border: 1px solid light-dark(#d0d7de, #30363d);
+    border-radius: 0.5rem;
+    max-height: 10rem;
+    overflow-y: auto;
+    padding: 0.5rem;
+    font-size: 0.75rem;
+  }
+
+  .log-line {
+    font-family: monospace;
+    white-space: nowrap;
   }
 
   button {

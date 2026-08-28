@@ -9,4 +9,5 @@ pub mod metrics;
 pub mod pool;
 pub mod probe;
 pub mod scan;
+pub mod stats;
 pub mod thumbnail;

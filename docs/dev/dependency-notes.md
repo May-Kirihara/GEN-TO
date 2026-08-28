@@ -1,6 +1,6 @@
 # 依存ライブラリメモ (Phase 2 / WP-2時点)
 
-- 記録日: 2026-08-28 (Phase 1 → WP-2更新)
+- 記録日: 2026-08-28 (Phase 1 → WP-2更新 → WP-3更新 2026-08-29)
 - 方針: バージョンはpin (npmは正確なバージョン指定、Cargoは `=` 付き + Cargo.lock)。追加・変更時に本メモへ記録する。
 
 ## Rust (workspace直依存)
@@ -15,6 +15,10 @@
 | tracing-subscriber | =0.3.23 (features: env-filter) | ローグ出力実装 (`GENTO_LOG`環境変数対応) | MIT | gento-tauri |
 | walkdir | =2.5.0 | ディレクトリ再帰走査 (WP-2。エントリ列挙・エラー隔離) | Unlicense OR MIT | gento-image |
 | png | =0.18.1 | PNGシグネチャ+IHDRのみの寸法プローブ (WP-2。全文デコードなし) | MIT OR Apache-2.0 | gento-image |
+| image | =0.25.10 (default-features=false, features: png) | サムネイル用デコード・リサイズ (WP-3)。PNGのみ有効化し攻撃面を最小化。`Limits` (max_alloc 256MiB・寸法20000) でdecompression bomb対策。`DynamicImage::thumbnail_exact` で拡大なしリサイズ | MIT OR Apache-2.0 | gento-image, gento-tauri (dev: テストPNG生成) |
+| webp | =0.3.1 (default-features=false) | lossy WebPエンコード (quality 80、`Encoder::from_rgba` への明示的RGBA渡し) およびテストでの往復デコード (`Decoder`。feature不問で利用可)。`img` featureは無効化し image crate との型結合に依存しない (PM計画 §3)。libwebp-sys はccでビルド (BSD-3-Clause) | MIT OR Apache-2.0 | gento-image |
+| twox-hash | =2.1.4 | キャッシュキーのXxh3 128bit (`xxhash3_128::Hasher::oneshot`)。非暗号だが128bitで衝突耐性を確保し、キー入力 (パス+size+mtime+クラス+バージョン) を決定的に圧縮 | MIT | gento-image |
+| dirs | =6.0.0 | 既定キャッシュディレクトリ解決 (`cache_dir()`) | MIT OR Apache-2.0 | gento-tauri |
 
 ## TypeScript / Svelte (apps/desktop)
 
@@ -59,7 +63,27 @@
 - **tracingをgento-imageでも使用**: 走査計測ログ (`scan metrics` 行、elapsed + RSS) の出力のため。
   実行時の新規依存ではなくworkspace既存crateの利用範囲拡大。
 
-## 将来WPでの追加予定 (WP-2時点では未追加)
+## WP-3で追加した依存の選定理由
 
-- WP-3 (Phase 4): `image` (PNGのみ有効化), `webp` (lossyエンコード), `twox-hash` (キャッシュキー), `dirs` (キャッシュディレクトリ解決)
+- **`image` =0.25.10 (pngのみ)**: デコード+リサイズの標準crate。`default-features=false`
+  + `features=["png"]` でPNG codecのみ (攻撃面・ビルド時間を最小化、PM計画 §3)。
+  リサイズは `DynamicImage::thumbnail_exact` (高速な整数box平均。指定寸法を正確に生成)。
+  デコード制限は `image::Limits` の `max_image_width/height=20000` (strict) と
+  `max_alloc=256MiB` (データセット最大7.9MP RGBA=32MiBに対し8倍の安全域)。
+- **`webp` =0.3.1 (default-features=false)**: libwebp-sysの安全ラッパー。
+  `Encoder::from_rgba(buf, w, h).encode(80.0)` でlossy品質80。`default-features=false`
+  (`img` feature無効) により `image` crateとのtrait結合に依存せず、明示的RGBA
+  バッファを渡す (PM計画 §3の契約)。デコード (`Decoder`/`WebPImage`/`BitstreamFeatures`)
+  はfeature不問で利用可能なため、透過往復テストにも同じcrateを使う。
+- **`twox-hash` =2.1.4**: キャッシュキーハッシュ。Xxh3は非暗号ながら高速で、
+  128bit出力 (`xxhash3_128::Hasher::oneshot`) により実用上の衝突を回避
+  (32hex文字をファイル名に埋め込み)。暗号強度が必要になったら内容ハッシュ移行
+  (AssetFingerprint関数境界) で差し替える。
+- **`dirs` =6.0.0**: XDG規約に沿ったキャッシュディレクトリ解決のみに使用。
+  失敗時は `std::env::temp_dir` へフォールバック。
+- **gento-coreをgento-imageが依存**: §5.1「ジョブ優先度の基本型はcore」に従い
+  `Priority`/`SizeClass` を `gento_core::jobs` へ置いたため (内部依存追加)。
+
+## 将来WPでの追加予定
+
 - WP-5 (Phase 3): `@tanstack/svelte-virtual` (仮想スクロール。Svelte 5互換プローブの結果により `@tanstack/virtual-core` 直使用に切り替える可能性)
