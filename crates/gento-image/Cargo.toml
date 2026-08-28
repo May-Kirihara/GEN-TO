@@ -3,3 +3,8 @@ name = "gento-image"
 description = "GEN-TO image pipeline"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+tracing = { workspace = true }
+walkdir = { workspace = true }
+png = { workspace = true }

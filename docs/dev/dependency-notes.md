@@ -1,18 +1,20 @@
-# 依存ライブラリメモ (Phase 1時点)
+# 依存ライブラリメモ (Phase 2 / WP-2時点)
 
-- 記録日: 2026-08-28
+- 記録日: 2026-08-28 (Phase 1 → WP-2更新)
 - 方針: バージョンはpin (npmは正確なバージョン指定、Cargoは `=` 付き + Cargo.lock)。追加・変更時に本メモへ記録する。
 
 ## Rust (workspace直依存)
 
 | crate | pinバージョン | 用途 | ライセンス | 使用crate |
 |---|---|---|---|---|
-| serde | =1.0.229 (features: derive) | DTOのSerialize/Deserialize | MIT OR Apache-2.0 | gento-core, (tauri間接) |
-| serde_json | =1.0.151 | gento-core単体テストのJSON形状検証 (通常依存には入れない) | MIT OR Apache-2.0 | gento-core (dev) |
+| serde | =1.0.229 (features: derive) | DTOのSerialize/Deserialize | MIT OR Apache-2.0 | gento-core, gento-tauri |
+| serde_json | =1.0.151 | gento-core単体テストのJSON形状検証 (通常依存には入れない) | MIT OR Apache-2.0 | gento-core (dev), gento-tauri (dev) |
 | tauri | =2.11.5 | デスクトップシェル・IPC・WebView | Apache-2.0 OR MIT | gento-tauri |
 | tauri-build | =2.6.3 | build.rsでのアセット/スキーマ生成 | Apache-2.0 OR MIT | gento-tauri (build) |
-| tracing | =0.1.44 | 構造化ログ | MIT | gento-tauri |
+| tracing | =0.1.44 | 構造化ログ (走査計測ログを含む) | MIT | gento-tauri, gento-image |
 | tracing-subscriber | =0.3.23 (features: env-filter) | ローグ出力実装 (`GENTO_LOG`環境変数対応) | MIT | gento-tauri |
+| walkdir | =2.5.0 | ディレクトリ再帰走査 (WP-2。エントリ列挙・エラー隔離) | Unlicense OR MIT | gento-image |
+| png | =0.18.1 | PNGシグネチャ+IHDRのみの寸法プローブ (WP-2。全文デコードなし) | MIT OR Apache-2.0 | gento-image |
 
 ## TypeScript / Svelte (apps/desktop)
 
@@ -44,8 +46,20 @@
 - **gento-coreのserde_jsonはdev-dependency**: コアはJSON実行時依存を持たず、シリアライズ形状のテストのみに使う。
 - **gento-tauriのlib crate-typeはrlibのみ**: 公式テンプレートのstaticlib/cdylibはmobile対象。desktop専用スパイクではビルド時間増大だけが残るため除外した。
 
-## 将来WPでの追加予定 (Phase 1時点では未追加)
+## WP-2で追加した依存の選定理由
 
-- WP-2 (Phase 2): `walkdir` (走査)
-- WP-3 (Phase 4): `image` (PNGのみ有効化), `png` (IHDRプローブ), `webp` (lossyエンコード), `twox-hash` (キャッシュキー), `dirs` (キャッシュディレクトリ解決)
+- **`walkdir` =2.5.0**: 定番の再帰ディレクトリ走査。イテレータが `Result` を返すため、権限不足等を
+  「1項目分のエラー」として収集して走査継続する要件 (本体計画 §6「エラーはファイル単位で隔離」) に
+  自然に対応できる。デフォルトでシンボリックリンクを辿らないため安全側。
+- **`png` =0.18.1**: IHDR読み取りのみで幅・高さが取れる (`Decoder::read_header_info`)。
+  docs.rs 0.18.1 で確認した使い方: `Decoder::new_with_limits(BufReader::new(File), Limits { bytes })`
+  — 0.18は `R: BufRead + Seek` が必要なため `BufReader` で包む。`Limits` を1MiBに設定し安全弁とする。
+  エラー判定: `DecodingError::IoError` のうち `UnexpectedEof` は切り詰め (=Corrupt)、それ以外の
+  IoErrorはUnreadable、Format/LimitsExceededはCorruptとして分類。
+- **tracingをgento-imageでも使用**: 走査計測ログ (`scan metrics` 行、elapsed + RSS) の出力のため。
+  実行時の新規依存ではなくworkspace既存crateの利用範囲拡大。
+
+## 将来WPでの追加予定 (WP-2時点では未追加)
+
+- WP-3 (Phase 4): `image` (PNGのみ有効化), `webp` (lossyエンコード), `twox-hash` (キャッシュキー), `dirs` (キャッシュディレクトリ解決)
 - WP-5 (Phase 3): `@tanstack/svelte-virtual` (仮想スクロール。Svelte 5互換プローブの結果により `@tanstack/virtual-core` 直使用に切り替える可能性)

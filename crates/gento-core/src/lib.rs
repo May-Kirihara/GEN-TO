@@ -1,6 +1,8 @@
 //! GEN-TO コアドメイン型。Tauriに依存してはならない
 //! (docs/implementation-plan.md §5.1)。
 
+pub mod catalog;
+
 use std::fmt;
 use std::str::FromStr;
 

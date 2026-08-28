@@ -13,9 +13,14 @@ tauri-build = { workspace = true }
 
 [dependencies]
 gento-core = { workspace = true }
+gento-image = { workspace = true }
+serde = { workspace = true }
 tauri = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
 
 [features]
 # Tauri CLIがrelease build時に有効化する。絶対に削除しないこと。

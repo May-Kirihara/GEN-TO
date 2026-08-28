@@ -4,18 +4,16 @@
 //! ビジネスロジックはgento-core / gento-imageへ置く
 //! (docs/implementation-plan.md §5, §5.1)。
 
+pub mod catalog;
+
 use std::path::{Path, PathBuf};
 
+use catalog::AppState;
 use gento_core::HealthInfo;
 use tauri::{Manager, State};
 use tracing_subscriber::EnvFilter;
 
 const APP_NAME: &str = "GEN-TO 技術検証プロトタイプ";
-
-/// Tauri command間で共有する実行時状態。
-struct AppState {
-    dataset_path: PathBuf,
-}
 
 #[tauri::command]
 fn health(state: State<'_, AppState>) -> HealthInfo {
@@ -42,13 +40,19 @@ pub fn run() {
                 exists = dataset_path.exists(),
                 "dataset resolved"
             );
-            app.manage(AppState { dataset_path });
+            app.manage(AppState::new(dataset_path));
             if app.get_webview_window("main").is_some() {
                 tracing::info!("main window created");
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![health])
+        .invoke_handler(tauri::generate_handler![
+            health,
+            catalog::get_catalog_summary,
+            catalog::get_catalog_page,
+            catalog::start_scan,
+            catalog::set_catalog_mode
+        ])
         .run(tauri::generate_context!())
         .expect("failed to run tauri application");
 }

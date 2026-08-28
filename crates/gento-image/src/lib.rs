@@ -5,6 +5,7 @@
 //! (docs/implementation-plan.md §5.1)。
 
 pub mod cache;
+pub mod metrics;
 pub mod pool;
 pub mod probe;
 pub mod scan;
