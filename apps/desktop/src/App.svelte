@@ -24,6 +24,10 @@
   import { ScrollPositionStore } from "./lib/grid/scroll-position";
   import type { ThumbCellClass } from "./lib/grid/layout";
   import ThumbnailGrid from "./lib/grid/ThumbnailGrid.svelte";
+  import { ViewerStore, type ViewerIpc } from "./lib/viewer/viewer-store";
+  import ImageViewer from "./lib/viewer/ImageViewer.svelte";
+  import { CompareStore, type CompareIpc } from "./lib/compare/compare-store";
+  import CompareView from "./lib/compare/CompareView.svelte";
 
   let healthStatus: HealthUiState | null = $state(null);
   let rawHealth: HealthInfo | null = $state(null);
@@ -62,6 +66,62 @@
   let gridComponent: ThumbnailGrid | null = $state(null);
   let gridModeKey = $state("real");
   let restoreNotice = $state("");
+
+  // ビューア/比較 (WP-6): グリッドのEnter/ダブルクリックまたはボタンで開く。
+  type ViewerMode = "single" | "compare2" | "compare4";
+  let viewerChoice: ViewerMode = $state("single");
+  let viewerMode: ViewerMode | null = $state(null);
+  let viewerStore: ViewerStore | null = $state(null);
+  let compareStore: CompareStore | null = $state(null);
+  let viewerNotice = $state("");
+  let gridSelection: { ids: string[]; focusIndex: number | null } = { ids: [], focusIndex: null };
+
+  const viewerIpc: ViewerIpc = { invoke, listen };
+  const compareIpc: CompareIpc = { invoke, listen };
+  const viewerItems = {
+    total: () => grid.summary?.total ?? 0,
+    get: (index: number) => grid.getItem(index),
+    ensureRange: (start: number, end: number) => grid.pager.ensureRange(start, end),
+  };
+  const compareItems = {
+    ...viewerItems,
+    findIndexById: (id: string) => grid.pager.findIndicesByIds(new Set([id])).get(id) ?? null,
+  };
+
+  function closeViewer(): void {
+    viewerMode = null;
+    viewerStore?.dispose();
+    compareStore?.dispose();
+    viewerStore = null;
+    compareStore = null;
+  }
+
+  async function openViewerForChoice(index: number): Promise<void> {
+    viewerNotice = "";
+    const focus = gridSelection.focusIndex ?? index;
+    try {
+      if (viewerChoice === "single") {
+        const store = new ViewerStore(viewerIpc, viewerItems);
+        viewerStore = store;
+        viewerMode = "single";
+        await store.init();
+        await store.open(index);
+      } else {
+        const count = viewerChoice === "compare2" ? 2 : 4;
+        const store = new CompareStore(compareIpc, compareItems);
+        compareStore = store;
+        viewerMode = viewerChoice;
+        await store.init();
+        await store.open(count, gridSelection.ids, focus);
+      }
+    } catch (error) {
+      viewerNotice = toErrorMessage(error);
+    }
+  }
+
+  function setViewerChoice(choice: ViewerMode): void {
+    viewerChoice = choice;
+  }
 
   const stopChangeNotification = catalog.onChange(() => {
     summary = catalog.summary;
@@ -340,6 +400,16 @@
     void grid.init().then((dispose) => {
       disposeGrid = dispose;
     });
+    // 実機検証ブリッジ (WP-6)。リリースビルドでは DEVガートで静的に除外される
+    if (import.meta.env.DEV) {
+      void import("./lib/devtest").then(({ installDevBridge }) => {
+        installDevBridge({
+          getViewer: () => viewerStore,
+          getCompare: () => compareStore,
+          getMode: () => viewerMode,
+        });
+      });
+    }
   });
 
   onDestroy(() => {
@@ -451,6 +521,33 @@
         <span class="notice">{restoreNotice}</span>
       {/if}
     </div>
+    <div class="grid-controls">
+      <span class="notice">ビューア (Enter/ダブルクリックで開く):</span>
+      <button class:active={viewerChoice === "single"} onclick={() => setViewerChoice("single")}>
+        単一
+      </button>
+      <button class:active={viewerChoice === "compare2"} onclick={() => setViewerChoice("compare2")}>
+        2枚比較
+      </button>
+      <button class:active={viewerChoice === "compare4"} onclick={() => setViewerChoice("compare4")}>
+        4枚比較
+      </button>
+      <button
+        onclick={() => {
+          const focus = gridSelection.focusIndex;
+          if (focus !== null) {
+            void openViewerForChoice(focus);
+          } else {
+            viewerNotice = "グリッドで項目を選択してください";
+          }
+        }}
+      >
+        開く
+      </button>
+      {#if viewerNotice}
+        <span class="error">{viewerNotice}</span>
+      {/if}
+    </div>
     {#key `${gridModeKey}-${cellClass}`}
       <ThumbnailGrid
         bind:this={gridComponent}
@@ -459,6 +556,10 @@
         modeKey={gridModeKey}
         {cellClass}
         overscanRows={overscanChoice}
+        onOpen={(index) => void openViewerForChoice(index)}
+        onSelectionChange={(snapshot) => {
+          gridSelection = snapshot;
+        }}
       />
     {/key}
   </section>
@@ -548,6 +649,12 @@
     <pre>{rawHealth ? JSON.stringify(rawHealth, null, 2) : "{}"}</pre>
   </section>
 </main>
+
+{#if viewerMode === "single" && viewerStore !== null}
+  <ImageViewer store={viewerStore} onClose={closeViewer} />
+{:else if (viewerMode === "compare2" || viewerMode === "compare4") && compareStore !== null}
+  <CompareView store={compareStore} onClose={closeViewer} />
+{/if}
 
 <style>
   main {

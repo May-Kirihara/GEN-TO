@@ -41,6 +41,8 @@
     modeKey,
     cellClass,
     overscanRows,
+    onOpen,
+    onSelectionChange,
   }: {
     grid: GridStore;
     scrollStore: ScrollPositionStore;
@@ -48,6 +50,10 @@
     modeKey: string;
     cellClass: ThumbCellClass;
     overscanRows: number;
+    /** Enter/ダブルクリックでビューアを開く (WP-6)。indexを渡す。 */
+    onOpen?: (index: number) => void;
+    /** 選択変化の通知 (比較表示の充填ソース用、WP-6)。 */
+    onSelectionChange?: (snapshot: { ids: string[]; focusIndex: number | null }) => void;
   } = $props();
 
   // GridStoreはプレーンクラスのため、版番号でUIへ変更を伝える (WP-2の教訓)
@@ -193,6 +199,14 @@
   };
 
   function handleKeydown(event: KeyboardEvent): void {
+    if (event.key === "Enter") {
+      const focus = sel.focusIndex;
+      if (focus !== null) {
+        event.preventDefault();
+        onOpen?.(focus);
+      }
+      return;
+    }
     const action = KEY_ACTIONS[event.key];
     if (!action) {
       return;
@@ -204,7 +218,12 @@
       { shift: event.shiftKey, total, columns, pageRows: pageRows() },
       idAt,
     );
+    notifySelection();
     followFocus();
+  }
+
+  function notifySelection(): void {
+    onSelectionChange?.({ ids: [...sel.selected], focusIndex: sel.focusIndex });
   }
 
   function followFocus(): void {
@@ -235,6 +254,18 @@
       total,
       idAt,
     );
+    notifySelection();
+  }
+
+  function handleDblClick(event: MouseEvent): void {
+    const cell = (event.target as HTMLElement).closest<HTMLElement>("[data-grid-cell]");
+    if (cell === null) {
+      return;
+    }
+    const index = Number(cell.dataset.index);
+    if (Number.isInteger(index) && index >= 0 && index < total) {
+      onOpen?.(index);
+    }
   }
 
   // ===== テンプレートヘルパー (gridTickを読み変化を伝える) =====
@@ -305,6 +336,7 @@
   tabindex="0"
   onkeydown={handleKeydown}
   onclick={handleClick}
+  ondblclick={handleDblClick}
 >
   <div class="grid-inner" style="height:{totalSize}px">
     {#each vitems as row (row.key)}

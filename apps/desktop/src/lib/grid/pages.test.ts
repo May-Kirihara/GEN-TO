@@ -159,6 +159,23 @@ describe("CatalogPager", () => {
     expect(pager.total).toBe(200);
   });
 
+  it("findIndicesByIdsはキャッシュ済みページからid→indexを解決する", async () => {
+    const calls: InvokeCall[] = [];
+    const pages = new Map<number, CatalogPage>([
+      [0, makePage(0, 200, 50_000, 1)],
+      [200, makePage(200, 200, 50_000, 1)],
+    ]);
+    const pager = new CatalogPager(makeIpc(pages, calls));
+    pager.reset(1, 50_000);
+    await pager.ensureRange(0, 5);
+    const found = pager.findIndicesByIds(new Set(["42", "250", "999"]));
+    expect(found.get("42")).toBe(42);
+    expect(found.get("250")).toBe(250);
+    // 未取得ページのidは結果に含まれない
+    expect(found.has("999")).toBe(false);
+    expect(pager.findIndicesByIds(new Set())).toEqual(new Map());
+  });
+
   it("staleGenerationはsummary再取得のうえ1回再試行する", async () => {
     const calls: InvokeCall[] = [];
     const pages = new Map<number, CatalogPage>([

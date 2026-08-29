@@ -96,6 +96,36 @@ export class CatalogPager {
     return this.pages.has(page);
   }
 
+  /**
+   * キャッシュ済みページのみを走査して id→index を解決する。
+   * 見つからないidは結果に含めない (呼び出し側は連続補充へフォールバック)。
+   * 比較表示の選択充填 (WP-6) 用 — 全カタログ走査は行わない。
+   */
+  findIndicesByIds(ids: ReadonlySet<string>): Map<string, number> {
+    const found = new Map<string, number>();
+    const remaining = new Set(ids);
+    if (remaining.size === 0 || this.pageSize <= 0) {
+      return found;
+    }
+    const pageNumbers = [...this.pages.keys()].sort((a, b) => a - b);
+    for (const page of pageNumbers) {
+      const items = this.pages.get(page);
+      if (!items) {
+        continue;
+      }
+      for (let i = 0; i < items.length; i++) {
+        const id = items[i].id;
+        if (remaining.delete(id)) {
+          found.set(id, page * this.pageSize + i);
+          if (remaining.size === 0) {
+            return found;
+          }
+        }
+      }
+    }
+    return found;
+  }
+
   getItem(index: number): ImageListItem | null {
     if (index < 0 || index >= this.total) {
       return null;
