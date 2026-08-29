@@ -1,12 +1,13 @@
 # GEN-TO IPC API契約 (Phase 2 / WP-2時点)
 
 - 作成日: 2026-08-28 (WP-2)
-- 最終更新: 2026-08-29 (WP-3: §7〜§11を追加)
-- 目的: Tauri command・イベントの形状をWP-3〜6の契約基準として固定する。
+- 最終更新: 2026-08-29 (WP-3: §7〜§11を追加 / WP-4: §8統計DTO・§12を追加)
+- 目的: Tauri command・イベント・ローカル画像プロトコルの形状をWP-3〜6の契約基準として固定する。
 - 整合性情報: 本書の型は `crates/gento-core/src/catalog.rs`、`apps/desktop/src-tauri/src/catalog.rs`、
   `apps/desktop/src/lib/catalog-types.ts`、およびサムネイル系は
   `crates/gento-core/src/jobs.rs`、`apps/desktop/src-tauri/src/thumbnails.rs`、
-  `apps/desktop/src/lib/thumbnail-types.ts` の実装と一致する。
+  `apps/desktop/src/lib/thumbnail-types.ts`、プロトコル系は
+  `apps/desktop/src-tauri/src/protocol.rs`、`apps/desktop/src/lib/protocol.ts` の実装と一致する。
   変更時は本書と実装の両方を更新する。
 
 ## 0. 命名規約 (既知の非統一について)
@@ -303,6 +304,13 @@ type ThumbnailStats = {
   p95_ms: number | null;
   p99_ms: number | null;
   paused: boolean;
+  // ローカル画像プロトコル統計 (WP-4で追加)
+  proto_requests: number;      // プロトコルハンドラが処理した要求 (拒否含む)
+  proto_ok: number;            // 200応答件数
+  proto_bytes_sent: number;    // 200応答で転送したバイト数
+  proto_p50_ms: number | null; // プロトコル応答時間 (データなしはnull)
+  proto_p95_ms: number | null;
+  proto_p99_ms: number | null;
 };
 ```
 
@@ -381,3 +389,79 @@ type ThumbReadyItem = {
    `dirs::cache_dir()/gento-spike/thumbnails`。
 10. **ページDTOの `thumbnailState`**: WP-3では常に `"missing"` のまま
     (実状態はイベントとstatsで観測する。WP-4/5でURL表示に切り替える際に更新)。
+
+---
+
+# ローカル画像プロトコル (WP-4 / Phase 5 追加分)
+
+## 12. カスタムURIスキーム
+
+3つのプロトコルを `register_asynchronous_uri_scheme_protocol` で非同期登録する
+(ファイルIOは `tauri::async_runtime::spawn_blocking`。プロトコル/UIスレッドをブロックしない)。
+
+| scheme | URL形式 | 内容 | Content-Type | 上限 |
+|---|---|---|---|---|
+| `gento-thumb` | `//localhost/asset/{id}/{s256\|s512}?v={gen}` | サムネイルのキャッシュWebP | `image/webp` | 64MiB |
+| `gento-preview` | `//localhost/asset/{id}?v={gen}` | preview2048キャッシュWebP | `image/webp` | 64MiB |
+| `gento-original` | `//localhost/asset/{id}?v={gen}` | 登録済みカタログ資産の元PNG | `image/png` | 512MiB |
+
+フロントエンドは `apps/desktop/src/lib/protocol.ts` のビルダ
+(`thumbUrl` / `previewUrl` / `originalUrl`) を使う。ビルダは常に
+`scheme://localhost/asset/...` 形式 (authority明示) を生成する。
+
+### 検証規則 (実装: `protocol.rs::parse_protocol_request`)
+
+URLのどの部分もファイルシステムパスとして解釈しない。解決は
+AssetId → カタログレコード → キャッシュキー/元パス (アプリ保有レジストリ) のみ。
+
+- メソッド: GETのみ。他 (HEAD/POST等) は **405**。
+- scheme: ハンドラのschemeと完全一致 (不一致は400)。
+- authority: userinfo・port禁止。hostは `localhost` (厳密一致。非特殊schemeの
+  hostは大文字小文字を保存するため `LOCALHOST` は拒否) または不在のみ。
+  他のhost (URL案の `asset` をauthorityに置いた形式、IP、`..` 等) は **400**。
+- パス: セグメントは厳密に `asset` → ID → [サイズクラス (thumbのみ)]。
+  IDは10進数字のみ・20桁上限・u64範囲。サイズクラスはenum完全一致
+  (`s256`/`s512`。thumbでの `preview2048` は拒否)。過剰・欠損・空セグメントは400。
+  パーセントエンコードは一切許可されない (正当なID/クラス構文に
+  `%` が現れないため、`%2F` `%2E` `%5C` `%00` `%252E` はすべて構文検証で拒否。
+  ただし `%2E%2E` はWHATWG URLパーサがドットセグメント正規化を行うため
+  正規化後の形状検証で拒否される)。
+- クエリ: なし、または `v={10進1..18桁}` のみ。未知クエリ (`x=1`)・
+  複数・空値・`V=1` は **400**。
+- fragment・opaque形式 (`scheme:asset/1`・cannot-be-a-base) は400。
+
+### 解決とステータス
+
+- 未登録ID・unreadableレコード・未生成 (キャッシュミス)・キャッシュファイル消失 →
+  **404 即応** (生成を待ってブロックしない — スクロール中の大量要求を滞留させない)。
+- サイズ上限超過 → **413**。その他の読み込みIOエラー → 500。
+- キャッシュ解決: 最終コンポーネントは `symlink_metadata` で正規ファイル確認
+  (シンボリックリンク拒否) + `canonicalize` でキャッシュルート包含検証 + サイズ上限。
+  元ファイル (original) も同様にシンボリックリンク拒否。
+- 不正要求 → 400/404/405。
+
+### 応答ヘッダ
+
+- 成功: `Content-Type` (正確) / `Content-Length` / `X-Content-Type-Options: nosniff` /
+  `Cache-Control`。
+- `Cache-Control`: `v` クエリ付きURLは `public, max-age=31536000, immutable`
+  (URLが一意なら内容不変)、無しは `no-store`。
+- エラー本文は固定の短い文字列 (`not found` 等)。**パス・ID・URLを含まない**。
+  ログも scheme・理由kind・ID・ステータスのみ (到着URLのdebugログを除く)。
+
+### 未生成→表示切替フロー
+
+1. UIは `request_thumbnails` で生成を要求 (プロトコルURLは直接叩かない)
+2. `thumb:ready` イベントの `cache_generation` を受け取る
+3. `?v={cache_generation}` 付きURLを組み直して `<img src>` へ反映
+
+### CSP (tauri.conf.json)
+
+`img-src` のみ制限 (`'self' data: gento-thumb: gento-preview: gento-original:`)。
+dev (`devCsp`) とrelease (`csp`) で同一。connect-src等は既定 (無制限) を維持。
+
+### 統計
+
+プロトコル応答時間 (p50/p95/p99) と転送バイト・件数を `ProtoStats`
+(`AppState` 内) に記録し、`get_thumbnail_stats` の `proto_*` フィールドへ統合する。
+durationサンプルは100,000件で打ち切り。

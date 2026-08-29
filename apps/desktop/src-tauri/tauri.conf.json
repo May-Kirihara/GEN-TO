@@ -17,7 +17,12 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": {
+        "img-src": "'self' data: gento-thumb: gento-preview: gento-original:"
+      },
+      "devCsp": {
+        "img-src": "'self' data: gento-thumb: gento-preview: gento-original:"
+      }
     }
   },
   "bundle": {

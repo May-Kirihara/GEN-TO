@@ -19,6 +19,13 @@ export type ThumbnailStats = {
   p95_ms: number | null;
   p99_ms: number | null;
   paused: boolean;
+  /** ローカル画像プロトコル統計 (WP-4)。 */
+  proto_requests: number;
+  proto_ok: number;
+  proto_bytes_sent: number;
+  proto_p50_ms: number | null;
+  proto_p95_ms: number | null;
+  proto_p99_ms: number | null;
 };
 
 /** request_thumbnails / generate_all_thumbnails の戻り値。 */

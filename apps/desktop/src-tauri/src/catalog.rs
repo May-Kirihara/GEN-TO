@@ -27,6 +27,8 @@ pub struct AppState {
     pub catalog: Mutex<CatalogInner>,
     /// サムネイル生成サービス (WP-3)。setupで生成、Exitでshutdown。
     pub thumbnails: Option<Arc<crate::thumbnails::ThumbnailService>>,
+    /// ローカル画像プロトコルの統計 (WP-4)。
+    pub proto_stats: Arc<crate::protocol::ProtoStats>,
 }
 
 /// ロック内で保持するカタログ実状態。
@@ -78,6 +80,7 @@ impl AppState {
             dataset_path,
             catalog: Mutex::new(CatalogInner::new()),
             thumbnails: None,
+            proto_stats: Arc::new(crate::protocol::ProtoStats::new()),
         }
     }
 

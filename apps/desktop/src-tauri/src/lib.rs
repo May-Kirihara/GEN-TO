@@ -5,6 +5,7 @@
 //! (docs/implementation-plan.md §5, §5.1)。
 
 pub mod catalog;
+pub mod protocol;
 pub mod thumbnails;
 
 use std::path::{Path, PathBuf};
@@ -34,7 +35,7 @@ fn health(state: State<'_, AppState>) -> HealthInfo {
 pub fn run() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    tauri::Builder::default()
+    protocol::register_uri_scheme_protocols(tauri::Builder::default())
         .setup(move |app| {
             init_tracing();
             let dataset_path = resolve_dataset_path(&args);

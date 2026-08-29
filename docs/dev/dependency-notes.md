@@ -1,6 +1,6 @@
 # 依存ライブラリメモ (Phase 2 / WP-2時点)
 
-- 記録日: 2026-08-28 (Phase 1 → WP-2更新 → WP-3更新 2026-08-29)
+- 記録日: 2026-08-28 (Phase 1 → WP-2更新 → WP-3更新 2026-08-29 → WP-4更新 2026-08-29)
 - 方針: バージョンはpin (npmは正確なバージョン指定、Cargoは `=` 付き + Cargo.lock)。追加・変更時に本メモへ記録する。
 
 ## Rust (workspace直依存)
@@ -83,6 +83,16 @@
   失敗時は `std::env::temp_dir` へフォールバック。
 - **gento-coreをgento-imageが依存**: §5.1「ジョブ優先度の基本型はcore」に従い
   `Priority`/`SizeClass` を `gento_core::jobs` へ置いたため (内部依存追加)。
+
+## WP-4で追加した依存の選定理由
+
+- **追加なし (Rust/TS両方)**: ローカル画像プロトコルのURL構造化パースには
+  `tauri::Url` (tauriが再エクスポートする `url::Url` 2.5.8、lock済みの推移依存) を使用。
+  スキーム登録 (`register_asynchronous_uri_scheme_protocol`) とHTTP応答組み立て
+  (`tauri::http`) も既存tauri部品のため、`url`/`http` を直依存に加える必要がない
+  (PM計画「依存追加は最小に」)。percentile算出は `gento_image::stats::percentile` を再利用。
+- **CSP設定のみ追加** (`tauri.conf.json`): `img-src 'self' data: gento-thumb:
+  gento-preview: gento-original:`。`csp` と `devCsp` で同一値。
 
 ## 将来WPでの追加予定
 

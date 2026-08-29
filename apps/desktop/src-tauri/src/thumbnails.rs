@@ -163,6 +163,11 @@ impl ThumbnailService {
         self.cache_generation.load(Ordering::SeqCst)
     }
 
+    /// プロトコルハンドラからのキャッシュ参照 (WP-4)。
+    pub fn cache(&self) -> &Arc<ThumbnailCache> {
+        &self.cache
+    }
+
     /// 要求: ヒットは即時ready、ミスはジョブ投入 (dedup)。
     pub fn request(
         &self,
@@ -288,7 +293,8 @@ impl ThumbnailService {
         result
     }
 
-    /// 統計スナップショット (command DTO)。
+    /// 統計スナップショット (command DTO)。プロトコル統計は
+    /// `with_proto` でcommand層が上書きする (ここではゼロ初期化)。
     pub fn stats_dto(&self) -> ThumbnailStatsDto {
         let snapshot = self.stats.snapshot();
         ThumbnailStatsDto {
@@ -304,6 +310,12 @@ impl ThumbnailService {
             p95_ms: snapshot.p95_ms,
             p99_ms: snapshot.p99_ms,
             paused: self.pool.is_paused(),
+            proto_requests: 0,
+            proto_ok: 0,
+            proto_bytes_sent: 0,
+            proto_p50_ms: None,
+            proto_p95_ms: None,
+            proto_p99_ms: None,
         }
     }
 
@@ -485,6 +497,26 @@ pub struct ThumbnailStatsDto {
     pub p95_ms: Option<f64>,
     pub p99_ms: Option<f64>,
     pub paused: bool,
+    // ローカル画像プロトコル統計 (WP-4。get_thumbnail_statsへ統合)
+    pub proto_requests: u64,
+    pub proto_ok: u64,
+    pub proto_bytes_sent: u64,
+    pub proto_p50_ms: Option<f64>,
+    pub proto_p95_ms: Option<f64>,
+    pub proto_p99_ms: Option<f64>,
+}
+
+impl ThumbnailStatsDto {
+    /// プロトコル統計を反映する (command層でAppStateから渡す)。
+    pub fn with_proto(mut self, proto: &crate::protocol::ProtoStatsSnapshot) -> Self {
+        self.proto_requests = proto.requests;
+        self.proto_ok = proto.ok;
+        self.proto_bytes_sent = proto.bytes_sent;
+        self.proto_p50_ms = proto.p50_ms;
+        self.proto_p95_ms = proto.p95_ms;
+        self.proto_p99_ms = proto.p99_ms;
+        self
+    }
 }
 
 /// `clear_thumbnail_cache` の結果DTO。
@@ -637,7 +669,10 @@ pub fn generate_all_thumbnails(
 
 #[tauri::command]
 pub fn get_thumbnail_stats(state: State<'_, AppState>) -> ThumbnailStatsDto {
-    state.thumbnails().stats_dto()
+    state
+        .thumbnails()
+        .stats_dto()
+        .with_proto(&state.proto_stats.snapshot())
 }
 
 #[tauri::command]

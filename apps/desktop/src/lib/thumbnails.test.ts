@@ -70,6 +70,12 @@ function stats(partial: Partial<ThumbnailStats> = {}): ThumbnailStats {
     p95_ms: 40.25,
     p99_ms: 90.125,
     paused: false,
+    proto_requests: 0,
+    proto_ok: 0,
+    proto_bytes_sent: 0,
+    proto_p50_ms: null,
+    proto_p95_ms: null,
+    proto_p99_ms: null,
     ...partial,
   };
 }

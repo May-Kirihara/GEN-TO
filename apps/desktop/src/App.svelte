@@ -6,6 +6,7 @@
   import {
     CatalogStore,
     type CatalogIpc,
+    type CatalogPage,
     type CatalogSummary,
     type ImageListItem,
     type ScanProgressEvent,
@@ -15,9 +16,11 @@
     formatBytes,
     formatHitRate,
     formatMs,
+    type RequestAccepted,
     type ThumbnailIpc,
     type ThumbnailStats,
   } from "./lib/thumbnails";
+  import { originalUrl, previewUrl, thumbUrl } from "./lib/protocol";
 
   let healthStatus: HealthUiState | null = $state(null);
   let rawHealth: HealthInfo | null = $state(null);
@@ -45,6 +48,12 @@
   let thumbError: string | null = $state(null);
   let thumbEventLog: string[] = $state([]);
   let thumbBusy = $state(false);
+
+  // プロトコルスモークパネル (WP-4): gento-thumb/preview/original の
+  // 表示とネガティブケースをアプリ内で証明する (結果はOCR可能なテキスト行)。
+  let smokeLines: string[] = $state([]);
+  let smokeRunning = $state(false);
+  let smokeResult = $state("");
 
   const stopChangeNotification = catalog.onChange(() => {
     summary = catalog.summary;
@@ -120,6 +129,183 @@
       return "?";
     }
     return `${width}×${height}`;
+  }
+
+  // ===== プロトコルスモーク (WP-4) =====
+
+  type LoadResult = { ok: boolean; detail: string };
+
+  function loadImage(url: string, timeoutMs = 20000): Promise<LoadResult> {
+    return new Promise((resolve) => {
+      const img = new Image();
+      let settled = false;
+      const finish = (result: LoadResult) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          img.onload = null;
+          img.onerror = null;
+          resolve(result);
+        }
+      };
+      const timer = setTimeout(() => finish({ ok: false, detail: "TIMEOUT" }), timeoutMs);
+      img.onload = () =>
+        finish(
+          img.naturalWidth > 0
+            ? { ok: true, detail: `${img.naturalWidth}x${img.naturalHeight}` }
+            : { ok: false, detail: "naturalWidth=0" },
+        );
+      img.onerror = () => finish({ ok: false, detail: "onerror" });
+      img.src = url;
+    });
+  }
+
+  /** 生成を要求し、その資産の thumb:ready を待つ (cache_generationを返す)。 */
+  async function requestAndWaitReady(
+    assetId: string,
+    sizeClass: string,
+  ): Promise<{ gen: number | null; note: string }> {
+    let unlisten: (() => void) | null = null;
+    const readyPromise = new Promise<number | null>((resolve) => {
+      let done = false;
+      const timer = setTimeout(() => {
+        done = true;
+        resolve(null);
+      }, 90000);
+      void listen<{
+        items: Array<{ asset_id: string; size_class: string; cache_generation: number }>;
+      }>("thumb:ready", (event) => {
+        if (done) {
+          return;
+        }
+        const hit = event.payload.items.find(
+          (item) => item.asset_id === assetId && item.size_class === sizeClass,
+        );
+        if (hit) {
+          done = true;
+          clearTimeout(timer);
+          resolve(hit.cache_generation);
+        }
+      }).then((un) => {
+        unlisten = un;
+        if (done) {
+          un();
+        }
+      });
+    });
+    const accepted = await invoke<RequestAccepted>("request_thumbnails", {
+      ids: [assetId],
+      sizeClass,
+      priority: "interactive",
+    });
+    const gen = await readyPromise;
+    // CFAはthenコールバック内の代入を追跡しないため、明示的に読み直す
+    const stop = unlisten as (() => void) | null;
+    stop?.();
+    const note = `受付 q=${accepted.queued} dup=${accepted.rejected_dup} hit=${accepted.cache_hits}`;
+    return { gen, note };
+  }
+
+  /** 先頭のreadyなカタログ項目を1件取得する (staleGenerationは1回だけ再試行)。 */
+  async function fetchFirstReadyItem(): Promise<{ id: string; name: string } | null> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const summary = await invoke<CatalogSummary>("get_catalog_summary");
+      try {
+        const page = await invoke<CatalogPage>("get_catalog_page", {
+          generation: summary.generation,
+          offset: 0,
+          limit: 5,
+        });
+        const item = page.items.find((entry) => entry.state === "ready");
+        return item ? { id: item.id, name: item.displayName } : null;
+      } catch {
+        // staleGeneration: summaryを引き直して再試行
+      }
+    }
+    return null;
+  }
+
+  async function runProtocolSmoke(): Promise<void> {
+    if (smokeRunning) {
+      return;
+    }
+    smokeRunning = true;
+    smokeResult = "";
+    const lines: string[] = [];
+    const checks: Array<{ label: string; pass: boolean }> = [];
+    const push = (line: string) => {
+      lines.push(line);
+      smokeLines = [...lines];
+    };
+
+    try {
+      const target = await fetchFirstReadyItem();
+      if (!target) {
+        push("target: カタログにready項目なし (スキャン後に再実行すること)");
+        push("SMOKE RESULT: FAIL (0/0)");
+        smokeResult = "SMOKE RESULT: FAIL (カタログ空)";
+        return;
+      }
+      push(`target: id=${target.id} (${target.name})`);
+
+      // S1: サムネイル (s256) — 要求 → thumb:ready → URL更新 → 表示切替
+      const s1 = await requestAndWaitReady(target.id, "s256");
+      if (s1.gen === null) {
+        checks.push({ label: "S1", pass: false });
+        push(`[S1] thumb s256 → FAIL (ready未受信 ${s1.note})`);
+      } else {
+        const r = await loadImage(thumbUrl(target.id, "s256", s1.gen));
+        checks.push({ label: "S1", pass: r.ok });
+        push(
+          `[S1] thumb s256 gen=${s1.gen} ${s1.note} → ${r.ok ? "LOAD OK" : "LOAD FAIL"} (${r.detail})`,
+        );
+      }
+
+      // S2: preview2048
+      const s2 = await requestAndWaitReady(target.id, "preview2048");
+      if (s2.gen === null) {
+        checks.push({ label: "S2", pass: false });
+        push(`[S2] preview2048 → FAIL (ready未受信 ${s2.note})`);
+      } else {
+        const r = await loadImage(previewUrl(target.id, s2.gen));
+        checks.push({ label: "S2", pass: r.ok });
+        push(
+          `[S2] preview2048 gen=${s2.gen} ${s2.note} → ${r.ok ? "LOAD OK" : "LOAD FAIL"} (${r.detail})`,
+        );
+      }
+
+      // S3: original (元ファイル。生成不要。vは直近のgenerationを流用)
+      const genForOriginal = s2.gen ?? s1.gen ?? 1;
+      const r3 = await loadImage(originalUrl(target.id, genForOriginal));
+      checks.push({ label: "S3", pass: r3.ok });
+      push(
+        `[S3] original gen=${genForOriginal} → ${r3.ok ? "LOAD OK" : "LOAD FAIL"} (${r3.detail})`,
+      );
+
+      // ネガティブ: いずれも onerror にならなければならない
+      const negatives: Array<[string, string]> = [
+        ["N1a 未登録ID (localhost形式)", "gento-thumb://localhost/asset/999999999/s256?v=1"],
+        ["N1b 未登録ID (WP指定形式)", "gento-thumb://asset/999999999/s256"],
+        ["N2 トラバーサル", "gento-thumb://../../../etc/passwd"],
+        ["N3a 未知クエリ (localhost形式)", `gento-thumb://localhost/asset/${target.id}/s256?x=1`],
+        ["N3b 未知クエリ (WP指定形式)", `gento-thumb://asset/${target.id}/s256?x=1`],
+      ];
+      for (const [label, url] of negatives) {
+        const r = await loadImage(url, 15000);
+        checks.push({ label, pass: !r.ok });
+        push(`[${label}] → ${!r.ok ? "ERROR OK" : "BAD: LOADED"} (${r.detail})`);
+      }
+
+      const passed = checks.filter((c) => c.pass).length;
+      const allPass = passed === checks.length && checks.length > 0;
+      push(`SMOKE RESULT: ${allPass ? "PASS" : "FAIL"} (${passed}/${checks.length})`);
+      smokeResult = `SMOKE RESULT: ${allPass ? "PASS" : "FAIL"} (${passed}/${checks.length})`;
+    } catch (error) {
+      push(`SMOKE RESULT: FAIL (例外: ${toErrorMessage(error)})`);
+      smokeResult = `SMOKE RESULT: FAIL (${toErrorMessage(error)})`;
+    } finally {
+      smokeRunning = false;
+    }
   }
 
   onMount(() => {
@@ -273,6 +459,14 @@
           p95 {formatMs(thumbStats.p95_ms)} /
           p99 {formatMs(thumbStats.p99_ms)}
         </div>
+        <div>
+          プロトコル {thumbStats.proto_requests.toLocaleString()} 件 /
+          OK {thumbStats.proto_ok.toLocaleString()} /
+          転送 {formatBytes(thumbStats.proto_bytes_sent)} /
+          p50 {formatMs(thumbStats.proto_p50_ms)} /
+          p95 {formatMs(thumbStats.proto_p95_ms)} /
+          p99 {formatMs(thumbStats.proto_p99_ms)}
+        </div>
       </div>
     {:else}
       <p>統計未取得</p>
@@ -283,6 +477,25 @@
           <div class="log-line">{line}</div>
         {/each}
       </div>
+    {/if}
+  </section>
+
+  <section>
+    <h2>プロトコルスモーク (WP-4)</h2>
+    <div class="thumb-buttons">
+      <button onclick={() => void runProtocolSmoke()} disabled={smokeRunning}>
+        {smokeRunning ? "スモーク実行中…" : "スモーク実行"}
+      </button>
+    </div>
+    <p class="notice">
+      手順: スキャン完了後に実行。thumb(s256) / preview2048 / original の表示と
+      ネガティブケース (未登録ID・トラバーサル・未知クエリ) を検証する。
+    </p>
+    {#if smokeResult}
+      <p class={smokeResult.includes("PASS") ? "ok" : "error"}>{smokeResult}</p>
+    {/if}
+    {#if smokeLines.length > 0}
+      <pre class="smoke-log">{smokeLines.join("\n")}</pre>
     {/if}
   </section>
 
@@ -383,6 +596,12 @@
   .log-line {
     font-family: monospace;
     white-space: nowrap;
+  }
+
+  .smoke-log {
+    font-family: monospace;
+    font-size: 0.875rem;
+    white-space: pre-wrap;
   }
 
   button {
