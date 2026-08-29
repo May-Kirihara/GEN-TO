@@ -1,6 +1,6 @@
 # 依存ライブラリメモ (Phase 2 / WP-2時点)
 
-- 記録日: 2026-08-28 (Phase 1 → WP-2更新 → WP-3更新 2026-08-29 → WP-4更新 2026-08-29)
+- 記録日: 2026-08-28 (Phase 1 → WP-2更新 → WP-3更新 2026-08-29 → WP-4更新 2026-08-29 → WP-5更新 2026-08-29)
 - 方針: バージョンはpin (npmは正確なバージョン指定、Cargoは `=` 付き + Cargo.lock)。追加・変更時に本メモへ記録する。
 
 ## Rust (workspace直依存)
@@ -25,6 +25,7 @@
 | パッケージ | pinバージョン | 用途 | ライセンス |
 |---|---|---|---|
 | @tauri-apps/api | 2.11.1 | invoke等のIPCクライアント | Apache-2.0 OR MIT |
+| @tanstack/svelte-virtual | 3.13.36 | 仮想スクロール (WP-5)。内部で `@tanstack/virtual-core` 3.17.8 を使用 | MIT |
 | svelte | 5.56.10 | UIフレームワーク (runes使用) | MIT |
 | @tauri-apps/cli | 2.11.4 | `pnpm tauri` (dev/build) | Apache-2.0 OR MIT |
 | vite | 8.2.2 | devサーバー・bundler | MIT |
@@ -94,6 +95,33 @@
 - **CSP設定のみ追加** (`tauri.conf.json`): `img-src 'self' data: gento-thumb:
   gento-preview: gento-original:`。`csp` と `devCsp` で同一値。
 
+## WP-5で追加した依存の選定理由 (判断ゲートAの記録)
+
+- **`@tanstack/svelte-virtual` =3.13.36 を採用 (ゲートA第一候補のまま)**:
+  - 検証内容: (1) peerDependenciesが `svelte ^3.48 || ^4 || ^5` とSvelte 5を明示サポート、
+    (2) dist実装は `svelte/store` の `writable`/`derived` で `Virtualizer` インスタンスを
+    ラップするだけの薄いアダプタ (52行) であり、Svelte 5 runesコンポーネントから
+    明示的 `subscribe` で利用可能、(3) `pnpm check` / `pnpm build` / 単体テストが
+    すべて通過、(4) 実アプリで5万件カタログの行単位仮想化・overscan切替・
+    scrollToIndex追従・スクロール位置復元が期待どおり動作し、DOMセル数が
+    可視行+overscanに厳密に比例 (49/63/35/21/39セルを幾何計算とOCRで確認)。
+    機能・性能とも問題なしと判断し、virtual-core直使用や命令的DOM更新
+    (ゲート2/3) への降格は不要とした。
+  - 既知の留意点: アダプタの `setOptions` は `estimateSize` 変更を測定キャッシュへ
+    反映しない (virtual-coreの `getMeasurements` メモ化がestimateSizeを依存に持たない
+    ため)。セルサイズ切替は `{#key cellClass}` でコンポーネントごと再生成して対応
+    (データはGridStore側に残るため再取得不要)。
+    また `useAnimationFrameWithResizeObserver: true` を指定し、ResizeObserverの
+    同一フレーム再通知によるloop警告を抑制している。
+
+## WP-5の実装上の発見 (依存ではないが再利用時の注意)
+
+- Tauri IPCの応答はまれに喪失しうる (WebViewのフォーカス遷移中に観測)。
+  `get_catalog_page` / `request_thumbnails` のpromiseが未解決のまま残ると、
+  ページ取得のin-flight dedupとサムネイルpending集合が永久に停滞する。
+  WP-5では両invokeに8秒タイムアウトを付けてエラー経路へ落とし、次の
+  レンジ変化で再試行する設計とした (`grid/pages.ts` / `grid/grid-store.ts`)。
+
 ## 将来WPでの追加予定
 
-- WP-5 (Phase 3): `@tanstack/svelte-virtual` (仮想スクロール。Svelte 5互換プローブの結果により `@tanstack/virtual-core` 直使用に切り替える可能性)
+- (WP-5で追加予定だった `@tanstack/svelte-virtual` は上記のとおり採用済み)

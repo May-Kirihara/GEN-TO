@@ -176,7 +176,8 @@ export class ThumbnailStore {
     }
   }
 
-  async clearCache(): Promise<boolean> {
+  /** キャッシュ全削除。成功時は新しいcache_generationを返す (WP-5のURL無効化用)。 */
+  async clearCache(): Promise<number | null> {
     try {
       const result = await this.ipc.invoke<{
         removed_files: number;
@@ -188,11 +189,11 @@ export class ThumbnailStore {
         `削除 ${result.removed_files} 件 / ${formatBytes(result.removed_bytes)}` +
         ` (generation → ${result.cache_generation})`;
       await this.refreshStats();
-      return true;
+      return result.cache_generation;
     } catch (error) {
       this.lastError = toMessage(error);
       this.notify();
-      return false;
+      return null;
     }
   }
 

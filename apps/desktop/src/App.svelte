@@ -8,7 +8,6 @@
     type CatalogIpc,
     type CatalogPage,
     type CatalogSummary,
-    type ImageListItem,
     type ScanProgressEvent,
   } from "./lib/catalog";
   import {
@@ -21,6 +20,10 @@
     type ThumbnailStats,
   } from "./lib/thumbnails";
   import { originalUrl, previewUrl, thumbUrl } from "./lib/protocol";
+  import { GridStore, type GridIpc } from "./lib/grid/grid-store";
+  import { ScrollPositionStore } from "./lib/grid/scroll-position";
+  import type { ThumbCellClass } from "./lib/grid/layout";
+  import ThumbnailGrid from "./lib/grid/ThumbnailGrid.svelte";
 
   let healthStatus: HealthUiState | null = $state(null);
   let rawHealth: HealthInfo | null = $state(null);
@@ -34,13 +37,9 @@
 
   let summary: CatalogSummary | null = $state(null);
   let progress: ScanProgressEvent | null = $state(null);
-  let pageItems: ImageListItem[] = $state([]);
-  let pageOffset = $state(0);
-  let pageHasMore = $state(false);
   let catalogError: string | null = $state(null);
 
   // サムネイル開発パネル (WP-3): 統計ポーリング + 全件生成/一時停止/全削除。
-  // 表示本体はWP-4/5。イベントはログ表示のみ。
   const thumbIpc: ThumbnailIpc = { invoke, listen };
   const thumbnails = new ThumbnailStore(thumbIpc);
   let thumbStats: ThumbnailStats | null = $state(null);
@@ -55,13 +54,23 @@
   let smokeRunning = $state(false);
   let smokeResult = $state("");
 
+  // 仮想サムネイルグリッド (WP-5)。
+  const grid = new GridStore({ invoke, listen } satisfies GridIpc);
+  const scrollPositions = new ScrollPositionStore(localStorage);
+  let cellClass = $state<ThumbCellClass>("s256");
+  let overscanChoice = $state(2);
+  let gridComponent: ThumbnailGrid | null = $state(null);
+  let gridModeKey = $state("real");
+  let restoreNotice = $state("");
+
   const stopChangeNotification = catalog.onChange(() => {
     summary = catalog.summary;
     progress = catalog.progress;
-    pageItems = catalog.pageItems;
-    pageOffset = catalog.pageOffset;
-    pageHasMore = catalog.pageHasMore;
     catalogError = catalog.lastError;
+    if (catalog.summary !== null) {
+      gridModeKey = catalog.summary.mode;
+      grid.syncSummary(catalog.summary);
+    }
   });
 
   const stopThumbNotification = thumbnails.onChange(() => {
@@ -73,6 +82,7 @@
 
   let disposeCatalog: (() => void) | null = null;
   let disposeThumbnails: (() => void) | null = null;
+  let disposeGrid: (() => void) | null = null;
 
   function toErrorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
@@ -120,15 +130,26 @@
 
   async function clearThumbCache(): Promise<void> {
     thumbBusy = true;
-    await thumbnails.clearCache();
+    const cacheGeneration = await thumbnails.clearCache();
+    if (cacheGeneration !== null) {
+      grid.noteCacheCleared(cacheGeneration);
+    }
     thumbBusy = false;
   }
 
-  function formatDimensions(width: number | null, height: number | null): string {
-    if (width === null || height === null) {
-      return "?";
+  function setCellClass(next: ThumbCellClass): void {
+    cellClass = next;
+    grid.setSizeClass(next);
+  }
+
+  function restoreScrollPosition(): void {
+    restoreNotice = "";
+    if (gridComponent === null) {
+      restoreNotice = "グリッドが未初期化です";
+      return;
     }
-    return `${width}×${height}`;
+    gridComponent.restoreFromStorage();
+    restoreNotice = "位置を復元しました";
   }
 
   // ===== プロトコルスモーク (WP-4) =====
@@ -316,6 +337,9 @@
     void thumbnails.init().then((dispose) => {
       disposeThumbnails = dispose;
     });
+    void grid.init().then((dispose) => {
+      disposeGrid = dispose;
+    });
   });
 
   onDestroy(() => {
@@ -323,6 +347,7 @@
     stopThumbNotification();
     disposeCatalog?.();
     disposeThumbnails?.();
+    disposeGrid?.();
   });
 </script>
 
@@ -400,24 +425,42 @@
   </section>
 
   <section>
-    <h2>ページプレビュー (先頭200件・単純テキスト)</h2>
-    <p>offset {pageOffset} / 全 {summary?.total ?? 0} 件 {pageHasMore ? "(続きあり)" : ""}</p>
-    <div class="page-preview">
-      {#if pageItems.length === 0}
-        <p>(項目なし。スキャン開始で表示されます)</p>
-      {:else}
-        {#each pageItems as item (item.id)}
-          <div class="page-row">
-            <span class="row-name">{item.displayName}</span>
-            <span class="row-meta">
-              {formatDimensions(item.width, item.height)} /
-              {formatBytes(item.byteSize)} /
-              {item.state}
-            </span>
-          </div>
-        {/each}
+    <h2>サムネイルグリッド (WP-5)</h2>
+    <div class="grid-controls">
+      <button class:active={cellClass === "s256"} onclick={() => setCellClass("s256")}>
+        セル小 (128px / s256)
+      </button>
+      <button class:active={cellClass === "s512"} onclick={() => setCellClass("s512")}>
+        セル大 (256px / s512)
+      </button>
+      <label>
+        overscan
+        <select
+          value={overscanChoice}
+          onchange={(event) => {
+            overscanChoice = Number(event.currentTarget.value);
+          }}
+        >
+          {#each [0, 2, 5, 10] as value (value)}
+            <option value={value}>{value}</option>
+          {/each}
+        </select>
+      </label>
+      <button onclick={() => restoreScrollPosition()}>位置復元</button>
+      {#if restoreNotice}
+        <span class="notice">{restoreNotice}</span>
       {/if}
     </div>
+    {#key `${gridModeKey}-${cellClass}`}
+      <ThumbnailGrid
+        bind:this={gridComponent}
+        {grid}
+        scrollStore={scrollPositions}
+        modeKey={gridModeKey}
+        {cellClass}
+        overscanRows={overscanChoice}
+      />
+    {/key}
   </section>
 
   <section>
@@ -528,33 +571,24 @@
     overflow-x: auto;
   }
 
-  .page-preview {
-    border: 1px solid light-dark(#d0d7de, #30363d);
-    border-radius: 0.5rem;
-    max-height: 20rem;
-    overflow-y: auto;
-    padding: 0.5rem;
-  }
-
-  .page-row {
+  .grid-controls {
     display: flex;
-    gap: 0.75rem;
-    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+  }
+
+  .grid-controls label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
     font-size: 0.875rem;
-    padding: 0.125rem 0.25rem;
   }
 
-  .page-row:nth-child(odd) {
-    background: light-dark(#fafbfc, #161b22);
-  }
-
-  .row-name {
-    overflow-wrap: anywhere;
-  }
-
-  .row-meta {
-    white-space: nowrap;
-    color: light-dark(#57606a, #8b949e);
+  .grid-controls button.active {
+    border-color: light-dark(#0969da, #58a6ff);
+    font-weight: bold;
   }
 
   .ok {
