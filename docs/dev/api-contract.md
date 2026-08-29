@@ -465,3 +465,67 @@ dev (`devCsp`) とrelease (`csp`) で同一。connect-src等は既定 (無制限
 プロトコル応答時間 (p50/p95/p99) と転送バイト・件数を `ProtoStats`
 (`AppState` 内) に記録し、`get_thumbnail_stats` の `proto_*` フィールドへ統合する。
 durationサンプルは100,000件で打ち切り。
+
+## 14. WP-7 (フェーズ8/9) で追加・拡張したAPI
+
+### `set_failure_injection`
+
+```ts
+invoke<{ mode: string, rate: number }>("set_failure_injection", {
+  mode: "none" | "decode" | "cache_write", rate: 0.0..1.0
+})
+```
+
+- 開発用の決定的エラー注入。即時に全ワーカーへ反映される。
+- **判定はassetIdではなくキャッシュキー (fingerprint由来) のハッシュ閾値**
+  (60bitを1e6スケール閾値と比較)。ジョブはキャッシュキーでdedupされるため
+  1ジョブが複数の仮想assetIdに対応し得るが、キャッシュキーは実ファイル+
+  size+mtimeから決まるため決定性は同等。実カタログ (1ファイル=1 asset) では
+  assetIdハッシュと同値になる。WP-7仕様からの意図的な逸脱として記録。
+- `decode`: デコード前に `decode failed: injected failure (decode)` で個別failed。
+- `cache_write`: 一時ファイル作成後に失敗 (Dropガードが掃除。`.tmp` 残存なし)。
+  `cache commit failed: injected failure (cache_write)`。
+- rate=0 / mode=none で完全復帰。rateは [0,1] 外をクランプ。
+
+### `dev_bridge_enabled`
+
+```ts
+invoke<boolean>("dev_bridge_enabled")
+```
+
+- 環境変数 `GENTO_DEV_BRIDGE` が設定されているとき true。release buildでも
+  計測ブリッジ (devtest.ts) を有効化するためのランタイムフラグ (既定無効)。
+
+### `devtest_report`
+
+```ts
+invoke<null>("devtest_report", { payload: string })
+```
+
+- 計測ブリッジから機械可読行を `devtest:` ターゲットのinfoログへ流す。
+  bash側は `grep devtest:` で採取する。悪用価値はないが開発用。
+
+### `get_thumbnail_stats` の拡張フィールド (後方互換の追加)
+
+```ts
+queue_depths: {   // 優先度別の未開始ジョブ数 (WP-7開発パネル用)
+  interactive: number; viewport: number; prefetch: number;
+  overscan: number; background: number;
+};
+injection_mode: "none" | "decode" | "cache_write";
+injection_rate: number;
+```
+
+### グリッドの画面外キャンセルポリシー (フロント実装、WP-7 A1)
+
+- `GridStore` は需要デバウンス毎 (150ms) に、維持ゾーン
+  (可視∪進行方向prefetch∪overscan) の外へ出た現在サイズクラスのpending要求を
+  `cancel_thumbnail_requests` へ送る。インデックス解決不能なIDは保守的に残す。
+- 画面外へ出た失敗記録 (`FailureSet`) はリトラクトされ、再登場時の次の
+  レンジ変化で再試行される (同一レンジ内の自動リトライはしない)。
+
+### SIGTERM graceful終了 (Rust実装、WP-7 A4)
+
+- SIGTERM/SIGINT → self-pipe (libc) → 監視スレッド → `AppHandle::exit(0)` →
+  `RunEvent::Exit` → `ThumbnailService::shutdown()` (ワーカー排出・join・
+  キューCancelled化)。ウィンドウ閉じと同じ経路。

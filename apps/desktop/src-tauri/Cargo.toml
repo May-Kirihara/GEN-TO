@@ -19,6 +19,8 @@ tauri = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 dirs = { workspace = true }
+# SIGTERM graceful終了のself-pipe実装用 (WP-7)。依存グラフに既存。
+libc = "0.2"
 
 [dev-dependencies]
 serde_json = { workspace = true }

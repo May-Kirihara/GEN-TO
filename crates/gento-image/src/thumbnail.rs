@@ -9,6 +9,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -55,6 +56,102 @@ impl fmt::Display for ThumbnailError {
 }
 
 impl std::error::Error for ThumbnailError {}
+
+/// 開発用エラー注入のモード (WP-7 / フェーズ8「耐障害性」)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectionMode {
+    None,
+    Decode,
+    CacheWrite,
+}
+
+impl InjectionMode {
+    pub const IPC_NAMES: [&'static str; 3] = ["none", "decode", "cache_write"];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            InjectionMode::None => "none",
+            InjectionMode::Decode => "decode",
+            InjectionMode::CacheWrite => "cache_write",
+        }
+    }
+
+    pub fn from_ipc(s: &str) -> Option<Self> {
+        match s {
+            "none" => Some(InjectionMode::None),
+            "decode" => Some(InjectionMode::Decode),
+            "cache_write" => Some(InjectionMode::CacheWrite),
+            _ => None,
+        }
+    }
+}
+
+/// 決定的エラー注入の設定。テストと計測が再現可能であることを保証するため、
+/// 乱数を使わずジョブのキャッシュキーhexを閾値判定に使う。
+///
+/// 判定対象がassetIdではなくキャッシュキー (fingerprint由来) である点は
+/// WP-7仕様からの意図的な逸脱: ジョブはキャッシュキーでdedupされるため
+/// 1ジョブが複数の仮想assetIdに対応し得る (5万件仮想カタログ)。
+/// キャッシュキーは実ファイル+size+mtimeから決まるため同じ決定性を持ち、
+/// 実カタログ (1ファイル=1 asset) ではassetIdハッシュと同値になる。
+#[derive(Debug, Default)]
+pub struct FailureInjection {
+    mode: std::sync::atomic::AtomicU8,
+    /// rate [0.0, 1.0] を1e6スケールの整数閾値として保持 (f64のatomicが無いため)。
+    rate_micro: std::sync::atomic::AtomicU64,
+}
+
+impl FailureInjection {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set(&self, mode: InjectionMode, rate: f64) {
+        let mode_u8 = match mode {
+            InjectionMode::None => 0u8,
+            InjectionMode::Decode => 1,
+            InjectionMode::CacheWrite => 2,
+        };
+        self.mode.store(mode_u8, Ordering::Relaxed);
+        self.rate_micro.store(
+            ((rate.clamp(0.0, 1.0)) * 1_000_000.0) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn mode(&self) -> InjectionMode {
+        match self.mode.load(Ordering::Relaxed) {
+            1 => InjectionMode::Decode,
+            2 => InjectionMode::CacheWrite,
+            _ => InjectionMode::None,
+        }
+    }
+
+    pub fn rate(&self) -> f64 {
+        self.rate_micro.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    }
+
+    /// このジョブキーに失敗を注入するか。決定的 (同一キーは常に同一判定)。
+    pub fn should_inject(&self, key_hex: &str) -> Option<InjectionMode> {
+        let mode = self.mode();
+        let rate = self.rate();
+        if mode == InjectionMode::None || rate <= 0.0 {
+            return None;
+        }
+        if rate >= 1.0 {
+            return Some(mode);
+        }
+        let head = &key_hex[..key_hex.len().min(16)];
+        let Ok(value) = u64::from_str_radix(head, 16) else {
+            return None;
+        };
+        if value % 1_000_000 < (rate * 1_000_000.0) as u64 {
+            Some(mode)
+        } else {
+            None
+        }
+    }
+}
 
 /// 生成成果物。
 #[derive(Debug, Clone)]
@@ -166,17 +263,33 @@ pub struct ThumbnailJob {
     pub size_class: SizeClass,
     pub cache: Arc<ThumbnailCache>,
     pub stats: Arc<ThumbStats>,
+    /// 開発用エラー注入 (WP-7)。注入なしでも全ジョブが共通の設定を参照する。
+    pub injection: Arc<FailureInjection>,
 }
 
 impl Job for ThumbnailJob {
     fn run(&self, cancel: &CancelToken) -> Result<Vec<u8>, String> {
         let started = Instant::now();
+        let key = cache_key(&self.fingerprint, self.size_class);
+        if self.injection.should_inject(&key.hex) == Some(InjectionMode::Decode) {
+            // キュー全体は停止しない: このジョブだけ個別failedになる
+            return Err("decode failed: injected failure (decode)".to_string());
+        }
         let output = generate(&self.source, self.size_class, cancel).map_err(|e| e.to_string())?;
         if cancel.is_cancelled() {
             // エンコード完了後のキャンセル: 書き込まずに中断する
             return Err("cancelled".to_string());
         }
-        let key = cache_key(&self.fingerprint, self.size_class);
+        if self.injection.should_inject(&key.hex) == Some(InjectionMode::CacheWrite) {
+            // 実際に一時ファイルを作ってから失敗させる (Dropガードの後始末を通す)。
+            // これにより「注入時も一時ファイルを残さない」ことを検証できる。
+            let writer = self
+                .cache
+                .begin_write(&key)
+                .map_err(|e| format!("cache write prepare failed: {e}"))?;
+            drop(writer);
+            return Err("cache commit failed: injected failure (cache_write)".to_string());
+        }
         let writer = self
             .cache
             .begin_write(&key)
@@ -458,6 +571,7 @@ mod tests {
             size_class: SizeClass::S256,
             cache: Arc::clone(&cache),
             stats: Arc::clone(&stats),
+            injection: Arc::new(FailureInjection::new()),
         };
         let bytes = job.run(&CancelToken::new()).unwrap();
         assert!(!bytes.is_empty());
@@ -483,6 +597,7 @@ mod tests {
             size_class: SizeClass::S512,
             cache,
             stats,
+            injection: Arc::new(FailureInjection::new()),
         };
         let handle = pool
             .submit("job2", gento_core::Priority::Interactive, Arc::new(job2))
@@ -492,5 +607,184 @@ mod tests {
         let completions: Vec<_> = rx.try_iter().collect();
         assert_eq!(completions.len(), 1);
         pool.shutdown();
+    }
+
+    // ===== エラー注入 (WP-7 / フェーズ8) =====
+
+    /// rate=0.5のとき閾値の両側に落ちる合成パスを探索する (決定性検証の素材)。
+    fn find_split_paths(rate: f64) -> (PathBuf, PathBuf) {
+        let mut below = None;
+        let mut above = None;
+        for i in 0..10_000u32 {
+            let fp = fingerprint_of(Path::new(&format!("/inject/{i}.png")), 1000, i as u64);
+            let key = crate::cache::cache_key(&fp, SizeClass::S256);
+            let head = &key.hex[..16];
+            let value = u64::from_str_radix(head, 16).unwrap();
+            let injects = value % 1_000_000 < (rate * 1_000_000.0) as u64;
+            if injects && below.is_none() {
+                below = Some(PathBuf::from(format!("/inject/{i}.png")));
+            }
+            if !injects && above.is_none() {
+                above = Some(PathBuf::from(format!("/inject/{i}.png")));
+            }
+            if below.is_some() && above.is_some() {
+                break;
+            }
+        }
+        (
+            below.expect("inject-side path"),
+            above.expect("non-inject-side path"),
+        )
+    }
+
+    fn key_hex_of(path: &Path) -> String {
+        let fp = fingerprint_of(path, 1000, 0);
+        crate::cache::cache_key(&fp, SizeClass::S256).hex
+    }
+
+    #[test]
+    fn injection_boundaries_none_and_full() {
+        let inj = FailureInjection::new();
+        let hex = key_hex_of(Path::new("/inject/boundary.png"));
+        assert_eq!(inj.should_inject(&hex), None, "default must not inject");
+
+        inj.set(InjectionMode::Decode, 0.0);
+        assert_eq!(inj.should_inject(&hex), None);
+        inj.set(InjectionMode::CacheWrite, 1.0);
+        assert_eq!(inj.should_inject(&hex), Some(InjectionMode::CacheWrite));
+        assert_eq!(inj.mode(), InjectionMode::CacheWrite);
+        assert_eq!(inj.rate(), 1.0);
+
+        // 範囲外rateはクランプされる (壊れた入力でも全域/無効にならない)
+        inj.set(InjectionMode::Decode, 1.5);
+        assert_eq!(inj.should_inject(&hex), Some(InjectionMode::Decode));
+        inj.set(InjectionMode::Decode, -0.2);
+        assert_eq!(inj.should_inject(&hex), None);
+    }
+
+    #[test]
+    fn injection_is_deterministic_per_key() {
+        let inj = FailureInjection::new();
+        inj.set(InjectionMode::Decode, 0.5);
+        let (yes, no) = find_split_paths(0.5);
+        let yes_hex = key_hex_of(&yes);
+        let no_hex = key_hex_of(&no);
+        // 同一キーは何度判定しても同じ結果
+        for _ in 0..5 {
+            assert_eq!(inj.should_inject(&yes_hex), Some(InjectionMode::Decode));
+            assert_eq!(inj.should_inject(&no_hex), None);
+        }
+        // mode=noneならrate>0でも注入しない (復帰)
+        inj.set(InjectionMode::None, 0.5);
+        assert_eq!(inj.should_inject(&yes_hex), None);
+    }
+
+    #[test]
+    fn decode_injection_fails_job_individually_without_cache_file() {
+        let dir = TestDir::new("inject-decode");
+        let stats = Arc::new(ThumbStats::new());
+        let cache =
+            Arc::new(ThumbnailCache::open(dir.path().join("cache"), Arc::clone(&stats)).unwrap());
+        let inj = Arc::new(FailureInjection::new());
+        inj.set(InjectionMode::Decode, 1.0);
+        let png = write_test_png(&dir, "a.png", 64, 64, false);
+        let fp = fingerprint_of(&png, 10, 0);
+
+        // 注入されたジョブ: 個別failed。キャッシュにも一時ファイルにも残さない
+        let bad = ThumbnailJob {
+            source: png.clone(),
+            fingerprint: fp.clone(),
+            size_class: SizeClass::S256,
+            cache: Arc::clone(&cache),
+            stats: Arc::clone(&stats),
+            injection: Arc::clone(&inj),
+        };
+        let err = bad.run(&CancelToken::new()).unwrap_err();
+        assert!(err.contains("decode failed"), "{err}");
+        let key = crate::cache::cache_key(&fp, SizeClass::S256);
+        assert!(matches!(
+            cache.lookup(&key),
+            crate::cache::CacheLookup::Miss
+        ));
+
+        // 同一プール設定で注入なしジョブは成功する (キュー全体は停止しない)
+        inj.set(InjectionMode::None, 0.0);
+        let good = ThumbnailJob {
+            source: png,
+            fingerprint: fp.clone(),
+            size_class: SizeClass::S256,
+            cache: Arc::clone(&cache),
+            stats: Arc::clone(&stats),
+            injection: Arc::clone(&inj),
+        };
+        assert!(good.run(&CancelToken::new()).is_ok());
+        assert!(matches!(
+            cache.lookup(&key),
+            crate::cache::CacheLookup::Hit(_)
+        ));
+
+        assert_no_tmp_files(dir.path().join("cache").as_path());
+    }
+
+    #[test]
+    fn cache_write_injection_fails_after_temp_creation_but_cleans_up() {
+        let dir = TestDir::new("inject-cache");
+        let stats = Arc::new(ThumbStats::new());
+        let cache =
+            Arc::new(ThumbnailCache::open(dir.path().join("cache"), Arc::clone(&stats)).unwrap());
+        let inj = Arc::new(FailureInjection::new());
+        inj.set(InjectionMode::CacheWrite, 1.0);
+        let png = write_test_png(&dir, "c.png", 300, 200, false);
+        let fp = fingerprint_of(&png, 10, 0);
+
+        let job = ThumbnailJob {
+            source: png,
+            fingerprint: fp.clone(),
+            size_class: SizeClass::S256,
+            cache: Arc::clone(&cache),
+            stats: Arc::clone(&stats),
+            injection: Arc::clone(&inj),
+        };
+        let err = job.run(&CancelToken::new()).unwrap_err();
+        assert!(err.contains("cache commit failed"), "{err}");
+        assert!(err.contains("injected"), "{err}");
+
+        // 最終ファイルなし・一時ファイル残存なし・generated会計なし
+        let key = crate::cache::cache_key(&fp, SizeClass::S256);
+        assert!(matches!(
+            cache.lookup(&key),
+            crate::cache::CacheLookup::Miss
+        ));
+        assert_eq!(stats.snapshot().generated, 0);
+        assert_no_tmp_files(dir.path().join("cache").as_path());
+    }
+
+    /// キャッシュツリー全体に `.tmp-*` が無いことを検証する共有ヘルパ。
+    fn assert_no_tmp_files(cache_root: &Path) {
+        let mut tmp_count = 0;
+        for shard in fs::read_dir(cache_root).unwrap() {
+            let shard = shard.unwrap();
+            if !shard.file_type().unwrap().is_dir() {
+                continue;
+            }
+            for file in fs::read_dir(shard.path()).unwrap() {
+                let name = file.unwrap().file_name().to_string_lossy().into_owned();
+                if name.starts_with(".tmp-") {
+                    tmp_count += 1;
+                }
+            }
+        }
+        assert_eq!(tmp_count, 0, "injected failure must not leave temp files");
+    }
+
+    #[test]
+    fn injection_mode_ipc_round_trip() {
+        for name in InjectionMode::IPC_NAMES {
+            let mode = InjectionMode::from_ipc(name).unwrap();
+            assert_eq!(mode.as_str(), name);
+        }
+        assert_eq!(InjectionMode::from_ipc("none"), Some(InjectionMode::None));
+        assert_eq!(InjectionMode::from_ipc("network"), None);
+        assert_eq!(InjectionMode::from_ipc(""), None);
     }
 }

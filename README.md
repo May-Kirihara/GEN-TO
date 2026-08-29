@@ -77,3 +77,22 @@ pnpm build   # vite build
 ```bash
 GENTO_LOG=debug pnpm tauri dev -- -- -- --dataset ../../../sample/dataset
 ```
+
+## 計測 (WP-7 / フェーズ9)
+
+release buildでの計測手順 (詳細は [docs/technical-spike-results.md](docs/technical-spike-results.md)、
+ドライバは検証機 `/tmp/opencode/wp7/`):
+
+```bash
+cd apps/desktop
+pnpm tauri build --no-bundle   # frontendDistビルド + cargo --release
+GENTO_LOG=info GENTO_DEV_BRIDGE=1 NO_COLOR=1 \
+  ../../target/release/gento-tauri --dataset ../../sample/dataset \
+  --cache-dir /tmp/gento-cache 2>&1 | tee app.log
+```
+
+- `GENTO_DEV_BRIDGE=1` で計測ブリッジ (F2〜F12) が有効になる。dev buildでは常に有効
+- アプリ内開発パネルに 統計 (優先度別キューを含む) / long task・ロングフレーム / 起動タイムマーク / エラー注入 を表示
+- ブリッジは1秒周期の機械可読行を `devtest:` プレフィックスでログ出力する (`grep devtest:` で採取)
+- Rustプロセス+WebView子プロセスのRSS合計は `/proc` を読むスクリプトで測定 (例: `rss-sample.sh <pid>`)
+- SIGTERMでgraceful終了 (ワーカー排出・一時ファイル掃除)。終了後 `find <cache-dir> -name '.tmp-*'` が空であることを確認できる

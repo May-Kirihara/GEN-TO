@@ -57,6 +57,15 @@ function makeIpc(opts?: {
           ...opts?.accepted,
         } as RequestAccepted as T;
       }
+      if (command === "cancel_thumbnail_requests") {
+        const count = (args?.ids as string[]).length;
+        return {
+          cancelled_queued: count,
+          cancel_requested: 0,
+          not_found: 0,
+          skipped_unreadable: 0,
+        } as T;
+      }
       throw `unexpected command ${command}`;
     },
     listen: async <T>(
@@ -352,5 +361,104 @@ describe("GridStore — summary同期", () => {
     };
     grid.syncSummary(summary);
     expect(grid.summary?.total).toBe(1615);
+  });
+});
+
+describe("GridStore — 画面外キャンセルと失敗リトラクト (WP-7)", () => {
+  function cancelCalls(calls: Array<{ command: string; args?: Record<string, unknown> }>) {
+    return calls.filter((c) => c.command === "cancel_thumbnail_requests");
+  }
+
+  it("スクロールで画面外へ出たpending要求をキャンセルし、進行方向先読みは維持する", async () => {
+    const { ipc, calls } = makeIpc();
+    const grid = new GridStore(ipc, { debounceMs: 150, prefetchRows: 0 });
+    await grid.init();
+    // 行0..2 × 3列 = index 0..8 を要求 → pendingに入る
+    grid.viewportChanged({ start: 0, end: 2 }, 0, 0, 3);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(requestCalls(calls)).toHaveLength(1);
+
+    // 行20..22へ一気にスクロール (下向き) → 0..8は画面外 → キャンセルされる
+    grid.viewportChanged({ start: 20, end: 22 }, 0, 5000, 3);
+    await vi.advanceTimersByTimeAsync(200);
+    const cancels = cancelCalls(calls);
+    expect(cancels).toHaveLength(1);
+    expect(cancels[0]?.args?.sizeClass).toBe("s256");
+    expect((cancels[0]?.args?.ids as string[]).sort()).toEqual(
+      ["0", "1", "2", "3", "4", "5", "6", "7", "8"].sort(),
+    );
+    expect(grid.stats.cancelled).toBe(9);
+    // pendingから除去されるため、行0..2へ戻れば再要求できる
+    grid.viewportChanged({ start: 0, end: 2 }, 0, 0, 3);
+    await vi.advanceTimersByTimeAsync(200);
+    // 2回目 (行20..22の要求) + 3回目 (行0..2の再要求)
+    expect(requestCalls(calls)).toHaveLength(3);
+  });
+
+  it("先読み・overscan行はキャンセルしない (維持ゾーン内)", async () => {
+    const { ipc, calls } = makeIpc();
+    const grid = new GridStore(ipc, { debounceMs: 150, prefetchRows: 4 });
+    await grid.init();
+    grid.viewportChanged({ start: 0, end: 2 }, 2, 0, 3);
+    await vi.advanceTimersByTimeAsync(200);
+    // 下向きに2行だけスクロール (overscan 2 + prefetch 4が旧要求をカバーする)
+    grid.viewportChanged({ start: 2, end: 4 }, 2, 100, 3);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(cancelCalls(calls)).toHaveLength(0);
+  });
+
+  it("現在以外のサイズクラスのpendingはキャンセル対象にしない", async () => {
+    const { ipc, calls } = makeIpc();
+    const grid = new GridStore(ipc, { debounceMs: 150, prefetchRows: 0 });
+    await grid.init();
+    grid.viewportChanged({ start: 0, end: 2 }, 0, 0, 3);
+    await vi.advanceTimersByTimeAsync(200);
+    // s512へ切替して要求 → s512のpendingが増える
+    grid.setSizeClass("s512");
+    grid.viewportChanged({ start: 0, end: 2 }, 0, 0, 3);
+    await vi.advanceTimersByTimeAsync(200);
+    // 大きくスクロール: s512のpendingはキャンセルされるが、
+    // キャンセル要求のsizeClassは現在のクラス (s512) に限定される
+    grid.viewportChanged({ start: 20, end: 22 }, 0, 5000, 3);
+    await vi.advanceTimersByTimeAsync(200);
+    const cancels = cancelCalls(calls);
+    expect(cancels).toHaveLength(1);
+    expect(cancels[0]?.args?.sizeClass).toBe("s512");
+  });
+
+  it("画面外へ出た失敗記録はリトラクトされ、再登場時に再試行する", async () => {
+    const { ipc, calls, listeners } = makeIpc();
+    const grid = new GridStore(ipc, { debounceMs: 150, prefetchRows: 0 });
+    await grid.init();
+    grid.viewportChanged({ start: 0, end: 2 }, 0, 0, 3);
+    await vi.advanceTimersByTimeAsync(200);
+    emit(listeners, "thumb:failed", {
+      items: [{ asset_id: "5", size_class: "s256", reason: "decode failed: injected" }],
+    });
+    expect(grid.isFailed("5")).toBe(true);
+
+    // 画面外へ出る → 失敗記録がリトラクトされる
+    grid.viewportChanged({ start: 20, end: 22 }, 0, 5000, 3);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(grid.isFailed("5")).toBe(false);
+
+    // 戻ってくると再要求される (失敗記録が解除されているため)
+    emit(listeners, "thumb:ready", readyItems(["0", "1", "2", "3", "4", "6", "7", "8"], 1));
+    grid.viewportChanged({ start: 0, end: 2 }, 0, 0, 3);
+    await vi.advanceTimersByTimeAsync(200);
+    const last = requestCalls(calls).at(-1);
+    expect(last?.args?.ids).toContain("5");
+  });
+
+  it("キャンセル要求の結果は統計に計上される", async () => {
+    const { ipc } = makeIpc();
+    const grid = new GridStore(ipc, { debounceMs: 150, prefetchRows: 0 });
+    await grid.init();
+    grid.viewportChanged({ start: 0, end: 2 }, 0, 0, 3);
+    await vi.advanceTimersByTimeAsync(200);
+    grid.viewportChanged({ start: 40, end: 42 }, 0, 9000, 3);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(grid.stats.cancelled).toBe(9);
+    expect(grid.stats.cancelBatches).toBe(1);
   });
 });

@@ -8,9 +8,13 @@
  *
  * IPC境界は注入 (ThumbnailIpc) してテスト容易にする (CatalogStoreと同じ構成)。
  */
-import type { RequestAccepted, ThumbnailStats } from "./thumbnail-types";
+import type {
+  InjectionStatus,
+  RequestAccepted,
+  ThumbnailStats,
+} from "./thumbnail-types";
 
-export type { RequestAccepted, ThumbnailStats } from "./thumbnail-types";
+export type { InjectionStatus, RequestAccepted, ThumbnailStats } from "./thumbnail-types";
 
 export type ThumbnailIpc = {
   invoke: <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
@@ -167,6 +171,27 @@ export class ThumbnailStore {
     try {
       await this.ipc.invoke("pause_thumbnail_generation", { paused });
       this.lastError = null;
+      await this.refreshStats();
+      return true;
+    } catch (error) {
+      this.lastError = toMessage(error);
+      this.notify();
+      return false;
+    }
+  }
+
+  /** 開発用エラー注入の設定 (WP-7)。mode=none・rate=0で復帰。 */
+  async setInjection(
+    mode: "none" | "decode" | "cache_write",
+    rate: number,
+  ): Promise<boolean> {
+    try {
+      const status = await this.ipc.invoke<InjectionStatus>("set_failure_injection", {
+        mode,
+        rate,
+      });
+      this.lastError = null;
+      this.lastNotice = `エラー注入: ${status.mode} @ rate=${status.rate.toFixed(2)}`;
       await this.refreshStats();
       return true;
     } catch (error) {

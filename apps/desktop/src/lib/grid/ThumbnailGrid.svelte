@@ -280,6 +280,12 @@
     return grid.thumbUrlFor(item.id);
   }
 
+  /** このセルが現在のサイズクラスで生成失敗しているか (WP-7 A2)。 */
+  function failed(item: ImageListItem): boolean {
+    void gridTick;
+    return grid.isFailed(item.id);
+  }
+
   function cellsOf(rowIndex: number): Array<{ index: number; key: string }> {
     void gridTick;
     const cells: Array<{ index: number; key: string }> = [];
@@ -299,6 +305,7 @@
     const stats = grid.stats;
     return (
       `要求 ${stats.requested.toLocaleString()} / 拒否 ${stats.rejectedFull.toLocaleString()}` +
+      ` / キャンセル ${stats.cancelled.toLocaleString()}` +
       ` / ready受信 ${stats.readyReceived.toLocaleString()} / 失敗 ${stats.failedReceived.toLocaleString()}`
     );
   }
@@ -309,6 +316,21 @@
     if (top !== null) {
       virtualizerInstance?.scrollToOffset(top, { align: "start" });
     }
+  }
+
+  /** スクロール要素へフォーカスする (計測ブリッジのキー入力用、WP-7)。 */
+  export function focus(): void {
+    scrollEl?.focus();
+  }
+
+  /** スクロール高さの割合 (0=先頭, 1=末尾) へジャンプする (§16 シナリオ9計測用)。 */
+  export function jumpTo(fraction: number): void {
+    const el = scrollEl;
+    if (el === null) {
+      return;
+    }
+    const clamped = Math.min(1, Math.max(0, fraction));
+    el.scrollTop = Math.round((el.scrollHeight - el.clientHeight) * clamped);
   }
 
   onDestroy(() => {
@@ -352,6 +374,7 @@
             class="cell"
             class:cell-selected={item !== null && sel.selected.has(item.id)}
             class:cell-focus={sel.focusIndex === cell.index}
+            class:cell-failed={item !== null && failed(item)}
             data-grid-cell
             data-index={cell.index}
             style="width:{cellPx}px; height:{cellPx}px"
@@ -362,6 +385,8 @@
               {@const url = urlFor(item)}
               {#if url !== null}
                 <img src={url} alt={item.displayName} loading="lazy" decoding="async" draggable="false" />
+              {:else if failed(item)}
+                <span class="cell-fail-mark" role="img" aria-label="サムネイル生成失敗">✕</span>
               {/if}
             {/if}
           </div>
@@ -418,6 +443,23 @@
   .cell-selected {
     border-color: light-dark(#0969da, #58a6ff);
     box-shadow: 0 0 0 2px light-dark(#0969da, #58a6ff);
+  }
+
+  /* 生成失敗セル (WP-7 A2): プレースホルダーと区別される失敗表示 */
+  .cell-failed {
+    border-color: light-dark(#cf222e, #f85149);
+    background: light-dark(#fdf0f1, #2d1517);
+  }
+
+  .cell-fail-mark {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    color: light-dark(#cf222e, #f85149);
+    font-weight: bold;
+    font-size: 1.25rem;
+    user-select: none;
   }
 
   .cell-focus {

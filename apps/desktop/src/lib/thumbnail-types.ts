@@ -14,11 +14,22 @@ export type ThumbnailStats = {
   failures: number;
   evictions: number;
   queue_depth: number;
+  /** 優先度別の未開始ジョブ数 (WP-7開発パネル用)。 */
+  queue_depths: {
+    interactive: number;
+    viewport: number;
+    prefetch: number;
+    overscan: number;
+    background: number;
+  };
   cache_bytes: number;
   p50_ms: number | null;
   p95_ms: number | null;
   p99_ms: number | null;
   paused: boolean;
+  /** 開発用エラー注入の現在値 (WP-7)。 */
+  injection_mode: "none" | "decode" | "cache_write";
+  injection_rate: number;
   /** ローカル画像プロトコル統計 (WP-4)。 */
   proto_requests: number;
   proto_ok: number;
@@ -26,6 +37,20 @@ export type ThumbnailStats = {
   proto_p50_ms: number | null;
   proto_p95_ms: number | null;
   proto_p99_ms: number | null;
+};
+
+/** cancel_thumbnail_requests の戻り値 (WP-7でグリッドが使用)。 */
+export type CancelThumbnailResult = {
+  cancelled_queued: number;
+  cancel_requested: number;
+  not_found: number;
+  skipped_unreadable: number;
+};
+
+/** set_failure_injection の戻り値。 */
+export type InjectionStatus = {
+  mode: "none" | "decode" | "cache_write";
+  rate: number;
 };
 
 /** request_thumbnails / generate_all_thumbnails の戻り値。 */

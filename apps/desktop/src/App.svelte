@@ -28,6 +28,7 @@
   import ImageViewer from "./lib/viewer/ImageViewer.svelte";
   import { CompareStore, type CompareIpc } from "./lib/compare/compare-store";
   import CompareView from "./lib/compare/CompareView.svelte";
+  import { perf } from "./lib/perf";
 
   let healthStatus: HealthUiState | null = $state(null);
   let rawHealth: HealthInfo | null = $state(null);
@@ -51,6 +52,7 @@
   let thumbError: string | null = $state(null);
   let thumbEventLog: string[] = $state([]);
   let thumbBusy = $state(false);
+  let injectionBusy = $state(false);
 
   // プロトコルスモークパネル (WP-4): gento-thumb/preview/original の
   // 表示とネガティブケースをアプリ内で証明する (結果はOCR可能なテキスト行)。
@@ -133,6 +135,15 @@
     }
   });
 
+  // 起動タイムマーク: 初回ページ受信 (WP-7 / §16)。ページ取得はgridの
+  // ensureRange完了通知 (grid.onChange) で観測する
+  const stopGridNotifyForPerf = grid.onChange(() => {
+    if (!markedFirstPage && grid.pager.stats.fetched > 0) {
+      markedFirstPage = true;
+      perf.markFirstPage();
+    }
+  });
+
   const stopThumbNotification = thumbnails.onChange(() => {
     thumbStats = thumbnails.stats;
     thumbNotice = thumbnails.lastNotice;
@@ -143,6 +154,7 @@
   let disposeCatalog: (() => void) | null = null;
   let disposeThumbnails: (() => void) | null = null;
   let disposeGrid: (() => void) | null = null;
+  let markedFirstPage = false;
 
   function toErrorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
@@ -153,6 +165,7 @@
       const response = await invoke<HealthInfo>("health");
       rawHealth = response;
       healthStatus = normalizeHealth(response);
+      perf.markHealthOk();
     } catch (error) {
       rawHealth = null;
       healthStatus = { kind: "error", message: toErrorMessage(error) };
@@ -195,6 +208,15 @@
       grid.noteCacheCleared(cacheGeneration);
     }
     thumbBusy = false;
+  }
+
+  async function setInjection(
+    mode: "none" | "decode" | "cache_write",
+    rate: number,
+  ): Promise<void> {
+    injectionBusy = true;
+    await thumbnails.setInjection(mode, rate);
+    injectionBusy = false;
   }
 
   function setCellClass(next: ThumbCellClass): void {
@@ -390,6 +412,9 @@
   }
 
   onMount(() => {
+    perf.markMounted();
+    perf.startLongTaskObserver();
+    perf.startFrameMonitor();
     void refreshHealth();
     void catalog.init().then((dispose) => {
       disposeCatalog = dispose;
@@ -400,24 +425,42 @@
     void grid.init().then((dispose) => {
       disposeGrid = dispose;
     });
-    // 実機検証ブリッジ (WP-6)。リリースビルドでは DEVガートで静的に除外される
-    if (import.meta.env.DEV) {
-      void import("./lib/devtest").then(({ installDevBridge }) => {
+    // 実機検証ブリッジ (WP-6/WP-7)。dev build、またはreleaseで
+    // GENTO_DEV_BRIDGE=1 のときのみ有効 (計測 §16)
+    void (async () => {
+      let enabled = import.meta.env.DEV;
+      if (!enabled) {
+        try {
+          enabled = await invoke<boolean>("dev_bridge_enabled");
+        } catch {
+          enabled = false;
+        }
+      }
+      if (enabled) {
+        const { installDevBridge } = await import("./lib/devtest");
         installDevBridge({
           getViewer: () => viewerStore,
           getCompare: () => compareStore,
           getMode: () => viewerMode,
+          getGrid: () => grid,
+          getThumb: () => thumbnails,
+          getPerf: () => perf,
+          getGridComponent: () => gridComponent,
+          getSelection: () => gridSelection,
+          invoke,
         });
-      });
-    }
+      }
+    })();
   });
 
   onDestroy(() => {
     stopChangeNotification();
     stopThumbNotification();
+    stopGridNotifyForPerf();
     disposeCatalog?.();
     disposeThumbnails?.();
     disposeGrid?.();
+    perf.stop();
   });
 </script>
 
@@ -577,6 +620,30 @@
         キャッシュ全削除
       </button>
     </div>
+    <div class="thumb-buttons">
+      <span class="notice">エラー注入 (WP-7):</span>
+      <button
+        class:active={thumbStats?.injection_mode === "none"}
+        onclick={() => void setInjection("none", 0)}
+        disabled={injectionBusy}
+      >
+        なし
+      </button>
+      <button
+        class:active={thumbStats?.injection_mode === "decode"}
+        onclick={() => void setInjection("decode", 0.3)}
+        disabled={injectionBusy}
+      >
+        decode失敗 30%
+      </button>
+      <button
+        class:active={thumbStats?.injection_mode === "cache_write"}
+        onclick={() => void setInjection("cache_write", 0.3)}
+        disabled={injectionBusy}
+      >
+        キャッシュ書込失敗 30%
+      </button>
+    </div>
     {#if thumbNotice}
       <p class="notice">{thumbNotice}</p>
     {/if}
@@ -594,7 +661,12 @@
         <div>
           失敗 {thumbStats.failures.toLocaleString()} /
           退避 {thumbStats.evictions.toLocaleString()} /
-          キュー {thumbStats.queue_depth.toLocaleString()} /
+          キュー {thumbStats.queue_depth.toLocaleString()}
+          (i {thumbStats.queue_depths.interactive} /
+          v {thumbStats.queue_depths.viewport} /
+          p {thumbStats.queue_depths.prefetch} /
+          o {thumbStats.queue_depths.overscan} /
+          b {thumbStats.queue_depths.background}) /
           容量 {formatBytes(thumbStats.cache_bytes)}
           {thumbStats.paused ? " / 一時停止中" : ""}
         </div>
@@ -641,6 +713,26 @@
     {#if smokeLines.length > 0}
       <pre class="smoke-log">{smokeLines.join("\n")}</pre>
     {/if}
+  </section>
+
+  <section>
+    <h2>パフォーマンス (WP-7計測)</h2>
+    <div class="thumb-stats">
+      <div>
+        long task {perf.longTasks.toLocaleString()} 件
+        (最悪 {perf.worstLongTaskMs === null ? "—" : `${Math.round(perf.worstLongTaskMs)} ms`})
+        / observer {perf.longTaskObserverSupported === null ? "未開始" : perf.longTaskObserverSupported ? "対応" : "非対応"}
+      </div>
+      <div>
+        long frame (≥50ms) {perf.longFrames.toLocaleString()} 件
+        (最悪 {perf.worstLongFrameMs === null ? "—" : `${Math.round(perf.worstLongFrameMs)} ms`})
+      </div>
+      <div>
+        起動: mount {Math.round(perf.marks.mountedAt ?? 0)} ms /
+        health OK +{perf.startupDurations().mountToHealthMs === null ? "—" : `${Math.round(perf.startupDurations().mountToHealthMs as number)} ms`} /
+        初回ページ +{perf.startupDurations().mountToFirstPageMs === null ? "—" : `${Math.round(perf.startupDurations().mountToFirstPageMs as number)} ms`}
+      </div>
+    </div>
   </section>
 
   <section>

@@ -12,6 +12,7 @@
  */
 import type { CatalogSummary } from "../catalog-types";
 import type {
+  CancelThumbnailResult,
   RequestAccepted,
   ThumbFailedItem,
   ThumbReadyItem,
@@ -23,6 +24,7 @@ import {
   FailureSet,
   ReadyMap,
   directionFromDelta,
+  keepZoneRows,
   pendingKey,
   planDemand,
   type RowRange,
@@ -47,6 +49,10 @@ export type GridStats = {
   readyReceived: number;
   /** thumb:failed 項目数。 */
   failedReceived: number;
+  /** 画面外キャンセルしたID数 (WP-7)。 */
+  cancelled: number;
+  /** cancel_thumbnail_requests 呼び出し回数 (WP-7)。 */
+  cancelBatches: number;
 };
 
 function toMessage(value: unknown): string {
@@ -83,6 +89,8 @@ export class GridStore {
     rejectedFull: 0,
     readyReceived: 0,
     failedReceived: 0,
+    cancelled: 0,
+    cancelBatches: 0,
   };
   lastError: string | null = null;
   /** ready/failed/ページ到着で増える版番号 (セル再描画のトリガー用)。 */
@@ -221,6 +229,11 @@ export class GridStore {
     return gen === null ? null : thumbUrl(id, this.sizeClassValue, gen);
   }
 
+  /** このセルが現在のサイズクラスで生成失敗しているか (WP-7 A2の失敗表示)。 */
+  isFailed(id: string): boolean {
+    return this.failures.has(this.sizeClassValue, id);
+  }
+
   /**
    * ビューポート変化の通知。rangeは**行番号** (virtualizer準拠)。
    * ページ取得は即時、サムネイル要求はデバウンスする。
@@ -271,6 +284,9 @@ export class GridStore {
     if (latest === null || this.summary === null) {
       return;
     }
+    // 画面外へ出た未開始要求のキャンセルと、画面外失敗記録のリトラクト (WP-7)。
+    // 新しい需要を出す前に実行し「過去の要求を長時間処理し続けない」を保証する。
+    await this.reapOutsideKeepZone(latest);
     const total = this.pager.total;
     const rowCount = totalRows(total, latest.columns);
     if (rowCount === 0) {
@@ -324,6 +340,85 @@ export class GridStore {
           this.pending.delete(pendingKey(this.sizeClassValue, id));
         }
       }
+    }
+  }
+
+  /**
+   * 維持ゾーン (visible ∪ prefetch ∪ overscan) の外へ出た要求・失敗記録を
+   * 掃除する (WP-7 / フェーズ8)。
+   *
+   * - pending内の現在サイズクラスのIDで、インデックス解決できたもののうち
+   *   ゾーン外のものを cancel_thumbnail_requests へ送る
+   *   (未開始ジョブは即時除去。進行方向先読み行はゾーンに含むため維持)
+   * - 失敗記録はゾーン外へ出たら解除する (再登場時に次のレンジ変化で再試行)
+   * - インデックス解決不能 (ページ未取得) のIDは保守的に残す
+   */
+  private async reapOutsideKeepZone(latest: {
+    range: RowRange;
+    overscanRows: number;
+    columns: number;
+  }): Promise<void> {
+    const sizeClass = this.sizeClassValue;
+    const zone = keepZoneRows({
+      visible: latest.range,
+      overscanBefore: latest.overscanRows,
+      overscanAfter: latest.overscanRows,
+      direction: this.direction,
+      prefetchRows: this.prefetchRows,
+    });
+    const lastRow = totalRows(this.pager.total, latest.columns) - 1;
+    const zoneStart = Math.max(0, zone.start) * latest.columns;
+    const zoneEnd = Math.min(lastRow, zone.end + 1) * latest.columns - 1;
+
+    const pendingIds: string[] = [];
+    for (const key of this.pending) {
+      const sep = key.indexOf(":");
+      if (sep >= 0 && key.slice(0, sep) === sizeClass) {
+        pendingIds.push(key.slice(sep + 1));
+      }
+    }
+    const failedIds = this.failures.ids(sizeClass);
+    if (pendingIds.length === 0 && failedIds.length === 0) {
+      return;
+    }
+
+    const resolve = new Map<string, number>();
+    const wanted = new Set<string>([...pendingIds, ...failedIds]);
+    for (const [id, index] of this.pager.findIndicesByIds(wanted)) {
+      resolve.set(id, index);
+    }
+
+    const outside = (id: string): boolean => {
+      const index = resolve.get(id);
+      return index !== undefined && (index < zoneStart || index > zoneEnd);
+    };
+
+    const stalePending = pendingIds.filter(outside);
+    if (stalePending.length > 0) {
+      this.stats.cancelBatches++;
+      try {
+        const result = await withTimeout(
+          this.ipc.invoke<CancelThumbnailResult>("cancel_thumbnail_requests", {
+            ids: stalePending,
+            sizeClass,
+          }),
+          this.requestTimeoutMs,
+          "cancel_thumbnail_requests",
+        );
+        this.stats.cancelled += result.cancelled_queued + result.cancel_requested;
+      } catch (error) {
+        this.lastError = toMessage(error);
+      }
+      // 要求済みジョブの成否はthumb:ready/failedで追跡するため、
+      // キャンセル結果にかかわらずpendingからは外す (再登場時の再要求を許す)
+      for (const id of stalePending) {
+        this.pending.delete(pendingKey(sizeClass, id));
+      }
+    }
+
+    const staleFailed = failedIds.filter(outside);
+    if (staleFailed.length > 0) {
+      this.failures.retract(sizeClass, staleFailed);
     }
   }
 

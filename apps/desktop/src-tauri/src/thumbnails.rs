@@ -21,7 +21,7 @@ use gento_core::{AssetId, Priority, SizeClass};
 use gento_image::cache::{asset_fingerprint, cache_key, CacheLookup, ThumbnailCache};
 use gento_image::pool::{OutcomeSummary, PoolConfig, WorkerPool};
 use gento_image::stats::ThumbStats;
-use gento_image::thumbnail::ThumbnailJob;
+use gento_image::thumbnail::{FailureInjection, InjectionMode, ThumbnailJob};
 use serde::Serialize;
 use tauri::{Emitter, State};
 
@@ -110,6 +110,8 @@ pub struct ThumbnailService {
     /// ジョブキー → 要求中アセット。完了 (ready/failed/cancelled) で消える。
     registry: Arc<Mutex<HashMap<String, PendingRequest>>>,
     cache_generation: AtomicU64,
+    /// 開発用エラー注入 (WP-7)。全ジョブが共有する。
+    injection: Arc<FailureInjection>,
     emitter_tx: Sender<EmitterMsg>,
     emitter_stop: Arc<AtomicBool>,
     emitter: Mutex<Option<JoinHandle<()>>>,
@@ -153,6 +155,7 @@ impl ThumbnailService {
             stats,
             registry,
             cache_generation: AtomicU64::new(1),
+            injection: Arc::new(FailureInjection::new()),
             emitter_tx,
             emitter_stop,
             emitter: Mutex::new(Some(emitter)),
@@ -210,6 +213,7 @@ impl ThumbnailService {
                             size_class,
                             cache: Arc::clone(&self.cache),
                             stats: Arc::clone(&self.stats),
+                            injection: Arc::clone(&self.injection),
                         });
                         match self.pool.submit(&key.hex, priority, job) {
                             Ok(submitted) => Some(submitted),
@@ -297,6 +301,7 @@ impl ThumbnailService {
     /// `with_proto` でcommand層が上書きする (ここではゼロ初期化)。
     pub fn stats_dto(&self) -> ThumbnailStatsDto {
         let snapshot = self.stats.snapshot();
+        let depths = self.pool.queue_depths_by_priority();
         ThumbnailStatsDto {
             generated: snapshot.generated,
             hits: snapshot.cache_hits,
@@ -305,11 +310,20 @@ impl ThumbnailService {
             failures: snapshot.failures,
             evictions: snapshot.evictions,
             queue_depth: self.pool.queue_depth(),
+            queue_depths: QueueDepthsDto {
+                interactive: depths[Priority::Interactive.as_u8() as usize],
+                viewport: depths[Priority::Viewport.as_u8() as usize],
+                prefetch: depths[Priority::Prefetch.as_u8() as usize],
+                overscan: depths[Priority::Overscan.as_u8() as usize],
+                background: depths[Priority::Background.as_u8() as usize],
+            },
             cache_bytes: self.cache.total_bytes(),
             p50_ms: snapshot.p50_ms,
             p95_ms: snapshot.p95_ms,
             p99_ms: snapshot.p99_ms,
             paused: self.pool.is_paused(),
+            injection_mode: self.injection.mode().as_str().to_string(),
+            injection_rate: self.injection.rate(),
             proto_requests: 0,
             proto_ok: 0,
             proto_bytes_sent: 0,
@@ -317,6 +331,12 @@ impl ThumbnailService {
             proto_p95_ms: None,
             proto_p99_ms: None,
         }
+    }
+
+    /// 開発用エラー注入の設定 (WP-7 / フェーズ8)。即時に全ワーカーへ反映される。
+    pub fn set_injection(&self, mode: InjectionMode, rate: f64) {
+        self.injection.set(mode, rate);
+        tracing::info!(mode = mode.as_str(), rate, "failure injection updated");
     }
 
     pub fn set_paused(&self, paused: bool) {
@@ -483,7 +503,7 @@ pub struct CancelResult {
 }
 
 /// `get_thumbnail_stats` の結果DTO。
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ThumbnailStatsDto {
     pub generated: u64,
     pub hits: u64,
@@ -492,11 +512,16 @@ pub struct ThumbnailStatsDto {
     pub failures: u64,
     pub evictions: u64,
     pub queue_depth: usize,
+    /// 優先度別の未開始ジョブ数 (WP-7開発パネル用)。
+    pub queue_depths: QueueDepthsDto,
     pub cache_bytes: u64,
     pub p50_ms: Option<f64>,
     pub p95_ms: Option<f64>,
     pub p99_ms: Option<f64>,
     pub paused: bool,
+    /// 開発用エラー注入の現在値 (WP-7)。
+    pub injection_mode: String,
+    pub injection_rate: f64,
     // ローカル画像プロトコル統計 (WP-4。get_thumbnail_statsへ統合)
     pub proto_requests: u64,
     pub proto_ok: u64,
@@ -504,6 +529,23 @@ pub struct ThumbnailStatsDto {
     pub proto_p50_ms: Option<f64>,
     pub proto_p95_ms: Option<f64>,
     pub proto_p99_ms: Option<f64>,
+}
+
+/// 優先度別キュー件数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+pub struct QueueDepthsDto {
+    pub interactive: usize,
+    pub viewport: usize,
+    pub prefetch: usize,
+    pub overscan: usize,
+    pub background: usize,
+}
+
+/// `set_failure_injection` の結果DTO (現在の設定を返す)。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct InjectionStatusDto {
+    pub mode: String,
+    pub rate: f64,
 }
 
 impl ThumbnailStatsDto {
@@ -673,6 +715,26 @@ pub fn get_thumbnail_stats(state: State<'_, AppState>) -> ThumbnailStatsDto {
         .thumbnails()
         .stats_dto()
         .with_proto(&state.proto_stats.snapshot())
+}
+
+/// 開発用エラー注入 (WP-7 / フェーズ8)。mode = none|decode|cache_write、
+/// rate = 0.0..1.0。決定的 (キャッシュキー閾値) ため計測が再現可能。
+#[tauri::command]
+pub fn set_failure_injection(
+    state: State<'_, AppState>,
+    mode: String,
+    rate: f64,
+) -> Result<InjectionStatusDto, String> {
+    if !(0.0..=1.0).contains(&rate) {
+        return Err(format!("rate must be within 0.0..=1.0 (got {rate})"));
+    }
+    let mode = InjectionMode::from_ipc(&mode)
+        .ok_or_else(|| format!("unknown injection mode {mode:?}: none|decode|cache_write"))?;
+    state.thumbnails().set_injection(mode, rate);
+    Ok(InjectionStatusDto {
+        mode: mode.as_str().to_string(),
+        rate,
+    })
 }
 
 #[tauri::command]
@@ -1057,6 +1119,128 @@ mod tests {
         assert!(
             batches.len() >= 2,
             "25 items must split into >=2 batches: {batches:?}"
+        );
+        svc.shutdown();
+    }
+
+    #[test]
+    fn failure_injection_fails_individually_and_recovers_at_zero_rate() {
+        let dir = TestDir::new("inject");
+        let events = SharedEvents::default();
+        let svc = service(&dir, events.clone());
+        let a = asset(1, &dir.write_png("a.png", 64, 64), true);
+        let b = asset(2, &dir.write_png("b.png", 64, 64), true);
+
+        // decode全件注入: 個別failedイベントのみ。キューは停滞しない
+        svc.set_injection(gento_image::thumbnail::InjectionMode::Decode, 1.0);
+        let counters = svc.request(
+            &[a.clone(), b.clone()],
+            SizeClass::S256,
+            Priority::Background,
+        );
+        assert_eq!(counters.queued, 2);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if events.failed_items().len() >= 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for injected failures"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let failed = events.failed_items();
+        assert!(failed.iter().all(|f| f.reason.contains("injected")));
+        assert_eq!(events.ready_items().len(), 0);
+        assert_eq!(svc.stats_dto().failures, 2);
+        assert_eq!(
+            svc.stats_dto().queue_depth,
+            0,
+            "queue must drain, not stall"
+        );
+        assert_eq!(svc.stats_dto().injection_mode, "decode");
+        assert_eq!(svc.stats_dto().injection_rate, 1.0);
+
+        // rate=0で復帰: 同じ要求が成功する
+        svc.set_injection(gento_image::thumbnail::InjectionMode::None, 0.0);
+        let retry = svc.request(
+            &[a.clone(), b.clone()],
+            SizeClass::S256,
+            Priority::Background,
+        );
+        assert_eq!(retry.queued, 2);
+        events.wait_ready_count(2);
+        assert_eq!(svc.stats_dto().generated, 2);
+
+        // cache_write全件注入: failed + 一時ファイル残存なし
+        svc.set_injection(gento_image::thumbnail::InjectionMode::CacheWrite, 1.0);
+        let c = asset(3, &dir.write_png("c.png", 300, 200), true);
+        let counters = svc.request(&[c], SizeClass::S256, Priority::Background);
+        assert_eq!(counters.queued, 1);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if events
+                .failed_items()
+                .iter()
+                .any(|f| f.asset_id == AssetId::new(3))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for cache_write failure"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut tmp_files = 0;
+        for shard in fs::read_dir(dir.path().join("cache")).unwrap() {
+            let shard = shard.unwrap();
+            if shard.file_type().unwrap().is_dir() {
+                for file in fs::read_dir(shard.path()).unwrap() {
+                    let name = file.unwrap().file_name().to_string_lossy().into_owned();
+                    if name.starts_with(".tmp-") {
+                        tmp_files += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            tmp_files, 0,
+            "injected cache_write failure must not leave temps"
+        );
+        svc.shutdown();
+    }
+
+    #[test]
+    fn stats_dto_reports_queue_depths_per_priority() {
+        let dir = TestDir::new("depths");
+        let events = SharedEvents::default();
+        let svc = service(&dir, events.clone());
+        svc.set_paused(true);
+        let assets: Vec<AssetSnapshot> = (0..4)
+            .map(|i| asset(i + 1, &dir.write_png(&format!("p{i}.png"), 64, 64), true))
+            .collect();
+        svc.request(&[assets[0].clone()], SizeClass::S256, Priority::Interactive);
+        svc.request(&[assets[1].clone()], SizeClass::S256, Priority::Viewport);
+        svc.request(
+            &[assets[2].clone(), assets[3].clone()],
+            SizeClass::S256,
+            Priority::Background,
+        );
+        let dto = svc.stats_dto();
+        assert_eq!(dto.queue_depth, 4);
+        assert_eq!(dto.queue_depths.interactive, 1);
+        assert_eq!(dto.queue_depths.viewport, 1);
+        assert_eq!(dto.queue_depths.background, 2);
+        assert_eq!(dto.queue_depths.prefetch + dto.queue_depths.overscan, 0);
+        svc.set_paused(false);
+        events.wait_ready_count(4);
+        let dto = svc.stats_dto();
+        assert_eq!(dto.queue_depth, 0);
+        assert_eq!(
+            dto.queue_depths.interactive + dto.queue_depths.background,
+            0
         );
         svc.shutdown();
     }

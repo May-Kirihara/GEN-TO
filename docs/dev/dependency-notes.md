@@ -125,3 +125,13 @@
 ## 将来WPでの追加予定
 
 - (WP-5で追加予定だった `@tanstack/svelte-virtual` は上記のとおり採用済み)
+
+## WP-7で追加した依存
+
+- `libc = "0.2"` (gento-tauri, 通常依存)
+  - 用途: SIGTERM/SIGINTのgraceful終了 (self-pipe実装: `pipe` / `signal` /
+    ハンドラ内 `write(2)` / 監視スレッド `read`)。フェーズ8「終了安全」の実証に必要。
+  - ライセンス: MIT OR Apache-2.0。ワークスペースの依存グラフに既存
+    (webkit2gtk系経由) のため新規コンパイルコストなし。
+  - 代替案: `signal-hook` / `ctrlc` crate。ハンドラ1本のため直接libc呼び出しを
+    選択 (依存追加を最小化)。async-signal-safeな操作のみ使用。

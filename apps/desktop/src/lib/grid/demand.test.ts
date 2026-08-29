@@ -3,6 +3,7 @@ import {
   FailureSet,
   ReadyMap,
   directionFromDelta,
+  keepZoneRows,
   planDemand,
 } from "./demand";
 import type { ThumbReadyItem } from "../thumbnail-types";
@@ -215,5 +216,75 @@ describe("planDemand", () => {
       itemAt: itemAtFrom(items),
     });
     expect(plan.find((b) => b.priority === "viewport")?.ids).toContain("a6");
+  });
+});
+
+describe("keepZoneRows — 画面外キャンセルの維持ゾーン (WP-7)", () => {
+  it("下向き: visible+overscan+進行方向prefetchの和集合を行範囲で返す", () => {
+    expect(
+      keepZoneRows({
+        visible: { start: 10, end: 12 },
+        overscanBefore: 2,
+        overscanAfter: 2,
+        direction: 1,
+        prefetchRows: 3,
+      }),
+    ).toEqual({ start: 8, end: 17 });
+  });
+
+  it("上向き: prefetchは上側へ拡張する", () => {
+    expect(
+      keepZoneRows({
+        visible: { start: 10, end: 12 },
+        overscanBefore: 2,
+        overscanAfter: 2,
+        direction: -1,
+        prefetchRows: 3,
+      }),
+    ).toEqual({ start: 5, end: 14 });
+  });
+
+  it("方向なしはprefetchを下側へ置く (planDemandの規約と同一)", () => {
+    expect(
+      keepZoneRows({
+        visible: { start: 10, end: 12 },
+        overscanBefore: 1,
+        overscanAfter: 1,
+        direction: 0,
+        prefetchRows: 2,
+      }),
+    ).toEqual({ start: 9, end: 15 });
+  });
+
+  it("0未満への拡張は起こる (呼び出し側でクランプする)", () => {
+    expect(
+      keepZoneRows({
+        visible: { start: 0, end: 2 },
+        overscanBefore: 3,
+        overscanAfter: 0,
+        direction: -1,
+        prefetchRows: 2,
+      }),
+    ).toEqual({ start: -5, end: 2 });
+  });
+});
+
+describe("FailureSet — 画面外リトラクト (WP-7)", () => {
+  it("idsでクラス別の失敗ID一覧を取り出せる", () => {
+    const failures = new FailureSet();
+    failures.add("s256", ["1", "2"]);
+    failures.add("s512", ["3"]);
+    expect(failures.ids("s256").sort()).toEqual(["1", "2"]);
+    expect(failures.ids("s512")).toEqual(["3"]);
+    expect(failures.ids("preview2048")).toEqual([]);
+  });
+
+  it("retractで指定IDの失敗記録を解除できる (画面外→再登場で再試行)", () => {
+    const failures = new FailureSet();
+    failures.add("s256", ["1", "2", "3"]);
+    failures.retract("s256", ["2"]);
+    expect(failures.has("s256", "2")).toBe(false);
+    expect(failures.has("s256", "1")).toBe(true);
+    expect(failures.has("s256", "3")).toBe(true);
   });
 });

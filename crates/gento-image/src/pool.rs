@@ -333,6 +333,19 @@ impl WorkerPool {
         lock(&self.inner.queue).queued_count
     }
 
+    /// 優先度別の未開始ジョブ数 (添字 = `Priority::as_u8()`)。
+    /// 開発パネルの「キュー長・優先度別件数」表示 (WP-7 / フェーズ8) 用。
+    pub fn queue_depths_by_priority(&self) -> [usize; 5] {
+        let queue = lock(&self.inner.queue);
+        let mut counts = [0usize; 5];
+        for slot in queue.jobs.values() {
+            if !slot.running {
+                counts[slot.priority.as_u8() as usize] += 1;
+            }
+        }
+        counts
+    }
+
     pub fn is_paused(&self) -> bool {
         self.inner.paused.load(Ordering::SeqCst)
     }
@@ -769,6 +782,60 @@ mod tests {
         // 完了順 (completion受信順) でも検証: interactive → viewport → bg1 → bg2
         let order: Vec<String> = drain_all(&rx, 4).into_iter().map(|c| c.key).collect();
         assert_eq!(order, vec!["interactive", "viewport", "bg1", "bg2"]);
+        p.shutdown();
+    }
+
+    #[test]
+    fn queue_depths_by_priority_counts_only_queued_jobs() {
+        let (p, _rx) = pool(1, 64);
+        p.set_paused(true);
+        let runs = Arc::new(AtomicUsize::new(0));
+        for (key, priority) in [
+            ("i1", Priority::Interactive),
+            ("i2", Priority::Interactive),
+            ("v1", Priority::Viewport),
+            ("b1", Priority::Background),
+            ("b2", Priority::Background),
+            ("b3", Priority::Background),
+        ] {
+            p.submit(
+                key,
+                priority,
+                Arc::new(OkJob {
+                    runs: Arc::clone(&runs),
+                }),
+            )
+            .unwrap();
+        }
+        let depths = p.queue_depths_by_priority();
+        assert_eq!(depths[Priority::Interactive.as_u8() as usize], 2);
+        assert_eq!(depths[Priority::Viewport.as_u8() as usize], 1);
+        assert_eq!(depths[Priority::Prefetch.as_u8() as usize], 0);
+        assert_eq!(depths[Priority::Overscan.as_u8() as usize], 0);
+        assert_eq!(depths[Priority::Background.as_u8() as usize], 3);
+        assert_eq!(depths.iter().sum::<usize>(), p.queue_depth());
+
+        // 再優先度化はカウントにも反映される
+        assert_eq!(
+            p.reprioritize("b1", Priority::Interactive),
+            ReprioritizeOutcome::Updated
+        );
+        let depths = p.queue_depths_by_priority();
+        assert_eq!(depths[Priority::Interactive.as_u8() as usize], 3);
+        assert_eq!(depths[Priority::Background.as_u8() as usize], 2);
+
+        // キャンセルで減る
+        p.cancel_job("i2");
+        let depths = p.queue_depths_by_priority();
+        assert_eq!(depths[Priority::Interactive.as_u8() as usize], 2);
+
+        // 実行開始でキューから減る (1ワーカー・一時停止解除で即開始)
+        p.set_paused(false);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while p.queue_depth() > 0 && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(p.queue_depths_by_priority().iter().sum::<usize>(), 0);
         p.shutdown();
     }
 

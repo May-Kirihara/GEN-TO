@@ -9,6 +9,7 @@ pub mod protocol;
 pub mod thumbnails;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use catalog::AppState;
 use gento_core::HealthInfo;
@@ -18,6 +19,56 @@ use tracing_subscriber::EnvFilter;
 use crate::thumbnails::ThumbnailService;
 
 const APP_NAME: &str = "GEN-TO 技術検証プロトタイプ";
+
+/// SIGTERM/SIGINTハンドラが書き込むself-pipeの書き込み側。
+/// ハンドラ内で安全に呼べるのはatomic読み取りとwrite(2)のみのため。
+static SIGNAL_PIPE_W: AtomicI32 = AtomicI32::new(-1);
+
+extern "C" fn on_termination_signal(_sig: libc::c_int) {
+    let fd = SIGNAL_PIPE_W.load(Ordering::SeqCst);
+    if fd >= 0 {
+        let byte = 1u8;
+        // write(2)はasync-signal-safe。失敗時の回復手段は無いので黙って諦める
+        unsafe {
+            let _ = libc::write(fd, &byte as *const u8 as *const libc::c_void, 1);
+        }
+    }
+}
+
+/// SIGTERM/SIGINTでGraceful終了する (WP-7 / フェーズ8「終了安全」)。
+/// 既定のSIGTERM摂動ではプロセスが即死しRunEvent::Exitが走らないため、
+/// self-pipe + 監視スレッドでapp.exit(0)へ繋ぎ、ワーカー排出と.tmp掃除を
+/// 実行させる。ウィンドウ閉じでも同じExit経路になる。
+fn install_termination_signals(app: tauri::AppHandle) {
+    let read_fd = unsafe {
+        let mut fds = [0i32; 2];
+        if libc::pipe(fds.as_mut_ptr()) != 0 {
+            tracing::warn!("failed to create signal pipe; SIGTERM will not be graceful");
+            return;
+        }
+        libc::signal(
+            libc::SIGTERM,
+            on_termination_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            on_termination_signal as *const () as libc::sighandler_t,
+        );
+        SIGNAL_PIPE_W.store(fds[1], Ordering::SeqCst);
+        fds[0]
+    };
+    std::thread::Builder::new()
+        .name("term-signal".into())
+        .spawn(move || {
+            let mut byte = [0u8; 1];
+            let n = unsafe { libc::read(read_fd, byte.as_mut_ptr() as *mut libc::c_void, 1) };
+            if n == 1 {
+                tracing::info!("termination signal received; exiting for clean shutdown");
+                app.exit(0);
+            }
+        })
+        .ok();
+}
 
 #[tauri::command]
 fn health(state: State<'_, AppState>) -> HealthInfo {
@@ -32,12 +83,26 @@ fn health(state: State<'_, AppState>) -> HealthInfo {
     }
 }
 
+/// 実機計測ブリッジ (devtest.ts) の有効化。既定は無効。
+/// release buildでも `GENTO_DEV_BRIDGE=1` で計測を可能にする (計画 §16)。
+#[tauri::command]
+fn dev_bridge_enabled() -> bool {
+    std::env::var_os("GENTO_DEV_BRIDGE").is_some()
+}
+
+/// 計測ブリッジから機械可読な行をログへ流す (bash側は `devtest:` でgrepする)。
+#[tauri::command]
+fn devtest_report(payload: String) {
+    tracing::info!(target: "devtest", "{payload}");
+}
+
 pub fn run() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     protocol::register_uri_scheme_protocols(tauri::Builder::default())
         .setup(move |app| {
             init_tracing();
+            install_termination_signals(app.handle().clone());
             let dataset_path = resolve_dataset_path(&args);
             let cache_dir = resolve_cache_dir(&args);
             tracing::info!(
@@ -68,6 +133,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             health,
+            dev_bridge_enabled,
+            devtest_report,
             catalog::get_catalog_summary,
             catalog::get_catalog_page,
             catalog::start_scan,
@@ -78,7 +145,8 @@ pub fn run() {
             thumbnails::generate_all_thumbnails,
             thumbnails::get_thumbnail_stats,
             thumbnails::pause_thumbnail_generation,
-            thumbnails::clear_thumbnail_cache
+            thumbnails::clear_thumbnail_cache,
+            thumbnails::set_failure_injection
         ])
         .build(tauri::generate_context!())
         .expect("failed to build tauri application")

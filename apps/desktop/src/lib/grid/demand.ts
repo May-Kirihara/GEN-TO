@@ -105,6 +105,23 @@ export class FailureSet {
     return this.sets.get(sizeClass)?.has(id) ?? false;
   }
 
+  /** このクラスの失敗ID一覧 (画面外リトラクト判定の素材、WP-7)。 */
+  ids(sizeClass: string): string[] {
+    const set = this.sets.get(sizeClass);
+    return set ? [...set] : [];
+  }
+
+  /** 指定IDの失敗記録を解除する (画面外へ出た→再登場時に再試行させる)。 */
+  retract(sizeClass: string, ids: Iterable<string>): void {
+    const set = this.sets.get(sizeClass);
+    if (!set) {
+      return;
+    }
+    for (const id of ids) {
+      set.delete(id);
+    }
+  }
+
   clear(): void {
     this.sets.clear();
   }
@@ -122,6 +139,27 @@ function rowIndices(row: number, columns: number, total: number): number[] {
 
 export function pendingKey(sizeClass: string, id: string): string {
   return `${sizeClass}:${id}`;
+}
+
+/**
+ * 需要計画の対象行 (visible ∪ prefetch ∪ overscan) の和集合を行範囲で返す
+ * (WP-7: 画面外へ出た未開始要求のキャンセル判定に使う)。
+ *
+ * planDemandと同じ規約でprefetchは進行方向側 (direction 0は下向き)。
+ * クランプは行わない (呼び出し側でtotalRows/0へクランプする)。
+ */
+export function keepZoneRows(input: {
+  visible: RowRange;
+  overscanBefore: number;
+  overscanAfter: number;
+  direction: 1 | -1 | 0;
+  prefetchRows: number;
+}): RowRange {
+  const { visible, overscanBefore, overscanAfter, direction, prefetchRows } = input;
+  const before =
+    overscanBefore + (direction < 0 ? prefetchRows : 0);
+  const after = overscanAfter + (direction >= 0 ? prefetchRows : 0);
+  return { start: visible.start - before, end: visible.end + after };
 }
 
 export type PlanDemandInput = {
