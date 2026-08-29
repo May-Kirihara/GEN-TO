@@ -19,15 +19,17 @@
 | 繰り返し | 主要シナリオ3回測定し中央値と最悪値を記録。一部は後述のとおり1回のみ |
 | ワーカープール | 4ワーカー (min(4, 論理CPU)) / キュー上限4096 |
 
-### 測定成果物 (検証機 `/tmp/opencode/wp7/`)
+### 測定成果物
+
+ログ・統計・ドライバは**リポジトリ内に保全** (`docs/dev/measurements/`)。スクリーンショットは容量の関係で検証機の一時領域のみ (揮発性。内容は本書の説明で代替)。
 
 | 種別 | パス |
 |---|---|
-| 統計スナップショット (全シナリオ) | `results.json` |
-| シナリオ別アプリログ | `logs/s1s2-r{1..3}.log`, `logs/s7s8-r{1..3}.log`, `logs/s3-cold.log`, `logs/s4-s6.log`, `logs/s9.log` |
-| Part A 実証ログ | `logs/sigterm-r{1..3}.log` (終了安全), `logs/a3-inject.log` (エラー注入), `logs/a1-priority.log` (優先度), `logs/a2-failed-ui.log` (失敗セルUI) |
-| スクリーンショット | `shots/*.png` (s2_grid_generated, a2_failed_cells, a1_priority, s3_after_scroll, s4_viewer, s5_compare2, s6_compare4, s8_cached_grid, s9_virtual_end ほか) |
-| 計測ドライバ | `run_b.py` / `run-b2.py` (シナリオ実行), `a4-sigterm.sh` / `a3-inject.sh` (Part A 実証), `rss-sample.sh` (RSS計測), `lib.sh` (共通) |
+| 統計スナップショット (全シナリオ) | `docs/dev/measurements/results.json` |
+| シナリオ別アプリログ | `docs/dev/measurements/logs/` (`s1s2-r{1..3}.log`, `s7s8-r{1..3}.log`, `s3-cold.log`, `s3-s9.log`, `s4-s6.log`, `s9.log`) |
+| Part A 実証ログ | `docs/dev/measurements/logs/` (`sigterm-r{1..3}.log` 終了安全, `a3-inject.log` エラー注入, `a1-priority.log` 優先度, `a2-failed-ui.log` 失敗セルUI) |
+| 計測ドライバ | `docs/dev/measurements/drivers/` (`run_b.py` / `run-b2.py`, `a4-sigterm.sh`, `a3-inject.sh`, `rss-sample.sh`, `lib.sh`) |
+| スクリーンショット | 測定時: `/tmp/opencode/wp7/shots/*.png` (s2_grid_generated, a2_failed_cells, a1_priority, s3_after_scroll, s4_viewer, s5_compare2, s6_compare4, s8_cached_grid, s9_virtual_end ほか。一時領域のため消滅する) |
 
 ## 2. シナリオ測定結果
 
