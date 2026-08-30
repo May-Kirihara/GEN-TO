@@ -42,6 +42,32 @@ impl Db {
     }
 }
 
+/// integrity_checkの診断行を応答へ収める上限。破損時はページ数分の
+/// 行が出るため、応答サイズを束ねる (残件数は末尾に明示)。
+const INTEGRITY_MAX_MESSAGES: usize = 20;
+
+/// integrity_checkの全診断行を1つの要約文字列へまとめる。
+/// 破損は複数の診断行を生み得るため、最初の1行だけを見て「ok相当」と
+/// 判断しない (全行を収集する)。
+fn summarize_integrity_messages(messages: Vec<String>) -> String {
+    // 正常時はSQLiteはちょうど1行 "ok" を返す。行が無いケースは
+    // SQLiteの仕様上発生しないが、報告すべき問題が無いものとして扱う。
+    if messages.is_empty() || messages.iter().all(|m| m == "ok") {
+        return "ok".to_string();
+    }
+    let extra = messages.len().saturating_sub(INTEGRITY_MAX_MESSAGES);
+    let mut summary = messages
+        .iter()
+        .take(INTEGRITY_MAX_MESSAGES)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+    if extra > 0 {
+        summary.push_str(&format!(" (+{extra} more)"));
+    }
+    summary
+}
+
 fn collect_status(
     conn: &Connection,
     path: &std::path::Path,
@@ -54,9 +80,16 @@ fn collect_status(
     let journal_mode: String = conn
         .query_row("PRAGMA journal_mode", [], |r| r.get(0))
         .map_err(sql_err)?;
-    let integrity_check: String = conn
-        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
-        .map_err(sql_err)?;
+    // integrity_checkは問題ごとに複数行を返すため全行収集する
+    let mut integrity_stmt = conn.prepare("PRAGMA integrity_check").map_err(sql_err)?;
+    let mut integrity_rows = integrity_stmt.query([]).map_err(sql_err)?;
+    let mut messages: Vec<String> = Vec::new();
+    while let Some(row) = integrity_rows.next().map_err(sql_err)? {
+        messages.push(row.get(0).map_err(sql_err)?);
+    }
+    drop(integrity_rows);
+    drop(integrity_stmt);
+    let integrity_check = summarize_integrity_messages(messages);
 
     let mut fk_stmt = conn.prepare("PRAGMA foreign_key_check").map_err(sql_err)?;
     let mut rows = fk_stmt.query([]).map_err(sql_err)?;
@@ -138,6 +171,29 @@ mod tests {
         assert!(status.table_row_counts.values().all(|&n| n == 0));
         assert!(status.db_bytes > 0);
         assert_eq!(status.busy_timeout_ms, DbOptions::default().busy_timeout_ms);
+    }
+
+    #[test]
+    fn integrity_summary_collects_all_rows() {
+        // 破損は複数の診断行を生み得るため、最初の1行で打ち切らない
+        assert_eq!(summarize_integrity_messages(vec![]), "ok");
+        assert_eq!(summarize_integrity_messages(vec!["ok".to_string()]), "ok");
+        assert_eq!(
+            summarize_integrity_messages(vec![
+                "row 999 missing from index files".to_string(),
+                "wrong # of entries in index files".to_string(),
+            ]),
+            "row 999 missing from index files; wrong # of entries in index files"
+        );
+    }
+
+    #[test]
+    fn integrity_summary_caps_long_diagnostics() {
+        let messages: Vec<String> = (0..25).map(|i| format!("problem {i}")).collect();
+        let summary = summarize_integrity_messages(messages);
+        assert!(summary.contains("problem 19"), "{summary}");
+        assert!(!summary.contains("problem 20"), "{summary}");
+        assert!(summary.ends_with("(+5 more)"), "{summary}");
     }
 
     #[test]

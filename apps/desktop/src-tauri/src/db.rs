@@ -37,13 +37,30 @@ impl DbState {
             Err(err) => {
                 tracing::error!(error = %err, path = %path.display(), "failed to open database");
                 Self {
+                    open_error: Some(sanitize_error_message(&err.to_string(), &path)),
                     path,
                     db: None,
-                    open_error: Some(err.to_string()),
                 }
             }
         }
     }
+}
+
+/// `db_status` のエラー文字列から絶対パスを伏せる。エラー種別
+/// (開けなかった理由・失敗した操作) はそのまま返す。
+///
+/// DBパス自体は `DbStatusDto.path` で露出を許容する — MVPのwebviewは
+/// ローカルアプリの信頼されたコンテンツであり、ユーザー自身の環境の
+/// パスだから (リモート/非信頼コンテンツを載せる前に再検討すること)。
+/// エラー文中のパスはトラブルシュートに不要な複製のため伏せる。
+fn sanitize_error_message(msg: &str, db_path: &std::path::Path) -> String {
+    let mut sanitized = msg.replace(&db_path.display().to_string(), "<db>");
+    if let Some(parent) = db_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            sanitized = sanitized.replace(&parent.display().to_string(), "<path>");
+        }
+    }
+    sanitized
 }
 
 /// DBパスの解決優位順: `--db <PATH>` 起動引数 > `GENTO_DB` 環境変数 >
@@ -124,11 +141,12 @@ pub fn db_status(state: State<'_, AppState>) -> DbStatusDto {
             wal_bytes: Some(status.wal_bytes),
             busy_timeout_ms: Some(status.busy_timeout_ms),
         },
-        // 開いているが診断失敗 (ディスク障害等)。open=true + エラー詳細。
+        // 開いているが診断失敗 (ディスク障害等)。open=true + エラー種別
+        // (絶対パスは伏せる)。
         Err(err) => DbStatusDto {
             path: db_state.path.display().to_string(),
             open: true,
-            open_error: Some(err.to_string()),
+            open_error: Some(sanitize_error_message(&err.to_string(), &db_state.path)),
             schema_version: None,
             journal_mode: None,
             integrity_check: None,
@@ -239,6 +257,52 @@ mod tests {
         assert!(state.db.is_none(), "ディレクトリはDBとして開けない");
         let err = state.open_error.expect("エラー詳細を保持");
         assert!(!err.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sanitize_error_message_replaces_paths_but_keeps_kind() {
+        // DBパス本体
+        let msg = sanitize_error_message(
+            "failed to open database: open /xdg/data/gento/library.sqlite3: unable to open database file",
+            &PathBuf::from("/xdg/data/gento/library.sqlite3"),
+        );
+        assert!(!msg.contains("/xdg"), "{msg}");
+        assert!(msg.contains("<db>"), "{msg}");
+        assert!(msg.contains("unable to open database file"), "{msg}");
+
+        // 親ディレクトリ (backup先などDB以外のパスが乗る場合)
+        let msg = sanitize_error_message(
+            "database migration failed: io error: create /xdg/data/gento/db-backups failed",
+            &PathBuf::from("/xdg/data/gento/library.sqlite3"),
+        );
+        assert!(!msg.contains("/xdg"), "{msg}");
+        assert!(msg.contains("<path>"), "{msg}");
+        assert!(
+            msg.contains("db-backups"),
+            "末端のディレクトリ名は種別情報として保持: {msg}"
+        );
+    }
+
+    #[test]
+    fn open_error_does_not_expose_absolute_paths() {
+        // エラー種別 (開けない理由) は返すが、エラー文字列中の絶対パスは
+        // 伏せる (webviewに環境情報を渡さない)。
+        let dir =
+            std::env::temp_dir().join(format!("gento-dbstate-sanitize-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = DbState::open(dir.clone());
+        assert!(state.db.is_none());
+        let err = state.open_error.expect("エラー詳細を保持");
+        assert!(
+            !err.contains(&dir.display().to_string()),
+            "DBパスが露出: {err}"
+        );
+        assert!(
+            !err.contains(&std::env::temp_dir().display().to_string()),
+            "親ディレクトリが露出: {err}"
+        );
+        assert!(!err.is_empty(), "種別は保持される");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

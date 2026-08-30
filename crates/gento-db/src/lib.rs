@@ -15,6 +15,12 @@
 //!   WALモードのためreaderはwriterをブロックしない。プールは不要で、
 //!   idle時2本を保持し、貸出要求が集中したときだけ追加接続を開き
 //!   返却時に閉じる (定常2本・突入時のみ増える軽いプール)。
+//!   reader接続は `PRAGMA query_only=ON` を設定し、SQL文レベルで
+//!   書き込みを拒否する (単一writer方針の強制。repo API・生SQLの
+//!   いずれでもSQLiteが `SQLITE_READONLY` を返す)。
+//!   `OPEN_READ_ONLY` フラグにしないのは、WAL運用 (-shm書き込み・
+//!   recovery) に書き込み権限が必要になり得るため — query_onlyは
+//!   SQL文のみを拒否しpagerレベルのWAL処理は妨げない。
 //! - `busy_timeout` 5000ms (既定。接続単位)。外部プロセス (ユーザーが
 //!   sqlite3 CLIで開いた等) との書き込み競合時は待ってからエラー。
 //! - 長時間トランザクションを避け、スキャン・メタデータ抽出・AI処理は
@@ -159,7 +165,7 @@ impl Db {
             }
         }
 
-        let mut conn = open_connection(&path, options.busy_timeout_ms)?;
+        let mut conn = open_connection(&path, options.busy_timeout_ms, false)?;
         let migrate_opts = migrate::MigrationOpts {
             backup_dir: Some(match &options.backup_dir {
                 Some(dir) => dir.clone(),
@@ -207,6 +213,10 @@ impl Db {
     }
 
     /// 読み取り用repo (writerと分離した接続。WALなのでwriterをブロックしない)。
+    ///
+    /// reader接続は `PRAGMA query_only=ON` のため、この中での書き込み
+    /// (repo API・生SQL問わず) は `SQLITE_READONLY` で失敗する。
+    /// 書き込みは [`Db::with_writer`] を使うこと。
     pub fn with_reader<T>(
         &self,
         f: impl FnOnce(&SqliteRepos<'_>) -> Result<T, RepoError>,
@@ -224,7 +234,7 @@ impl Db {
             .map_err(|_| RepoError::Db("reader pool poisoned".to_string()))?;
         match pool.pop() {
             Some(conn) => Ok(conn),
-            None => open_connection(&self.path, self.options.busy_timeout_ms)
+            None => open_connection(&self.path, self.options.busy_timeout_ms, true)
                 .map_err(|e| RepoError::Db(e.to_string())),
         }
     }
@@ -242,9 +252,16 @@ impl Db {
     }
 }
 
-/// PRAGMA一式を設定した接続を開く (writer/reader共通)。
+/// PRAGMA一式を設定した接続を開く (writer/reader共通の基礎部分)。
 /// `journal_mode=WAL` はファイルDBでのみ有効 (in-memoryは `memory` のまま)。
-fn open_connection(path: &Path, busy_timeout_ms: u64) -> Result<Connection, DbError> {
+/// `query_only` はreader接続向け: SQL文レベルの書き込みを拒否する
+/// (flagベースのREAD_ONLYではなくPRAGMAなのは、WALのpager処理
+/// (-shm書き込み・recovery) は妨げないようにするため)。
+fn open_connection(
+    path: &Path,
+    busy_timeout_ms: u64,
+    query_only: bool,
+) -> Result<Connection, DbError> {
     let conn = Connection::open(path)
         .map_err(|e| DbError::Open(format!("open {}: {e}", path.display())))?;
     let _: String = conn
@@ -256,6 +273,12 @@ fn open_connection(path: &Path, busy_timeout_ms: u64) -> Result<Connection, DbEr
         .map_err(|e| DbError::Open(format!("set synchronous: {e}")))?;
     conn.busy_timeout(Duration::from_millis(busy_timeout_ms))
         .map_err(|e| DbError::Open(format!("set busy_timeout: {e}")))?;
+    if query_only {
+        // 最後に設定 (journal_mode等、設定自体に書き込みが必要なPRAGMAを
+        // 先に通すため)
+        conn.pragma_update(None, "query_only", true)
+            .map_err(|e| DbError::Open(format!("set query_only: {e}")))?;
+    }
     Ok(conn)
 }
 
@@ -316,20 +339,30 @@ mod tests {
             let sync: i64 = conn
                 .query_row("PRAGMA synchronous", [], |r| r.get(0))
                 .unwrap();
+            // readerは書き込み禁止 (単一writer方針の強制)
+            let qo: i64 = conn
+                .query_row("PRAGMA query_only", [], |r| r.get(0))
+                .unwrap();
             assert_eq!(jm, "wal");
             assert_eq!(fk, 1, "foreign_keys=ON (接続ごと)");
             assert_eq!(bt, 5_000);
             assert_eq!(sync, 1, "synchronous=NORMAL");
+            assert_eq!(qo, 1, "readerはquery_only=ON");
             Ok(())
         })
         .unwrap();
-        // writer側も同一PRAGMA
+        // writer側も同一PRAGMA (query_onlyのみ立たない)
         db.with_writer(|repos| {
             let fk: i64 = repos
                 .conn()
                 .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
                 .unwrap();
+            let qo: i64 = repos
+                .conn()
+                .query_row("PRAGMA query_only", [], |r| r.get(0))
+                .unwrap();
             assert_eq!(fk, 1);
+            assert_eq!(qo, 0, "writerは書き込み可能");
             Ok(())
         })
         .unwrap();
@@ -462,9 +495,11 @@ mod tests {
     fn fts5_is_available_at_runtime() {
         // PM計画§6-2: bundled SQLiteのFTS5可用性を実行時証明する。
         // (WP-8のFTS構築の前提。feature確認だけでは不十分という指摘への対応)
+        // 仮想テーブル構築は書き込みのためwith_writerで行う (readerは
+        // query_onlyで書けない)。
         let tmp = TempDir::new("fts5");
         let db = Db::open(tmp.path().join("db.sqlite3")).unwrap();
-        db.with_reader(|repos| {
+        db.with_writer(|repos| {
             let conn = repos.conn();
             conn.execute_batch(
                 "CREATE VIRTUAL TABLE wp1_fts_probe USING fts5(content); \
@@ -490,6 +525,70 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn reader_connections_cannot_write() {
+        let tmp = TempDir::new("ro");
+        let db = Db::open(tmp.path().join("db.sqlite3")).unwrap();
+        db.with_writer(|repos| {
+            repos.add_root(Path::new("/data/p"))?;
+            Ok(())
+        })
+        .unwrap();
+
+        // repo API経由の書き込みも拒否
+        let err = db
+            .with_reader(|repos| repos.add_root(Path::new("/data/q")))
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("readonly"),
+            "reader経由の書き込みはSQLITE_READONLY: {err}"
+        );
+
+        // 生Connection経由の書き込みも同様 (engineレベルで強制)
+        db.with_reader(|repos| {
+            let e = repos
+                .conn()
+                .execute("CREATE TABLE rogue (x)", [])
+                .unwrap_err();
+            assert!(e.to_string().to_lowercase().contains("readonly"), "{e}");
+            // 読み取りは引き続き可能
+            let n: i64 = repos
+                .conn()
+                .query_row("SELECT count(*) FROM library_roots", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 1);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn open_rejects_db_with_future_schema_version() {
+        let tmp = TempDir::new("future");
+        let db_path = tmp.path().join("db.sqlite3");
+        {
+            let db = Db::open(&db_path).unwrap();
+            drop(db);
+        }
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.pragma_update(None, "user_version", schema::LATEST_VERSION + 1)
+                .unwrap();
+        }
+        let err = Db::open(&db_path).unwrap_err();
+        assert!(matches!(err, DbError::Migration(_)), "{err}");
+        assert!(
+            err.to_string().contains("newer"),
+            "新しいバイナリが必要な旨: {err}"
+        );
+        // user_versionは不変
+        let conn = Connection::open(&db_path).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v as i32, schema::LATEST_VERSION + 1);
     }
 
     #[test]

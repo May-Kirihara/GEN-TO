@@ -3,11 +3,16 @@
 //! 要件 (PM計画§6-2):
 //! - 1 migration = 1トランザクション。失敗時rollback。
 //! - スタートアップ冪等 (適用済みmigration = `user_version` 以下をスキップ)。
+//! - `user_version` が本バイナリの最新より新しいDBは拒否する
+//!   (旧バイナリで未来schemaを開き、誤解・破損させないため)。
 //! - 適用前backupはWAL安全な方法 (`VACUUM INTO`)。メインDBファイルの
 //!   単純コピーはWAL活性時に不整合になり得るため禁止。
 //! - backupはintegrity_checkで検証し、世代保持 (既定3世代) する。
-//! - `user_version = 0` で非管理テーブルが存在するDBは「非管理DB」として
-//!   拒否する (他アプリのDB・破損DBを上書きしない)。
+//!   ファイル名はタイムスタンプ先行の固定幅形式 — 辞書順 = 時系列に
+//!   なるため、version桁数の違いで世代破棄順が崩れない。
+//! - `user_version = 0` で非管理オブジェクト (テーブル・view・trigger) が
+//!   存在するDBは「非管理DB」として拒否する (他アプリのDB・破損DBを
+//!   上書きしない)。
 
 use std::path::{Path, PathBuf};
 
@@ -49,8 +54,12 @@ pub(crate) struct MigrationOutcome {
 pub(crate) enum MigrationError {
     /// 下層のSQL/IOエラー (文脈はDisplayに含む)。
     Internal(String),
-    /// user_version=0 なのにSQLite内部テーブル以外が存在する。
-    UnmanagedDatabase { tables: Vec<String> },
+    /// DBの `user_version` が本バイナリの最新より新しい。
+    /// 旧バイナリでの未来schemaアクセスを防ぐため開けない。
+    NewerSchema { found: i32, latest: i32 },
+    /// user_version=0 なのにSQLite内部オブジェクト以外が存在する
+    /// (テーブル・view・trigger)。
+    UnmanagedDatabase { objects: Vec<String> },
     /// migration一覧自体の不整合 (versionが1開始連続でない)。
     BadMigrationList(String),
 }
@@ -59,11 +68,16 @@ impl std::fmt::Display for MigrationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MigrationError::Internal(msg) => write!(f, "{msg}"),
-            MigrationError::UnmanagedDatabase { tables } => write!(
+            MigrationError::NewerSchema { found, latest } => write!(
                 f,
-                "database contains unmanaged tables {:?} with schema version 0; \
+                "database schema version {found} is newer than this binary supports \
+                 (latest {latest}); a newer GEN-TO binary is required"
+            ),
+            MigrationError::UnmanagedDatabase { objects } => write!(
+                f,
+                "database contains unmanaged schema objects {:?} with schema version 0; \
                  refusing to migrate (not created by GEN-TO?)",
-                tables
+                objects
             ),
             MigrationError::BadMigrationList(msg) => write!(f, "bad migration list: {msg}"),
         }
@@ -88,8 +102,19 @@ impl From<std::io::Error> for MigrationError {
 const BACKUP_PREFIX: &str = "library-pre-";
 const BACKUP_SUFFIX: &str = ".sqlite3";
 
+/// backupファイル名: `library-pre-{時刻}-v{version}.sqlite3`。
+/// 時刻は固定幅19文字 (`YYYYMMDDTHHMMSSmmmZ`) で**先頭**に置く —
+/// 辞書順 = 時系列が成立し、`v{version}` の桁数混在 (v9 と v10 等) で
+/// ソート順が崩れない。`v{version}` を先頭にした旧形式はこの性質が
+/// 壊れるため採用しない。
+fn backup_file_name(timestamp: &str, from_version: i32) -> String {
+    format!("{BACKUP_PREFIX}{timestamp}-v{from_version}{BACKUP_SUFFIX}")
+}
+
 /// migrationを実行する。
 ///
+/// - DBの `user_version` がmigration一覧の最新より新ければ拒否する
+///   (旧バイナリで未来schemaを開かせない)。
 /// - 適用済み (`version <= user_version`) はスキップ (冪等)。
 /// - 未適用があり、かつ `user_version > 0` (データ保有の可能性) で
 ///   `backup_dir` が指定されている場合、まずbackupを作る。
@@ -102,6 +127,13 @@ pub(crate) fn run_migrations(
     validate_migration_list(migrations)?;
 
     let current = read_user_version(conn)?;
+    let latest = migrations.last().map(|m| m.version).unwrap_or(0);
+    if current > latest {
+        return Err(MigrationError::NewerSchema {
+            found: current,
+            latest,
+        });
+    }
     let pending: Vec<&Migration> = migrations.iter().filter(|m| m.version > current).collect();
     if pending.is_empty() {
         return Ok(MigrationOutcome {
@@ -111,11 +143,11 @@ pub(crate) fn run_migrations(
     }
 
     if current == 0 {
-        // この時点で未適用migrationがある = 初回。他テーブルが残っていれば
-        // 本アプリが作ったDBではないため拒否する。
-        let tables = non_internal_tables(conn)?;
-        if !tables.is_empty() {
-            return Err(MigrationError::UnmanagedDatabase { tables });
+        // この時点で未適用migrationがある = 初回。他オブジェクトが残って
+        // いれば本アプリが作ったDBではないため拒否する。
+        let objects = non_internal_schema_objects(conn)?;
+        if !objects.is_empty() {
+            return Err(MigrationError::UnmanagedDatabase { objects });
         }
     }
 
@@ -162,17 +194,20 @@ fn read_user_version(conn: &Connection) -> Result<i32, MigrationError> {
         .map_err(|_| MigrationError::Internal(format!("user_version out of range: {v}")))
 }
 
-fn non_internal_tables(conn: &Connection) -> Result<Vec<String>, MigrationError> {
+/// 非管理DB検出: `sqlite_master` 上のテーブル・view・triggerのうち
+/// SQLite内部 (`sqlite_%`) 以外の名前。indexは他オブジェクトに付随して
+/// 作られ得るため対象外 (検出の意味を持つオブジェクト種に限定)。
+fn non_internal_schema_objects(conn: &Connection) -> Result<Vec<String>, MigrationError> {
     let mut stmt = conn.prepare(
         "SELECT name FROM sqlite_master \
-         WHERE type = 'table' \
+         WHERE type IN ('table', 'view', 'trigger') \
          AND name NOT LIKE 'sqlite_%' \
          ORDER BY name",
     )?;
-    let tables = stmt
+    let objects = stmt
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(tables)
+    Ok(objects)
 }
 
 fn apply_one(conn: &mut Connection, m: &Migration) -> Result<(), MigrationError> {
@@ -201,10 +236,7 @@ fn create_backup(
     from_version: i32,
 ) -> Result<PathBuf, MigrationError> {
     std::fs::create_dir_all(dir)?;
-    let dest = dir.join(format!(
-        "{BACKUP_PREFIX}v{from_version}-{ts}{BACKUP_SUFFIX}",
-        ts = now_utc_compact()
-    ));
+    let dest = dir.join(backup_file_name(&now_utc_compact(), from_version));
     let dest_str = dest.to_string_lossy().into_owned();
     conn.execute("VACUUM INTO ?1", [dest_str.as_str()])?;
 
@@ -225,7 +257,8 @@ fn create_backup(
 }
 
 /// `library-pre-*.sqlite3` のうち新しい方から `keep` 世代を残し、
-/// 残りを削除する。ファイル名のタイムスタンプは辞書順 = 時系列。
+/// 残りを削除する。ファイル名はタイムスタンプ先行の固定幅形式のため、
+/// 名前のソート = 時系列 (version桁数の違いは順序に影響しない)。
 fn rotate_backups(dir: &Path, keep: usize) -> Result<(), MigrationError> {
     let mut backups: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
@@ -237,7 +270,7 @@ fn rotate_backups(dir: &Path, keep: usize) -> Result<(), MigrationError> {
                 .unwrap_or(false)
         })
         .collect();
-    backups.sort(); // パス全体のソート = タイムスタンプ順 (プレフィックス固定)
+    backups.sort(); // プレフィックス固定 + タイムスタンプ先行のため時系列順
     while backups.len() > keep {
         let oldest = backups.remove(0);
         std::fs::remove_file(&oldest)?;
@@ -366,8 +399,8 @@ mod tests {
             .unwrap();
         let err = run_migrations(&mut conn, MIGRATIONS, &MigrationOpts::default()).unwrap_err();
         match &err {
-            MigrationError::UnmanagedDatabase { tables } => {
-                assert_eq!(tables, &vec!["someone_elses".to_string()]);
+            MigrationError::UnmanagedDatabase { objects } => {
+                assert_eq!(objects, &vec!["someone_elses".to_string()]);
             }
             other => panic!("unexpected error: {other:?}"),
         }
@@ -489,11 +522,7 @@ mod tests {
             "20260201T000000000Z",
             "20260301T000000000Z",
         ] {
-            std::fs::write(
-                backup_dir.join(format!("{BACKUP_PREFIX}v1-{ts}{BACKUP_SUFFIX}")),
-                b"dummy",
-            )
-            .unwrap();
+            std::fs::write(backup_dir.join(backup_file_name(ts, 1)), b"dummy").unwrap();
         }
 
         let mut conn = Connection::open(tmp.path().join("db.sqlite3")).unwrap();
@@ -532,6 +561,197 @@ mod tests {
         std::fs::write(&keeper, b"x").unwrap();
         rotate_backups(&backup_dir, 3).unwrap();
         assert!(keeper.exists());
+    }
+
+    #[test]
+    fn unmanaged_db_with_view_is_rejected() {
+        let tmp = TempDir::new("unmanaged-view");
+        let mut conn = Connection::open(tmp.path().join("db.sqlite3")).unwrap();
+        conn.execute_batch("CREATE VIEW someone_elses_view AS SELECT 1 AS x;")
+            .unwrap();
+        let err = run_migrations(&mut conn, MIGRATIONS, &MigrationOpts::default()).unwrap_err();
+        assert!(
+            matches!(err, MigrationError::UnmanagedDatabase { .. }),
+            "{err}"
+        );
+        // 破壊されていない (viewはそのまま残る)
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM someone_elses_view", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn unmanaged_db_with_trigger_is_rejected() {
+        // triggerも検出対象であることの直接検証 (tableだけなら旧実装でも
+        // 検出済み。objectsにtrigger名が乗ることを確認する)。
+        let tmp = TempDir::new("unmanaged-trigger");
+        let mut conn = Connection::open(tmp.path().join("db.sqlite3")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE someone_elses (x);\
+             CREATE TRIGGER someone_elses_trg AFTER INSERT ON someone_elses \
+             BEGIN SELECT 1; END;",
+        )
+        .unwrap();
+        let err = run_migrations(&mut conn, MIGRATIONS, &MigrationOpts::default()).unwrap_err();
+        match &err {
+            MigrationError::UnmanagedDatabase { objects } => {
+                assert!(
+                    objects.contains(&"someone_elses".to_string()),
+                    "{objects:?}"
+                );
+                assert!(
+                    objects.contains(&"someone_elses_trg".to_string()),
+                    "triggerも検出対象: {objects:?}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        // 破壊されていない (triggerはそのまま残る)
+        let remains: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'someone_elses_trg'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(remains, 1);
+    }
+
+    #[test]
+    fn library_roots_settings_columns_exist_with_defaults() {
+        // data-model §2.3のルート設定列。WP-2のwatcherが直ちに使用する。
+        let tmp = TempDir::new("rootsettings");
+        let mut conn = Connection::open(tmp.path().join("db.sqlite3")).unwrap();
+        run_migrations(&mut conn, MIGRATIONS, &MigrationOpts::default()).unwrap();
+        conn.execute(
+            "INSERT INTO library_roots (uuid, path, path_encoding, display_path, created_at, updated_at)
+             VALUES ('00000000-0000-7000-8000-000000000003', x'2f63', 'utf8', '/c',
+                     '2026-08-30T00:00:00.000Z', '2026-08-30T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        let (watch, ai, exif, gps, settings): (i64, i64, i64, i64, Option<String>) = conn
+            .query_row(
+                "SELECT watch_enabled, ai_enabled, send_exif, send_gps, settings_json
+                 FROM library_roots",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!((watch, ai, exif, gps), (1, 0, 0, 0), "既定値");
+        assert_eq!(settings, None, "settings_jsonはNULL可");
+
+        // 0/1以外はCHECKで拒否
+        let err = conn
+            .execute("UPDATE library_roots SET watch_enabled = 2", [])
+            .unwrap_err();
+        assert!(err.to_string().contains("CHECK"), "{err}");
+    }
+
+    #[test]
+    fn migration_v1_defers_ai_run_id_columns_to_wp10() {
+        // FKなしのai_run_id列を先行定義すると、後のFK付与にはテーブル再構築が
+        // 必要になる (SQLiteは既存列へのFK追加ができない)。WP-10で
+        // ai_runsテーブル作成と同時にADD COLUMNで追加するため、#1には含めない。
+        // 検証はPRAGMA table_info (実列) で行う — sqlite_masterのSQL文本体には
+        // 経緯コメントが残り得るため。
+        let tmp = TempDir::new("airunid");
+        let mut conn = Connection::open(tmp.path().join("db.sqlite3")).unwrap();
+        run_migrations(&mut conn, MIGRATIONS, &MigrationOpts::default()).unwrap();
+        for table in ["asset_tags", "captions"] {
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap();
+            let columns: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(
+                !columns.contains(&"ai_run_id".to_string()),
+                "{table} に ai_run_id 列が存在する: {columns:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn newer_schema_db_is_rejected() {
+        let tmp = TempDir::new("future");
+        let mut conn = Connection::open(tmp.path().join("db.sqlite3")).unwrap();
+        run_migrations(&mut conn, MIGRATIONS, &MigrationOpts::default()).unwrap();
+        conn.pragma_update(None, "user_version", LATEST_VERSION + 1)
+            .unwrap();
+
+        let err = run_migrations(&mut conn, MIGRATIONS, &MigrationOpts::default()).unwrap_err();
+        match &err {
+            MigrationError::NewerSchema { found, latest } => {
+                assert_eq!(*found, LATEST_VERSION + 1);
+                assert_eq!(*latest, LATEST_VERSION);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(err.to_string().contains("newer"), "{err}");
+        // user_versionもDB内容も不変
+        assert_eq!(read_user_version(&conn).unwrap(), LATEST_VERSION + 1);
+    }
+
+    #[test]
+    fn backup_names_are_timestamp_first_fixed_width() {
+        // タイムスタンプが先頭・固定幅であることが世代管理の前提
+        assert_eq!(
+            backup_file_name("20260830T010203004Z", 9),
+            "library-pre-20260830T010203004Z-v9.sqlite3"
+        );
+    }
+
+    #[test]
+    fn backup_rotation_with_mixed_digit_versions_is_chronological() {
+        // version桁数が混在 (1, 2, 9, 10) しても、時系列 (=タイムスタンプ順)
+        // で古い側から破棄されること。時刻順は t1 < t2 < t3 < t4で、
+        // 数値version順とは無関係に並べる。
+        let tmp = TempDir::new("mixedigits");
+        let backup_dir = tmp.path().join("db-backups");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        let entries = [
+            ("20260101T000000000Z", 9),
+            ("20260201T000000000Z", 10),
+            ("20260301T000000000Z", 1),
+            ("20260401T000000000Z", 2),
+        ];
+        for (ts, v) in entries {
+            std::fs::write(backup_dir.join(backup_file_name(ts, v)), b"dummy").unwrap();
+        }
+
+        rotate_backups(&backup_dir, 2).unwrap();
+
+        let mut remaining = list_backups(&backup_dir);
+        remaining.sort();
+        let names: Vec<String> = remaining
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "keep=2: {names:?}");
+        // 残るのは時系列で新しい t3(v1) と t4(v2)。桁数の大きい
+        // v10/v9が時系列古い側として破棄される
+        assert!(
+            names
+                .iter()
+                .any(|n| n.contains("20260301") && n.contains("-v1")),
+            "{names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|n| n.contains("20260401") && n.contains("-v2")),
+            "{names:?}"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.contains("20260101") || n.contains("20260201")),
+            "時系列で古い世代 (v9/v10) が破棄: {names:?}"
+        );
     }
 
     #[test]

@@ -659,6 +659,10 @@ type DbStatusDto = {
   (devtools対象外)。§14の計測系とは無関係。
 - `open: true` でも `open_error` が入り得る (開いた後の診断失敗 —
   ディスク障害等。その場合は統計系フィールドが `null`)。
+- `open_error` のエラー種別 (開けなかった理由・失敗した操作) は返すが、
+  文字列中の絶対パスは `<db>` / `<path>` に伏せる。`path` フィールド
+  自体はMVPのローカルwebview (信頼されたコンテンツ) 向けのため
+  露出を許容する — リモート/非信頼コンテンツを載せる前に再検討。
 - DBパスの解決順位: `--db <PATH>` 起動引数 > `GENTO_DB` 環境変数 >
   `AppDirs.data_dir/library.sqlite3` (テスト・計測用の上書き)。
 - DBの並行性・backup仕様は [architecture.md](architecture.md) および

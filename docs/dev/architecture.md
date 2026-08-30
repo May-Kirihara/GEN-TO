@@ -41,24 +41,35 @@ Tauriに依存してよいのは `gento-tauri` のみ。逆方向の依存
 ### `crates/gento-db` — SQLite基盤 (WP-1。メタデータの正本)
 
 - `Db::open(path)` / `Db::open_with(path, DbOptions)`: 親ディレクトリ
-  作成 + migration適用まで行う。新規作成・既存オープン両対応
+  作成 + migration適用まで行う。新規作成・既存オープン両対応。
+  DBの `user_version` が本バイナリの最新より新しい場合は拒否する
+  (旧バイナリでの未来schemaアクセス防止)
 - migration (migrate.rs): `PRAGMA user_version` 管理・順方向のみ・
   1件=1トランザクション・失敗時rollback・冪等スキップ。
   データ保有DBへの未適用migrationがある場合、適用前に `VACUUM INTO`
   によるWAL安全backupを作成し、integrity_checkで検証、世代保持
-  (既定3世代、`db-backups/` 配下 `library-pre-v{N}-{時刻}.sqlite3`)。
-  `user_version=0` で非管理テーブルが存在するDBは拒否
+  (既定3世代、`db-backups/` 配下 `library-pre-{時刻}-v{N}.sqlite3`。
+  時刻は固定幅19文字で**先頭** — 辞書順=時系列が成立し、version桁数
+  の違いで世代破棄順が崩れない)。`user_version=0` で非管理オブジェクト
+  (テーブル・view・trigger) が存在するDBは拒否
 - migration #1 (schema.rs): 12テーブル (`library_roots` / `assets` /
   `files` / `tags` / `asset_tags` / `captions` / `collections` /
   `collection_items` / `asset_metadata` / `jobs` / `file_operations` /
   `embeddings`) と検索用インデックス。DDLはdocs/data-model.md §2〜§12
-  準拠。AiProfile/AiRunはWP-10の追加migration
+  準拠。`library_roots` はルート設定列 (`watch_enabled`/`ai_enabled`/
+  `send_exif`/`send_gps`/`settings_json`) を持つ。AiProfile/AiRunは
+  WP-10の追加migration — `ai_run_id` 列もその時点で `ALTER TABLE …
+  ADD COLUMN … REFERENCES ai_runs(id)` として追加する (既存列へのFK
+  付与にはテーブル再構築が必要なため、#1には列自体を置かない)
 - `SqliteRepos`: gento-coreの3 repository traitのSQLite実装。
   WP-2が必要とする最小範囲 (root追加/一覧/有効化/解除/親子検出雛形、
   file upsert (root_id+rel_pathキー)・scan_state更新・missing一覧、
-  asset作成 (content_hash一意)・hash検索・file↔assetリンク)
-- `Db::diagnose()`: `PRAGMA integrity_check`・`foreign_key_check`・
-  schema version・journal_mode・テーブル行数・DB/WALファイルサイズ
+  asset作成 (content_hash一意)・hash検索・file↔assetリンク)。
+  エラー分類: 一意制約→`RepoError::Duplicate`、CHECK/NOT NULL→
+  `RepoError::Constraint`、FK違反→`RepoError::Db` (文面で判別)
+- `Db::diagnose()`: `PRAGMA integrity_check` (複数診断行を全行収集・
+  上限20行で要約)・`foreign_key_check`・schema version・journal_mode・
+  テーブル行数・DB/WALファイルサイズ
 - `percent_encode_bytes` / `percent_decode_to_bytes`: backup/restore用
   正準表現 (パーセントエスケープUTF-8。WP-13で使用)
 - 格納規約: UUIDv7 TEXT 36文字小文字 (一意性のみ保証、単調性は保証
@@ -105,6 +116,10 @@ Tauriに依存してよいのは `gento-tauri` のみ。逆方向の依存
   Mutexで直列化。scan/UI編集/AIジョブ/backupの全書き込みがこの経路)。
   読み取りは分離接続 (`Db::with_reader`。WALなのでwriterをブロック
   しない。idle 2本、貸出集中時のみ追加接続を開き返却時に閉じる)。
+  **reader接続は `PRAGMA query_only=ON`** — repo API・生SQLのいずれの
+  書き込みもSQLiteが `SQLITE_READONLY` で拒否する (単一writer方針の
+  強制。`OPEN_READ_ONLY` フラグにしないのはWALのpager処理
+  (-shm書き込み・recovery) に書き込み権限が必要になり得るため)。
   busy_timeout 5000ms (外部プロセスとの競合猶予)
 - **PRAGMA**: WAL / `foreign_keys=ON` (全接続で毎回) /
   `synchronous=NORMAL` (WAL組み合わせの標準推奨。アプリ異常終了で
@@ -115,7 +130,8 @@ Tauriに依存してよいのは `gento-tauri` のみ。逆方向の依存
 - **異常時挙動**: DBを閉じずにプロセス死亡 → 次回オープンでWAL自動回復
   (クラッシュシミュレーションテストあり)。migration失敗 → rollback +
   backup保持で元DB不変。DB open失敗 → アプリは続行し `health.db_open`
-  / `db_status` で観測。非管理DB (user_version=0で他テーブルあり) は
+  / `db_status` で観測。未来schema (`user_version` > バイナリの最新) は
+  拒否。非管理DB (user_version=0でテーブル・view・triggerあり) は
   拒否して上書きしない
 - **破損・権限・disk full**: integrity_check/foreign_key_checkは
   `db_status` で常時観測可能。disk fullはSQLiteエラーとして各書き込みが

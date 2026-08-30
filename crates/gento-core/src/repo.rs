@@ -130,6 +130,9 @@ pub enum RepoError {
     NotFound,
     /// 一意制約違反 (登録ルートパス重複・content_hash重複等)。
     Duplicate,
+    /// 一意制約・外部キー以外の制約違反 (CHECK・NOT NULL等)。
+    /// メッセージにSQLiteの診断文 (例: "NOT NULL constraint failed: …")。
+    Constraint(String),
     /// 下層の失敗。外部キー違反を含む (メッセージで判別)。
     Db(String),
 }
@@ -139,6 +142,7 @@ impl fmt::Display for RepoError {
         match self {
             RepoError::NotFound => f.write_str("not found"),
             RepoError::Duplicate => f.write_str("duplicate: unique constraint violation"),
+            RepoError::Constraint(msg) => write!(f, "constraint violation: {msg}"),
             RepoError::Db(msg) => write!(f, "database error: {msg}"),
         }
     }
@@ -192,6 +196,9 @@ pub struct FileRecord {
     pub byte_size: u64,
     pub mtime_ms: u64,
     pub scan_state: ScanState,
+    /// 最後にファイルの**存在を確認した**時刻 (UTC RFC3339)。
+    /// missingへの状態変更では更新されない — 存在確認を反映するのは
+    /// 発見時の [`crate::repo::FileRepo::upsert_file`] のみ。
     pub last_seen_at: String,
     pub created_at: String,
     pub updated_at: String,
@@ -250,11 +257,16 @@ pub trait LibraryRootRepo {
 /// ファイルのrepository。
 pub trait FileRepo {
     /// `root_id` + `rel_path` をキーにupsertする。
-    /// 既存時は byte_size / mtime / scan_state / 表示名を更新し、
-    /// uuid・asset_id は変えない。新規時は asset_id NULL で作成する。
+    /// 既存時は byte_size / mtime / scan_state / 表示名 / `last_seen_at` を
+    /// 更新し、uuid・asset_id は変えない。新規時は asset_id NULL で作成する。
+    /// upsertは「存在を確認した」ことを意味するため `last_seen_at` を現在
+    /// 時刻へ進める。
     fn upsert_file(&self, file: FileUpsert) -> Result<FileRecord, RepoError>;
 
     /// 走査状態を更新する (missing と削除の区別はここで担保)。
+    /// `last_seen_at` は更新しない — 同一刻は「最後に存在を確認した時刻」
+    /// を意味し、存在確認は [`FileRepo::upsert_file`] 等の明示的な
+    /// 更新経由でのみ反映される。
     /// 存在しないIDは [`RepoError::NotFound`]。
     fn set_scan_state(&self, file_id: i64, state: ScanState) -> Result<(), RepoError>;
 
@@ -329,6 +341,11 @@ mod tests {
         assert_eq!(
             RepoError::Duplicate.to_string(),
             "duplicate: unique constraint violation"
+        );
+        assert_eq!(
+            RepoError::Constraint("NOT NULL constraint failed: files.display_name".to_string())
+                .to_string(),
+            "constraint violation: NOT NULL constraint failed: files.display_name"
         );
         assert_eq!(
             RepoError::Db("boom".to_string()).to_string(),

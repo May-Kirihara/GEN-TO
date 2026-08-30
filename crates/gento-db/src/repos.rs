@@ -44,8 +44,11 @@ impl<'a> SqliteRepos<'a> {
     }
 }
 
-/// rusqliteエラー → [`RepoError`]。一意制約違反は [`RepoError::Duplicate`]、
-/// 外部キー違反は「foreign key violation」付きの [`RepoError::Db`]へ寄せる。
+/// rusqliteエラー → [`RepoError`]。
+/// - 一意制約違反 (UNIQUE/PK) → [`RepoError::Duplicate`]
+/// - CHECK・NOT NULL等、一意・FK以外の制約違反 → [`RepoError::Constraint`]
+///   (Duplicateと誤分類すると呼び出し側が「重複」処理をしてしまうため区別)
+/// - 外部キー違反 → 「foreign key violation」付きの [`RepoError::Db`]
 fn map_err(e: rusqlite::Error) -> RepoError {
     if let rusqlite::Error::SqliteFailure(code, msg) = &e {
         if code.code == rusqlite::ffi::ErrorCode::ConstraintViolation {
@@ -57,10 +60,28 @@ fn map_err(e: rusqlite::Error) -> RepoError {
                     msg.as_deref().unwrap_or_default()
                 ));
             }
-            return RepoError::Duplicate;
+            let is_unique = code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                || code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+                || msg
+                    .as_deref()
+                    .is_some_and(|m| m.contains("UNIQUE") || m.contains("PRIMARY KEY"));
+            if is_unique {
+                return RepoError::Duplicate;
+            }
+            return RepoError::Constraint(
+                msg.as_deref()
+                    .unwrap_or("check or not-null violation")
+                    .to_string(),
+            );
         }
     }
     RepoError::Db(e.to_string())
+}
+
+/// u64値をi64列へ格納する。直接castはオーバーフローで負値にラップする
+/// ため禁止し、範囲外はErrとする。
+fn u64_to_i64(value: u64, field: &'static str) -> Result<i64, RepoError> {
+    i64::try_from(value).map_err(|_| RepoError::Db(format!("{field} exceeds i64 range: {value}")))
 }
 
 fn map_library_root(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryRootRecord> {
@@ -265,8 +286,8 @@ impl FileRepo for SqliteRepos<'_> {
                     enc.as_str(),
                     file.display_name,
                     extension,
-                    file.byte_size as i64,
-                    file.mtime_ms as i64,
+                    u64_to_i64(file.byte_size, "byte_size")?,
+                    u64_to_i64(file.mtime_ms, "mtime_ms")?,
                     file.scan_state.as_str(),
                     now,
                 ],
@@ -340,7 +361,7 @@ impl AssetRepo for SqliteRepos<'_> {
                     asset.content_hash,
                     asset.hash_algorithm,
                     asset.mime_type,
-                    asset.byte_size as i64,
+                    u64_to_i64(asset.byte_size, "byte_size")?,
                     now,
                 ],
             )
@@ -893,6 +914,126 @@ mod tests {
                 .unwrap();
             assert_eq!(again.id, f.id);
             assert_eq!(again.byte_size, 8);
+        });
+    }
+
+    #[test]
+    fn oversized_u64_inputs_are_errors_not_wrapped() {
+        // u64→i64の直接castはオーバーフローで負値にラップするため禁止。
+        // i64範囲超えは明示的なErrとする。
+        with_repos("overflow", |repos| {
+            let root = repos.add_root(Path::new("/data/p")).unwrap();
+            let mk = |size: u64, mtime: u64| FileUpsert {
+                root_id: root.id,
+                rel_path: PathBuf::from("big.png"),
+                display_name: "big.png".to_string(),
+                byte_size: size,
+                mtime_ms: mtime,
+                scan_state: ScanState::Present,
+            };
+            let err = repos.upsert_file(mk(u64::MAX, 1)).unwrap_err();
+            assert!(err.to_string().contains("byte_size"), "{err}");
+            let err = repos.upsert_file(mk(1, u64::MAX)).unwrap_err();
+            assert!(err.to_string().contains("mtime_ms"), "{err}");
+            let err = repos.create_asset(new_asset("dd", u64::MAX)).unwrap_err();
+            assert!(err.to_string().contains("byte_size"), "{err}");
+        });
+    }
+
+    #[test]
+    fn set_scan_state_does_not_update_last_seen_at() {
+        // last_seen_at = 「最後にファイルの存在を確認した時刻」。missingへの
+        // 状態変更は存在確認ではないため更新しない。存在確認を反映するのは
+        // upsert (発見) のみ。
+        with_repos("lastseen", |repos| {
+            let root = repos.add_root(Path::new("/data/p")).unwrap();
+            let mk = || FileUpsert {
+                root_id: root.id,
+                rel_path: PathBuf::from("a.png"),
+                display_name: "a.png".to_string(),
+                byte_size: 1,
+                mtime_ms: 1,
+                scan_state: ScanState::Present,
+            };
+            let f = repos.upsert_file(mk()).unwrap();
+            let sentinel = "2000-01-01T00:00:00.000Z";
+            repos
+                .conn()
+                .execute(
+                    "UPDATE files SET last_seen_at = ?1 WHERE id = ?2",
+                    params![sentinel, f.id],
+                )
+                .unwrap();
+
+            repos.set_scan_state(f.id, ScanState::Missing).unwrap();
+            let back = repos
+                .find_by_path(root.id, &PathBuf::from("a.png"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(back.scan_state, ScanState::Missing);
+            assert_eq!(
+                back.last_seen_at, sentinel,
+                "set_scan_stateはlast_seen_atを更新しない"
+            );
+            assert_ne!(back.updated_at, sentinel, "updated_atは更新される");
+
+            // 再upsert = 存在確認 → last_seen_atは更新される
+            repos.upsert_file(mk()).unwrap();
+            let back = repos
+                .find_by_path(root.id, &PathBuf::from("a.png"))
+                .unwrap()
+                .unwrap();
+            assert_ne!(back.last_seen_at, sentinel);
+        });
+    }
+
+    #[test]
+    fn not_null_and_check_violations_are_constraint_not_duplicate() {
+        // CHECK/NOT NULL違反をDuplicateと誤分類すると、呼び出し側が
+        // 「重複」として処理してしまうため区別する。
+        with_repos("constraint", |repos| {
+            let root = repos.add_root(Path::new("/data/p")).unwrap();
+            // NOT NULL違反 (display_name NULL)
+            let err = repos
+                .conn()
+                .execute(
+                    "INSERT INTO files (uuid, root_id, rel_path, path_encoding, display_name,
+                         byte_size, mtime_ms, scan_state, last_seen_at, created_at, updated_at)
+                     VALUES ('00000000-0000-7000-8000-00000000000a', ?1, x'61', 'utf8', NULL,
+                         1, 1, 'present', '2026-08-30T00:00:00.000Z',
+                         '2026-08-30T00:00:00.000Z', '2026-08-30T00:00:00.000Z')",
+                    [root.id],
+                )
+                .unwrap_err();
+            match map_err(err) {
+                RepoError::Constraint(msg) => {
+                    assert!(msg.contains("NOT NULL"), "{msg}");
+                }
+                other => panic!("expected Constraint, got {other:?}"),
+            }
+
+            // CHECK違反 (rating 0..5)
+            let err = repos
+                .conn()
+                .execute(
+                    "INSERT INTO assets (uuid, content_hash, hash_algorithm, byte_size,
+                         rating, created_at, updated_at)
+                     VALUES ('00000000-0000-7000-8000-00000000000b', 'blake3:ee', 'blake3', 1,
+                         6, '2026-08-30T00:00:00.000Z', '2026-08-30T00:00:00.000Z')",
+                    [],
+                )
+                .unwrap_err();
+            match map_err(err) {
+                RepoError::Constraint(msg) => {
+                    assert!(msg.to_lowercase().contains("check"), "{msg}");
+                }
+                other => panic!("expected Constraint, got {other:?}"),
+            }
+
+            // 一意制約は引き続きDuplicate
+            repos.add_root(Path::new("/data/dup")).unwrap();
+            let err = repos.add_root(Path::new("/data/dup")).unwrap_err();
+            assert_eq!(err, RepoError::Duplicate);
         });
     }
 

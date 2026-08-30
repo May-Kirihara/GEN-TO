@@ -2,7 +2,12 @@
 //!
 //! migration #1 は計画書§9の12テーブル全部 (DDLはdocs/data-model.md
 //! §2〜§12の属性を反映)。AiProfile/AiRunテーブルはWP-10で追加migration
-//! (#2以降) とする — `ai_run_id` 列はこの時点ではFKなしの整数のみ。
+//! (#2以降) とする — `asset_tags.ai_run_id` / `captions.ai_run_id` 列も
+//! この時点では作らない。SQLiteは既存列へのFK付与ができず、後付けには
+//! テーブル再構築が必要になるため、WP-10で `ai_runs` テーブル作成と
+//! 同時に `ALTER TABLE … ADD COLUMN ai_run_id INTEGER REFERENCES
+//! ai_runs(id)` で追加する (NULL既定のADD COLUMNならFK参照を付与可能。
+//! テーブル再構築を避ける意図)。
 //!
 //! 方針:
 //! - 1 migration = 1トランザクション (migrate.rs)。順方向のみ。
@@ -56,6 +61,13 @@ CREATE TABLE library_roots (
     -- 表示用パス (lossy変換。非UTF-8部分は置換文字)。
     display_path TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    -- ルートごとの拡張設定 (data-model §2.3。WP-2のwatcherが使用)。
+    watch_enabled INTEGER NOT NULL DEFAULT 1 CHECK (watch_enabled IN (0, 1)),
+    ai_enabled INTEGER NOT NULL DEFAULT 0 CHECK (ai_enabled IN (0, 1)),
+    send_exif INTEGER NOT NULL DEFAULT 0 CHECK (send_exif IN (0, 1)),
+    send_gps INTEGER NOT NULL DEFAULT 0 CHECK (send_gps IN (0, 1)),
+    -- 将来の詳細設定用JSON (NULL可。列追加を避ける逃がし)。
+    settings_json TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (path_encoding, path)
@@ -112,6 +124,8 @@ CREATE TABLE files (
     os_file_id BLOB,
     scan_state TEXT NOT NULL DEFAULT 'present'
         CHECK (scan_state IN ('present', 'missing', 'unreadable', 'unsupported', 'corrupt')),
+    -- 最後にファイルの存在を確認した時刻。状態変更 (set_scan_state) では
+    -- 更新しない。存在確認を反映するのはupsert (発見) のみ。
     last_seen_at TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -138,8 +152,8 @@ CREATE TABLE asset_tags (
     source TEXT NOT NULL
         CHECK (source IN ('manual', 'ai', 'import', 'embedded_metadata')),
     ai_confidence REAL,
-    -- WP-10のai_runsテーブル追加時にFKを付与する (それまで整数のみ)。
-    ai_run_id INTEGER,
+    -- ai_run_id は WP-10 でai_runsテーブル作成と同時にADD COLUMNで追加
+    -- (crate doc参照。この時点では列自体を持たない)。
     manually_edited INTEGER NOT NULL DEFAULT 0 CHECK (manually_edited IN (0, 1)),
     created_at TEXT NOT NULL,
     PRIMARY KEY (asset_id, tag_id)
@@ -158,7 +172,8 @@ CREATE TABLE captions (
     source TEXT NOT NULL
         CHECK (source IN ('manual', 'ai', 'import', 'embedded_metadata')),
     language TEXT,
-    ai_run_id INTEGER,
+    -- ai_run_id は WP-10 でai_runsテーブル作成と同時にADD COLUMNで追加
+    -- (crate doc参照。この時点では列自体を持たない)。
     -- 再生成時は旧レコードを削除せず非現行 (0) として履歴を残す。
     current INTEGER NOT NULL DEFAULT 1 CHECK (current IN (0, 1)),
     manually_edited INTEGER NOT NULL DEFAULT 0 CHECK (manually_edited IN (0, 1)),
