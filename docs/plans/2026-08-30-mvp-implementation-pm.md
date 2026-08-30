@@ -84,6 +84,9 @@ QAレビュー（ユーザー可視面）: WP-4後、WP-8後、WP-18最終。
 - 2026-08-30: **WP-1完了** (`9cf81c2` + FG-WP1 `a63ae07`)。Codex基盤レビュー: 1回目reject（未来schema受入・writer未強制・backup世代ソート）→修正→2回目**approve-with-notes**。migration #1凍結（ai_run_id列はWP-10 ADD COLUMN戦略、ルート設定列追加）。cargo 243 / vitest 221。
 - 2026-08-30: **WP-2完了** (`94a9892` + FG-WP2 `ef920c6` + FG-WP2-2 `bb15f68`)。正確性レビュー: 1回目reject（6ブロッカー）→2回目reject（根因=世代トークン弱さ→**トークン再設計**で対応）→3回目**approve-with-notes**。`(os_file_id,size,mtime_ns)`トークン、fd束ねprobe、積極的不在証明、決定論リトライ。migration #2〜#4。cargo 328 / vitest 236。E2E: 1615/974/0/0。
 - 後続硬化メモ（非ブロッキング記録）: write_retの明示的SQLiteトランザクション化（crash-atomicなasset作成+link）/ os_file_id不在プラットフォームのフォールバック強化 / 敵対的in-place変更（size+mtime復元）の検出は範囲外と明記 / WP-1レビューの非ブロッカー未対応分はWP-3以降の健全性確認時に拾う。
+- 2026-08-30: **WP-3完了** (`c67cda5`、done-with-notes)。6形式対応（probe/decode/thumb/orientation/animated/背景切替）。**AVIFはblocked**: `libdav1d-dev`不足（検出・mime・型は前方実装済み、feature追加のみで有効化）。cargo 347 / vitest 246。Codex個別レビューなし（normal、基盤レビューで担保）。
+- 2026-08-30: **WP-4完了** (`60f5529` + QA-WP4 `c1fd151`)。3ペインUIシェル・ツリー・InfoPanel・クイックプレビュー・コンテキストメニュー・選別セッション。性能退行なし（S3相当long frame +0、S4相当p50同等）。QA **pass-with-concerns** → Major-2件（走査キャンセル不能→scan_token世代切替+cancel_scan+深さ/件数ガードで解決、adhocセッションID不安定→ソート永続化+再開検証で解決）+Minor-3件修正。cargo 372 / vitest 331。
+- ユーザー依頼事項: `sudo apt install libdav1d-dev`（AVIF有効化。feature `avif-native`追加は別委任）。
 
 ## 9. オープンクエスチョン（ユーザー判断不要・PM判断で進行）
 
