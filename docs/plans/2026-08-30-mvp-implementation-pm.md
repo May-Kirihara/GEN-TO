@@ -79,7 +79,11 @@ QAレビュー（ユーザー可視面）: WP-4後、WP-8後、WP-18最終。
 
 ## 8. 進捗記録
 
-- 2026-08-30: 本書作成。Codex計画レビュー実施予定。
+- 2026-08-30: 本書作成。Codex計画レビュー approve-with-notes。
+- 2026-08-30: **WP-0完了** (`e14707f`)。devtools feature隔離+artifact証拠（スモーク8/8）、AppDirs、API version、panic診断、license生成。cargo 165 / vitest 219。
+- 2026-08-30: **WP-1完了** (`9cf81c2` + FG-WP1 `a63ae07`)。Codex基盤レビュー: 1回目reject（未来schema受入・writer未強制・backup世代ソート）→修正→2回目**approve-with-notes**。migration #1凍結（ai_run_id列はWP-10 ADD COLUMN戦略、ルート設定列追加）。cargo 243 / vitest 221。
+- 2026-08-30: **WP-2完了** (`94a9892` + FG-WP2 `ef920c6` + FG-WP2-2 `bb15f68`)。正確性レビュー: 1回目reject（6ブロッカー）→2回目reject（根因=世代トークン弱さ→**トークン再設計**で対応）→3回目**approve-with-notes**。`(os_file_id,size,mtime_ns)`トークン、fd束ねprobe、積極的不在証明、決定論リトライ。migration #2〜#4。cargo 328 / vitest 236。E2E: 1615/974/0/0。
+- 後続硬化メモ（非ブロッキング記録）: write_retの明示的SQLiteトランザクション化（crash-atomicなasset作成+link）/ os_file_id不在プラットフォームのフォールバック強化 / 敵対的in-place変更（size+mtime復元）の検出は範囲外と明記 / WP-1レビューの非ブロッカー未対応分はWP-3以降の健全性確認時に拾う。
 
 ## 9. オープンクエスチョン（ユーザー判断不要・PM判断で進行）
 
