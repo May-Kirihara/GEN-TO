@@ -150,6 +150,46 @@ impl fmt::Display for RepoError {
 
 impl std::error::Error for RepoError {}
 
+/// OS固有のファイル識別子 (WP-2。spec-draft §6.2「利用可能な場合はOS固有のファイル識別子」)。
+///
+/// Linuxでは `stat` の `st_dev + st_ino`。同一ファイルシステム内で
+/// リネーム・移動しても不変のため、外部移動・改名の再発見に使う。
+/// DBには16バイトリトルエンディアンBLOB (dev, ino の順) で格納する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OsFileId {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+impl OsFileId {
+    pub const fn new(dev: u64, ino: u64) -> Self {
+        Self { dev, ino }
+    }
+
+    /// DB格納BLOB (16バイトLE)。
+    pub fn to_bytes(self) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out[..8].copy_from_slice(&self.dev.to_le_bytes());
+        out[8..].copy_from_slice(&self.ino.to_le_bytes());
+        out
+    }
+
+    /// BLOBからの復元。長さが16でなければ `None`。
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 16 {
+            return None;
+        }
+        let mut dev = [0u8; 8];
+        let mut ino = [0u8; 8];
+        dev.copy_from_slice(&bytes[..8]);
+        ino.copy_from_slice(&bytes[8..]);
+        Some(Self {
+            dev: u64::from_le_bytes(dev),
+            ino: u64::from_le_bytes(ino),
+        })
+    }
+}
+
 /// 登録ルート (library_roots) のレコード。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibraryRootRecord {
@@ -160,8 +200,36 @@ pub struct LibraryRootRecord {
     /// 表示用パス (lossy変換。非UTF-8部分は置換文字になる)。
     pub display_path: String,
     pub enabled: bool,
+    /// フォルダ監視 (WP-2のwatcherが使用。data-model §2.3)。
+    pub watch_enabled: bool,
+    /// AI自動処理 (WP-10で使用)。
+    pub ai_enabled: bool,
+    pub send_exif: bool,
+    pub send_gps: bool,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// [`crate::repo::LibraryRootRepo::set_root_settings`] の入力。
+/// `settings_json` は将来用の逃がし列でWP-2では対象外。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootSettings {
+    pub watch_enabled: bool,
+    pub ai_enabled: bool,
+    pub send_exif: bool,
+    pub send_gps: bool,
+}
+
+impl Default for RootSettings {
+    fn default() -> Self {
+        // schema #1の列既定値と同一 (watch=1, ai/exif/gps=0)。
+        Self {
+            watch_enabled: true,
+            ai_enabled: false,
+            send_exif: false,
+            send_gps: false,
+        }
+    }
 }
 
 /// [`crate::repo::FileRepo::upsert_file`] の入力。
@@ -180,6 +248,14 @@ pub struct FileUpsert {
     pub byte_size: u64,
     pub mtime_ms: u64,
     pub scan_state: ScanState,
+    /// OSファイルID (取得可能な場合)。外部移動・改名の再発見に使用。
+    pub os_file_id: Option<OsFileId>,
+    /// `true` の場合、upsert時に asset リンクを解除する。
+    /// サイズ+mtime変化を検出した際、内容が変わった可能性があるため
+    /// 再ハッシュで正しいAssetへ再リンクされるまで Asset確定前 (NULL) に
+    /// 戻す。内容が同一だった場合はハッシュ一致で同一Assetへ再リンクされ
+    /// メタデータは失われない。
+    pub detach_asset: bool,
 }
 
 /// ファイル (files) のレコード。
@@ -196,6 +272,8 @@ pub struct FileRecord {
     pub byte_size: u64,
     pub mtime_ms: u64,
     pub scan_state: ScanState,
+    /// OSファイルID (Linux: dev+inode)。取得不能な環境・未走査は `None`。
+    pub os_file_id: Option<OsFileId>,
     /// 最後にファイルの**存在を確認した**時刻 (UTC RFC3339)。
     /// missingへの状態変更では更新されない — 存在確認を反映するのは
     /// 発見時の [`crate::repo::FileRepo::upsert_file`] のみ。
@@ -212,6 +290,9 @@ pub struct NewAsset {
     pub hash_algorithm: String,
     pub byte_size: u64,
     pub mime_type: Option<String>,
+    /// プローブ可能だった場合の寸法 (WP-2ではPNGのみ。他形式はNULL)。
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 /// 画像内容 (assets) のレコード。
@@ -224,6 +305,9 @@ pub struct AssetRecord {
     pub hash_state: HashState,
     pub byte_size: u64,
     pub mime_type: Option<String>,
+    /// 寸法 (プローブ時点の値。未プローブは `None`)。
+    pub width: Option<u32>,
+    pub height: Option<u32>,
     pub rating: u8,
     pub triage: TriageState,
     pub favorite: bool,
@@ -252,6 +336,10 @@ pub trait LibraryRootRepo {
     /// `path` が既存ルートの配下、または既存ルートが `path` の配下に
     /// ある場合にそれらのルートを返す (同一パスを含む)。
     fn overlapping_roots(&self, path: &Path) -> Result<Vec<LibraryRootRecord>, RepoError>;
+
+    /// ルート設定列 (watch/ai/exif/gps) を更新する。
+    /// 存在しないIDは [`RepoError::NotFound`]。
+    fn set_root_settings(&self, root_id: i64, settings: RootSettings) -> Result<(), RepoError>;
 }
 
 /// ファイルのrepository。
@@ -275,6 +363,46 @@ pub trait FileRepo {
 
     /// `root_id` + `rel_path` でFileを引く。
     fn find_by_path(&self, root_id: i64, rel_path: &Path) -> Result<Option<FileRecord>, RepoError>;
+
+    /// [`FileRepo::upsert_file`] のバッチ版 (data-model §13「小さなバッチで
+    /// コミット」)。1呼び出し=1トランザクション。呼び出し側がバッチサイズを
+    /// 制御し、writer接続を長時間専有しない。
+    fn upsert_files_batch(&self, files: &[FileUpsert]) -> Result<Vec<FileRecord>, RepoError>;
+
+    /// OSファイルIDでFileを引く (外部移動・改名の再発見。WP-2)。
+    /// 同一ルート内のみ探索 (クロスルートの再関連付けは将来課題)。
+    fn find_by_os_file_id(
+        &self,
+        root_id: i64,
+        os_file_id: &OsFileId,
+    ) -> Result<Option<FileRecord>, RepoError>;
+
+    /// ファイルの実体が移動・改名されたことを反映する (同一レコードの
+    /// rel_path を更新。uuid・assetリンクは保持)。
+    /// 移動先rel_pathに既存レコードが存在する場合は [`RepoError::Duplicate`]
+    /// (呼び出し側は通常upsertへフォールバック)。
+    fn relocate_file(&self, file_id: i64, file: FileUpsert) -> Result<FileRecord, RepoError>;
+
+    /// 走査状態を一括更新 (不在化バッチ用)。更新した行数を返す。
+    fn set_scan_state_batch(&self, file_ids: &[i64], state: ScanState) -> Result<usize, RepoError>;
+
+    /// ルート配下のFileをページングで列挙 (offset昇順・id順)。
+    /// 戻り値は (ページ, 全件数)。
+    fn list_files_paged(
+        &self,
+        root_id: i64,
+        offset: u32,
+        limit: u32,
+    ) -> Result<(Vec<FileRecord>, u64), RepoError>;
+
+    /// 全ルートの `scan_state='present'` なFileをAsset情報 (LEFT JOIN) 付きで
+    /// 列挙する (永続カタログのスナップショット生成。WP-2)。
+    /// 件数はカタログ規模 (5万件程度) を想定した全件読み込み。
+    fn list_present_joined(&self) -> Result<Vec<(FileRecord, Option<AssetRecord>)>, RepoError>;
+
+    /// ルート配下でAsset未リンク (asset_id NULL = ハッシュ未計算) のFile一覧。
+    /// ハッシュ処理の再開 (resume) 判定に使用。
+    fn list_files_without_asset(&self, root_id: i64) -> Result<Vec<FileRecord>, RepoError>;
 }
 
 /// 画像内容 (Asset) のrepository。
@@ -288,6 +416,11 @@ pub trait AssetRepo {
     /// File → Asset のリンクを設定する。
     /// FileまたはAssetが存在しない場合は [`RepoError::NotFound`]。
     fn link_file(&self, file_id: i64, asset_id: i64) -> Result<(), RepoError>;
+
+    /// 同一内容ハッシュのAssetがあればそれを返し、無ければ作成する。
+    /// 戻り値は (Asset, 新規作成か)。[`AssetRepo::create_asset`] の
+    /// Duplicate処理 (find→create→競合時再find) を冪等にまとめたもの。
+    fn create_or_get_asset(&self, asset: NewAsset) -> Result<(AssetRecord, bool), RepoError>;
 }
 
 /// `child` が `parent` 配下 (または同一) のパスかをコンポーネント単位で
@@ -362,5 +495,27 @@ mod tests {
         assert!(!path_is_within(Path::new("/data"), parent));
         // コンポーネント単位: "/data/photosx" は "/data/photos" 配下ではない
         assert!(!path_is_within(Path::new("/data/photosx/x.png"), parent));
+    }
+
+    #[test]
+    fn os_file_id_bytes_round_trip() {
+        let id = OsFileId::new(0x0102_0304_0506_0708, 42);
+        let bytes = id.to_bytes();
+        assert_eq!(bytes.len(), 16);
+        assert_eq!(OsFileId::from_bytes(&bytes), Some(id));
+        // LE順: dev先頭8バイト
+        assert_eq!(&bytes[..8], &0x0102_0304_0506_0708u64.to_le_bytes());
+        assert_eq!(&bytes[8..], &42u64.to_le_bytes());
+        assert_eq!(OsFileId::from_bytes(&[0u8; 15]), None);
+        assert_eq!(OsFileId::from_bytes(&[0u8; 17]), None);
+    }
+
+    #[test]
+    fn root_settings_default_matches_schema_defaults() {
+        let s = RootSettings::default();
+        assert!(s.watch_enabled);
+        assert!(!s.ai_enabled);
+        assert!(!s.send_exif);
+        assert!(!s.send_gps);
     }
 }

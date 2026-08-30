@@ -5,7 +5,8 @@
  * summary・イベントペイロードはWP-2委任仕様の表記に合わせ snake_case。
  */
 
-export type CatalogMode = "real" | "virtual";
+/** WP-2で "library" (登録ルートのDB由来カタログ) を追加。 */
+export type CatalogMode = "real" | "virtual" | "library";
 
 export type ImageState = "ready" | "unreadable" | "unsupported" | "corrupt";
 
@@ -46,17 +47,24 @@ export type CatalogSummary = {
   last_scan_elapsed_ms: number | null;
 };
 
-/** scan:progress イベントペイロード。 */
+/** scan:progress イベントペイロード (WP-2でライブラリスキャン用フィールド追加)。 */
 export type ScanProgressEvent = {
   /** 列挙したファイルエントリ累積 (拡張子を問わない)。 */
   scanned: number;
-  /** カタログへ追加したPNG累積。 */
+  /** カタログへ追加したPNG累計 / ライブラリスキャンでは新規発見累計。 */
   found: number;
   errors: number;
   elapsed_ms: number;
   done: boolean;
   /** 直近数件のエラーサンプル。 */
   error_samples?: string[];
+  /** 以下はライブラリスキャンのみ (一時走査では 0/undefined)。 */
+  updated?: number;
+  relocated?: number;
+  missing?: number;
+  hashed?: number;
+  pending_hash?: number;
+  phase?: "scanning" | "hashing" | null;
 };
 
 /** catalog:changed イベントペイロード。 */

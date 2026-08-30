@@ -38,6 +38,8 @@ pub struct AppState {
     /// SQLite DB状態 (WP-1)。setupで生成。開けなくてもアプリは続行
     /// (通常ファイラー機能はDB非依存のため)。
     pub db: Option<crate::db::DbState>,
+    /// 登録ルート制御 (WP-2)。DBが開けている場合のみ生成。
+    pub library: Option<Arc<crate::library::LibraryController>>,
     /// 計測ブリッジ (devtest) の有効フラグ (FG-1)。devtoolsビルドのみ存在
     /// (WP-0)。起動時に環境変数 `GENTO_DEV_BRIDGE` (値は厳密に "1") から
     /// 確定し以後不変。危険コマンド (set_failure_injection / devtest_report /
@@ -50,10 +52,11 @@ pub struct AppState {
 pub struct CatalogInner {
     /// 稼働モードに応じた「表示中」レコード列。
     state: CatalogState,
-    /// 最後に完了した走査の実レコード (仮想カタログのソース)。
-    /// devtoolsビルドのみ (WP-0)。
-    #[cfg(any(debug_assertions, feature = "devtools"))]
+    /// 最後に完了した一時走査の実レコード (Realモード復帰用。
+    /// WP-2でset_catalog_sourceがproduction経路でも使うため無条件保持)。
     real: Vec<ImageRecord>,
+    /// 登録ルート由来のスナップショット (WP-2。DBから再生成可能)。
+    library: Vec<ImageRecord>,
     progress: ProgressCounters,
     scan_started_at: Option<Instant>,
     last_scan_elapsed_ms: Option<u64>,
@@ -83,8 +86,8 @@ impl CatalogInner {
     fn new() -> Self {
         Self {
             state: CatalogState::new(),
-            #[cfg(any(debug_assertions, feature = "devtools"))]
             real: Vec::new(),
+            library: Vec::new(),
             progress: ProgressCounters::default(),
             scan_started_at: None,
             last_scan_elapsed_ms: None,
@@ -100,6 +103,7 @@ impl AppState {
             thumbnails: None,
             proto_stats: Arc::new(crate::protocol::ProtoStats::new()),
             db: None,
+            library: None,
             #[cfg(any(debug_assertions, feature = "devtools"))]
             dev_bridge: AtomicBool::new(crate::devtools::dev_bridge_enabled_strict()),
         }
@@ -150,6 +154,7 @@ pub struct CatalogSummary {
 }
 
 /// `scan:progress` イベントペイロード。
+/// WP-2でライブラリスキャン用フィールドを追加 (一時走査では 0/空)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ScanProgressPayload {
     pub scanned: u64,
@@ -159,6 +164,18 @@ pub struct ScanProgressPayload {
     pub done: bool,
     /// 直近数件のエラーサンプル (毎件は流さない)。
     pub error_samples: Vec<String>,
+    /// 変更検出数 (ライブラリスキャンのみ)。
+    pub updated: u64,
+    /// 外部移動・改名の再発見数 (同上)。
+    pub relocated: u64,
+    /// 不在化数 (同上)。
+    pub missing: u64,
+    /// ハッシュ計算完了数 (同上)。
+    pub hashed: u64,
+    /// ハッシュ待ち残数 (同上)。
+    pub pending_hash: u64,
+    /// `"scanning"` | `"hashing"` (一時走査ではNone)。
+    pub phase: Option<String>,
 }
 
 /// `catalog:changed` イベントの理由。
@@ -219,7 +236,6 @@ fn begin_scan(inner: &mut CatalogInner) -> u64 {
 // ===== カタログモード切替 (devtools機能。仮想5万件カタログは計測用) =====
 // 通常releaseビルドでは set_catalog_mode commandごと存在しない (WP-0)。
 
-#[cfg(any(debug_assertions, feature = "devtools"))]
 #[derive(Debug)]
 enum ModeSwitchOutcome {
     Changed(CatalogSummary),
@@ -231,6 +247,13 @@ enum ModeSwitchOutcome {
 fn switch_mode(inner: &mut CatalogInner, want_virtual: bool) -> Result<ModeSwitchOutcome, String> {
     if inner.state.scanning {
         return Err("cannot switch catalog mode while scanning".to_string());
+    }
+    if inner.state.mode == CatalogMode::Library {
+        // devtoolsのreal↔virtual切替は一時走査カタログ上の操作。
+        // Library表示中は set_catalog_source で temp へ戻してから。
+        return Err(
+            "switch to temp source (set_catalog_source) before using virtual mode".to_string(),
+        );
     }
     let target = if want_virtual {
         CatalogMode::Virtual
@@ -255,6 +278,90 @@ fn switch_mode(inner: &mut CatalogInner, want_virtual: bool) -> Result<ModeSwitc
     inner.state.generation += 1;
     Ok(ModeSwitchOutcome::Changed(summary_of(inner)))
 }
+/// カタログ表示ソースの切替 (WP-2。production command)。
+///
+/// - `temp`: 一時走査カタログ (Realモード。`--dataset` の走査結果)
+/// - `library`: 登録ルートのDB由来スナップショット (Libraryモード)
+///
+/// 一時走査の実行中は切り替えを拒否する (run_scanがrecordsを直接更新する
+/// ため、Library表示と混在しないようにする)。
+#[tauri::command]
+pub fn set_catalog_source(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    source: String,
+) -> Result<CatalogSummary, String> {
+    let target = match source.as_str() {
+        "temp" => CatalogMode::Real,
+        "library" => CatalogMode::Library,
+        other => {
+            return Err(format!(
+                "unknown catalog source: {other} (expected temp|library)"
+            ))
+        }
+    };
+    let outcome = {
+        let mut inner = lock(&state.catalog);
+        if inner.state.scanning {
+            return Err("cannot switch catalog source while scanning".to_string());
+        }
+        if inner.state.mode == target {
+            ModeSwitchOutcome::Unchanged(summary_of(&inner))
+        } else {
+            match target {
+                CatalogMode::Real => inner.state.records = inner.real.clone(),
+                CatalogMode::Library => inner.state.records = inner.library.clone(),
+                CatalogMode::Virtual => unreachable!("target is Real|Library here"),
+            }
+            inner.state.mode = target;
+            inner.state.generation += 1;
+            ModeSwitchOutcome::Changed(summary_of(&inner))
+        }
+    };
+    if let ModeSwitchOutcome::Changed(summary) = outcome {
+        let _ = app.emit(
+            "catalog:changed",
+            CatalogChangedPayload {
+                generation: summary.generation,
+                reason: CatalogChangeReason::ModeSwitch,
+            },
+        );
+        Ok(summary)
+    } else {
+        match outcome {
+            ModeSwitchOutcome::Unchanged(summary) => Ok(summary),
+            ModeSwitchOutcome::Changed(_) => unreachable!("handled above"),
+        }
+    }
+}
+
+/// ライブラリスナップショットをカタログへ反映する (WP-2)。
+/// Libraryモード表示中は表示レコードを差し替え、generationを進めて
+/// `catalog:changed` をemitする (ページ再取得でAssetIdの確定へ追従)。
+pub fn apply_library_snapshot(app: &AppHandle, records: Vec<ImageRecord>) {
+    let state = app.state::<AppState>();
+    let generation = {
+        let mut inner = lock(&state.catalog);
+        inner.library = records;
+        if inner.state.mode == CatalogMode::Library && !inner.state.scanning {
+            inner.state.records = inner.library.clone();
+            inner.state.generation += 1;
+            inner.state.generation
+        } else {
+            0
+        }
+    };
+    if generation > 0 {
+        let _ = app.emit(
+            "catalog:changed",
+            CatalogChangedPayload {
+                generation,
+                reason: CatalogChangeReason::ScanBatch,
+            },
+        );
+    }
+}
+
 #[tauri::command]
 pub fn get_catalog_summary(state: State<'_, AppState>) -> CatalogSummary {
     summary_of(&lock(&state.catalog))
@@ -441,6 +548,12 @@ fn run_scan(app: AppHandle, dataset: PathBuf, generation: u64) {
                 elapsed_ms: started.elapsed().as_millis() as u64,
                 done: false,
                 error_samples: inner.progress.error_samples.clone(),
+                updated: 0,
+                relocated: 0,
+                missing: 0,
+                hashed: 0,
+                pending_hash: 0,
+                phase: None,
             }
         };
         let _ = app.emit("scan:progress", payload);
@@ -468,12 +581,9 @@ fn run_scan(app: AppHandle, dataset: PathBuf, generation: u64) {
                 .push_error(format!("{}: {}", error.path.display(), error.reason));
         }
         inner.last_scan_elapsed_ms = Some(scan_elapsed_ms);
-        // 仮想カタログ (devtoolsビルド) のソースとして実レコードを保持する。
-        // 通常releaseではこの複製は行わない。
-        #[cfg(any(debug_assertions, feature = "devtools"))]
-        {
-            inner.real = inner.state.records.clone();
-        }
+        // Realモード復帰用に実レコードを保持する (set_catalog_sourceが
+        // production経路で使用するため無条件。仮想カタログのソースでもある)。
+        inner.real = inner.state.records.clone();
         ScanProgressPayload {
             scanned: inner.progress.scanned,
             found: inner.progress.found,
@@ -481,6 +591,12 @@ fn run_scan(app: AppHandle, dataset: PathBuf, generation: u64) {
             elapsed_ms: scan_elapsed_ms,
             done: true,
             error_samples: inner.progress.error_samples.clone(),
+            updated: 0,
+            relocated: 0,
+            missing: 0,
+            hashed: 0,
+            pending_hash: 0,
+            phase: None,
         }
     };
 
@@ -718,6 +834,12 @@ mod tests {
             elapsed_ms: 123,
             done: false,
             error_samples: vec!["a.png: Corrupt".to_string()],
+            updated: 0,
+            relocated: 0,
+            missing: 0,
+            hashed: 0,
+            pending_hash: 0,
+            phase: None,
         };
         assert_eq!(
             serde_json::to_value(&progress).unwrap(),
@@ -728,6 +850,13 @@ mod tests {
                 "elapsed_ms": 123,
                 "done": false,
                 "error_samples": ["a.png: Corrupt"],
+                // WP-2ライブラリスキャンフィールド (一時走査では初期値)
+                "updated": 0,
+                "relocated": 0,
+                "missing": 0,
+                "hashed": 0,
+                "pending_hash": 0,
+                "phase": null,
             })
         );
 

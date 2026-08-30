@@ -210,6 +210,8 @@ mod tests {
                 byte_size: 1,
                 mtime_ms: 1,
                 scan_state: ScanState::Present,
+                os_file_id: None,
+                detach_asset: false,
             })?;
             Ok(())
         })
@@ -227,7 +229,10 @@ mod tests {
         let db = Db::open_with(tmp.0.join("db.sqlite3"), DbOptions::default()).unwrap();
         let status = db.diagnose().unwrap();
         let json = serde_json::to_value(&status).unwrap();
-        assert_eq!(json["schema_version"], serde_json::json!(1));
+        assert_eq!(
+            json["schema_version"],
+            serde_json::json!(crate::schema::LATEST_VERSION)
+        );
         assert_eq!(json["journal_mode"], serde_json::json!("wal"));
         assert_eq!(json["integrity_check"], serde_json::json!("ok"));
         assert!(json["table_row_counts"].is_object());

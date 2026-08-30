@@ -3,12 +3,20 @@
 
 pub mod catalog;
 pub mod jobs;
+pub mod library;
 pub mod repo;
 
 pub use jobs::{ParsePriorityError, ParseSizeClassError, Priority, SizeClass};
+pub use library::{
+    decode_library_asset_id, library_asset_id, provisional_file_asset_id, CoalescedChanges,
+    FileContentHash, FsChange, HashFileError, LibraryAssetRef, PendingHash, ScanEntry, ScanFs,
+    ScanOptions, ScanPhase, ScanProgress, ScanSummary, WalkOutcome, WatchBuffer,
+    DEFAULT_SCAN_BATCH_SIZE, PROVISIONAL_FILE_FLAG,
+};
 pub use repo::{
     AssetRecord, AssetRepo, FileRecord, FileRepo, FileUpsert, HashState, LibraryRootRecord,
-    LibraryRootRepo, NewAsset, ParseScanStateError, RepoError, ScanState, TriageState,
+    LibraryRootRepo, NewAsset, OsFileId, ParseScanStateError, RepoError, RootSettings, ScanState,
+    TriageState,
 };
 
 use std::fmt;

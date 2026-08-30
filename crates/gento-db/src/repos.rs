@@ -9,12 +9,24 @@ use std::path::Path;
 
 use gento_core::repo::{
     AssetRecord, AssetRepo, FileRecord, FileRepo, FileUpsert, HashState, LibraryRootRecord,
-    LibraryRootRepo, NewAsset, RepoError, ScanState, TriageState,
+    LibraryRootRepo, NewAsset, OsFileId, RepoError, RootSettings, ScanState, TriageState,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::ids::{new_uuid_v7, now_utc_rfc3339};
 use crate::paths::{decode_path, encode_path, PathEncoding};
+
+/// ルート行のSELECT列一覧 (map_library_rootと共通)。
+const ROOT_COLUMNS: &str = "id, uuid, path, path_encoding, display_path, enabled, \
+     watch_enabled, ai_enabled, send_exif, send_gps, created_at, updated_at";
+
+/// files行のSELECT列一覧 (map_fileと共通)。
+const FILE_COLUMNS: &str = "id, uuid, root_id, asset_id, rel_path, path_encoding, display_name, \
+     extension, byte_size, mtime_ms, os_file_id, scan_state, last_seen_at, created_at, updated_at";
+
+/// assets行のSELECT列一覧 (map_assetと共通)。
+const ASSET_COLUMNS: &str = "id, uuid, content_hash, hash_algorithm, hash_state, mime_type, \
+     byte_size, width, height, rating, triage, favorite, created_at, updated_at";
 
 /// 1接続ぶんのrepository集合。
 pub struct SqliteRepos<'a> {
@@ -32,13 +44,9 @@ impl<'a> SqliteRepos<'a> {
     }
 
     fn get_root(&self, id: i64) -> Result<Option<LibraryRootRecord>, RepoError> {
+        let sql = format!("SELECT {ROOT_COLUMNS} FROM library_roots WHERE id = ?1");
         self.conn
-            .query_row(
-                "SELECT id, uuid, path, path_encoding, display_path, enabled, created_at, updated_at
-                 FROM library_roots WHERE id = ?1",
-                [id],
-                map_library_root,
-            )
+            .query_row(&sql, [id], map_library_root)
             .optional()
             .map_err(map_err)
     }
@@ -102,6 +110,10 @@ fn map_library_root(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryRootReco
         path: decode_path(&path_bytes),
         display_path: row.get("display_path")?,
         enabled: row.get::<_, i64>("enabled")? != 0,
+        watch_enabled: row.get::<_, i64>("watch_enabled")? != 0,
+        ai_enabled: row.get::<_, i64>("ai_enabled")? != 0,
+        send_exif: row.get::<_, i64>("send_exif")? != 0,
+        send_gps: row.get::<_, i64>("send_gps")? != 0,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
@@ -111,6 +123,7 @@ fn map_file(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
     let rel_bytes: Vec<u8> = row.get("rel_path")?;
     let scan_state_str: String = row.get("scan_state")?;
     let scan_state = scan_state_from_db_value(&scan_state_str)?;
+    let os_file_id_bytes: Option<Vec<u8>> = row.get("os_file_id")?;
     Ok(FileRecord {
         id: row.get("id")?,
         uuid: row.get("uuid")?,
@@ -121,6 +134,7 @@ fn map_file(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
         extension: row.get("extension")?,
         byte_size: row.get::<_, i64>("byte_size")?.max(0) as u64,
         mtime_ms: row.get("mtime_ms")?,
+        os_file_id: os_file_id_bytes.as_deref().and_then(OsFileId::from_bytes),
         scan_state,
         last_seen_at: row.get("last_seen_at")?,
         created_at: row.get("created_at")?,
@@ -173,6 +187,12 @@ fn map_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord> {
         hash_state,
         byte_size: row.get::<_, i64>("byte_size")?.max(0) as u64,
         mime_type: row.get("mime_type")?,
+        width: row
+            .get::<_, Option<i64>>("width")?
+            .and_then(|v| u32::try_from(v).ok()),
+        height: row
+            .get::<_, Option<i64>>("height")?
+            .and_then(|v| u32::try_from(v).ok()),
         rating: row.get::<_, i64>("rating")?.clamp(0, 5) as u8,
         triage,
         favorite: row.get::<_, i64>("favorite")? != 0,
@@ -209,13 +229,8 @@ impl LibraryRootRepo for SqliteRepos<'_> {
     }
 
     fn list_roots(&self) -> Result<Vec<LibraryRootRecord>, RepoError> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT id, uuid, path, path_encoding, display_path, enabled, created_at, updated_at
-                 FROM library_roots ORDER BY id",
-            )
-            .map_err(map_err)?;
+        let sql = format!("SELECT {ROOT_COLUMNS} FROM library_roots ORDER BY id");
+        let mut stmt = self.conn.prepare(&sql).map_err(map_err)?;
         let rows = stmt
             .query_map([], map_library_root)
             .map_err(map_err)?
@@ -257,6 +272,30 @@ impl LibraryRootRepo for SqliteRepos<'_> {
             .filter(|root| path_is_within(path, &root.path) || path_is_within(&root.path, path))
             .collect())
     }
+
+    fn set_root_settings(&self, root_id: i64, settings: RootSettings) -> Result<(), RepoError> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE library_roots SET
+                    watch_enabled = ?2, ai_enabled = ?3, send_exif = ?4, send_gps = ?5,
+                    updated_at = ?6
+                 WHERE id = ?1",
+                params![
+                    root_id,
+                    settings.watch_enabled as i64,
+                    settings.ai_enabled as i64,
+                    settings.send_exif as i64,
+                    settings.send_gps as i64,
+                    now_utc_rfc3339(),
+                ],
+            )
+            .map_err(map_err)?;
+        if changed == 0 {
+            return Err(RepoError::NotFound);
+        }
+        Ok(())
+    }
 }
 
 impl FileRepo for SqliteRepos<'_> {
@@ -268,16 +307,19 @@ impl FileRepo for SqliteRepos<'_> {
             .execute(
                 "INSERT INTO files
                     (uuid, root_id, asset_id, rel_path, path_encoding, display_name,
-                     extension, byte_size, mtime_ms, scan_state, last_seen_at,
+                     extension, byte_size, mtime_ms, os_file_id, scan_state, last_seen_at,
                      created_at, updated_at)
-                 VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?10)
+                 VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?11)
                  ON CONFLICT (root_id, path_encoding, rel_path) DO UPDATE SET
                     display_name = excluded.display_name,
                     extension = excluded.extension,
                     byte_size = excluded.byte_size,
                     mtime_ms = excluded.mtime_ms,
+                    os_file_id = excluded.os_file_id,
                     scan_state = excluded.scan_state,
                     last_seen_at = excluded.last_seen_at,
+                    -- 内容変化検出時のみassetリンク解除 (NULLへ)。それ以外は保持。
+                    asset_id = CASE WHEN ?12 THEN NULL ELSE files.asset_id END,
                     updated_at = excluded.updated_at",
                 params![
                     new_uuid_v7(),
@@ -288,8 +330,10 @@ impl FileRepo for SqliteRepos<'_> {
                     extension,
                     u64_to_i64(file.byte_size, "byte_size")?,
                     u64_to_i64(file.mtime_ms, "mtime_ms")?,
+                    file.os_file_id.map(|id| id.to_bytes().to_vec()),
                     file.scan_state.as_str(),
                     now,
+                    file.detach_asset as i64,
                 ],
             )
             .map_err(map_err)?;
@@ -314,15 +358,11 @@ impl FileRepo for SqliteRepos<'_> {
     }
 
     fn list_missing(&self, root_id: i64) -> Result<Vec<FileRecord>, RepoError> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT id, uuid, root_id, asset_id, rel_path, path_encoding, display_name,
-                        extension, byte_size, mtime_ms, scan_state, last_seen_at,
-                        created_at, updated_at
-                 FROM files WHERE root_id = ?1 AND scan_state = 'missing' ORDER BY id",
-            )
-            .map_err(map_err)?;
+        let sql = format!(
+            "SELECT {FILE_COLUMNS} FROM files
+             WHERE root_id = ?1 AND scan_state = 'missing' ORDER BY id"
+        );
+        let mut stmt = self.conn.prepare(&sql).map_err(map_err)?;
         let rows = stmt
             .query_map([root_id], map_file)
             .map_err(map_err)?
@@ -333,18 +373,303 @@ impl FileRepo for SqliteRepos<'_> {
 
     fn find_by_path(&self, root_id: i64, rel_path: &Path) -> Result<Option<FileRecord>, RepoError> {
         let (rel_blob, enc) = encode_path(rel_path);
+        let sql = format!(
+            "SELECT {FILE_COLUMNS} FROM files
+             WHERE root_id = ?1 AND path_encoding = ?2 AND rel_path = ?3"
+        );
+        self.conn
+            .query_row(&sql, params![root_id, enc.as_str(), rel_blob], map_file)
+            .optional()
+            .map_err(map_err)
+    }
+
+    fn upsert_files_batch(&self, files: &[FileUpsert]) -> Result<Vec<FileRecord>, RepoError> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| RepoError::Db(e.to_string()))?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO files
+                        (uuid, root_id, asset_id, rel_path, path_encoding, display_name,
+                         extension, byte_size, mtime_ms, os_file_id, scan_state, last_seen_at,
+                         created_at, updated_at)
+                     VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?11)
+                     ON CONFLICT (root_id, path_encoding, rel_path) DO UPDATE SET
+                        display_name = excluded.display_name,
+                        extension = excluded.extension,
+                        byte_size = excluded.byte_size,
+                        mtime_ms = excluded.mtime_ms,
+                        os_file_id = excluded.os_file_id,
+                        scan_state = excluded.scan_state,
+                        last_seen_at = excluded.last_seen_at,
+                        asset_id = CASE WHEN ?12 THEN NULL ELSE files.asset_id END,
+                        updated_at = excluded.updated_at",
+                )
+                .map_err(map_err)?;
+            for file in files {
+                let (rel_blob, enc) = encode_path(&file.rel_path);
+                let now = now_utc_rfc3339();
+                stmt.execute(params![
+                    new_uuid_v7(),
+                    file.root_id,
+                    rel_blob,
+                    enc.as_str(),
+                    file.display_name,
+                    extension_of(&file.display_name),
+                    u64_to_i64(file.byte_size, "byte_size")?,
+                    u64_to_i64(file.mtime_ms, "mtime_ms")?,
+                    file.os_file_id.map(|id| id.to_bytes().to_vec()),
+                    file.scan_state.as_str(),
+                    now,
+                    file.detach_asset as i64,
+                ])
+                .map_err(map_err)?;
+            }
+        }
+        tx.commit().map_err(map_err)?;
+
+        // コミット済み行を引き直して返す (batch keysの順で)。
+        files
+            .iter()
+            .map(|file| {
+                self.find_by_path(file.root_id, &file.rel_path)?
+                    .ok_or_else(|| RepoError::Db("upserted file row is not readable".to_string()))
+            })
+            .collect()
+    }
+
+    fn find_by_os_file_id(
+        &self,
+        root_id: i64,
+        os_file_id: &OsFileId,
+    ) -> Result<Option<FileRecord>, RepoError> {
+        let sql = format!(
+            "SELECT {FILE_COLUMNS} FROM files
+             WHERE root_id = ?1 AND os_file_id = ?2 ORDER BY id LIMIT 1"
+        );
         self.conn
             .query_row(
-                "SELECT id, uuid, root_id, asset_id, rel_path, path_encoding, display_name,
-                        extension, byte_size, mtime_ms, scan_state, last_seen_at,
-                        created_at, updated_at
-                 FROM files WHERE root_id = ?1 AND path_encoding = ?2 AND rel_path = ?3",
-                params![root_id, enc.as_str(), rel_blob],
+                &sql,
+                params![root_id, os_file_id.to_bytes().to_vec()],
                 map_file,
             )
             .optional()
             .map_err(map_err)
     }
+
+    fn relocate_file(&self, file_id: i64, file: FileUpsert) -> Result<FileRecord, RepoError> {
+        let (rel_blob, enc) = encode_path(&file.rel_path);
+        let now = now_utc_rfc3339();
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE files SET
+                    rel_path = ?2, path_encoding = ?3, display_name = ?4,
+                    extension = ?5, byte_size = ?6, mtime_ms = ?7, os_file_id = ?8,
+                    scan_state = ?9, last_seen_at = ?10, updated_at = ?10
+                 WHERE id = ?1",
+                params![
+                    file_id,
+                    rel_blob,
+                    enc.as_str(),
+                    file.display_name,
+                    extension_of(&file.display_name),
+                    u64_to_i64(file.byte_size, "byte_size")?,
+                    u64_to_i64(file.mtime_ms, "mtime_ms")?,
+                    file.os_file_id.map(|id| id.to_bytes().to_vec()),
+                    file.scan_state.as_str(),
+                    now,
+                ],
+            )
+            .map_err(map_err)?;
+        if changed == 0 {
+            return Err(RepoError::NotFound);
+        }
+        // rel_path一意制約違反はDuplicateで伝える (呼び出し側はupsertへフォールバック)
+        self.conn
+            .query_row(
+                &format!("SELECT {FILE_COLUMNS} FROM files WHERE id = ?1"),
+                [file_id],
+                map_file,
+            )
+            .map_err(map_err)
+    }
+
+    fn set_scan_state_batch(&self, file_ids: &[i64], state: ScanState) -> Result<usize, RepoError> {
+        if file_ids.is_empty() {
+            return Ok(0);
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| RepoError::Db(e.to_string()))?;
+        let changed = {
+            let mut stmt = tx
+                .prepare(
+                    "UPDATE files SET scan_state = ?2, updated_at = ?3
+                     WHERE id = ?1 AND scan_state != ?2",
+                )
+                .map_err(map_err)?;
+            let mut changed = 0;
+            for id in file_ids {
+                changed += stmt
+                    .execute(params![id, state.as_str(), now_utc_rfc3339()])
+                    .map_err(map_err)?;
+            }
+            changed
+        };
+        tx.commit().map_err(map_err)?;
+        Ok(changed)
+    }
+
+    fn list_files_paged(
+        &self,
+        root_id: i64,
+        offset: u32,
+        limit: u32,
+    ) -> Result<(Vec<FileRecord>, u64), RepoError> {
+        let total: i64 = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM files WHERE root_id = ?1",
+                [root_id],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        let sql = format!(
+            "SELECT {FILE_COLUMNS} FROM files WHERE root_id = ?1 ORDER BY id LIMIT ?2 OFFSET ?3"
+        );
+        let mut stmt = self.conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map(params![root_id, limit, offset], map_file)
+            .map_err(map_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_err)?;
+        Ok((rows, total.max(0) as u64))
+    }
+
+    fn list_present_joined(&self) -> Result<Vec<(FileRecord, Option<AssetRecord>)>, RepoError> {
+        const SQL: &str =
+            "SELECT f.id AS f_id, f.uuid AS f_uuid, f.root_id, f.asset_id, f.rel_path,
+                    f.path_encoding, f.display_name, f.extension, f.byte_size, f.mtime_ms,
+                    f.os_file_id, f.scan_state, f.last_seen_at, f.created_at AS f_created_at,
+                    f.updated_at AS f_updated_at,
+                    a.id AS a_id, a.uuid AS a_uuid, a.content_hash, a.hash_algorithm,
+                    a.hash_state, a.mime_type, a.byte_size AS a_byte_size, a.width, a.height,
+                    a.rating, a.triage, a.favorite, a.created_at AS a_created_at,
+                    a.updated_at AS a_updated_at
+             FROM files f LEFT JOIN assets a ON f.asset_id = a.id
+             WHERE f.scan_state = 'present'
+             ORDER BY f.root_id, f.rel_path";
+        let mut stmt = self.conn.prepare(SQL).map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                let has_asset: Option<i64> = row.get("a_id")?;
+                let file = map_file_prefixed(row)?;
+                let asset = if has_asset.is_some() {
+                    Some(map_asset_prefixed(row)?)
+                } else {
+                    None
+                };
+                Ok((file, asset))
+            })
+            .map_err(map_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_err)?;
+        Ok(rows)
+    }
+
+    fn list_files_without_asset(&self, root_id: i64) -> Result<Vec<FileRecord>, RepoError> {
+        let sql = format!(
+            "SELECT {FILE_COLUMNS} FROM files
+             WHERE root_id = ?1 AND asset_id IS NULL AND scan_state = 'present' ORDER BY id"
+        );
+        let mut stmt = self.conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map([root_id], map_file)
+            .map_err(map_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_err)?;
+        Ok(rows)
+    }
+}
+
+/// JOINクエリ用: files列をエイリアス付きで読む (map_fileと同意味)。
+fn map_file_prefixed(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
+    let rel_bytes: Vec<u8> = row.get("rel_path")?;
+    let scan_state_str: String = row.get("scan_state")?;
+    let scan_state = scan_state_from_db_value(&scan_state_str)?;
+    let os_file_id_bytes: Option<Vec<u8>> = row.get("os_file_id")?;
+    Ok(FileRecord {
+        id: row.get("f_id")?,
+        uuid: row.get("f_uuid")?,
+        root_id: row.get("root_id")?,
+        asset_id: row.get("asset_id")?,
+        rel_path: decode_path(&rel_bytes),
+        display_name: row.get("display_name")?,
+        extension: row.get("extension")?,
+        byte_size: row.get::<_, i64>("byte_size")?.max(0) as u64,
+        mtime_ms: row.get("mtime_ms")?,
+        os_file_id: os_file_id_bytes.as_deref().and_then(OsFileId::from_bytes),
+        scan_state,
+        last_seen_at: row.get("last_seen_at")?,
+        created_at: row.get("f_created_at")?,
+        updated_at: row.get("f_updated_at")?,
+    })
+}
+
+/// JOINクエリ用: assets列をエイリアス付きで読む (map_assetと同意味)。
+fn map_asset_prefixed(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord> {
+    let triage_str: String = row.get("triage")?;
+    let hash_state_str: String = row.get("hash_state")?;
+    let triage = match triage_str.as_str() {
+        "unselected" => TriageState::Unselected,
+        "picked" => TriageState::Picked,
+        "rejected" => TriageState::Rejected,
+        other => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                format!("unknown triage: {other}").into(),
+            ))
+        }
+    };
+    let hash_state = match hash_state_str.as_str() {
+        "pending" => HashState::Pending,
+        "done" => HashState::Done,
+        other => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                format!("unknown hash_state: {other}").into(),
+            ))
+        }
+    };
+    Ok(AssetRecord {
+        id: row.get("a_id")?,
+        uuid: row.get("a_uuid")?,
+        content_hash: row.get("content_hash")?,
+        hash_algorithm: row.get("hash_algorithm")?,
+        hash_state,
+        byte_size: row.get::<_, i64>("a_byte_size")?.max(0) as u64,
+        mime_type: row.get("mime_type")?,
+        width: row
+            .get::<_, Option<i64>>("width")?
+            .and_then(|v| u32::try_from(v).ok()),
+        height: row
+            .get::<_, Option<i64>>("height")?
+            .and_then(|v| u32::try_from(v).ok()),
+        rating: row.get::<_, i64>("rating")?.clamp(0, 5) as u8,
+        triage,
+        favorite: row.get::<_, i64>("favorite")? != 0,
+        created_at: row.get("a_created_at")?,
+        updated_at: row.get("a_updated_at")?,
+    })
 }
 
 impl AssetRepo for SqliteRepos<'_> {
@@ -354,39 +679,29 @@ impl AssetRepo for SqliteRepos<'_> {
             .execute(
                 "INSERT INTO assets
                     (uuid, content_hash, hash_algorithm, hash_state, mime_type,
-                     byte_size, rating, triage, favorite, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'done', ?4, ?5, 0, 'unselected', 0, ?6, ?6)",
+                     byte_size, width, height, rating, triage, favorite, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'done', ?4, ?5, ?6, ?7, 0, 'unselected', 0, ?8, ?8)",
                 params![
                     new_uuid_v7(),
                     asset.content_hash,
                     asset.hash_algorithm,
                     asset.mime_type,
                     u64_to_i64(asset.byte_size, "byte_size")?,
+                    u32_opt_to_i64(asset.width, "width")?,
+                    u32_opt_to_i64(asset.height, "height")?,
                     now,
                 ],
             )
             .map_err(map_err)?;
         let id = self.conn.last_insert_rowid();
-        self.conn
-            .query_row(
-                "SELECT id, uuid, content_hash, hash_algorithm, hash_state, mime_type,
-                        byte_size, rating, triage, favorite, created_at, updated_at
-                 FROM assets WHERE id = ?1",
-                [id],
-                map_asset,
-            )
-            .map_err(map_err)
+        let sql = format!("SELECT {ASSET_COLUMNS} FROM assets WHERE id = ?1");
+        self.conn.query_row(&sql, [id], map_asset).map_err(map_err)
     }
 
     fn find_by_hash(&self, content_hash: &str) -> Result<Option<AssetRecord>, RepoError> {
+        let sql = format!("SELECT {ASSET_COLUMNS} FROM assets WHERE content_hash = ?1");
         self.conn
-            .query_row(
-                "SELECT id, uuid, content_hash, hash_algorithm, hash_state, mime_type,
-                        byte_size, rating, triage, favorite, created_at, updated_at
-                 FROM assets WHERE content_hash = ?1",
-                [content_hash],
-                map_asset,
-            )
+            .query_row(&sql, [content_hash], map_asset)
             .optional()
             .map_err(map_err)
     }
@@ -415,6 +730,30 @@ impl AssetRepo for SqliteRepos<'_> {
         }
         Ok(())
     }
+
+    fn create_or_get_asset(&self, asset: NewAsset) -> Result<(AssetRecord, bool), RepoError> {
+        if let Some(existing) = self.find_by_hash(&asset.content_hash)? {
+            return Ok((existing, false));
+        }
+        let hash = asset.content_hash.clone();
+        match self.create_asset(asset) {
+            Ok(record) => Ok((record, true)),
+            // 単一writer内では発生し得ないが、将来の並行経路に備えた再確認。
+            Err(RepoError::Duplicate) => {
+                let existing = self.find_by_hash(&hash)?.ok_or(RepoError::Duplicate)?;
+                Ok((existing, false))
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
+
+/// Option<u32>値をINTEGER列へ格納する (直接castのオーバーフロー禁止)。
+fn u32_opt_to_i64(value: Option<u32>, field: &'static str) -> Result<Option<i64>, RepoError> {
+    value
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| RepoError::Db(format!("{field} exceeds i64 range")))
 }
 
 #[cfg(test)]
@@ -517,6 +856,8 @@ mod tests {
                     byte_size: 10,
                     mtime_ms: 1,
                     scan_state: ScanState::Present,
+                    os_file_id: None,
+                    detach_asset: false,
                 })
                 .unwrap();
             repos.remove_root(root.id).unwrap();
@@ -571,6 +912,8 @@ mod tests {
                     byte_size: 100,
                     mtime_ms: 1_700_000_000_000,
                     scan_state: ScanState::Present,
+                    os_file_id: None,
+                    detach_asset: false,
                 })
                 .unwrap();
             assert!(f1.asset_id.is_none(), "Asset作成前はNULL (受入条件)");
@@ -586,6 +929,8 @@ mod tests {
                     byte_size: 999,
                     mtime_ms: 1_700_000_999_000,
                     scan_state: ScanState::Missing,
+                    os_file_id: None,
+                    detach_asset: false,
                 })
                 .unwrap();
             assert_eq!(f2.id, f1.id);
@@ -602,6 +947,8 @@ mod tests {
                     byte_size: 1,
                     mtime_ms: 1,
                     scan_state: ScanState::Present,
+                    os_file_id: None,
+                    detach_asset: false,
                 })
                 .unwrap();
             assert_ne!(f3.id, f1.id);
@@ -616,6 +963,8 @@ mod tests {
                     byte_size: 5,
                     mtime_ms: 1,
                     scan_state: ScanState::Present,
+                    os_file_id: None,
+                    detach_asset: false,
                 })
                 .unwrap();
             assert_ne!(f4.id, f1.id);
@@ -633,6 +982,8 @@ mod tests {
                     byte_size: 1,
                     mtime_ms: 1,
                     scan_state: ScanState::Present,
+                    os_file_id: None,
+                    detach_asset: false,
                 })
                 .unwrap_err();
             match err {
@@ -653,6 +1004,8 @@ mod tests {
                 byte_size: 1,
                 mtime_ms: 1,
                 scan_state: state,
+                os_file_id: None,
+                detach_asset: false,
             };
             let a = repos.upsert_file(mk("a.png", ScanState::Present)).unwrap();
             let b = repos.upsert_file(mk("b.png", ScanState::Missing)).unwrap();
@@ -690,6 +1043,8 @@ mod tests {
                     byte_size: 1,
                     mtime_ms: 1,
                     scan_state: ScanState::Present,
+                    os_file_id: None,
+                    detach_asset: false,
                 })
                 .unwrap();
             assert!(repos
@@ -718,6 +1073,8 @@ mod tests {
                 byte_size: 1,
                 mtime_ms: 1,
                 scan_state: ScanState::Present,
+                os_file_id: None,
+                detach_asset: false,
             };
             let png = repos.upsert_file(mk("IMG.PNG")).unwrap();
             assert_eq!(png.extension.as_deref(), Some("png"), "小文字化");
@@ -736,6 +1093,8 @@ mod tests {
             hash_algorithm: "blake3".to_string(),
             byte_size: size,
             mime_type: Some("image/png".to_string()),
+            width: None,
+            height: None,
         }
     }
 
@@ -772,6 +1131,8 @@ mod tests {
                     byte_size: 42,
                     mtime_ms: 1,
                     scan_state: ScanState::Present,
+                    os_file_id: None,
+                    detach_asset: false,
                 })
                 .unwrap();
             assert!(f.asset_id.is_none());
@@ -794,6 +1155,8 @@ mod tests {
                     byte_size: 42,
                     mtime_ms: 1,
                     scan_state: ScanState::Present,
+                    os_file_id: None,
+                    detach_asset: false,
                 })
                 .unwrap();
             let existing = repos.find_by_hash("blake3:bb").unwrap().unwrap();
@@ -823,6 +1186,8 @@ mod tests {
                     byte_size: 1,
                     mtime_ms: 1,
                     scan_state: ScanState::Present,
+                    os_file_id: None,
+                    detach_asset: false,
                 })
                 .unwrap();
             let asset = repos.create_asset(new_asset("cc", 1)).unwrap();
@@ -894,6 +1259,8 @@ mod tests {
                     byte_size: 7,
                     mtime_ms: 9,
                     scan_state: ScanState::Present,
+                    os_file_id: None,
+                    detach_asset: false,
                 })
                 .unwrap();
             let back = repos.find_by_path(root.id, &rel).unwrap().unwrap();
@@ -910,6 +1277,8 @@ mod tests {
                     byte_size: 8,
                     mtime_ms: 10,
                     scan_state: ScanState::Present,
+                    os_file_id: None,
+                    detach_asset: false,
                 })
                 .unwrap();
             assert_eq!(again.id, f.id);
@@ -930,6 +1299,8 @@ mod tests {
                 byte_size: size,
                 mtime_ms: mtime,
                 scan_state: ScanState::Present,
+                os_file_id: None,
+                detach_asset: false,
             };
             let err = repos.upsert_file(mk(u64::MAX, 1)).unwrap_err();
             assert!(err.to_string().contains("byte_size"), "{err}");
@@ -954,6 +1325,8 @@ mod tests {
                 byte_size: 1,
                 mtime_ms: 1,
                 scan_state: ScanState::Present,
+                os_file_id: None,
+                detach_asset: false,
             };
             let f = repos.upsert_file(mk()).unwrap();
             let sentinel = "2000-01-01T00:00:00.000Z";
@@ -1041,5 +1414,258 @@ mod tests {
     fn path_is_within_helper_used_by_overlap() {
         // coreのhelperとDB実装の整合 (同一ロジックを使用している証拠の最小確認)
         assert!(path_is_within(Path::new("/a/b"), Path::new("/a")));
+    }
+
+    // ===== WP-2: 設定列・os_file_id・バッチ・移動・ページング・JOIN =====
+
+    fn upsert(root_id: i64, rel: &str, size: u64, mtime: u64) -> FileUpsert {
+        FileUpsert {
+            root_id,
+            rel_path: PathBuf::from(rel),
+            display_name: rel.rsplit('/').next().unwrap_or(rel).to_string(),
+            byte_size: size,
+            mtime_ms: mtime,
+            scan_state: ScanState::Present,
+            os_file_id: None,
+            detach_asset: false,
+        }
+    }
+
+    #[test]
+    fn root_settings_round_trip_through_repo() {
+        with_repos("settings", |repos| {
+            let root = repos.add_root(Path::new("/data/p")).unwrap();
+            let defaults = repos.list_roots().unwrap().remove(0);
+            assert!(defaults.watch_enabled, "schema既定 watch=1");
+            assert!(!defaults.ai_enabled);
+
+            repos
+                .set_root_settings(
+                    root.id,
+                    RootSettings {
+                        watch_enabled: false,
+                        ai_enabled: true,
+                        send_exif: true,
+                        send_gps: true,
+                    },
+                )
+                .unwrap();
+            let updated = repos.list_roots().unwrap().remove(0);
+            assert!(!updated.watch_enabled);
+            assert!(updated.ai_enabled);
+            assert!(updated.send_exif);
+            assert!(updated.send_gps);
+
+            assert_eq!(
+                repos
+                    .set_root_settings(9999, RootSettings::default())
+                    .unwrap_err(),
+                RepoError::NotFound
+            );
+        });
+    }
+
+    #[test]
+    fn upsert_stores_and_reads_os_file_id() {
+        with_repos("osfid", |repos| {
+            let root = repos.add_root(Path::new("/data/p")).unwrap();
+            let mut file = upsert(root.id, "a.png", 1, 1);
+            file.os_file_id = Some(OsFileId::new(9, 77));
+            repos.upsert_file(file).unwrap();
+
+            let found = repos
+                .find_by_os_file_id(root.id, &OsFileId::new(9, 77))
+                .unwrap()
+                .expect("os_file_id照合");
+            assert_eq!(found.rel_path, PathBuf::from("a.png"));
+            assert!(repos
+                .find_by_os_file_id(root.id, &OsFileId::new(9, 78))
+                .unwrap()
+                .is_none());
+            // 別ルートは対象外
+            let root2 = repos.add_root(Path::new("/data/q")).unwrap();
+            assert!(repos
+                .find_by_os_file_id(root2.id, &OsFileId::new(9, 77))
+                .unwrap()
+                .is_none());
+        });
+    }
+
+    #[test]
+    fn batch_upsert_is_transactional_and_detaches_on_demand() {
+        with_repos("batch", |repos| {
+            let root = repos.add_root(Path::new("/data/p")).unwrap();
+            let a = repos.upsert_file(upsert(root.id, "a.png", 1, 1)).unwrap();
+            let asset = repos.create_asset(new_asset("ba", 1)).unwrap();
+            repos.link_file(a.id, asset.id).unwrap();
+
+            let mut changed = upsert(root.id, "a.png", 99, 2);
+            changed.detach_asset = true;
+            let records = repos
+                .upsert_files_batch(&[
+                    changed,
+                    upsert(root.id, "b.png", 2, 2),
+                    upsert(root.id, "c.png", 3, 3),
+                ])
+                .unwrap();
+            assert_eq!(records.len(), 3);
+            assert_eq!(records[0].asset_id, None, "detach指定はリンク解除");
+            assert_eq!(records[1].byte_size, 2);
+            // detachなしの再upsertではリンク保持を確認
+            let again = repos
+                .upsert_files_batch(&[upsert(root.id, "b.png", 2, 2)])
+                .unwrap();
+            assert_eq!(again[0].id, records[1].id);
+
+            // 空バッチはno-op
+            assert!(repos.upsert_files_batch(&[]).unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn relocate_moves_path_keeps_uuid_and_asset() {
+        with_repos("relocate", |repos| {
+            let root = repos.add_root(Path::new("/data/p")).unwrap();
+            let file = repos
+                .upsert_file(upsert(root.id, "old/a.png", 5, 5))
+                .unwrap();
+            let asset = repos.create_asset(new_asset("rel", 5)).unwrap();
+            repos.link_file(file.id, asset.id).unwrap();
+
+            let moved = repos
+                .relocate_file(file.id, upsert(root.id, "new/b.png", 5, 5))
+                .unwrap();
+            assert_eq!(moved.id, file.id);
+            assert_eq!(moved.uuid, file.uuid, "同一実体");
+            assert_eq!(moved.asset_id, Some(asset.id), "リンク保持");
+            assert_eq!(moved.rel_path, PathBuf::from("new/b.png"));
+            assert!(repos
+                .find_by_path(root.id, &PathBuf::from("old/a.png"))
+                .unwrap()
+                .is_none());
+
+            // 移動先に既存行 → Duplicate
+            let other = repos
+                .upsert_file(upsert(root.id, "new/c.png", 1, 1))
+                .unwrap();
+            assert_eq!(
+                repos
+                    .relocate_file(other.id, upsert(root.id, "new/b.png", 1, 1))
+                    .unwrap_err(),
+                RepoError::Duplicate
+            );
+            assert_eq!(
+                repos
+                    .relocate_file(9999, upsert(root.id, "x.png", 1, 1))
+                    .unwrap_err(),
+                RepoError::NotFound
+            );
+        });
+    }
+
+    #[test]
+    fn scan_state_batch_counts_only_real_changes() {
+        with_repos("statebatch", |repos| {
+            let root = repos.add_root(Path::new("/data/p")).unwrap();
+            let ids: Vec<i64> = (0..4)
+                .map(|i| {
+                    repos
+                        .upsert_file(upsert(root.id, &format!("f{i}.png"), 1, 1))
+                        .unwrap()
+                        .id
+                })
+                .collect();
+            // 1件だけ事前にmissingへ
+            repos.set_scan_state(ids[3], ScanState::Missing).unwrap();
+
+            let changed = repos
+                .set_scan_state_batch(&ids, ScanState::Missing)
+                .unwrap();
+            assert_eq!(changed, 3, "既にmissingの1件は数えない");
+            assert_eq!(repos.list_missing(root.id).unwrap().len(), 4);
+            assert!(repos.set_scan_state_batch(&[], ScanState::Present).unwrap() == 0);
+        });
+    }
+
+    #[test]
+    fn list_files_paged_walks_all_pages() {
+        with_repos("paged", |repos| {
+            let root = repos.add_root(Path::new("/data/p")).unwrap();
+            for i in 0..250 {
+                repos
+                    .upsert_file(upsert(root.id, &format!("f{i:03}.png"), 1, 1))
+                    .unwrap();
+            }
+            let (page, total) = repos.list_files_paged(root.id, 0, 100).unwrap();
+            assert_eq!(total, 250);
+            assert_eq!(page.len(), 100);
+            assert_eq!(page[0].rel_path, PathBuf::from("f000.png"));
+            let (page, _) = repos.list_files_paged(root.id, 200, 100).unwrap();
+            assert_eq!(page.len(), 50);
+            let (page, _) = repos.list_files_paged(root.id, 250, 100).unwrap();
+            assert!(page.is_empty());
+            // 他ルートは混入しない
+            let other = repos.add_root(Path::new("/data/q")).unwrap();
+            let (_, other_total) = repos.list_files_paged(other.id, 0, 10).unwrap();
+            assert_eq!(other_total, 0);
+        });
+    }
+
+    #[test]
+    fn list_present_joined_and_without_asset() {
+        with_repos("joined", |repos| {
+            let root = repos.add_root(Path::new("/data/p")).unwrap();
+            let linked = repos
+                .upsert_file(upsert(root.id, "linked.png", 1, 1))
+                .unwrap();
+            let asset = repos
+                .create_asset(NewAsset {
+                    content_hash: "blake3:jj".to_string(),
+                    hash_algorithm: "blake3".to_string(),
+                    byte_size: 1,
+                    mime_type: Some("image/png".to_string()),
+                    width: Some(640),
+                    height: Some(480),
+                })
+                .unwrap();
+            repos.link_file(linked.id, asset.id).unwrap();
+            repos
+                .upsert_file(upsert(root.id, "unlinked.png", 2, 2))
+                .unwrap();
+            let mut missing = upsert(root.id, "missing.png", 3, 3);
+            missing.scan_state = ScanState::Missing;
+            repos.upsert_file(missing).unwrap();
+
+            let joined = repos.list_present_joined().unwrap();
+            assert_eq!(joined.len(), 2, "missingは除外");
+            let (file, asset_opt) = joined
+                .iter()
+                .find(|(f, _)| f.rel_path == *"linked.png")
+                .unwrap();
+            let asset = asset_opt.as_ref().expect("JOINでAsset取得");
+            assert_eq!(asset.width, Some(640));
+            assert_eq!(asset.height, Some(480));
+            assert_eq!(file.asset_id, Some(asset.id));
+            let unlinked = joined
+                .iter()
+                .find(|(f, _)| f.rel_path == *"unlinked.png")
+                .unwrap();
+            assert!(unlinked.1.is_none());
+
+            let without = repos.list_files_without_asset(root.id).unwrap();
+            assert_eq!(without.len(), 1);
+            assert_eq!(without[0].rel_path, PathBuf::from("unlinked.png"));
+        });
+    }
+
+    #[test]
+    fn create_or_get_is_idempotent_for_same_hash() {
+        with_repos("corget", |repos| {
+            let (a, created_a) = repos.create_or_get_asset(new_asset("cg", 1)).unwrap();
+            assert!(created_a);
+            let (b, created_b) = repos.create_or_get_asset(new_asset("cg", 1)).unwrap();
+            assert!(!created_b);
+            assert_eq!(a.id, b.id, "同一ハッシュは既存を返す");
+        });
     }
 }

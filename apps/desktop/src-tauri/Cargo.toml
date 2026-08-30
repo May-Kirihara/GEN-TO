@@ -22,6 +22,8 @@ tracing-subscriber = { workspace = true }
 dirs = { workspace = true }
 # SIGTERM graceful終了のself-pipe実装用 (WP-7)。依存グラフに既存。
 libc = "0.2"
+# 登録ルートのフォルダ監視 (MVP WP-2)。Linux: inotify backend。
+notify = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

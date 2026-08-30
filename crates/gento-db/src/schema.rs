@@ -31,6 +31,7 @@ pub(crate) const TABLES: [&str; 12] = [
 ];
 
 /// 個別のmigration定義。
+#[derive(Debug, Clone)]
 pub(crate) struct Migration {
     pub version: i32,
     pub name: &'static str,
@@ -39,15 +40,35 @@ pub(crate) struct Migration {
 
 /// 順方向migration一覧。versionは1開始・連続であること
 /// (run_migrationsが検証する)。
-pub(crate) const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial_12_tables",
-    sql: MIGRATION_V1_SQL,
-}];
+pub(crate) const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial_12_tables",
+        sql: MIGRATION_V1_SQL,
+    },
+    Migration {
+        version: 2,
+        name: "wp2_files_scan_indexes",
+        sql: MIGRATION_V2_SQL,
+    },
+];
 
 /// 現在の最新schema version (`PRAGMA user_version` の目標値)。
 /// このbuildの [`crate::Db::open`] は既存DBを必ずこの値へ移行する。
-pub const LATEST_VERSION: i32 = 1;
+pub const LATEST_VERSION: i32 = 2;
+
+/// WP-2 (登録ルート・差分スキャン) のindex追加。
+/// 列追加は不要 — 設定列は#1に含まれ、os_file_idも#1でNULL可として定義済み。
+///
+/// - `(root_id, scan_state)`: 差分スキャンの既存File列挙とmissing一覧の
+///   複合条件。既存の `idx_files_scan_state` は全ルート横断のため
+///   ルート単位の絞り込みに効かない。
+/// - `os_file_id` 部分index: 外部移動・改名の再発見照合
+///   (`WHERE os_file_id IS NOT NULL` でNULL行を索引に載せない)。
+const MIGRATION_V2_SQL: &str = r"
+CREATE INDEX idx_files_root_scan_state ON files(root_id, scan_state);
+CREATE INDEX idx_files_os_file_id ON files(os_file_id) WHERE os_file_id IS NOT NULL;
+";
 
 const MIGRATION_V1_SQL: &str = r#"
 CREATE TABLE library_roots (

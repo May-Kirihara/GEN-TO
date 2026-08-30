@@ -20,6 +20,7 @@
     type ThumbnailStats,
   } from "./lib/thumbnails";
   import { originalUrl, previewUrl, thumbUrl } from "./lib/protocol";
+  import { LibraryStore, type LibraryIpc, type LibraryRoot } from "./lib/library";
   import { GridStore, type GridIpc } from "./lib/grid/grid-store";
   import { ScrollPositionStore } from "./lib/grid/scroll-position";
   import type { ThumbCellClass } from "./lib/grid/layout";
@@ -62,6 +63,16 @@
   let smokeLines: string[] = $state([]);
   let smokeRunning = $state(false);
   let smokeResult = $state("");
+
+  // 登録ルート (WP-2): 追加・解除・有効切替・ライブラリ再スキャン。
+  const libraryIpc: LibraryIpc = { invoke, listen };
+  const library = new LibraryStore(libraryIpc);
+  let libraryRoots: LibraryRoot[] = $state([]);
+  let libraryNotice = $state("");
+  let libraryError = $state<string | null>(null);
+  let libraryScanBusy = $state(false);
+  let newRootPath = $state("");
+  let catalogSource = $state<"temp" | "library">("temp");
 
   // 仮想サムネイルグリッド (WP-5)。
   const grid = new GridStore({ invoke, listen } satisfies GridIpc);
@@ -154,9 +165,17 @@
     thumbEventLog = thumbnails.eventLog;
   });
 
+  const stopLibraryNotification = library.onChange(() => {
+    libraryRoots = library.roots;
+    libraryNotice = library.overlapWarning ?? library.lastNotice ?? "";
+    libraryError = library.lastError;
+    libraryScanBusy = library.status.scanning;
+  });
+
   let disposeCatalog: (() => void) | null = null;
   let disposeThumbnails: (() => void) | null = null;
   let disposeGrid: (() => void) | null = null;
+  let disposeLibrary: (() => void) | null = null;
   let markedFirstPage = false;
 
   function toErrorMessage(error: unknown): string {
@@ -181,6 +200,50 @@
     const ok = await catalog.startScan();
     if (!ok) {
       scanNotice = catalog.lastError ?? "スキャン開始に失敗しました";
+    }
+  }
+
+  // ===== 登録ルート (WP-2) =====
+
+  async function addRoot(): Promise<void> {
+    if (newRootPath.trim() === "") {
+      libraryError = "パスを入力してください";
+      return;
+    }
+    const ok = await library.addRoot(newRootPath.trim());
+    if (ok) {
+      newRootPath = "";
+    }
+  }
+
+  async function removeRoot(id: string): Promise<void> {
+    await library.removeRoot(id);
+  }
+
+  async function toggleEnabled(root: LibraryRoot): Promise<void> {
+    await library.setEnabled(root.id, !root.enabled);
+  }
+
+  async function libraryScan(): Promise<void> {
+    const ok = await library.startScan();
+    if (!ok) {
+      libraryError = library.lastError ?? "スキャン開始に失敗しました";
+    }
+  }
+
+  async function libraryScanStop(): Promise<void> {
+    await library.stopScan();
+  }
+
+  async function useSource(source: "temp" | "library"): Promise<void> {
+    const ok = await library.useSource(source);
+    if (ok) {
+      catalogSource = source;
+      // カタログストアへ新しいsummary/generationを反映
+      await catalog.refreshSummary();
+      await catalog.loadPage(0);
+    } else {
+      libraryError = library.lastError ?? "表示切替に失敗しました";
     }
   }
 
@@ -433,6 +496,9 @@
     void grid.init().then((dispose) => {
       disposeGrid = dispose;
     });
+    void library.init().then((dispose) => {
+      disposeLibrary = dispose;
+    });
     // 実機検証ブリッジ (WP-6/WP-7)。dev build、またはdevtoolsビルドのreleaseで
     // GENTO_DEV_BRIDGE=1 のときのみ有効 (WP-0)。backend側にcommandが無い
     // (通常release) 場合はinvokeがrejectされ、ブリッジも開発パネル (仮想
@@ -468,9 +534,11 @@
     stopChangeNotification();
     stopThumbNotification();
     stopGridNotifyForPerf();
+    stopLibraryNotification();
     disposeCatalog?.();
     disposeThumbnails?.();
     disposeGrid?.();
+    disposeLibrary?.();
     perf.stop();
   });
 </script>
@@ -554,6 +622,89 @@
     {#if catalogError}
       <p class="error">エラー: {catalogError}</p>
     {/if}
+  </section>
+
+  <section>
+    <h2>登録ルート (WP-2)</h2>
+    <div class="grid-controls">
+      <label>
+        パス
+        <input
+          type="text"
+          size="40"
+          placeholder="/path/to/images"
+          bind:value={newRootPath}
+        />
+      </label>
+      <button onclick={() => void addRoot()}>追加</button>
+      <button onclick={() => void libraryScan()} disabled={libraryScanBusy}>
+        ライブラリ再スキャン
+      </button>
+      <button onclick={() => void libraryScanStop()} disabled={!libraryScanBusy}>
+        停止
+      </button>
+    </div>
+    {#if libraryNotice}
+      <p class="notice">{libraryNotice}</p>
+    {/if}
+    {#if libraryError}
+      <p class="error">{libraryError}</p>
+    {/if}
+    {#if libraryRoots.length === 0}
+      <p class="notice">登録されたルートはありません</p>
+    {:else}
+      <table class="roots-table">
+        <thead>
+          <tr>
+            <th>パス</th>
+            <th>状態</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each libraryRoots as root (root.id)}
+            <tr>
+              <td class="roots-path">{root.path}</td>
+              <td>
+                {root.enabled ? "有効" : "無効"}
+                {root.available ? "" : " / 不在 (マウント確認)"}
+              </td>
+              <td>
+                <button onclick={() => void toggleEnabled(root)}>
+                  {root.enabled ? "無効化" : "有効化"}
+                </button>
+                <button onclick={() => void removeRoot(root.id)}>解除</button>
+              </td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    {/if}
+    <p class="notice">
+      スキャン状態: {library.status.phase ?? "待機"}
+      / 発見 {library.status.found.toLocaleString()}
+      / 変更 {library.status.updated.toLocaleString()}
+      / 移動 {library.status.relocated.toLocaleString()}
+      / 不在 {library.status.missing.toLocaleString()}
+      / ハッシュ {library.status.hashed.toLocaleString()}
+      (待ち {library.status.pending_hash.toLocaleString()})
+      / エラー {library.status.errors.toLocaleString()}
+    </p>
+    <div class="grid-controls">
+      <span class="notice">一覧の表示元:</span>
+      <button
+        class:active={catalogSource === "temp"}
+        onclick={() => void useSource("temp")}
+      >
+        一時走査 (未登録)
+      </button>
+      <button
+        class:active={catalogSource === "library"}
+        onclick={() => void useSource("library")}
+      >
+        ライブラリ (登録ルート・DB)
+      </button>
+    </div>
   </section>
 
   <section>
@@ -858,6 +1009,23 @@
     font-family: monospace;
     font-size: 0.875rem;
     white-space: pre-wrap;
+  }
+
+  .roots-table {
+    border-collapse: collapse;
+    margin: 0.5rem 0;
+    font-size: 0.875rem;
+  }
+
+  .roots-table th,
+  .roots-table td {
+    border: 1px solid light-dark(#d0d7de, #30363d);
+    padding: 0.25rem 0.5rem;
+    text-align: left;
+  }
+
+  .roots-path {
+    font-family: monospace;
   }
 
   button {

@@ -5,9 +5,17 @@
 
 ## リポジトリ構成
 
-- `crates/gento-core` — ID・基本ドメイン型 (Tauri非依存)
-- `crates/gento-image` — 画像パイプライン (走査・プローブ・サムネイル・キャッシュ、Phase 2/3で実装。Tauri非依存)
+- `crates/gento-core` — ID・基本ドメイン型・repository抽象・登録ルート走査エンジン (Tauri非依存)
+- `crates/gento-db` — SQLite基盤 (migration・repository実装。メタデータの正本)
+- `crates/gento-image` — 画像パイプライン (走査・プローブ・BLAKE3・サムネイル・キャッシュ。Tauri非依存)
 - `apps/desktop` — Svelte 5 + Vite フロントエンドと `src-tauri` (Tauri 2 thin adapter)
+
+## 登録ルート (永続ライブラリ、WP-2)
+
+任意のディレクトリを登録ルートとして追加すると、初回スキャン → 差分スキャン →
+BLAKE3による同一内容Asset統合 → フォルダ監視 (inotify) による外部変更の自動反映が
+有効になる。登録ルートとファイル一覧はSQLite (`~/.local/share/gento-spike/library.sqlite3`)
+へ永続化され、再起動後に復元される。詳細な契約は [docs/dev/api-contract.md](docs/dev/api-contract.md) §17〜21。
 
 ## 必要システムパッケージ (Ubuntu 24.04)
 

@@ -1,7 +1,7 @@
 # GEN-TO IPC API契約 (Phase 2 / WP-2時点)
 
 - 作成日: 2026-08-28 (WP-2)
-- 最終更新: 2026-08-30 (WP-0: §0/§1 healthへ `api_version` 追加・§14 devtools feature化・§15 APIバージョン互換方針追加 / WP-1: §1 healthへ `db_open` 追加・§16 `db_status` 追加)
+- 最終更新: 2026-08-30 (WP-0: §0/§1 healthへ `api_version` 追加・§14 devtools feature化・§15 APIバージョン互換方針追加 / WP-1: §1 healthへ `db_open` 追加・§16 `db_status` 追加 / WP-2: §17〜21 登録ルート・永続カタログ・`set_catalog_source`・`"library"`モード追加)
 - 目的: Tauri command・イベント・ローカル画像プロトコルの形状をWP-3〜6の契約基準として固定する。
 - 整合性情報: 本書の型は `crates/gento-core/src/catalog.rs`、`apps/desktop/src-tauri/src/catalog.rs`
   (ページDTOのversion拡張もここ)、
@@ -667,3 +667,189 @@ type DbStatusDto = {
   `AppDirs.data_dir/library.sqlite3` (テスト・計測用の上書き)。
 - DBの並行性・backup仕様は [architecture.md](architecture.md) および
   `gento-db` crate doc参照。
+
+---
+
+# 登録ルート・永続カタログ (WP-2 / 2026-08-30 追加)
+
+## 17. Commands
+
+### `library_roots_list`
+
+```ts
+invoke<LibraryRoot[]>("library_roots_list")
+```
+
+```ts
+type LibraryRoot = {
+  id: string;             // 10進文字列 (AssetIdの文字列方針に合わせる)
+  uuid: string;
+  path: string;           // canonicalize済み絶対パス (lossy)
+  enabled: boolean;
+  watch_enabled: boolean;
+  available: boolean;     // パスが現在ディレクトリ存在するか (アンマウント検出)
+};
+```
+
+- DB未開時はstring reject (`"library feature unavailable..."`)。
+- 常に成功するのはDB開時のみ。`available: false` のルートも返す
+  (「不在ルート=無効表示、削除しない」方針)。
+
+### `library_roots_add`
+
+```ts
+invoke<AddRootResponse>("library_roots_add", { path: string })
+```
+
+- 失敗 (string reject): 未存在パス (`"path does not exist..."`) /
+  ディレクトリ以外 (`"path is not a directory"`) /
+  同一パス登録済み (`"path is already registered"`)。
+- 成功時の効果: canonicalizeしたパスでルート登録 (設定既定:
+  watch_enabled=1) → 監視開始 → 対象ルートのスキャンを非同期投入 →
+  `roots:changed` emit。
+- **親子二重登録は警告であって拒否しない** (spec-draft §4.2の「警告または
+  登録制限」から警告方式を採用):
+
+```ts
+type AddRootResponse = {
+  root: LibraryRoot;
+  overlapping: LibraryRoot[];  // 親子関係にある既存ルート (警告表示用)
+};
+```
+
+### `library_roots_remove` / `library_roots_set_enabled`
+
+```ts
+invoke<null>("library_roots_remove", { rootId: string })
+invoke<null>("library_roots_set_enabled", { rootId: string, enabled: boolean })
+```
+
+- `remove`: 監視停止 → ルート削除 (配下FileはCASCADE削除。**Assetは残る**
+  — 評価等の共有メタデータ保持) → `roots:changed`。
+- `set_enabled(false)`: 監視停止・スキャン対象外 (File行は保持)。
+  `set_enabled(true)`: 監視再開 + 当該ルートのスキャン投入。
+- 不正な `rootId` (非数字) は reject。
+
+### `scan_start` / `scan_stop` / `scan_status`
+
+```ts
+invoke<null>("scan_start")            // 全有効ルートの再スキャン
+invoke<null>("scan_stop")             // 実行中スキャン+ハッシュのキャンセル
+invoke<LibraryScanStatus>("scan_status")
+```
+
+```ts
+type LibraryScanStatus = {
+  scanning: boolean;        // スキャンワーカー処理中
+  phase: "scanning" | "hashing" | null;
+  found: number; updated: number; relocated: number; missing: number;
+  hashed: number; pending_hash: number; errors: number;
+};
+```
+
+- `scan_start` はワーカー処理中 (`scanning: true`) の呼び出しを
+  `"scan already in progress"` で拒否。既定ではUIから非同期で完了する。
+- `scan_stop` は協調キャンセル (walk中止・不在化確定前の打ち切り・ハッシュ
+  中止)。**再開 = `scan_start` 再呼び出し** (進行状況はDBが正本のため、
+  差分スキャンが続きを冪等に拾う。ハッシュ待ちも `asset_id IS NULL` から
+  再構成される)。
+- `scan_status` は常に成功 (DB未開は初期値0のDTO)。
+- 既存の `start_scan` (一時走査) とは別コマンド。名前の衝突なし。
+
+### `set_catalog_source` (カタログ表示ソース切替)
+
+```ts
+invoke<CatalogSummary>("set_catalog_source", { source: "temp" | "library" })
+```
+
+- カタログの3ソース統合 (WP-2):
+  - `temp`: `--dataset` 一時走査の結果 (従来のReal。未登録フォルダ閲覧)
+  - `library`: 登録ルートのDB由来スナップショット (永続カタログ)
+  - (virtual: devtools機能。`set_catalog_mode` のまま。Library表示中から
+    の切替は `"switch to temp source..."` で拒否)
+- モードが実際に変化した場合のみ `generation` を +1 して `catalog:changed`
+  (reason `mode_switch`) をemit。同一ソースへの切替はno-op。
+- 一時走査の実行中 (`scanning`) は `"cannot switch catalog source while
+  scanning"` で拒否。ライブラリスキャン中の切替は可 (スナップショットは
+  次の更新で上書きされる)。
+- `CatalogMode` (`CatalogSummary.mode`) に `"library"` を追加 (列挙値追加 =
+  minor。`GENTO_API_VERSION` は据え置き)。
+
+## 18. Events
+
+### `scan:progress` (拡張)
+
+ライブラリスキャンも同じ `scan:progress` をemitする。既存フィールドに加え
+**ライブラリスキャンのみ**以下が載る (一時走査では 0 / `null`):
+
+```ts
+type ScanProgressEvent = {
+  scanned: number; found: number; errors: number;   // 既存
+  elapsed_ms: number; done: boolean;                // 既存
+  error_samples?: string[];                         // 既存
+  updated?: number;      // 変更検出 (size+mtime変化)
+  relocated?: number;    // 外部移動・改名の再発見 (os_file_id照合)
+  missing?: number;      // 不在化
+  hashed?: number;       // BLAKE3計算完了
+  pending_hash?: number; // ハッシュ待ち残数
+  phase?: "scanning" | "hashing" | null;
+};
+```
+
+- ハッシュ進捗はイベント嵐回避のため100ms間隔で間引きされる。
+- `done: true` はスキャン位相完了時 (ハッシュ残0) またはハッシュ完了時。
+
+### `roots:changed`
+
+ペイロードなし (`null`)。フロントは `library_roots_list` を再取得する。
+発火: 追加・解除・有効切替・ルート不在検出。
+
+## 19. ライブラリAssetIdの符号化 (設計判断の記録)
+
+ライブラリカタログ (`source: "library"`) の一覧DTO `id` は **DB由来の安定ID**
+(restart後も不変) とし、次の符号化を採る:
+
+- **Asset確定済み (ハッシュ計算済み)**: `id = assets.id` (SQLite整数ROWID)。
+  同一バイト内容の複数Fileは同一IDを返す (= 1 Asset共有が一覧から見える)。
+- **ハッシュ未完了 (asset_id NULL)**: `id = 2^63 | files.id` の**仮ID**。
+  bit63はSQLiteのINTEGER範囲外のため assets.id と衝突しない。
+  ハッシュ完了でAssetへリンクされると安定IDへ切り替わる (フロントは
+  `catalog:changed` → ページ再取得で追従。仮IDは過渡状態)。
+
+WP-5のメタデータ編集は**安定ID (assets.id) を指定して**行うこと。
+仮IDを編集対象にしないこと (過渡状態のため)。`AssetId` はIPCでは
+10進文字列 (既存規約どおり)。
+
+## 20. 監視プロトコル (WP-2。Codex計画レビュー指摘の反映)
+
+```text
+監視確立 (inotify再帰watch) → イベントバッファリング (400ms debounceで
+パス単位結合) → 初回スキャン → キューイベント適用 (スコープ差分スキャン
+= reconciliation) → (以後イベント駆動でスコープ差分)
+```
+
+- イベント結合規則 (gento-core `WatchBuffer`): 同一パスの Create+Modify →
+  Modified、Remove+Create → Modified、変更後Remove → Removed (最終状態
+  のみ残る)。inotifyのアクセスイベント (Access) は無視。
+- 結合後の変化パスから影響ディレクトリを導出し、そのサブツリーのみ差分
+  スキャン (`scope`)。スコープが24箇所を超えるかイベント欠落 (overflow・
+  未知イベント種・watcherエラー) を検出した場合は**全体再スキャン**で収束。
+- スコープ差分スキャンはファイルシステムの最終状態のみに依存して冪等
+  (size+mtime高速判定 + os_file_id移動検出 + 未参照missing化) のため、
+  **大量イベント後も最終状態が一致する** (受入条件5。テスト
+  `watcher_burst_of_many_events_converges` で実inotifyにより証明)。
+- ルート自体の削除 (アンマウント含む) はwatcher停止 + `roots:changed`。
+  DBのルート行・File行は保持。
+- アプリ内からのスキャン中に到着したイベントはワーカーキューへ蓄積され、
+  スキャン完了後に適用される (バッファリング)。
+
+## 21. 逸脱・判断記録 (WP-2)
+
+| # | 判断 | 理由 |
+|---|---|---|
+| 1 | ライブラリカタログのページ取得は「DB→スナップショット一括生成→既存ページAPI」という2段構成 (SQL直接ページングではない) | 既存のgeneration/protocol/thumbnail機構 (レコード解決はメモリ上) をそのまま再利用でき、WP-4 (3ペインUI) で直接SQLページングへ発展させられる。5万件規模のメモリ保持はスパイクの仮想カタログで実績済み |
+| 2 | `scan:progress` イベントを一時走査とライブラリで共用 (フィールド追加) | UIの進捗表示が単一リスナーで済む。イベント分割は表示先が必要になった時点で検討 |
+| 3 | 親子二重登録は警告レスポンス (`overlapping`) であって拒否しない | 仕様が「警告または登録制限」を選択可能のため。利用者判断を妨げない |
+| 4 | 変更検出時 (size/mtime変化) は assetリンクを一度解除 (NULL化) し、再ハッシュで再リンク | 列追加なし (migration #2はindexのみの要件) で「内容変化 → 別Asset」を実現。同一内容なら同一Assetへ再リンクされメタデータは失われない |
+| 5 | ハッシュ計算はサムネイルとは別の専用ワーカープール (2ワーカー) でBackground優先度 | gento-image WorkerPoolの優先度・キャンセル・一時停止機構を再利用しつつ、サムネイル生成 (Interactive/Viewport) をハッシュが飢餓させない分離。scan_stopで協調キャンセル |
+| 6 | `overlapping_roots` の照合はcanonicalize後のパスで実施 (呼び出し側で正規化) | WP-1の設計 (字面比較・シンボリックリンク解決は呼び出し側) を踏襲 |

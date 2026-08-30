@@ -167,6 +167,39 @@
     `zerocopy` + `zerocopy-derive` (MIT OR Apache-2.0)。
   - 対応プラットフォーム: 全主要OS (getrandomが各OSのシステム乱数APIを使用)。
 
+## WP-2 (MVP) で追加した依存 (2026-08-30。登録ルート・永続カタログ・差分スキャン)
+
+- **`blake3` =1.8.7** (gento-image, 通常依存)
+  - 用途: 画像内容ハッシュ (Asset同一性判定。data-model §2.1「バイト列ハッシュ
+    一致 = 同一Asset」)。`Hasher::new()` + 1MiBチャンク `update` のストリーミング
+    計算で大きなファイルもメモリ一定。形式は `blake3:<64hex小文字>`。
+  - 入手元: crates.io (BLAKE3チーム公式crate。READMEの実装はRust)。
+  - ライセンス: **CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception**
+    (アセンブリ部分がLLVM例外条項付きApache-2.0)。
+  - 推移依存 (default featuresのみ使用): arrayvec (MIT OR Apache-2.0) /
+    cfg-if (MIT OR Apache-2.0) / constant_time_eq (MIT OR Apache-2.0 OR Zlib) /
+    cpufeatures (MIT OR Apache-2.0)。native libraryなし (pure Rust + SIMD)。
+    rayon/mmap/serde featureは無効のまま。
+  - 対応プラットフォーム: 全主要OS (純Rust実装)。
+- **`notify` =8.2.0** (gento-tauri, 通常依存)
+  - 用途: 登録ルートのフォルダ監視 (WP-2)。Linuxではinotify backend
+    (`notify::recommended_watcher` = inotify)。`RecursiveMode::Recursive` で
+    ルート配下を再帰監視。debounce/結合は自前実装 (gento-core
+    `library::WatchBuffer`) — notify 8の`notify-debouncer`系は別crateのため
+    取り込まず、結合規則をドメイン層でテスト可能にした。
+  - 入手元: crates.io (notify-rs公式)。
+  - ライセンス: **CC0-1.0**。notify-types (CC0-1.0) を含む。
+  - 推移依存 (Linux): inotify 0.11 (ISC) / inotify-sys (ISC) / mio (MIT) /
+    libc (MIT OR Apache-2.0) / bitflags (MIT OR Apache-2.0) / log (MIT OR Apache-2.0) /
+    notify-types (CC0-1.0) / walkdir (既存)。
+    kqueue/fsevent-sysはmacOS向けoptional feature (Linux buildには入らない)。
+  - 対応プラットフォーム: Linux/macOS/Windows (backend自動選択)。
+  - バージョンpin理由: 9.0.0系は2026-08時点でrc (9.0.0-rc.4) のため
+    安定版の8系最新をpin。
+- **`gento-core`への新規外部依存なし**: 走査エンジン (`library` module) は
+  stdのみ (trait `RepoStore`/`ScanFs` でDB実装とfs実装を注入。計画書§5
+  「外部機能はtraitを介して注入」に従う)。
+
 ## WP-7で追加した依存
 
 - `libc = "0.2"` (gento-tauri, 通常依存)

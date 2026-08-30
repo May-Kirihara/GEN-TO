@@ -1,6 +1,6 @@
 # アーキテクチャ (WP-1時点の実装に即した要約)
 
-- 作成日: 2026-08-30 (WP-0。WP-1で gento-db 追加)
+- 作成日: 2026-08-30 (WP-0。WP-1で gento-db 追加。WP-2で library系追加)
 - 目的: crate責務・依存方向・公開APIの要点・devtools featureの境界を
   実装に即して1枚で把握するためのもの。詳細な契約は
   [api-contract.md](api-contract.md) を参照。
@@ -36,7 +36,18 @@ Tauriに依存してよいのは `gento-tauri` のみ。逆方向の依存
   `FileRepo` / `AssetRepo`) とレコード型 (`LibraryRootRecord` /
   `FileRecord` / `AssetRecord`)、`ScanState`・`TriageState`・
   `HashState`・`RepoError`、`path_is_within` (親子パス判定)。
-  SQLite実装はgento-db (依存方向: gento-db → gento-core)
+  SQLite実装はgento-db (依存方向: gento-db → gento-core)。
+  WP-2で設定列 (`RootSettings`)・`OsFileId` (Linux dev+inode)・バッチ
+  API (`upsert_files_batch`/`set_scan_state_batch`)・移動
+  (`relocate_file`)・ページング (`list_files_paged`)・JOIN一覧
+  (`list_present_joined`)・`create_or_get_asset` を追加
+- `library` (WP-2): 登録ルートの走査・同期エンジン。**Tauri・rusqlite非依存**
+  (trait注入: `RepoStore` (実装=gento-db `Db`) / `ScanFs`
+  (実装=gento-image `PlatformFs`) / `AllRepos`)。差分スキャン
+  (`scan_root`: size+mtime高速判定・os_file_id移動検出・未参照missing化・
+  小バッチcommit)、`hash_and_link_file` (BLAKE3→Asset統合)、
+  `WatchBuffer` (監視イベントのパス単位結合)、ライブラリAssetId符号化
+  (`library_asset_id`/`provisional_file_asset_id`。api-contract §19)
 
 ### `crates/gento-db` — SQLite基盤 (WP-1。メタデータの正本)
 
@@ -56,7 +67,9 @@ Tauriに依存してよいのは `gento-tauri` のみ。逆方向の依存
   `files` / `tags` / `asset_tags` / `captions` / `collections` /
   `collection_items` / `asset_metadata` / `jobs` / `file_operations` /
   `embeddings`) と検索用インデックス。DDLはdocs/data-model.md §2〜§12
-  準拠。`library_roots` はルート設定列 (`watch_enabled`/`ai_enabled`/
+  準拠。
+- migration #2 (WP-2): indexのみ — `files(root_id, scan_state)` と
+  `os_file_id` 部分index (列追加不要。設定列・os_file_id列は#1に存在)`library_roots` はルート設定列 (`watch_enabled`/`ai_enabled`/
   `send_exif`/`send_gps`/`settings_json`) を持つ。AiProfile/AiRunは
   WP-10の追加migration — `ai_run_id` 列もその時点で `ALTER TABLE …
   ADD COLUMN … REFERENCES ai_runs(id)` として追加する (既存列へのFK
@@ -79,7 +92,12 @@ Tauriに依存してよいのは `gento-tauri` のみ。逆方向の依存
 
 ### `crates/gento-image` — 画像パイプライン (Tauri非依存)
 
-- `scan`: walkdirによるPNG再帰走査 (エラー隔離・バッチsink)
+- `scan`: walkdirによるPNG再帰走査 (エラー隔離・バッチsink)。
+  WP-2で `scan_images` (MVP 7形式の拡張子判定 + os_file_id収集) を追加
+- `fs` (WP-2): gento-core `ScanFs` の実装 `PlatformFs`
+  (walk=scan_images・probe=PNG・hash=blake3)
+- `hash` (WP-2): ファイル全体のBLAKE3 (1MiBチャンク ストリーミング・
+  協調キャンセル。`blake3:<64hex>` 形式)
 - `probe`: PNGシグネチャ+IHDRのみの寸法プローブ (全文デコードなし)
 - `thumbnail`: デコード (Limits付き) → リサイズ → WebPエンコード。
   `ThumbnailJob` がプール投入単位。`FailureInjection` (**devtools**) は
@@ -97,6 +115,13 @@ Tauriに依存してよいのは `gento-tauri` のみ。逆方向の依存
   invoke handler登録 (devtoolsビルドのみ計測commandを追加)、`health`
 - `db.rs` (WP-1): DBパス解決 (`--db` / `GENTO_DB` / 既定)・`DbState`
   保持 (setupでオープン。失敗時もアプリ継続)・`db_status` command
+- `library.rs` (WP-2): `LibraryController` — スキャン逐次ワーカー
+  (単一キューで全体/スコープ差分を直列実行)、BLAKE3ハッシュ専用プール
+  (2ワーカー・Background優先度)、ルートごとのnotify (inotify) 監視
+  (debounce 400ms → スコープ差分。欠落は全体再スキャンで収束)、
+  カタログスナップショット生成 (DB→ImageRecord)、command群
+  (`library_roots_*`/`scan_start`/`scan_stop`/`scan_status`)。setupで
+  有効ルートの監視開始+初回スキャンを非同期投入、Exitでshutdown
 - `catalog.rs`: カタログcommand群 (summary/page/scan) と走査スレッド。
   ページDTOへのversion付与もここ (thin adapter層の責務)
 - `thumbnails.rs`: サムネイル生成サービス (要求の受付・dedup・イベント

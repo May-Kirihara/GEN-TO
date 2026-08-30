@@ -128,6 +128,101 @@ pub(crate) fn is_png_entry(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// MVP対象の画像拡張子 (計画書§11の7形式。実デコードはWP-3)。
+pub const IMAGE_EXTENSIONS: [&str; 9] = [
+    "png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "avif",
+];
+
+/// 拡張子がMVP対象画像形式か (大小文字無視)。
+pub fn is_image_entry(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            IMAGE_EXTENSIONS
+                .iter()
+                .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+        })
+        .unwrap_or(false)
+}
+
+/// metadataからOSファイルIDを取り出す (WP-2。Linux: dev+inode)。
+/// シンボリックリンクは走査対象外のため、常に実ファイルのmetadata。
+#[cfg(unix)]
+pub fn os_file_id_of(md: &Metadata) -> Option<gento_core::repo::OsFileId> {
+    use std::os::unix::fs::MetadataExt;
+    Some(gento_core::repo::OsFileId::new(md.dev(), md.ino()))
+}
+
+#[cfg(not(unix))]
+pub fn os_file_id_of(_md: &Metadata) -> Option<gento_core::repo::OsFileId> {
+    None
+}
+
+/// 走査で列挙した画像ファイル (WP-2。os_file_id付き)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScannedImage {
+    pub path: PathBuf,
+    pub size: u64,
+    /// Unixエポックからのミリ秒。
+    pub mtime_ms: u64,
+    pub os_file_id: Option<gento_core::repo::OsFileId>,
+}
+
+/// MVP対象7形式を再帰列挙し、1ファイルごとに `sink` へ渡す (WP-2登録ルート用)。
+/// rel_path解決は呼び出し側 (gento-coreのScanFs実装) で行う。
+/// DB書き込みのバッチ化も呼び出し側の責務 (ここは純粋な列挙)。
+pub fn scan_images(root: &Path, sink: &mut dyn FnMut(ScannedImage)) -> ScanResult {
+    let started = Instant::now();
+    let mut entries: u64 = 0;
+    let mut image_count: u64 = 0;
+    let mut errors: Vec<ScanEntryError> = Vec::new();
+
+    for entry in WalkDir::new(root).into_iter() {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                errors.push(ScanEntryError {
+                    path: err
+                        .path()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| root.to_path_buf()),
+                    reason: err.to_string(),
+                });
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        entries += 1;
+        if !is_image_entry(entry.path()) {
+            continue;
+        }
+        match entry.metadata() {
+            Ok(md) => {
+                sink(ScannedImage {
+                    path: entry.path().to_path_buf(),
+                    size: md.len(),
+                    mtime_ms: system_time_to_ms(md.modified()),
+                    os_file_id: os_file_id_of(&md),
+                });
+                image_count += 1;
+            }
+            Err(err) => errors.push(ScanEntryError {
+                path: entry.path().to_path_buf(),
+                reason: err.to_string(),
+            }),
+        }
+    }
+
+    ScanResult {
+        entries,
+        png_count: image_count,
+        errors,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    }
+}
+
 pub(crate) fn scanned_file(path: PathBuf, md: &Metadata) -> ScannedFile {
     ScannedFile {
         size: md.len(),
@@ -319,6 +414,77 @@ mod tests {
             reason: "boom".to_string(),
         };
         assert_eq!(err.path, PathBuf::from("/x"));
+    }
+
+    #[test]
+    fn scan_images_covers_mvp_extensions_case_insensitively() {
+        let dir = TestDir::new("imgext");
+        dir.write("a.png", PNG_BYTES);
+        dir.write("b.JPG", PNG_BYTES);
+        dir.write("c.jpeg", PNG_BYTES);
+        dir.write("d.WebP", PNG_BYTES);
+        dir.write("e.gif", PNG_BYTES);
+        dir.write("f.bmp", PNG_BYTES);
+        dir.write("g.TIFF", PNG_BYTES);
+        dir.write("h.tif", PNG_BYTES);
+        dir.write("i.avif", PNG_BYTES);
+        dir.write("skip.txt", b"x");
+        dir.write("j.pngx", b"x");
+        let sub = dir.mkdir("sub");
+        fs::write(sub.join("nested.png"), PNG_BYTES).unwrap();
+
+        let mut files = Vec::new();
+        let result = scan_images(dir.path(), &mut |img| files.push(img));
+        let mut names: Vec<String> = files
+            .iter()
+            .map(|f| f.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "a.png",
+                "b.JPG",
+                "c.jpeg",
+                "d.WebP",
+                "e.gif",
+                "f.bmp",
+                "g.TIFF",
+                "h.tif",
+                "i.avif",
+                "nested.png"
+            ]
+        );
+        assert_eq!(result.entries, 12);
+        assert_eq!(result.png_count, 10);
+        assert!(result.errors.is_empty());
+        // サイズ・mtimeも載る
+        assert_eq!(files[0].size, PNG_BYTES.len() as u64);
+        assert!(files[0].mtime_ms > 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_images_collects_os_file_id_on_unix() {
+        let dir = TestDir::new("imgos");
+        dir.write("a.png", PNG_BYTES);
+        let mut ids = Vec::new();
+        scan_images(dir.path(), &mut |img| ids.push(img.os_file_id));
+        assert_eq!(ids.len(), 1);
+        assert!(ids[0].is_some());
+    }
+
+    #[test]
+    fn is_image_entry_cases() {
+        for ok in [
+            "x.png", "x.PNG", "x.jpg", "x.JpEg", "x.webp", "x.gif", "x.bmp", "x.tiff", "x.tif",
+            "x.avif",
+        ] {
+            assert!(is_image_entry(Path::new(&format!("/a/{ok}"))), "{ok}");
+        }
+        for ng in ["x.pngx", "x.txt", "png", "x.PNG ", ".png"] {
+            assert!(!is_image_entry(Path::new(&format!("/a/{ng}"))), "{ng}");
+        }
     }
 
     #[test]

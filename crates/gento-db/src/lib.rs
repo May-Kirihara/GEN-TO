@@ -42,6 +42,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use gento_core::library::{AllRepos, RepoStore};
 use gento_core::repo::RepoError;
 use rusqlite::Connection;
 
@@ -252,6 +253,24 @@ impl Db {
     }
 }
 
+/// gento-core走査エンジンへのDBアクセス境界 (WP-2)。
+/// `SqliteRepos` は3 traitを実装するため `&dyn AllRepos` へ強制変換できる。
+impl RepoStore for Db {
+    fn write(
+        &self,
+        f: &mut dyn FnMut(&dyn AllRepos) -> Result<(), RepoError>,
+    ) -> Result<(), RepoError> {
+        Db::with_writer(self, |repos| f(repos))
+    }
+
+    fn read(
+        &self,
+        f: &mut dyn FnMut(&dyn AllRepos) -> Result<(), RepoError>,
+    ) -> Result<(), RepoError> {
+        Db::with_reader(self, |repos| f(repos))
+    }
+}
+
 /// PRAGMA一式を設定した接続を開く (writer/reader共通の基礎部分)。
 /// `journal_mode=WAL` はファイルDBでのみ有効 (in-memoryは `memory` のまま)。
 /// `query_only` はreader接続向け: SQL文レベルの書き込みを拒否する
@@ -421,12 +440,16 @@ mod tests {
                     byte_size: 42,
                     mtime_ms: 1_700_000_000_000,
                     scan_state: ScanState::Present,
+                    os_file_id: None,
+                    detach_asset: false,
                 })?;
                 let asset = repos.create_asset(NewAsset {
                     content_hash: "blake3:cafe".to_string(),
                     hash_algorithm: "blake3".to_string(),
                     byte_size: 42,
                     mime_type: None,
+                    width: None,
+                    height: None,
                 })?;
                 repos.link_file(file.id, asset.id)?;
                 Ok(())
@@ -602,5 +625,172 @@ mod tests {
         let err = Db::open(&db_path).unwrap_err();
         assert!(matches!(err, DbError::Migration(_)), "{err}");
         assert!(err.to_string().contains("unmanaged"), "{err}");
+    }
+
+    // ===== WP-2: v1→v2移行・再起動復元・並行読み取り =====
+
+    #[test]
+    fn v1_database_upgrades_to_v2_with_backup() {
+        let tmp = TempDir::new("v1tov2");
+        let db_path = tmp.path().join("db.sqlite3");
+        {
+            // v1だけ適用したDBを作る (migration #1の凍結内容そのまま)
+            let mut conn = Connection::open(&db_path).unwrap();
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
+            migrate::run_migrations(
+                &mut conn,
+                &schema::MIGRATIONS[..1],
+                &migrate::MigrationOpts::default(),
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO library_roots (uuid, path, path_encoding, display_path, created_at, updated_at)
+                 VALUES ('00000000-0000-7000-8000-0000000000aa', x'2f76', 'utf8', '/v',
+                         '2026-08-30T00:00:00.000Z', '2026-08-30T00:00:00.000Z')",
+                [],
+            )
+            .unwrap();
+        }
+        // 通常オープンで v1 → v2 へ移行 (backup作成含む)
+        let db = Db::open(&db_path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), schema::LATEST_VERSION);
+        db.with_reader(|repos| {
+            assert_eq!(repos.list_roots()?.len(), 1, "移行でデータは失われない");
+            Ok(())
+        })
+        .unwrap();
+        let backup_dir = default_backup_dir(&db_path);
+        assert!(
+            backup_dir.exists(),
+            "データ保有DBのmigration前にbackupが作られる"
+        );
+        // 新indexが存在する
+        db.with_reader(|repos| {
+            for name in ["idx_files_root_scan_state", "idx_files_os_file_id"] {
+                let exists: bool = repos
+                    .conn()
+                    .query_row(
+                        "SELECT count(*) > 0 FROM sqlite_master WHERE type='index' AND name = ?1",
+                        [name],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert!(exists, "missing index {name}");
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn restart_restores_roots_files_and_links() {
+        // WP-2受入1: 再起動後も登録ルートと一覧が復元される。
+        let tmp = TempDir::new("restore");
+        let db_path = tmp.path().join("db.sqlite3");
+        let (root_id, file_id, asset_id) = {
+            let db = Db::open(&db_path).unwrap();
+            db.with_writer(|repos| {
+                let root = repos.add_root(Path::new("/data/photos"))?;
+                let file = repos.upsert_file(FileUpsert {
+                    root_id: root.id,
+                    rel_path: PathBuf::from("dir/img.png"),
+                    display_name: "img.png".to_string(),
+                    byte_size: 42,
+                    mtime_ms: 7,
+                    scan_state: ScanState::Present,
+                    os_file_id: Some(gento_core::repo::OsFileId::new(3, 11)),
+                    detach_asset: false,
+                })?;
+                let (asset, _) = repos.create_or_get_asset(NewAsset {
+                    content_hash: "blake3:restart".to_string(),
+                    hash_algorithm: "blake3".to_string(),
+                    byte_size: 42,
+                    mime_type: None,
+                    width: None,
+                    height: None,
+                })?;
+                repos.link_file(file.id, asset.id)?;
+                Ok((root.id, file.id, asset.id))
+            })
+            .unwrap()
+        };
+        drop(Db::open(&db_path).unwrap()); // 一旦閉じて開き直す
+
+        let db2 = Db::open(&db_path).unwrap();
+        db2.with_reader(|repos| {
+            let roots = repos.list_roots()?;
+            assert_eq!(roots.len(), 1);
+            assert_eq!(roots[0].id, root_id);
+            assert_eq!(roots[0].path, PathBuf::from("/data/photos"));
+
+            let joined = repos.list_present_joined()?;
+            assert_eq!(joined.len(), 1);
+            let (file, asset) = &joined[0];
+            assert_eq!(file.id, file_id);
+            assert_eq!(file.rel_path, PathBuf::from("dir/img.png"));
+            assert_eq!(
+                file.os_file_id,
+                Some(gento_core::repo::OsFileId::new(3, 11))
+            );
+            let asset = asset.as_ref().expect("リンクも復元");
+            assert_eq!(asset.id, asset_id);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn reader_queries_stay_responsive_during_batch_writes() {
+        // WP-2受入6/8のDB側保証: 1000件の小バッチ書き込み中もreaderの
+        // ページ相当クエリ (count + 先頭ページ) がbusy_timeoutで失敗しない。
+        let tmp = TempDir::new("concurrent");
+        let db = Db::open(tmp.path().join("db.sqlite3")).unwrap();
+        let root_id = db
+            .with_writer(|repos| {
+                let root = repos.add_root(Path::new("/data/p"))?;
+                Ok(root.id)
+            })
+            .unwrap();
+
+        let writer_db = std::sync::Arc::new(db);
+        let writer_for_thread = std::sync::Arc::clone(&writer_db);
+        let handle = std::thread::spawn(move || {
+            for chunk in 0..10 {
+                let files: Vec<FileUpsert> = (0..100)
+                    .map(|i| FileUpsert {
+                        root_id,
+                        rel_path: PathBuf::from(format!("chunk{chunk}/f{i:03}.png")),
+                        display_name: format!("f{i:03}.png"),
+                        byte_size: 1,
+                        mtime_ms: 1,
+                        scan_state: ScanState::Present,
+                        os_file_id: None,
+                        detach_asset: false,
+                    })
+                    .collect();
+                writer_for_thread
+                    .with_writer(|repos| repos.upsert_files_batch(&files).map(|_| ()))
+                    .unwrap();
+            }
+        });
+
+        let mut queries = 0u32;
+        while !handle.is_finished() {
+            writer_db
+                .with_reader(|repos| {
+                    let (page, total) = repos.list_files_paged(root_id, 0, 500)?;
+                    assert!(total >= page.len() as u64);
+                    queries += 1;
+                    Ok(())
+                })
+                .expect("readerはwriterと並行してクエリ可能");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        handle.join().unwrap();
+        assert!(queries > 0, "走査中に少なくとも1回はクエリできた");
+        let total = writer_db
+            .with_reader(|repos| repos.list_files_paged(root_id, 0, 1).map(|(_, t)| t))
+            .unwrap();
+        assert_eq!(total, 1000);
     }
 }

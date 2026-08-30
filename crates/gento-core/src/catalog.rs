@@ -113,12 +113,16 @@ pub enum Triage {
     Reject,
 }
 
-/// カタログの稼働モード。Real = 実走査結果、Virtual = UI負荷試験用。
+/// カタログの稼働モード (WP-2で Library 追加)。
+/// - Real: 一時走査 (未登録フォルダ) の結果
+/// - Virtual: UI負荷試験用 (devtools機能)
+/// - Library: 登録ルートのDB由来スナップショット (永続カタログ)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CatalogMode {
     Real,
     Virtual,
+    Library,
 }
 
 /// カタログ内の1画像。

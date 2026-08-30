@@ -11,6 +11,7 @@ pub mod catalog;
 pub mod db;
 #[cfg(any(debug_assertions, feature = "devtools"))]
 pub mod devtools;
+pub mod library;
 pub mod protocol;
 pub mod thumbnails;
 
@@ -145,6 +146,14 @@ pub fn run() {
         catalog::get_catalog_page,
         catalog::start_scan,
         catalog::set_catalog_mode,
+        catalog::set_catalog_source,
+        library::library_roots_list,
+        library::library_roots_add,
+        library::library_roots_remove,
+        library::library_roots_set_enabled,
+        library::scan_start,
+        library::scan_stop,
+        library::scan_status,
         thumbnails::request_thumbnails,
         thumbnails::reprioritize_thumbnails,
         thumbnails::cancel_thumbnail_requests,
@@ -161,6 +170,14 @@ pub fn run() {
         catalog::get_catalog_summary,
         catalog::get_catalog_page,
         catalog::start_scan,
+        catalog::set_catalog_source,
+        library::library_roots_list,
+        library::library_roots_add,
+        library::library_roots_remove,
+        library::library_roots_set_enabled,
+        library::scan_start,
+        library::scan_stop,
+        library::scan_status,
         thumbnails::request_thumbnails,
         thumbnails::reprioritize_thumbnails,
         thumbnails::cancel_thumbnail_requests,
@@ -212,6 +229,43 @@ pub fn run() {
             let mut state = AppState::new(dataset_path);
             state.thumbnails = Some(service);
             state.db = Some(db_state);
+            // WP-2: 登録ルート制御。DBが開けている場合のみ生成し、
+            // 有効ルートの監視を開始して初回スキャンを非同期投入する
+            // (UIブロックなし。再起動復元はスナップショット生成で担保)。
+            if let Some(db) = state.db.as_ref().and_then(|d| d.db.clone()) {
+                match library::LibraryController::new(
+                    db,
+                    std::sync::Arc::new(library::TauriLibraryHost {
+                        app: app.handle().clone(),
+                    }),
+                ) {
+                    Ok(controller) => {
+                        match controller.list_roots() {
+                            Ok(roots) => {
+                                for (root, available) in roots {
+                                    if root.enabled && root.watch_enabled && available {
+                                        if let Err(err) = spawn_root_watcher(&controller, &root) {
+                                            tracing::warn!(
+                                                root_id = root.id,
+                                                error = %err,
+                                                "failed to start watcher"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(error = %err, "failed to list roots at startup")
+                            }
+                        }
+                        controller.enqueue_scan_all();
+                        state.library = Some(controller);
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "library controller unavailable")
+                    }
+                }
+            }
             app.manage(state);
             if app.get_webview_window("main").is_some() {
                 tracing::info!("main window created");
@@ -226,6 +280,10 @@ pub fn run() {
                     if let Some(service) = &state.thumbnails {
                         tracing::info!("shutting down thumbnail service");
                         service.shutdown();
+                    }
+                    if let Some(controller) = &state.library {
+                        tracing::info!("shutting down library controller");
+                        controller.shutdown();
                     }
                 }
             }
@@ -304,6 +362,14 @@ fn display_absolute(path: &Path) -> String {
         .unwrap_or_else(|_| path.to_path_buf())
         .display()
         .to_string()
+}
+
+/// setup時の監視開始 (controllerの公開ラッパ)。
+fn spawn_root_watcher(
+    controller: &std::sync::Arc<library::LibraryController>,
+    root: &gento_core::repo::LibraryRootRecord,
+) -> Result<(), String> {
+    controller.start_root_watcher(root)
 }
 
 fn epoch_ms() -> u64 {
