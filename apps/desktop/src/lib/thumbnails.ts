@@ -101,7 +101,12 @@ export class ThumbnailStore {
   /** イベント購読とポーリングを開始し、dispose関数を返す。 */
   async init(): Promise<() => void> {
     const unlistenReady = await this.ipc.listen<{
-      items: Array<{ asset_id: string; size_class: string; cache_generation: number }>;
+      items: Array<{
+        asset_id: string;
+        size_class: string;
+        cache_generation: number;
+        version: number;
+      }>;
     }>("thumb:ready", (event) => {
       this.applyReady(event.payload.items);
     });

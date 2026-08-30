@@ -8,7 +8,9 @@
 //! - 一時ファイルは最終ディレクトリと同一場所に `.tmp-{pid}-{連番}.webp` →
 //!   fsync → rename (同ディレクトリ内renameはアトミック)。Dropガードで失敗時削除
 //! - 2GiB不変条件: 会計対象 = 最終ファイル + 生成中一時ファイル。
-//!   書き込み成功ごとと起動時に検査し、超過なら目標容量までLRU削除
+//!   書き込み開始前に予定サイズをin-flightへ予約し (書き込み中の一時ファイル
+//!   が会計から漏れない)、予約時と書き込み成功ごとと起動時に検査し、超過すれば
+//!   目標容量までLRU削除する
 //!   (アクセス台帳はメモリ内。未登録ファイルはmtime順。実行中ジョブの
 //!   キーとin-flight一時ファイルは削除禁止)
 
@@ -115,6 +117,37 @@ pub fn validate_file_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
+/// 内容感応URLバージョン (FG-1 / api-contract.md §12) のビット幅。
+/// プロトコルのクエリ `v` 検証が18桁上限のため、56bitへ切り詰める
+/// (2^56-1 = 72,057,594,037,927,935 は17桁で常に収まる)。
+const CONTENT_VERSION_BITS: u64 = u64::MAX >> 8;
+
+/// fingerprintから内容感応URLバージョンを計算する。
+///
+/// 入力はキャッシュキーと同じ (canonicalパス+size+mtime) + アルゴリズム
+/// バージョンで、Xxh3-128の下位56bit。設計判断:
+/// - サイズクラスは含めない。URLはパス側 (`/asset/{id}/{s256|s512}`) で
+///   クラスを区別するため、バージョンは (パス, サイズ, mtime, アルゴリズム)
+///   の変化だけで全スキーム (thumb/preview/original) のURLを変化させればよい。
+///   元ファイル変更 → サーバのキャッシュキー変化 → URLのversion変化 →
+///   WebViewのimmutableキャッシュが無効化される (§12-5受け入れ)。
+/// - グローバルcache_generationとの合成はしない。version単体で内容を
+///   識別でき、クリア後の再生成も同一URLになる (内容が同一のため正当)。
+pub fn content_version(fp: &AssetFingerprint) -> u64 {
+    let input = format!(
+        "{}\0{}\0{}\0{}",
+        fp.canonical_path, fp.byte_size, fp.mtime_ms, ALGORITHM_VERSION
+    );
+    let hash = xxhash3_128::Hasher::oneshot(input.as_bytes());
+    (hash as u64) & CONTENT_VERSION_BITS
+}
+
+/// パス+サイズ+mtimeから内容感応バージョンを計算する (キャッシュキーと
+/// 同一の正規化を通る)。
+pub fn asset_version(path: &Path, byte_size: u64, mtime_ms: u64) -> u64 {
+    content_version(&asset_fingerprint(path, byte_size, mtime_ms))
 }
 
 /// キャッシュ検索結果。
@@ -237,9 +270,10 @@ impl ThumbnailCache {
         let path = self.root.join(&key.relative);
         let mut inner = lock(&self.inner);
         // symlinkでない正規ファイルのみヒットとする (WP-4プロトコルの
-        // 「正規ファイルのみ」方針に先んじた防御)。
-        match fs::metadata(&path) {
-            Ok(md) if md.is_file() => {
+        // 「正規ファイルのみ」方針に先んじた防御)。最終コンポーネントの
+        // symlinkは symlink_metadata で検出する (fs::metadataは追従するため不可)。
+        match fs::symlink_metadata(&path) {
+            Ok(md) if md.file_type().is_file() => {
                 inner.access_clock += 1;
                 let seq = inner.access_clock;
                 inner
@@ -480,15 +514,30 @@ impl TempWriter {
             .file
             .take()
             .ok_or_else(|| io::Error::other("temp file already consumed"))?;
-        file.write_all(data)?;
-        file.sync_all()?;
-        drop(file);
-        // ディスクに乗った分を先に会計 (保守方向: 一時ファイルも上限に数える)
+        // 予約: 書き込み開始前に予定サイズ (エンコード済みバイト長) を
+        // in-flight会計へ繰り入れる。書き込み中の一時ファイルが会計から
+        // 漏れる隙間を閉じ、並行書き込みで上限を超過しないようにする。
         {
             let mut inner = lock(&self.cache.inner);
             inner.inflight_bytes += len;
+            self.cache.enforce_limit_locked(&mut inner);
+            if inner.bytes_total + inner.inflight_bytes > self.cache.max_bytes {
+                // 退避し切れない (実行中ジョブのピンだらけ等)。予約を巻き戻して
+                // この書き込みを諦める。ジョブはfailedとなりバックプレッシャーとして
+                // 働く (実運用の同時書き込みはワーカー数=4×サムネイル上限64MiBで
+                // 2GiBには遠く及ばないため、通常この経路は通らない)。
+                inner.inflight_bytes = inner.inflight_bytes.saturating_sub(len);
+                return Err(io::Error::other(
+                    "inflight reservation would exceed cache limit",
+                ));
+            }
+            // Dropガードがこの値を解放する。予約と同時に設定する
+            // (書き込み失敗・パニック時に会計が残らないように)。
+            self.accounted = len;
         }
-        self.accounted = len;
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
         // 同一ディレクトリ内rename = アトミック配置
         fs::rename(&self.tmp_path, &self.final_path)?;
         let (bytes_total, clock) = {
@@ -735,6 +784,24 @@ mod tests {
     }
 
     #[test]
+    fn symlink_at_cache_path_is_miss() {
+        // 契約「lookupはシンボリックリンクを拒否」: 最終コンポーネントが
+        // 外部ファイルへのsymlinkでもMiss (metadataの追従でHitにならないこと)。
+        let dir = TestDir::new("symlink-miss");
+        let c = cache(&dir, 1 << 20);
+        let key = cache_key(&fp("/x/a.png", 1, 1), SizeClass::S256);
+        let shard = dir.path().join(&key.hex[..2]);
+        fs::create_dir_all(&shard).unwrap();
+        let outside = dir.path().join("outside.webp");
+        fs::write(&outside, b"evil").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.path().join(&key.relative)).unwrap();
+        assert_eq!(c.lookup(&key), CacheLookup::Miss);
+        // 会計にも登録しない
+        assert_eq!(c.total_bytes(), 0);
+        assert_eq!(c.entry_count(), 0);
+    }
+
+    #[test]
     fn accounting_tracks_committed_bytes() {
         let dir = TestDir::new("accounting");
         let c = cache(&dir, 1 << 20);
@@ -892,6 +959,100 @@ mod tests {
         // 会計にも残らない
         assert_eq!(c.total_bytes(), 0);
         assert_eq!(c.entry_count(), 0);
+    }
+
+    // ===== 内容感応バージョン (FG-1 / F3) =====
+
+    #[test]
+    fn content_version_is_stable_and_content_sensitive() {
+        let v = content_version(&fp("/x/a.png", 10, 20));
+        // 決定的
+        assert_eq!(v, content_version(&fp("/x/a.png", 10, 20)));
+        // 構成要素のどれかが変われば変わる
+        assert_ne!(v, content_version(&fp("/x/b.png", 10, 20)));
+        assert_ne!(v, content_version(&fp("/x/a.png", 11, 20)));
+        assert_ne!(v, content_version(&fp("/x/a.png", 10, 21)));
+        // プロトコルのクエリ桁上限 (18桁) に常に収まる
+        assert!(v.to_string().len() <= 18, "version={v}");
+    }
+
+    #[test]
+    fn asset_version_normalizes_real_paths_like_cache_key() {
+        let dir = TestDir::new("ver-canon");
+        let file = dir.path().join("a.png");
+        fs::write(&file, b"hi").unwrap();
+        let direct = asset_version(&file, 1, 1);
+        let obfuscated = asset_version(&dir.path().join(".").join("a.png"), 1, 1);
+        assert_eq!(direct, obfuscated);
+    }
+
+    // ===== 書き込み中の会計 (FG-1 / F4) =====
+
+    #[test]
+    fn concurrent_commits_keep_accounting_within_limit_during_writes() {
+        // 並行書き込み中の会計 (最終ファイル+inflight) が上限を超えないこと。
+        // 予約を書き込み前に行い、退避しても抑えられない予約は巻き戻して
+        // 失敗させるため、ロック下のすべての中間状態で total <= max が成り立つ
+        // (サンプルはロック下のスナップショットなので超過状態は観測され得ない)。
+        let dir = TestDir::new("inflight");
+        let max = 4_000_000u64;
+        let stats = Arc::new(ThumbStats::new());
+        let c =
+            Arc::new(ThumbnailCache::open_with_limit(dir.path(), max, Arc::clone(&stats)).unwrap());
+        // 退避可能な既存final (3MiB) を用意
+        for i in 0..3u64 {
+            let k = cache_key(&fp(&format!("/x/old{i}.png"), i, i), SizeClass::S256);
+            commit(&c, &k, &vec![0u8; 1_000_000]);
+        }
+        assert_eq!(c.total_bytes(), 3_000_000);
+
+        let keys: Vec<_> = (0..6u64)
+            .map(|i| {
+                cache_key(
+                    &fp(&format!("/x/new{i}.png"), 100 + i, 100),
+                    SizeClass::S256,
+                )
+            })
+            .collect();
+        let barrier = Arc::new(std::sync::Barrier::new(keys.len()));
+        let mut handles = Vec::new();
+        for k in keys {
+            let c2 = Arc::clone(&c);
+            let b = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                c2.begin_write(&k).unwrap().commit(&vec![1u8; 1_000_000])
+            }));
+        }
+        let mut samples = 0u64;
+        let mut over = 0u64;
+        while handles.iter().any(|h| !h.is_finished()) {
+            let total = c.total_bytes();
+            samples += 1;
+            if total > max {
+                over += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        let results: Vec<bool> = handles
+            .into_iter()
+            .map(|h| h.join().unwrap().is_ok())
+            .collect();
+        assert!(
+            samples > 0,
+            "サンプルが取れないほど書き込みが速い (要サイズ調整)"
+        );
+        assert_eq!(over, 0, "書き込み中に上限超過 ({over}/{samples}サンプル)");
+        // 予約時点の退避が実際に働いたことの傍証
+        assert!(stats.snapshot().evictions > 0);
+        // 収束後も上限内
+        assert!(c.total_bytes() <= max);
+        // 成功分はfinalとして存在し、失敗分 (予約巻き戻し) は会計に残さない
+        let committed = results.iter().filter(|r| **r).count();
+        assert_eq!(
+            c.entry_count(),
+            3 + committed - stats.snapshot().evictions as usize
+        );
     }
 
     #[cfg(unix)]

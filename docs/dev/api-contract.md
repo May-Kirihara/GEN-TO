@@ -1,9 +1,10 @@
 # GEN-TO IPC API契約 (Phase 2 / WP-2時点)
 
 - 作成日: 2026-08-28 (WP-2)
-- 最終更新: 2026-08-29 (WP-3: §7〜§11を追加 / WP-4: §8統計DTO・§12を追加)
+- 最終更新: 2026-08-30 (FG-1: §8/§9/§10/§12 version追加・§14 devブリッジゲートとrate検証の実際への合わせ込み)
 - 目的: Tauri command・イベント・ローカル画像プロトコルの形状をWP-3〜6の契約基準として固定する。
-- 整合性情報: 本書の型は `crates/gento-core/src/catalog.rs`、`apps/desktop/src-tauri/src/catalog.rs`、
+- 整合性情報: 本書の型は `crates/gento-core/src/catalog.rs`、`apps/desktop/src-tauri/src/catalog.rs`
+  (ページDTOのversion拡張もここ)、
   `apps/desktop/src/lib/catalog-types.ts`、およびサムネイル系は
   `crates/gento-core/src/jobs.rs`、`apps/desktop/src-tauri/src/thumbnails.rs`、
   `apps/desktop/src/lib/thumbnail-types.ts`、プロトコル系は
@@ -36,6 +37,7 @@ export type ImageListItem = {
   byteSize: number;
   state: ImageState;
   thumbnailState: ThumbnailState;
+  version: number;       // 内容感応URLバージョン (FG-1。§12の ?v= 仕様参照)
 };
 
 export type CatalogPage = {
@@ -98,7 +100,9 @@ invoke<CatalogSummary>("get_catalog_summary")
 invoke<CatalogPage>("get_catalog_page", { generation: number, offset: number, limit: number })
 ```
 
-- 成功: `CatalogPage`。
+- 成功: `CatalogPage` (項目は `ImageListItem` + `version`。Rust側は
+  `apps/desktop/src-tauri/src/catalog.rs::CatalogItemDto` — gento-coreのDTOに
+  thin adapter層で内容感応versionを付与する)。
 - 失敗: `CatalogPageError` をreject。
   - `staleGeneration`: `generation` がサーバ側と不一致。フロントは summary 再取得→同一オフセットで
     1回再試行する (`CatalogStore.loadPage` の実装参照)。
@@ -335,7 +339,8 @@ invoke<{ removed_files: number, removed_bytes: number, cache_generation: number 
   `cache_generation` を +1 する。実行中ジョブのコミットが追いつく場合、
   クリア後に正当なサムネイルが再登録されることがある (内容はキーに対応
   するため無害)。
-- `cache_generation` はWP-4/5のプロトコルURL `?v=` で使用する。
+- `cache_generation` はreadyイベントの古い世代を破棄する**世代ガード**に
+  使う (URLには内容感応versionを使う。FG-1で分離。§10参照)。
 
 ## 9. Events
 
@@ -349,11 +354,13 @@ type ThumbReadyPayload = { items: ThumbReadyItem[] };
 type ThumbReadyItem = {
   asset_id: string;        // 要求時のAssetId (10進文字列)
   size_class: string;      // 要求時のサイズクラスIPC名
-  cache_generation: number; // 要求時点のgeneration
+  cache_generation: number; // 要求時点のgeneration (世代ガード用)
+  version: number;         // 内容感応URLバージョン (FG-1。?v= に使う)
 };
 ```
 
-- キャッシュヒット (即時ready) も同じイベントで流れる。
+- キャッシュヒット (即時ready) も同じイベントで流れる
+  (versionは要求時のキャッシュキー入力から計算するためヒット・生成で同一)。
 - キャンセルされたジョブはこのイベントを出さない。
 
 ### `thumb:failed` — 生成失敗
@@ -361,11 +368,34 @@ type ThumbReadyItem = {
 - payload: `{ items: { asset_id, size_class, reason }[] }`
   (reasonは `ThumbnailError` の表示文字列。パスは含まれない)。
 
-## 10. cache_generation semantics
+## 10. cache_generation・version semantics
+
+### cache_generation (世代ガード用)
 
 - 初期値1。`clear_thumbnail_cache` 成功時のみ +1。
 - readyイベントの `cache_generation` は**要求時点**の値 (クリア前の要求が
   クリア後に完了した場合、古いgeneration付きで届く = UIは破棄してよい)。
+- URLには使わない (後述のversionと独立。FG-1で分離)。
+
+### version (内容感応URLバージョン、FG-1)
+
+- 各アセットの version = キャッシュキー入力と同じ
+  **canonicalパス + byte_size + mtime_ms + アルゴリズムバージョン** の
+  Xxh3-128下位56bit (`gento-image/src/cache.rs::content_version`。
+  56bit ⇒ 最大17桁で、クエリ `v` の18桁上限に常に収まる)。
+- **サイズクラスは入力に含めない** (設計判断): URLはパス側
+  (`/asset/{id}/{s256|s512}`) でクラスを区別するため、versionは
+  (パス, サイズ, mtime, アルゴリズム) の変化だけで全スキームのURLを
+  変化させれば足りる。クラスを含めるとDTOがクラス別の値を運ぶ必要があり
+  過剰になる。
+- グローバル `cache_generation` との合成はしない (設計判断):
+  version単体で内容を識別でき、キャッシュクリア後の再生成は同一URLになる
+  (内容が同一のためimmutableキャッシュの再利用は正当)。
+- 元ファイル変更 → サーバのキャッシュキー変化 → readyイベント/ページDTOの
+  version変化 → URLの `?v=` 変化 → WebViewのimmutableキャッシュが無効化
+  (§12-5「URLが一意なら内容不変」の受け入れを満たす)。
+- 出所: `thumb:ready` イベント (thumb/preview表示の切り替え时机) と
+  `get_catalog_page` の項目DTO (original表示など生成を待たない用途)。
 
 ## 11. 制約・保証 (WP-3)
 
@@ -376,9 +406,12 @@ type ThumbReadyItem = {
 3. **キュー上限**: 4096件 (未開始)。満杯時は `rejected_full` で拒否
    (バックプレッシャー。無制限spawnなし)。
 4. **キャッシュ不変条件**: 最終ファイル+生成中一時ファイルの合計 ≤ 2GiB。
-   書き込み成功ごとと起動時に検査、超過時は目標1.9GiB (95%) までLRU削除。
-   実行中ジョブのキーと一時ファイルは削除禁止。アクセス台帳はメモリ内
-   (プロセス再起動で未登録ファイルはmtime順に扱われる)。
+    書き込み開始前に予定サイズをin-flight会計へ**予約**し (書き込み中の一時
+    ファイルが会計から漏れない。FG-1)、予約時と書き込み成功ごとと起動時に
+    検査、超過時は目標1.9GiB (95%) までLRU削除。退避しても抑えられない
+    予約は巻き戻されて書き込みが失敗する (バックプレッシャー)。
+    実行中ジョブのキーと一時ファイルは削除禁止。アクセス台帳はメモリ内
+    (プロセス再起動で未登録ファイルはmtime順に扱われる)。
 5. **アトミック配置**: 一時ファイル `.tmp-{pid}-{seq}.webp` を最終ディレクトリと
    同一場所に作成 → fsync → rename。途中ファイルがhitすることはない。
 6. **panic隔離**: ジョブのpanicは失敗扱い (`thumb:failed`) でワーカーは継続。
@@ -401,9 +434,14 @@ type ThumbReadyItem = {
 
 | scheme | URL形式 | 内容 | Content-Type | 上限 |
 |---|---|---|---|---|
-| `gento-thumb` | `//localhost/asset/{id}/{s256\|s512}?v={gen}` | サムネイルのキャッシュWebP | `image/webp` | 64MiB |
-| `gento-preview` | `//localhost/asset/{id}?v={gen}` | preview2048キャッシュWebP | `image/webp` | 64MiB |
-| `gento-original` | `//localhost/asset/{id}?v={gen}` | 登録済みカタログ資産の元PNG | `image/png` | 512MiB |
+| `gento-thumb` | `//localhost/asset/{id}/{s256\|s512}?v={version}` | サムネイルのキャッシュWebP | `image/webp` | 64MiB |
+| `gento-preview` | `//localhost/asset/{id}?v={version}` | preview2048キャッシュWebP | `image/webp` | 64MiB |
+| `gento-original` | `//localhost/asset/{id}?v={version}` | 登録済みカタログ資産の元PNG | `image/png` | 512MiB |
+
+`?v={version}` は**内容感応バージョン** (§10参照。元ファイルの
+path+size+mtimeとアルゴリズムバージョンから決まる)。任意の資産で
+「同一URL ⇒ 同一内容」が成り立つため `immutable` 1年キャッシュが安全であり、
+元ファイルの変更はversionの変化経由でURLを変えてWebViewキャッシュを更新させる。
 
 フロントエンドは `apps/desktop/src/lib/protocol.ts` のビルダ
 (`thumbUrl` / `previewUrl` / `originalUrl`) を使う。ビルダは常に
@@ -438,6 +476,12 @@ AssetId → カタログレコード → キャッシュキー/元パス (アプ
 - キャッシュ解決: 最終コンポーネントは `symlink_metadata` で正規ファイル確認
   (シンボリックリンク拒否) + `canonicalize` でキャッシュルート包含検証 + サイズ上限。
   元ファイル (original) も同様にシンボリックリンク拒否。
+- **TOCTOU閉鎖 (FG-1)**: 読み取りは最終コンポーネントを `O_NOFOLLOW` で開き、
+  open済みfdのfstatで検証時statの (dev, ino) 一致と、`/proc/self/fd/{fd}` の
+  実パスが正規キャッシュルート配下であることを再確認する
+  (検証→open間のシンボリックリンク・中間ディレクトリ差し替えを拒否)。
+  同一inodeへのhardlink差し替えのみ検出不能だが、キャッシュディレクトリへ
+  書き込める攻撃者は内容を直接書き換え可能なため脅威モデル外。
 - 不正要求 → 400/404/405。
 
 ### 応答ヘッダ
@@ -445,20 +489,25 @@ AssetId → カタログレコード → キャッシュキー/元パス (アプ
 - 成功: `Content-Type` (正確) / `Content-Length` / `X-Content-Type-Options: nosniff` /
   `Cache-Control`。
 - `Cache-Control`: `v` クエリ付きURLは `public, max-age=31536000, immutable`
-  (URLが一意なら内容不変)、無しは `no-store`。
+  (versionが内容感応のため同一URLの内容は不変)、無しは `no-store`。
 - エラー本文は固定の短い文字列 (`not found` 等)。**パス・ID・URLを含まない**。
   ログも scheme・理由kind・ID・ステータスのみ (到着URLのdebugログを除く)。
 
 ### 未生成→表示切替フロー
 
 1. UIは `request_thumbnails` で生成を要求 (プロトコルURLは直接叩かない)
-2. `thumb:ready` イベントの `cache_generation` を受け取る
-3. `?v={cache_generation}` 付きURLを組み直して `<img src>` へ反映
+2. `thumb:ready` イベントの `version` を受け取る
+3. `?v={version}` 付きURLを組み直して `<img src>` へ反映
+   (original表示はページDTOの `version` を使う。生成不要)
 
 ### CSP (tauri.conf.json)
 
 `img-src` のみ制限 (`'self' data: gento-thumb: gento-preview: gento-original:`)。
-dev (`devCsp`) とrelease (`csp`) で同一。connect-src等は既定 (無制限) を維持。
+dev (`devCsp`) とrelease (`csp`) で同一。
+**これは本プロトタイプのローカル画像プロトコルのための限定対応であり、
+一般的なCSPハードニング (connect-src・script-src等の厳格化) を実施した
+ものではない** (スパイクの範囲外。MVP前の課題)。connect-src等は既定
+(無制限) を維持する。
 
 ### 統計
 
@@ -467,6 +516,13 @@ dev (`devCsp`) とrelease (`csp`) で同一。connect-src等は既定 (無制限
 durationサンプルは100,000件で打ち切り。
 
 ## 14. WP-7 (フェーズ8/9) で追加・拡張したAPI
+
+> FG-1: `set_failure_injection` / `devtest_report` / `dev_bridge_enabled` の
+> 3コマンドは**計測ブリッジのゲート**を持つ。起動時に環境変数
+> `GENTO_DEV_BRIDGE` (値が**厳密に `"1"`** のときのみ有効。`0`・`true`・
+> 空文字・未設定は無効) から `AppState` のフラグを確定し、無効な場合は
+> stringでrejectする (releaseで常に登録されていてもWebViewから呼べない)。
+> プロトコル・通常コマンドには影響しない。
 
 ### `set_failure_injection`
 
@@ -477,6 +533,9 @@ invoke<{ mode: string, rate: number }>("set_failure_injection", {
 ```
 
 - 開発用の決定的エラー注入。即時に全ワーカーへ反映される。
+- **ブリッジ無効時はErr** (`"dev bridge is disabled..."`)。
+- `rate` は [0,1] 外を**reject**する (`"rate must be within 0.0..=1.0"`。
+  FG-1でクランプから変更 — 不正入力を黙って受け付けない)。
 - **判定はassetIdではなくキャッシュキー (fingerprint由来) のハッシュ閾値**
   (60bitを1e6スケール閾値と比較)。ジョブはキャッシュキーでdedupされるため
   1ジョブが複数の仮想assetIdに対応し得るが、キャッシュキーは実ファイル+
@@ -485,7 +544,7 @@ invoke<{ mode: string, rate: number }>("set_failure_injection", {
 - `decode`: デコード前に `decode failed: injected failure (decode)` で個別failed。
 - `cache_write`: 一時ファイル作成後に失敗 (Dropガードが掃除。`.tmp` 残存なし)。
   `cache commit failed: injected failure (cache_write)`。
-- rate=0 / mode=none で完全復帰。rateは [0,1] 外をクランプ。
+- rate=0 / mode=none で完全復帰。
 
 ### `dev_bridge_enabled`
 
@@ -493,8 +552,10 @@ invoke<{ mode: string, rate: number }>("set_failure_injection", {
 invoke<boolean>("dev_bridge_enabled")
 ```
 
-- 環境変数 `GENTO_DEV_BRIDGE` が設定されているとき true。release buildでも
-  計測ブリッジ (devtest.ts) を有効化するためのランタイムフラグ (既定無効)。
+- ブリッジ有効時は `Ok(true)`。**無効時はErr** (上記ゲート参照)。
+- release buildでも計測ブリッジ (devtest.ts) を有効化するための
+  ランタイムフラグ (既定無効。`GENTO_DEV_BRIDGE` は値が厳密に `"1"` の
+  ときのみ有効)。
 
 ### `devtest_report`
 
@@ -503,7 +564,8 @@ invoke<null>("devtest_report", { payload: string })
 ```
 
 - 計測ブリッジから機械可読行を `devtest:` ターゲットのinfoログへ流す。
-  bash側は `grep devtest:` で採取する。悪用価値はないが開発用。
+  bash側は `grep devtest:` で採取する。
+- **ブリッジ無効時はErr** (ログへ書き込めない)。
 
 ### `get_thumbnail_stats` の拡張フィールド (後方互換の追加)
 

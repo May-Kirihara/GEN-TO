@@ -81,7 +81,7 @@ GENTO_LOG=debug pnpm tauri dev -- -- -- --dataset ../../../sample/dataset
 ## 計測 (WP-7 / フェーズ9)
 
 release buildでの計測手順 (詳細は [docs/technical-spike-results.md](docs/technical-spike-results.md)、
-ドライバは検証機 `/tmp/opencode/wp7/`):
+ドライバとログは `docs/dev/measurements/` を参照):
 
 ```bash
 cd apps/desktop

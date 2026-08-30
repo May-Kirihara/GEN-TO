@@ -13,6 +13,7 @@ function makeItems(count: number): ImageListItem[] {
     byteSize: 1000,
     state: "ready" as const,
     thumbnailState: "ready" as const,
+    version: 200_000 + i,
   }));
 }
 
@@ -55,7 +56,9 @@ function makeStore(items: ImageListItem[], mock: ReturnType<typeof makeIpc>): Co
 
 function emitReady(mock: ReturnType<typeof makeIpc>, id: string): void {
   mock.emit("thumb:ready", {
-    items: [{ asset_id: id, size_class: "preview2048", cache_generation: 1 }],
+    items: [
+      { asset_id: id, size_class: "preview2048", cache_generation: 1, version: 7 },
+    ],
   });
 }
 

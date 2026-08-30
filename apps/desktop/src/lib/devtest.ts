@@ -6,8 +6,13 @@
  * から本物のDOMイベントを生成して生産コードパスを駆動し、
  * 機械可読な状態リードアウト (画面右上) で数値を実測する。
  *
- * - リリースビルドからは App.svelte の import.meta.env.DEV ガードで除外される
- *   (計測時のみ GENTO_DEV_BRIDGE=1 で Rust側 dev_bridge_enabled が有効化する)
+ * - このモジュールは常にバンドルに含まれるが、**動的import + ランタイム
+ *   フラグ**で起動時にのみ読み込まれる: dev build (import.meta.env.DEV)、
+ *   またはreleaseで Rust側 `dev_bridge_enabled` がOkを返す場合
+ *   (環境変数 `GENTO_DEV_BRIDGE` の値が**厳密に "1"** のときのみ有効。
+ *   `0`・`true`・空文字では無効)。フラグ無効時はRust側で
+ *   `devtest_report` / `set_failure_injection` 等がErrを返す
+ *   (FG-1: リリースでの常時呼び出しを無害化)。
  * - wheel/pointerイベントは実リスナー (store.zoomAt / dragBy) を通る。
  *   setPointerCaptureだけは合成pointerIdでNotFoundになるため
  *   操作中のみ一時的にパッチする (本来の呼び出しは維持)

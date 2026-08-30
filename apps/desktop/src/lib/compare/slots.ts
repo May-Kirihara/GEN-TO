@@ -11,6 +11,8 @@ export type SlotItem = {
   displayName: string;
   width: number;
   height: number;
+  /** 内容感応URLバージョン (ページDTO由来。FG-1)。 */
+  version: number | null;
 };
 
 export type SlotSourceItem = {
@@ -19,6 +21,8 @@ export type SlotSourceItem = {
   width: number | null;
   height: number | null;
   state: string;
+  /** 内容感応URLバージョン (ページDTO由来。FG-1)。 */
+  version: number | null;
 };
 
 export type SlotGet = (index: number) => SlotSourceItem | null;
@@ -29,6 +33,7 @@ function toSlotItem(item: SlotSourceItem): SlotItem {
     displayName: item.displayName,
     width: item.width ?? 0,
     height: item.height ?? 0,
+    version: item.version,
   };
 }
 

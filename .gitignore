@@ -15,4 +15,6 @@ sample/dataset/
 
 # ログ・OS生成物
 *.log
+# 計測ログは証拠としてリポジトリに保全する (FG-1)
+!docs/dev/measurements/logs/*.log
 .DS_Store

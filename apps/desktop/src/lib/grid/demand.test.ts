@@ -8,8 +8,8 @@ import {
 } from "./demand";
 import type { ThumbReadyItem } from "../thumbnail-types";
 
-function readyItem(id: string, gen = 1, sizeClass = "s256"): ThumbReadyItem {
-  return { asset_id: id, size_class: sizeClass, cache_generation: gen };
+function readyItem(id: string, gen = 1, sizeClass = "s256", version = gen): ThumbReadyItem {
+  return { asset_id: id, size_class: sizeClass, cache_generation: gen, version };
 }
 
 describe("directionFromDelta", () => {
@@ -35,8 +35,20 @@ describe("ReadyMap", () => {
     expect(map.applyReady([readyItem("5", 1)])).toBe(1);
     expect(map.has("s256", "5")).toBe(true);
     expect(map.generation("s256", "5")).toBe(1);
+    expect(map.version("s256", "5")).toBe(1);
     expect(map.has("s512", "5")).toBe(false);
     expect(map.size("s256")).toBe(1);
+  });
+
+  it("versionはgenerationと独立に保持する (URL構成と世代ガードの分離)", () => {
+    const map = new ReadyMap();
+    map.applyReady([readyItem("5", 2, "s256", 999_999)]);
+    expect(map.generation("s256", "5")).toBe(2);
+    expect(map.version("s256", "5")).toBe(999_999);
+    // 世代ガードはgeneration側で機能する
+    map.noteGeneration(3);
+    expect(map.has("s256", "5")).toBe(false);
+    expect(map.version("s256", "5")).toBeNull();
   });
 
   it("既知世代より古いイベントは破棄される", () => {

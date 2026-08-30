@@ -460,5 +460,143 @@
    "dom": 49.0,
    "page_errors": 0.0
   }
+ ],
+ "fg1_s256_all": [
+  {
+   "run": 1,
+   "scan_ok": true,
+   "done": true,
+   "elapsed_s": 10.05,
+   "max_queue": 1548.0,
+   "p50_ms": 18.5,
+   "p95_ms": 28.0,
+   "p99_ms": 33.5,
+   "fail": 0.0,
+   "cache_bytes": 17823638.0
+  },
+  {
+   "run": 2,
+   "scan_ok": true,
+   "done": true,
+   "elapsed_s": 10.05,
+   "max_queue": 1548.0,
+   "p50_ms": 18.6,
+   "p95_ms": 27.5,
+   "p99_ms": 33.6,
+   "fail": 0.0,
+   "cache_bytes": 17823638.0
+  },
+  {
+   "run": 3,
+   "scan_ok": true,
+   "done": true,
+   "elapsed_s": 10.05,
+   "max_queue": 1548.0,
+   "p50_ms": 18.9,
+   "p95_ms": 29.1,
+   "p99_ms": 34.8,
+   "fail": 0.0,
+   "cache_bytes": 17823638.0
+  }
+ ],
+ "fg1_preview_all": [
+  {
+   "run": 1,
+   "scan_ok": true,
+   "done": true,
+   "elapsed_s": 27.05,
+   "generated": 1678.0,
+   "p50_ms": 59.3,
+   "p95_ms": 89.6,
+   "p99_ms": 106.0,
+   "fail": 0.0,
+   "cache_bytes": 81340914.0
+  },
+  {
+   "run": 2,
+   "scan_ok": true,
+   "done": true,
+   "elapsed_s": 27.05,
+   "generated": 1678.0,
+   "p50_ms": 58.6,
+   "p95_ms": 88.0,
+   "p99_ms": 101.1,
+   "fail": 0.0,
+   "cache_bytes": 81346440.0
+  },
+  {
+   "run": 3,
+   "scan_ok": true,
+   "done": true,
+   "elapsed_s": 27.05,
+   "generated": 1678.0,
+   "p50_ms": 59.1,
+   "p95_ms": 86.9,
+   "p99_ms": 100.2,
+   "fail": 0.0,
+   "cache_bytes": 81340914.0
+  }
+ ],
+ "fg1_v50k_scroll": [
+  {
+   "run": 1,
+   "mode_ok": true,
+   "total": 50000,
+   "pages_down": 40,
+   "keys_wall_s": 1.67,
+   "long_tasks": 0.0,
+   "lt_obs": 0.0,
+   "long_frames": 2.0,
+   "worst_frame_ms": 109.0,
+   "cancelled": 0.0,
+   "cancel_batches": 0.0,
+   "requests": 770.0,
+   "ready_recv": 770.0,
+   "generated": 0.0,
+   "q_after": 0.0,
+   "dom": 63.0,
+   "q_settled": 0.0,
+   "page_errors": 0.0
+  },
+  {
+   "run": 2,
+   "mode_ok": true,
+   "total": 50000,
+   "pages_down": 40,
+   "keys_wall_s": 1.65,
+   "long_tasks": 0.0,
+   "lt_obs": 0.0,
+   "long_frames": 2.0,
+   "worst_frame_ms": 128.0,
+   "cancelled": 0.0,
+   "cancel_batches": 0.0,
+   "requests": 770.0,
+   "ready_recv": 770.0,
+   "generated": 0.0,
+   "q_after": 0.0,
+   "dom": 63.0,
+   "q_settled": 0.0,
+   "page_errors": 0.0
+  },
+  {
+   "run": 3,
+   "mode_ok": true,
+   "total": 50000,
+   "pages_down": 40,
+   "keys_wall_s": 1.66,
+   "long_tasks": 0.0,
+   "lt_obs": 0.0,
+   "long_frames": 2.0,
+   "worst_frame_ms": 109.0,
+   "cancelled": 0.0,
+   "cancel_batches": 0.0,
+   "requests": 770.0,
+   "ready_recv": 770.0,
+   "generated": 0.0,
+   "q_after": 0.0,
+   "dom": 63.0,
+   "q_settled": 0.0,
+   "page_errors": 0.0
+  }
  ]
 }

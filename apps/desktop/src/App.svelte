@@ -263,11 +263,11 @@
     });
   }
 
-  /** 生成を要求し、その資産の thumb:ready を待つ (cache_generationを返す)。 */
+  /** 生成を要求し、その資産の thumb:ready を待つ (versionを返す)。 */
   async function requestAndWaitReady(
     assetId: string,
     sizeClass: string,
-  ): Promise<{ gen: number | null; note: string }> {
+  ): Promise<{ version: number | null; note: string }> {
     let unlisten: (() => void) | null = null;
     const readyPromise = new Promise<number | null>((resolve) => {
       let done = false;
@@ -276,7 +276,12 @@
         resolve(null);
       }, 90000);
       void listen<{
-        items: Array<{ asset_id: string; size_class: string; cache_generation: number }>;
+        items: Array<{
+          asset_id: string;
+          size_class: string;
+          cache_generation: number;
+          version: number;
+        }>;
       }>("thumb:ready", (event) => {
         if (done) {
           return;
@@ -287,7 +292,7 @@
         if (hit) {
           done = true;
           clearTimeout(timer);
-          resolve(hit.cache_generation);
+          resolve(hit.version);
         }
       }).then((un) => {
         unlisten = un;
@@ -301,12 +306,12 @@
       sizeClass,
       priority: "interactive",
     });
-    const gen = await readyPromise;
+    const version = await readyPromise;
     // CFAはthenコールバック内の代入を追跡しないため、明示的に読み直す
     const stop = unlisten as (() => void) | null;
     stop?.();
     const note = `受付 q=${accepted.queued} dup=${accepted.rejected_dup} hit=${accepted.cache_hits}`;
-    return { gen, note };
+    return { version, note };
   }
 
   /** 先頭のreadyなカタログ項目を1件取得する (staleGenerationは1回だけ再試行)。 */
@@ -353,36 +358,36 @@
 
       // S1: サムネイル (s256) — 要求 → thumb:ready → URL更新 → 表示切替
       const s1 = await requestAndWaitReady(target.id, "s256");
-      if (s1.gen === null) {
+      if (s1.version === null) {
         checks.push({ label: "S1", pass: false });
         push(`[S1] thumb s256 → FAIL (ready未受信 ${s1.note})`);
       } else {
-        const r = await loadImage(thumbUrl(target.id, "s256", s1.gen));
+        const r = await loadImage(thumbUrl(target.id, "s256", s1.version));
         checks.push({ label: "S1", pass: r.ok });
         push(
-          `[S1] thumb s256 gen=${s1.gen} ${s1.note} → ${r.ok ? "LOAD OK" : "LOAD FAIL"} (${r.detail})`,
+          `[S1] thumb s256 v=${s1.version} ${s1.note} → ${r.ok ? "LOAD OK" : "LOAD FAIL"} (${r.detail})`,
         );
       }
 
       // S2: preview2048
       const s2 = await requestAndWaitReady(target.id, "preview2048");
-      if (s2.gen === null) {
+      if (s2.version === null) {
         checks.push({ label: "S2", pass: false });
         push(`[S2] preview2048 → FAIL (ready未受信 ${s2.note})`);
       } else {
-        const r = await loadImage(previewUrl(target.id, s2.gen));
+        const r = await loadImage(previewUrl(target.id, s2.version));
         checks.push({ label: "S2", pass: r.ok });
         push(
-          `[S2] preview2048 gen=${s2.gen} ${s2.note} → ${r.ok ? "LOAD OK" : "LOAD FAIL"} (${r.detail})`,
+          `[S2] preview2048 v=${s2.version} ${s2.note} → ${r.ok ? "LOAD OK" : "LOAD FAIL"} (${r.detail})`,
         );
       }
 
-      // S3: original (元ファイル。生成不要。vは直近のgenerationを流用)
-      const genForOriginal = s2.gen ?? s1.gen ?? 1;
-      const r3 = await loadImage(originalUrl(target.id, genForOriginal));
+      // S3: original (元ファイル。生成不要。vは内容感応versionを流用)
+      const versionForOriginal = s2.version ?? s1.version ?? 1;
+      const r3 = await loadImage(originalUrl(target.id, versionForOriginal));
       checks.push({ label: "S3", pass: r3.ok });
       push(
-        `[S3] original gen=${genForOriginal} → ${r3.ok ? "LOAD OK" : "LOAD FAIL"} (${r3.detail})`,
+        `[S3] original v=${versionForOriginal} → ${r3.ok ? "LOAD OK" : "LOAD FAIL"} (${r3.detail})`,
       );
 
       // ネガティブ: いずれも onerror にならなければならない

@@ -2,7 +2,8 @@
  * サムネイル需要 (demand) の純粋ロジック (WP-5 / docs/dev/api-contract.md §12「未生成時」フロー)。
  *
  * - 可視行範囲から未生成IDを抽出し、優先度 (viewport > prefetch > overscan) ごとにバッチ化
- * - ReadyMap: サイズクラス別の生成済み地図。cache_generationで古いイベントを破棄
+ * - ReadyMap: サイズクラス別の生成済み地図。cache_generationで古いイベントを破棄し、
+ *   URL構成には内容感応versionを使う (FG-1)
  * - FailureSet: 生成失敗の記録 (再要求防止)
  */
 import type { ThumbReadyItem } from "../thumbnail-types";
@@ -26,10 +27,18 @@ export function directionFromDelta(prev: number, next: number, threshold = 8): 1
   return 0;
 }
 
+/** ReadyMapのエントリ: 世代ガード用のcache_generationとURL用のversion。 */
+type ReadyEntry = {
+  /** 要求時のcache_generation (キャッシュクリア検出用)。 */
+  generation: number;
+  /** 内容感応URLバージョン (`?v=`。FG-1)。 */
+  version: number;
+};
+
 /** サイズクラス別の生成済み地図。世代ガード込み。 */
 export class ReadyMap {
   private latestGeneration = 1;
-  private readonly maps = new Map<string, Map<string, number>>();
+  private readonly maps = new Map<string, Map<string, ReadyEntry>>();
 
   /** キャッシュクリア等で既知世代を進める。古い世代の項目を一掃する。 */
   noteGeneration(generation: number): void {
@@ -38,8 +47,8 @@ export class ReadyMap {
     }
     this.latestGeneration = generation;
     for (const map of this.maps.values()) {
-      for (const [id, gen] of map) {
-        if (gen < generation) {
+      for (const [id, entry] of map) {
+        if (entry.generation < generation) {
           map.delete(id);
         }
       }
@@ -62,7 +71,10 @@ export class ReadyMap {
         map = new Map();
         this.maps.set(item.size_class, map);
       }
-      map.set(item.asset_id, item.cache_generation);
+      map.set(item.asset_id, {
+        generation: item.cache_generation,
+        version: item.version,
+      });
       accepted++;
     }
     return accepted;
@@ -73,7 +85,12 @@ export class ReadyMap {
   }
 
   generation(sizeClass: string, id: string): number | null {
-    return this.maps.get(sizeClass)?.get(id) ?? null;
+    return this.maps.get(sizeClass)?.get(id)?.generation ?? null;
+  }
+
+  /** URL構成用の内容感応バージョン (未生成はnull)。 */
+  version(sizeClass: string, id: string): number | null {
+    return this.maps.get(sizeClass)?.get(id)?.version ?? null;
   }
 
   size(sizeClass: string): number {

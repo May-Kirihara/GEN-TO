@@ -37,6 +37,7 @@ function makeIpc(opts?: {
           byteSize: 1000,
           state: "ready" as const,
           thumbnailState: "missing" as const,
+          version: 800_000 + offset + i,
         }));
         return {
           generation: args?.generation,
@@ -85,9 +86,19 @@ function emit(listeners: Map<string, Listener>, event: string, payload: unknown)
   listeners.get(event)?.({ payload });
 }
 
-function readyItems(ids: string[], gen: number, sizeClass = "s256"): { items: ThumbReadyItem[] } {
+function readyItems(
+  ids: string[],
+  gen: number,
+  sizeClass = "s256",
+  version = gen,
+): { items: ThumbReadyItem[] } {
   return {
-    items: ids.map((id) => ({ asset_id: id, size_class: sizeClass, cache_generation: gen })),
+    items: ids.map((id) => ({
+      asset_id: id,
+      size_class: sizeClass,
+      cache_generation: gen,
+      version,
+    })),
   };
 }
 
@@ -275,6 +286,7 @@ describe("GridStore — 需要スケジューリング", () => {
                 byteSize: 1000,
                 state: "ready" as const,
                 thumbnailState: "missing" as const,
+                version: 800_000 + offset + i,
               })),
             } as CatalogPage as T,
           );
@@ -340,6 +352,19 @@ describe("GridStore — 世代ガード", () => {
     expect(grid.thumbUrlFor("3")).toBeNull();
     emit(listeners, "thumb:ready", readyItems(["3"], 2));
     expect(grid.thumbUrlFor("3")).toBe("gento-thumb://localhost/asset/3/s256?v=2");
+  });
+
+  it("URLのvは内容感応versionを使い (generationとは独立)、世代ガードはgenerationで効く", async () => {
+    const { ipc, listeners } = makeIpc();
+    const grid = new GridStore(ipc, { debounceMs: 150 });
+    await grid.init();
+    // generation=2・version=999999 のready → URLの ?v= は999999
+    emit(listeners, "thumb:ready", readyItems(["3"], 2, "s256", 999_999));
+    expect(grid.thumbUrlFor("3")).toBe("gento-thumb://localhost/asset/3/s256?v=999999");
+    // クリア (generation 3) で古い世代 (2) の項目は一掃される
+    grid.noteCacheCleared(3);
+    emit(listeners, "thumb:ready", readyItems(["3"], 2, "s256", 999_999));
+    expect(grid.thumbUrlFor("3")).toBeNull();
   });
 });
 

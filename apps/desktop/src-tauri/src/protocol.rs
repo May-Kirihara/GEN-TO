@@ -10,6 +10,9 @@
 //!   (url crateの構造化パース + 生パスセグメントのASCII厳密一致で保証)
 //! - キャッシュは正規化ルート包含 + シンボリックリンク拒否 (最終コンポーネントは
 //!   `symlink_metadata` で正規ファイル確認) + サイズ上限 (サムネイル64MiB / 元512MiB)
+//! - 読み取りは検証とopenの間の差し替え (TOCTOU) を閉じる: 最終コンポーネントを
+//!   `O_NOFOLLOW` で開き、open済みfdのfstatで検証時statの (dev, ino) 一致と
+//!   正規キャッシュルート包含 (`/proc/self/fd/{fd}` の実パス) を再確認する
 //! - 応答は `Content-Type` 正確・`X-Content-Type-Options: nosniff`・意図的な
 //!   `Cache-Control` (`v` 付きは immutable、無しは no-store)。
 //!   エラー本文・ログにファイルパスを出さない (IDとステータスのみ)
@@ -18,12 +21,18 @@
 //!   `tauri::async_runtime::spawn_blocking` で実行する
 //!
 //! URL契約 (docs/dev/api-contract.md §12):
-//! - `gento-thumb://localhost/asset/{id}/{s256|s512}?v={gen}`
-//! - `gento-preview://localhost/asset/{id}?v={gen}`
-//! - `gento-original://localhost/asset/{id}?v={gen}` (登録済みカタログ資産の元PNG)
+//! - `gento-thumb://localhost/asset/{id}/{s256|s512}?v={version}`
+//! - `gento-preview://localhost/asset/{id}?v={version}`
+//! - `gento-original://localhost/asset/{id}?v={version}` (登録済みカタログ資産の元PNG)
+//!
+//! `v` は内容感応バージョン (FG-1): 元ファイルのpath+size+mtimeとアルゴリズム
+//! バージョンから決まる (gento_image::cache::content_version)。同一URLは
+//! 同一内容を意味するためimmutable応答が安全になる。
 
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::Read;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -211,6 +220,12 @@ pub struct ServeSpec {
     pub content_type: &'static str,
     pub max_bytes: u64,
     pub cache_control: &'static str,
+    /// 検証時 (`resolve_file` 内の `symlink_metadata`) の (dev, ino)。
+    /// open後のfstat一致検証に使う (検証とopen間の差し替え検出)。
+    pub file_id: (u64, u64),
+    /// open済みfdの実パス包含を再検証する正規キャッシュルート。
+    /// None = 元ファイル系 (`gento-original`。包含対象なし、fstat一致のみ)。
+    pub canonical_root: Option<PathBuf>,
 }
 
 /// 解決失敗。パス等の詳細は保持しない (ログにIDとステータスのみ出す契約)。
@@ -256,13 +271,16 @@ pub fn resolve_file(
             if md.len() > MAX_THUMB_BYTES {
                 return Err(ResolveFailure::TooLarge);
             }
-            // キャッシュルート配下への包含 (中間ディレクトリのsymlink脱出対策)
-            verify_within_cache_root(&path, cache.root())?;
+            // キャッシュルート配下への包含 (中間ディレクトリのsymlink脱出対策)。
+            // 正規化ルートを返し、open後の再検証に使う。
+            let canonical_root = verify_within_cache_root(&path, cache.root())?;
             Ok(ServeSpec {
                 path,
                 content_type: "image/webp",
                 max_bytes: MAX_THUMB_BYTES,
                 cache_control,
+                file_id: (md.dev(), md.ino()),
+                canonical_root: Some(canonical_root),
             })
         }
         ProtoKind::Original => {
@@ -283,6 +301,8 @@ pub fn resolve_file(
                 content_type: "image/png",
                 max_bytes: MAX_ORIGINAL_BYTES,
                 cache_control,
+                file_id: (md.dev(), md.ino()),
+                canonical_root: None,
             })
         }
     }
@@ -290,31 +310,67 @@ pub fn resolve_file(
 
 /// 最終コンポーネントがシンボリックリンクでないことを symlink_metadata で確認し、
 /// canonicalize したキャッシュルート配下に収まることを検証する。
-fn verify_within_cache_root(path: &Path, root: &Path) -> Result<(), ResolveFailure> {
+/// 戻り値は正規化済みキャッシュルート (open後の包含再検証用)。
+fn verify_within_cache_root(path: &Path, root: &Path) -> Result<PathBuf, ResolveFailure> {
     let canonical = fs::canonicalize(path).map_err(|_| ResolveFailure::NotFound)?;
     let canonical_root = fs::canonicalize(root).map_err(|_| ResolveFailure::NotFound)?;
     if canonical.starts_with(&canonical_root) {
-        Ok(())
+        Ok(canonical_root)
     } else {
         Err(ResolveFailure::NotFound)
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReadError {
     Gone,
     Io,
 }
 
-/// 解決済みパスを読み込む。open後のfstatで正規ファイル・上限・長さ一致を再検証する
-/// (検証とopen間の置き換え検出。完全なTOCTOU排除はO_NOFOLLOWが必要でstdにない)。
+/// 解決済みパスを読み込む。`resolve_file` での検証とopenの間の差し替え
+/// (TOCTOU) を閉じる:
+///
+/// 1. 最終コンポーネントを `O_NOFOLLOW` 付きで開く (シンボリックリンクなら
+///    ELOOPで失敗 = 検証後のシンボリックリンク差し替えを拒否)
+/// 2. open済みfdをfstatし、(a) 正規ファイル (b) サイズ上限 (c) 検証時statの
+///    (dev, ino) 一致を確認する (中間ディレクトリ差し替えで別ファイルが開けば
+///    不一致となり拒否)
+/// 3. キャッシュ系はfdの実パス (`/proc/self/fd/{fd}` のreadlink) が正規
+///    キャッシュルート配下であることを再確認する (防御の重ね)
+///
+/// open後のreadはfdがinodeをピンするため、以後の差し替え・renameの影響を受けない。
+///
+/// 残る理論的制限: 同一inodeへのhardlink差し替えは (dev, ino) と実パスの
+/// いずれでも区別できない。キャッシュディレクトリへ書き込める攻撃者は
+/// ファイル内容を直接書き換えることもできるため脅威モデル外とする
+/// (キャッシュディレクトリはアプリ私有)。
 fn read_file_checked(spec: &ServeSpec) -> Result<Vec<u8>, ReadError> {
-    let file = File::open(&spec.path).map_err(|e| match e.kind() {
-        io::ErrorKind::NotFound => ReadError::Gone,
-        _ => ReadError::Io,
-    })?;
+    let file = File::options()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&spec.path)
+        .map_err(|e| match e.raw_os_error() {
+            // O_NOFOLLOW: 最終コンポーネントがシンボリックリンク (検証後の
+            // 差し替え)。消失 (ENOENT) と同じ「もう無い」扱い。
+            Some(libc::ELOOP) | Some(libc::ENOENT) | None => ReadError::Gone,
+            _ => ReadError::Io,
+        })?;
     let md = file.metadata().map_err(|_| ReadError::Gone)?;
     if !md.is_file() || md.len() > spec.max_bytes {
         return Err(ReadError::Gone);
+    }
+    if (md.dev(), md.ino()) != spec.file_id {
+        // 検証時と別のinode = 中間ディレクトリ差し替え等
+        return Err(ReadError::Gone);
+    }
+    if let Some(root) = &spec.canonical_root {
+        let proc_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        let real = fs::read_link(&proc_path).map_err(|_| ReadError::Io)?;
+        // open済みパスがrename/unlink済みならcanonicalize失敗 → 拒否 (安全側)
+        let real = fs::canonicalize(&real).map_err(|_| ReadError::Gone)?;
+        if !real.starts_with(root) {
+            return Err(ReadError::Gone);
+        }
     }
     let mut buf = Vec::with_capacity(md.len() as usize);
     file.take(spec.max_bytes.saturating_add(1))
@@ -1339,6 +1395,87 @@ mod tests {
             Some(&cache),
         );
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ===== TOCTOU競合シミュレーション (FG-1 / F1) =====
+    // resolve_file (検証) と read_file_checked (open+read) の間でファイルシステムを
+    // 差し替えることで、検証→open間の競合ウィンドウを単体テスト可能にしている。
+
+    fn resolved_thumb_spec(dir: &TestDir, cache: &ThumbnailCache) -> (ServeSpec, PathBuf) {
+        let src = dir.path().join("src.png");
+        fs::write(&src, b"x").unwrap();
+        let asset = snapshot_for(1, &src, true);
+        let path = cache_path_for(cache, &asset, SizeClass::S256);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"WEBPDATA!").unwrap();
+        let req = parse_ok(ProtoKind::Thumb, "gento-thumb://localhost/asset/1/s256?v=1");
+        let spec = resolve_file(&req, &asset, cache).expect("resolve before swap");
+        (spec, path)
+    }
+
+    #[test]
+    fn final_component_swapped_to_symlink_after_resolve_is_rejected() {
+        // 検証後に最終コンポーネントを外部ファイルへのシンボリックリンクへ
+        // 差し替えても拒否されること (O_NOFOLLOW + fstatの二重防御)。
+        let dir = TestDir::new("toctou-final");
+        let cache = cache_at(&dir);
+        let (spec, path) = resolved_thumb_spec(&dir, &cache);
+
+        let outside = dir.path().join("outside.webp");
+        fs::write(&outside, b"stolen").unwrap();
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+
+        match read_file_checked(&spec) {
+            Err(ReadError::Gone) => {}
+            Err(ReadError::Io) => panic!("symlink swap must map to 404 (Gone), not 500"),
+            Ok(bytes) => panic!("symlink swap must be rejected, got {} bytes", bytes.len()),
+        }
+    }
+
+    #[test]
+    fn intermediate_dir_swapped_after_resolve_is_rejected() {
+        // 検証後にshardディレクトリ側を差し替えると、open自体は成功しても
+        // fstatの (dev, ino) が検証時と一致しないため拒否されること。
+        let dir = TestDir::new("toctou-dir");
+        let cache = cache_at(&dir);
+        let (spec, path) = resolved_thumb_spec(&dir, &cache);
+
+        let shard = path.parent().unwrap().to_path_buf();
+        let outside_dir = dir.path().join("outside-shard");
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(outside_dir.join(path.file_name().unwrap()), b"stolen").unwrap();
+        fs::rename(&shard, dir.path().join("shard-moved")).unwrap();
+        std::os::unix::fs::symlink(&outside_dir, &shard).unwrap();
+
+        match read_file_checked(&spec) {
+            Err(ReadError::Gone) => {}
+            Err(ReadError::Io) => panic!("dir swap must map to 404 (Gone), not 500"),
+            Ok(bytes) => panic!("dir swap must be rejected, got {} bytes", bytes.len()),
+        }
+    }
+
+    #[test]
+    fn fd_real_path_outside_root_is_rejected() {
+        // 包含再検証自体の単体検証: (dev, ino) が正しくても、open済みfdの
+        // 実パスが正規ルート外を指すspecは拒否されること。
+        let dir = TestDir::new("toctou-contain");
+        let cache = cache_at(&dir);
+        let (mut spec, _path) = resolved_thumb_spec(&dir, &cache);
+        spec.canonical_root = Some(PathBuf::from("/definitely/not/the/cache/root"));
+        match read_file_checked(&spec) {
+            Err(ReadError::Gone) => {}
+            other => panic!("outside-root spec must be rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_after_successful_checks_returns_body() {
+        // 競合なしの場合は従来どおり読み取れる (回帰確認)。
+        let dir = TestDir::new("toctou-clean");
+        let cache = cache_at(&dir);
+        let (spec, _) = resolved_thumb_spec(&dir, &cache);
+        assert_eq!(read_file_checked(&spec).unwrap(), b"WEBPDATA!");
     }
 
     #[test]

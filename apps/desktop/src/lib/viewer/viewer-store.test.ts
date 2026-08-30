@@ -14,6 +14,7 @@ function item(index: number, overrides: Partial<ImageListItem> = {}): ImageListI
     byteSize: 1000,
     state: "ready",
     thumbnailState: "ready",
+    version: 100_000 + index,
     ...overrides,
   };
 }
@@ -55,8 +56,10 @@ function makeIpc(): IpcMock {
   };
 }
 
-function readyPayload(id: string, gen = 1): { items: ThumbReadyItem[] } {
-  return { items: [{ asset_id: id, size_class: "preview2048", cache_generation: gen }] };
+function readyPayload(id: string, gen = 1, version = gen): { items: ThumbReadyItem[] } {
+  return {
+    items: [{ asset_id: id, size_class: "preview2048", cache_generation: gen, version }],
+  };
 }
 
 function makeStore(items: ImageListItem[], mock: IpcMock, now: () => number): ViewerStore {

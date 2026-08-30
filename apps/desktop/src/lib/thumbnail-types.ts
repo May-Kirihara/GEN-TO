@@ -68,6 +68,8 @@ export type ThumbReadyItem = {
   asset_id: string;
   size_class: string;
   cache_generation: number;
+  /** 内容感応URLバージョン (FG-1)。`?v={version}` に使う。 */
+  version: number;
 };
 
 /** thumb:failed イベントの項目。 */

@@ -225,8 +225,8 @@ export class GridStore {
 
   /** ready地図からプロトコルURLを構成する (未生成はnull)。 */
   thumbUrlFor(id: string): string | null {
-    const gen = this.ready.generation(this.sizeClassValue, id);
-    return gen === null ? null : thumbUrl(id, this.sizeClassValue, gen);
+    const version = this.ready.version(this.sizeClassValue, id);
+    return version === null ? null : thumbUrl(id, this.sizeClassValue, version);
   }
 
   /** このセルが現在のサイズクラスで生成失敗しているか (WP-7 A2の失敗表示)。 */

@@ -3,8 +3,12 @@
  *
  * - Rustハンドラは authority として `localhost` (または空) のみを受ける。
  *   ビルダは常に `localhost` 形式で生成する。
- * - ID は10進数字のみ・最大20桁、generation (v) は10進・最大18桁。
+ * - ID は10進数字のみ・最大20桁、version (v) は10進・最大18桁。
  *   不正な値は例外にする (静かにエンコードして拡張構文を生まない)。
+ * - `?v=` は内容感応バージョン (FG-1): 元ファイルの path+size+mtime と
+ *   サムネイルアルゴリズムバージョンから決まる値 (thumb:ready イベントまたは
+ *   ページDTOの version)。元ファイルが変わればURLが変わり、WebViewの
+ *   immutableキャッシュが更新される。
  */
 
 /** gento-thumb で指定できるサイズクラス (preview2048は gento-preview 側)。 */
@@ -19,30 +23,34 @@ function requireDecimalDigits(value: string, what: string, maxLen: number): stri
   return value;
 }
 
-function requireGeneration(gen: number): string {
-  if (!Number.isInteger(gen) || gen < 0) {
-    throw new Error("invalid generation: expected a non-negative integer");
+function requireVersion(version: number): string {
+  if (!Number.isInteger(version) || version < 0) {
+    throw new Error("invalid version: expected a non-negative integer");
   }
-  return requireDecimalDigits(String(gen), "generation", 18);
+  return requireDecimalDigits(String(version), "version", 18);
 }
 
-/** `gento-thumb://localhost/asset/{id}/{sizeClass}?v={gen}` */
-export function thumbUrl(assetId: string, sizeClass: ThumbSizeClass, gen: number): string {
+/** `gento-thumb://localhost/asset/{id}/{sizeClass}?v={version}` */
+export function thumbUrl(
+  assetId: string,
+  sizeClass: ThumbSizeClass,
+  version: number,
+): string {
   const id = requireDecimalDigits(assetId, "asset id", 20);
   if (sizeClass !== "s256" && sizeClass !== "s512") {
     throw new Error(`invalid thumb size class: ${String(sizeClass)}`);
   }
-  return `gento-thumb://${HOST}/asset/${id}/${sizeClass}?v=${requireGeneration(gen)}`;
+  return `gento-thumb://${HOST}/asset/${id}/${sizeClass}?v=${requireVersion(version)}`;
 }
 
-/** `gento-preview://localhost/asset/{id}?v={gen}` */
-export function previewUrl(assetId: string, gen: number): string {
+/** `gento-preview://localhost/asset/{id}?v={version}` */
+export function previewUrl(assetId: string, version: number): string {
   const id = requireDecimalDigits(assetId, "asset id", 20);
-  return `gento-preview://${HOST}/asset/${id}?v=${requireGeneration(gen)}`;
+  return `gento-preview://${HOST}/asset/${id}?v=${requireVersion(version)}`;
 }
 
-/** `gento-original://localhost/asset/{id}?v={gen}` */
-export function originalUrl(assetId: string, gen: number): string {
+/** `gento-original://localhost/asset/{id}?v={version}` */
+export function originalUrl(assetId: string, version: number): string {
   const id = requireDecimalDigits(assetId, "asset id", 20);
-  return `gento-original://${HOST}/asset/${id}?v=${requireGeneration(gen)}`;
+  return `gento-original://${HOST}/asset/${id}?v=${requireVersion(version)}`;
 }

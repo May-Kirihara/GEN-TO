@@ -48,6 +48,8 @@ export type CompareItems = {
     width: number | null;
     height: number | null;
     state: string;
+    /** 内容感応URLバージョン (ページDTO由来。FG-1)。 */
+    version: number | null;
   } | null;
   ensureRange(start: number, end: number): Promise<void>;
   findIndexById(id: string): number | null;
@@ -74,6 +76,8 @@ export type CompareSlot = {
   /** URL束縛世代 (onload照合用)。 */
   key: string;
   note: string | null;
+  /** ページDTO由来の内容感応バージョン (original昇格時のURLに使う。FG-1)。 */
+  version: number | null;
 };
 
 function emptySlot(seq: number): CompareSlot {
@@ -92,6 +96,7 @@ function emptySlot(seq: number): CompareSlot {
     viewport: { width: 0, height: 0 },
     key: `s${seq}`,
     note: null,
+    version: null,
   };
 }
 
@@ -212,11 +217,12 @@ export class CompareStore {
     slot.width = item.width;
     slot.height = item.height;
     slot.isOriginal = false;
+    slot.version = item.version;
     slot.key = `s${++this.seq}`;
     slot.note = null;
     slot.own = fitTransform(slot.viewport, { width: item.width, height: item.height });
-    const readyGen = this.ready.generation(PREVIEW_CLASS, item.assetId);
-    slot.url = readyGen !== null ? previewUrl(item.assetId, readyGen) : null;
+    const readyVersion = this.ready.version(PREVIEW_CLASS, item.assetId);
+    slot.url = readyVersion !== null ? previewUrl(item.assetId, readyVersion) : null;
     if (slot.url === null) {
       this.requestPreview(item.assetId);
     }
@@ -256,7 +262,7 @@ export class CompareStore {
           slot.assetId === event.asset_id &&
           event.size_class === PREVIEW_CLASS
         ) {
-          slot.url = previewUrl(event.asset_id, event.cache_generation);
+          slot.url = previewUrl(event.asset_id, event.version);
         }
       }
     }
@@ -287,6 +293,7 @@ export class CompareStore {
               displayName: slot.displayName,
               width: slot.width,
               height: slot.height,
+              version: slot.version,
             },
       ),
       this.nextIndex,
@@ -533,15 +540,18 @@ export class CompareStore {
     const prevW = slot.width;
     const prevH = slot.height;
     if (useOriginal) {
-      const gen = this.ready.generation(PREVIEW_CLASS, slot.assetId) ?? 1;
+      // original URLのバージョンはページDTO由来のものを優先 (表示中項目の
+      // 現在の内容に対応)。未取得時のみready地図の値へフォールバックする。
+      const version =
+        slot.version ?? this.ready.version(PREVIEW_CLASS, slot.assetId) ?? 1;
       slot.key = `s${++this.seq}`;
-      slot.url = originalUrl(slot.assetId, gen);
+      slot.url = originalUrl(slot.assetId, version);
       slot.isOriginal = true;
     } else {
-      const gen = this.ready.generation(PREVIEW_CLASS, slot.assetId);
+      const readyVersion = this.ready.version(PREVIEW_CLASS, slot.assetId);
       slot.key = `s${++this.seq}`;
       slot.isOriginal = false;
-      slot.url = gen !== null ? previewUrl(slot.assetId, gen) : null;
+      slot.url = readyVersion !== null ? previewUrl(slot.assetId, readyVersion) : null;
       if (slot.url === null) {
         this.requestPreview(slot.assetId);
       }
@@ -570,9 +580,9 @@ export class CompareStore {
       return;
     }
     slot.isOriginal = false;
-    const gen = this.ready.generation(PREVIEW_CLASS, slot.assetId);
+    const readyVersion = this.ready.version(PREVIEW_CLASS, slot.assetId);
     slot.key = `s${++this.seq}`;
-    slot.url = gen !== null ? previewUrl(slot.assetId, gen) : null;
+    slot.url = readyVersion !== null ? previewUrl(slot.assetId, readyVersion) : null;
     if (slot.url === null) {
       this.requestPreview(slot.assetId);
     }

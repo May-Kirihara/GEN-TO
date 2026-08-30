@@ -107,6 +107,7 @@ function makePage(generation: number, offset: number, names: string[]): CatalogP
       byteSize: 12345,
       state: "ready" as const,
       thumbnailState: "missing" as const,
+      version: 900_000 + offset + i,
     })),
   };
 }

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { originalUrl, previewUrl, thumbUrl } from "./protocol";
 
 describe("thumbUrl", () => {
-  it("s256 with generation を localhost host 形式で生成する", () => {
+  it("s256 with version を localhost host 形式で生成する", () => {
     expect(thumbUrl("42", "s256", 3)).toBe("gento-thumb://localhost/asset/42/s256?v=3");
   });
 
@@ -15,11 +15,11 @@ describe("thumbUrl", () => {
     expect(thumbUrl(id, "s256", 1)).toBe(`gento-thumb://localhost/asset/${id}/s256?v=1`);
   });
 
-  it("generation 0 は文法上有効なため許可する", () => {
+  it("version 0 は文法上有効なため許可する", () => {
     expect(thumbUrl("1", "s256", 0)).toBe("gento-thumb://localhost/asset/1/s256?v=0");
   });
 
-  it("18桁のgenerationを許可する (Rust側上限と一致)", () => {
+  it("18桁のversionを許可する (Rust側上限と一致)", () => {
     // 注: 2^53超の整数はfloat64で正確に表せないため、
     // 正確に表現可能な 1e17 (18桁) を境界値に使う
     const gen = 1e17;
@@ -37,7 +37,7 @@ describe("thumbUrl", () => {
     expect(() => thumbUrl("100000000000000000000", "s256", 1)).toThrow();
   });
 
-  it("不正なgeneration (負・小数・19桁) を拒否する", () => {
+  it("不正なversion (負・小数・19桁) を拒否する", () => {
     expect(() => thumbUrl("1", "s256", -1)).toThrow();
     expect(() => thumbUrl("1", "s256", 1.5)).toThrow();
     expect(() => thumbUrl("1", "s256", 1e17)).not.toThrow(); // 18桁
@@ -56,7 +56,7 @@ describe("previewUrl", () => {
     expect(previewUrl("9", 2)).toBe("gento-preview://localhost/asset/9?v=2");
   });
 
-  it("不正なID/generationを拒否する", () => {
+  it("不正なID/versionを拒否する", () => {
     expect(() => previewUrl("x", 1)).toThrow();
     expect(() => previewUrl("1", Number.NaN)).toThrow();
   });

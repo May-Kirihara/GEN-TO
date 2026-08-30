@@ -3,7 +3,9 @@
 //! 本モジュールはthin adapter: ビジネスロジックはgento-core / gento-imageにある。
 //! UIスレッドでファイルI/Oを行わない (走査・プローブは専用スレッド)。
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -12,6 +14,7 @@ use gento_core::catalog::{
     ThumbnailState, Triage, VIRTUAL_CATALOG_COUNT,
 };
 use gento_core::AssetId;
+use gento_image::cache::asset_version;
 use gento_image::metrics::{log_scan_metrics, read_self_rss_kb, ScanMetrics};
 use gento_image::probe::{probe_png_dimensions, ProbeResult};
 use gento_image::scan::{scan_pngs, ScanBatch};
@@ -29,6 +32,11 @@ pub struct AppState {
     pub thumbnails: Option<Arc<crate::thumbnails::ThumbnailService>>,
     /// ローカル画像プロトコルの統計 (WP-4)。
     pub proto_stats: Arc<crate::protocol::ProtoStats>,
+    /// 計測ブリッジ (devtest) の有効フラグ (FG-1)。起動時に環境変数
+    /// `GENTO_DEV_BRIDGE` (値は厳密に "1") から確定し以後不変。
+    /// 危険コマンド (set_failure_injection / devtest_report /
+    /// dev_bridge_enabled) のゲートとして使う。
+    pub dev_bridge: AtomicBool,
 }
 
 /// ロック内で保持するカタログ実状態。
@@ -81,12 +89,18 @@ impl AppState {
             catalog: Mutex::new(CatalogInner::new()),
             thumbnails: None,
             proto_stats: Arc::new(crate::protocol::ProtoStats::new()),
+            dev_bridge: AtomicBool::new(crate::dev_bridge_enabled_strict()),
         }
     }
 
     /// カタログロックの取得 (poisoning復旧付き)。
     pub fn lock_catalog(&self) -> MutexGuard<'_, CatalogInner> {
         lock(&self.catalog)
+    }
+
+    /// 計測ブリッジが有効か (起動時に確定したフラグ)。
+    pub fn dev_bridge_enabled(&self) -> bool {
+        self.dev_bridge.load(Ordering::SeqCst)
     }
 
     /// サムネイルサービスを取り出す。setup以降は必ず存在する。
@@ -229,14 +243,83 @@ pub fn get_catalog_summary(state: State<'_, AppState>) -> CatalogSummary {
     summary_of(&lock(&state.catalog))
 }
 
+/// `get_catalog_page` の項目DTO。gento-core `ImageListItem` + 内容感応version
+/// (FG-1 / F3)。version計算はキャッシュキー入力 (path+size+mtime) を必要と
+/// するため、gento-coreではなくthin adapter層で付与する。
+/// camelCaseは `ImageListItem` (本体計画 §9) に合わせる。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogItemDto {
+    pub id: AssetId,
+    pub display_name: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub byte_size: u64,
+    pub state: ImageState,
+    pub thumbnail_state: ThumbnailState,
+    /// 内容感応URLバージョン (api-contract §12)。元ファイルの
+    /// size/mtime・実体パス・アルゴリズムバージョンから決まる。
+    /// フロントは original 表示やURL組み立てに使う。
+    pub version: u64,
+}
+
+/// `get_catalog_page` の戻り値DTO (`PageResult` + 項目のversion)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CatalogPageDto {
+    pub generation: u64,
+    pub total: u32,
+    pub offset: u32,
+    pub items: Vec<CatalogItemDto>,
+    pub has_more: bool,
+}
+
+/// ページ項目へ内容感応versionを付与する。レコード列を1回走査して
+/// ページ内IDのversion表を作る (項目ごとの線形探索を避けるため)。
+fn augment_page_with_versions(state: &AppState, page: PageResult) -> CatalogPageDto {
+    let mut versions: HashMap<AssetId, u64> = HashMap::with_capacity(page.items.len());
+    {
+        let inner = state.lock_catalog();
+        let wanted: HashSet<AssetId> = page.items.iter().map(|item| item.id).collect();
+        for record in inner.records() {
+            if wanted.contains(&record.id) {
+                versions.insert(
+                    record.id,
+                    asset_version(&record.source_path, record.byte_size, record.mtime_ms),
+                );
+            }
+        }
+    }
+    CatalogPageDto {
+        generation: page.generation,
+        total: page.total,
+        offset: page.offset,
+        has_more: page.has_more,
+        items: page
+            .items
+            .into_iter()
+            .map(|item| CatalogItemDto {
+                version: versions.get(&item.id).copied().unwrap_or(0),
+                id: item.id,
+                display_name: item.display_name,
+                width: item.width,
+                height: item.height,
+                byte_size: item.byte_size,
+                state: item.state,
+                thumbnail_state: item.thumbnail_state,
+            })
+            .collect(),
+    }
+}
+
 #[tauri::command]
 pub fn get_catalog_page(
     state: State<'_, AppState>,
     generation: u64,
     offset: u32,
     limit: u32,
-) -> Result<PageResult, PageError> {
-    lock(&state.catalog).state.page(generation, offset, limit)
+) -> Result<CatalogPageDto, PageError> {
+    let page = lock(&state.catalog).state.page(generation, offset, limit)?;
+    Ok(augment_page_with_versions(&state, page))
 }
 
 #[tauri::command]
@@ -519,6 +602,83 @@ mod tests {
         assert_eq!(progress.error_samples.len(), ERROR_SAMPLE_LIMIT);
         assert_eq!(progress.error_samples[0], "e5");
         assert_eq!(progress.error_samples[4], "e9");
+    }
+
+    // ===== ページDTOの内容感応version (FG-1 / F3) =====
+
+    fn record_with(path: &str, id: u64, byte_size: u64, mtime_ms: u64) -> ImageRecord {
+        ImageRecord {
+            id: AssetId::new(id),
+            source_path: PathBuf::from(path),
+            display_name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            width: Some(100),
+            height: Some(200),
+            byte_size,
+            mtime_ms,
+            state: ImageState::Ready,
+            thumb_state: ThumbnailState::Missing,
+            rating: 0,
+            triage: Triage::Undecided,
+        }
+    }
+
+    #[test]
+    fn page_dto_items_carry_version_that_tracks_content() {
+        let state = AppState::new(PathBuf::from("/tmp/gento-test-dataset"));
+        {
+            let mut inner = state.lock_catalog();
+            inner
+                .state
+                .records
+                .push(record_with("/x/a.png", 1, 100, 1_000));
+        }
+        // page()とaugment()は別statementで (augment内でロックを取り直すため)
+        let page = state.lock_catalog().state.page(1, 0, 10).expect("page");
+        let dto = augment_page_with_versions(&state, page);
+        assert_eq!(dto.items.len(), 1);
+        let v1 = dto.items[0].version;
+        assert!(v1 > 0);
+
+        // 元ファイルのsize変化 → version変化 (同一assetIdのまま)
+        state.lock_catalog().state.records[0].byte_size = 101;
+        let page = state.lock_catalog().state.page(1, 0, 10).expect("page");
+        let dto2 = augment_page_with_versions(&state, page);
+        assert_ne!(dto2.items[0].version, v1);
+
+        // mtime変化でも変化
+        state.lock_catalog().state.records[0].mtime_ms = 2_000;
+        let page = state.lock_catalog().state.page(1, 0, 10).expect("page");
+        let dto3 = augment_page_with_versions(&state, page);
+        assert_ne!(dto3.items[0].version, v1);
+        assert_ne!(dto3.items[0].version, dto2.items[0].version);
+        // クエリ桁上限 (18桁) に収まる
+        assert!(dto3.items[0].version.to_string().len() <= 18);
+    }
+
+    #[test]
+    fn page_dto_serialization_shape_keeps_camel_case_and_adds_version() {
+        let state = AppState::new(PathBuf::from("/tmp/gento-test-dataset"));
+        state
+            .lock_catalog()
+            .state
+            .records
+            .push(record_with("/x/a.png", 42, 1234, 5));
+        let page = state.lock_catalog().state.page(1, 0, 10).expect("page");
+        let dto = augment_page_with_versions(&state, page);
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(
+            json["items"][0],
+            serde_json::json!({
+                "id": "42",
+                "displayName": "a.png",
+                "width": 100,
+                "height": 200,
+                "byteSize": 1234,
+                "state": "ready",
+                "thumbnailState": "missing",
+                "version": dto.items[0].version,
+            })
+        );
     }
 
     #[test]

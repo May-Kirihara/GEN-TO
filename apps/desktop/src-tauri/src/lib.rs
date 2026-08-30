@@ -85,15 +85,57 @@ fn health(state: State<'_, AppState>) -> HealthInfo {
 
 /// 実機計測ブリッジ (devtest.ts) の有効化。既定は無効。
 /// release buildでも `GENTO_DEV_BRIDGE=1` で計測を可能にする (計画 §16)。
+/// フラグは AppState (起動時にenvから確定) が持ち、無効ならErrを返す
+/// (危険コマンドの常時登録を登録済みでも無害化する。FG-1)。
 #[tauri::command]
-fn dev_bridge_enabled() -> bool {
-    std::env::var_os("GENTO_DEV_BRIDGE").is_some()
+fn dev_bridge_enabled(state: State<'_, AppState>) -> Result<bool, String> {
+    dev_bridge_enabled_impl(&state)
 }
 
 /// 計測ブリッジから機械可読な行をログへ流す (bash側は `devtest:` でgrepする)。
+/// ブリッジ無効時はErr (書き込み不能)。
 #[tauri::command]
-fn devtest_report(payload: String) {
+fn devtest_report(state: State<'_, AppState>, payload: String) -> Result<(), String> {
+    devtest_report_impl(&state, &payload)
+}
+
+/// [`dev_bridge_enabled`] のゲート付き本体 (単体テスト用にStateから切り出した)。
+pub(crate) fn dev_bridge_enabled_impl(state: &AppState) -> Result<bool, String> {
+    if state.dev_bridge_enabled() {
+        Ok(true)
+    } else {
+        Err(DEV_BRIDGE_DISABLED_MESSAGE.to_string())
+    }
+}
+
+/// [`devtest_report`] のゲート付き本体 (単体テスト用にStateから切り出した)。
+pub(crate) fn devtest_report_impl(state: &AppState, payload: &str) -> Result<(), String> {
+    dev_bridge_gate(state)?;
     tracing::info!(target: "devtest", "{payload}");
+    Ok(())
+}
+
+/// 危険コマンド共通のゲート。無効ならErr。
+pub(crate) fn dev_bridge_gate(state: &AppState) -> Result<(), String> {
+    if state.dev_bridge_enabled() {
+        Ok(())
+    } else {
+        Err(DEV_BRIDGE_DISABLED_MESSAGE.to_string())
+    }
+}
+
+const DEV_BRIDGE_DISABLED_MESSAGE: &str =
+    "dev bridge is disabled (set GENTO_DEV_BRIDGE=1 to enable)";
+
+/// `GENTO_DEV_BRIDGE` の値が有効か。**値がちょうど `"1"` のときのみ有効**。
+/// 未設定・`0`・`true`・空文字は無効 (releaseでの意図しない有効化を防ぐ)。
+fn dev_bridge_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+/// 環境変数から計測ブリッジ有効フラグを確定する (AppState生成時に一度だけ)。
+pub(crate) fn dev_bridge_enabled_strict() -> bool {
+    dev_bridge_value_enabled(std::env::var_os("GENTO_DEV_BRIDGE").as_deref())
 }
 
 pub fn run() {
@@ -259,5 +301,65 @@ mod tests {
         let dir = resolve_cache_dir(&[]);
         let base = dirs::cache_dir().unwrap_or_else(std::env::temp_dir);
         assert_eq!(dir, base.join("gento-spike").join("thumbnails"));
+    }
+
+    // ===== 計測ブリッジのゲート (FG-1 / F2) =====
+
+    use std::ffi::OsStr;
+
+    #[test]
+    fn dev_bridge_env_value_must_be_exactly_one() {
+        // 値がちょうど "1" のときのみ有効
+        assert!(dev_bridge_value_enabled(Some(OsStr::new("1"))));
+        // 未設定・"0"・"true"・空文字・前後空白は無効
+        assert!(!dev_bridge_value_enabled(None));
+        assert!(!dev_bridge_value_enabled(Some(OsStr::new("0"))));
+        assert!(!dev_bridge_value_enabled(Some(OsStr::new("true"))));
+        assert!(!dev_bridge_value_enabled(Some(OsStr::new(""))));
+        assert!(!dev_bridge_value_enabled(Some(OsStr::new(" 1"))));
+        assert!(!dev_bridge_value_enabled(Some(OsStr::new("1\n"))));
+    }
+
+    #[test]
+    fn dev_bridge_commands_gate_on_appstate_flag() {
+        use thumbnails::{ThumbEvents, ThumbFailedItem, ThumbReadyItem};
+
+        struct NoEvents;
+        impl ThumbEvents for NoEvents {
+            fn ready(&self, _items: &[ThumbReadyItem]) {}
+            fn failed(&self, _items: &[ThumbFailedItem]) {}
+        }
+
+        let cache_root =
+            std::env::temp_dir().join(format!("gento-lib-gate-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_root);
+        let service =
+            ThumbnailService::new(cache_root.clone(), Box::new(NoEvents)).expect("service");
+        // テスト実行時の環境変数に依存しないようフラグを明示する
+        let mut state = AppState::new(PathBuf::from("/tmp/gento-test-dataset"));
+        state.thumbnails = Some(std::sync::Arc::clone(&service));
+        state
+            .dev_bridge
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(dev_bridge_enabled_impl(&state).is_err());
+        assert!(devtest_report_impl(&state, "G line").is_err());
+        assert!(
+            thumbnails::set_failure_injection_impl(&state, "decode", 0.5).is_err(),
+            "set_failure_injection must be gated"
+        );
+
+        state
+            .dev_bridge
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(dev_bridge_enabled_impl(&state), Ok(true));
+        assert!(devtest_report_impl(&state, "G line").is_ok());
+        let dto = thumbnails::set_failure_injection_impl(&state, "none", 0.0).unwrap();
+        assert_eq!(dto.mode, "none");
+        assert_eq!(dto.rate, 0.0);
+        // 無効時と異なり、不正な引数は通常どおり引数検証で拒否される
+        assert!(thumbnails::set_failure_injection_impl(&state, "bogus", 0.5).is_err());
+        assert!(thumbnails::set_failure_injection_impl(&state, "decode", 1.5).is_err());
+        service.shutdown();
+        let _ = std::fs::remove_dir_all(&cache_root);
     }
 }

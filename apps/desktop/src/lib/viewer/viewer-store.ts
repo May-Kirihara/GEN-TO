@@ -59,6 +59,8 @@ export type ViewerImage = {
   url: string | null;
   isOriginal: boolean;
   note: string | null;
+  /** ページDTO由来の内容感応バージョン (original昇格時のURLに使う。FG-1)。 */
+  version: number | null;
 };
 
 function placeholderImage(navGen: number): ViewerImage {
@@ -72,6 +74,7 @@ function placeholderImage(navGen: number): ViewerImage {
     url: null,
     isOriginal: false,
     note: null,
+    version: null,
   };
 }
 
@@ -224,10 +227,11 @@ export class ViewerStore {
     cur.displayName = item.displayName;
     cur.width = item.width;
     cur.height = item.height;
+    cur.version = item.version;
     this.transform = fitTransform(this.viewport, { width: item.width, height: item.height });
-    const readyGen = this.ready.generation(PREVIEW_CLASS, item.id);
-    if (readyGen !== null) {
-      cur.url = previewUrl(item.id, readyGen);
+    const readyVersion = this.ready.version(PREVIEW_CLASS, item.id);
+    if (readyVersion !== null) {
+      cur.url = previewUrl(item.id, readyVersion);
     } else {
       this.requestPreview(item.id, "interactive");
     }
@@ -288,10 +292,10 @@ export class ViewerStore {
         ) {
           continue;
         }
-        const readyGen = this.ready.generation(PREVIEW_CLASS, item.id);
-        if (readyGen !== null) {
+        const readyVersion = this.ready.version(PREVIEW_CLASS, item.id);
+        if (readyVersion !== null) {
           this.stats.prefetchReady++;
-          this.warmCache(previewUrl(item.id, readyGen));
+          this.warmCache(previewUrl(item.id, readyVersion));
         } else {
           void this.requestPreview(item.id, "prefetch");
         }
@@ -323,7 +327,7 @@ export class ViewerStore {
         cur.assetId === item.asset_id &&
         item.size_class === PREVIEW_CLASS
       ) {
-        cur.url = previewUrl(item.asset_id, item.cache_generation);
+        cur.url = previewUrl(item.asset_id, item.version);
       }
     }
     // actual要求中にpreviewが到着した場合: previewを保持レイヤーへ回して
@@ -381,8 +385,8 @@ export class ViewerStore {
     }
     if (cur.isOriginal) {
       cur.isOriginal = false;
-      const readyGen = this.ready.generation(PREVIEW_CLASS, cur.assetId);
-      cur.url = readyGen !== null ? previewUrl(cur.assetId, readyGen) : null;
+      const readyVersion = this.ready.version(PREVIEW_CLASS, cur.assetId);
+      cur.url = readyVersion !== null ? previewUrl(cur.assetId, readyVersion) : null;
       if (cur.url === null) {
         this.requestPreview(cur.assetId, "interactive");
       }
@@ -477,19 +481,22 @@ export class ViewerStore {
       // previewを保持レイヤーへ回してからoriginalへ差し替える (空白を出さない)
       this.retained = { ...cur };
       this.retainedTransform = this.transform;
-      const gen = this.ready.generation(PREVIEW_CLASS, cur.assetId) ?? 1;
+      // original URLのバージョンはページDTO由来のものを優先 (表示中項目の
+      // 現在の内容に対応)。未取得時のみready地図の値へフォールバックする。
+      const version =
+        cur.version ?? this.ready.version(PREVIEW_CLASS, cur.assetId) ?? 1;
       cur.key = `${cur.key}-o`;
-      cur.url = originalUrl(cur.assetId, gen);
+      cur.url = originalUrl(cur.assetId, version);
       cur.isOriginal = true;
     } else {
-      const gen = this.ready.generation(PREVIEW_CLASS, cur.assetId);
-      if (gen !== null) {
+      const readyVersion = this.ready.version(PREVIEW_CLASS, cur.assetId);
+      if (readyVersion !== null) {
         this.retained = { ...cur };
         this.retainedTransform = this.transform;
       }
       cur.key = `${cur.key}-p`;
       cur.isOriginal = false;
-      cur.url = gen !== null ? previewUrl(cur.assetId, gen) : null;
+      cur.url = readyVersion !== null ? previewUrl(cur.assetId, readyVersion) : null;
       if (cur.url === null) {
         this.requestPreview(cur.assetId, "interactive");
       }

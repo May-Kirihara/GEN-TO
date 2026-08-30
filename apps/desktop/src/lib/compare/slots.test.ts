@@ -17,6 +17,7 @@ function catalog(items: SrcItem[]) {
         width: item.state === "ready" ? item.width : null,
         height: item.state === "ready" ? item.height : null,
         state: item.state,
+        version: 300_000 + index,
       };
     },
   };
@@ -103,7 +104,13 @@ describe("nextGroup (基準スロット固定)", () => {
     return ids.map((id) =>
       id === null
         ? null
-        : { assetId: id, displayName: `name-${id}`, width: 1000, height: 800 },
+        : {
+            assetId: id,
+            displayName: `name-${id}`,
+            width: 1000,
+            height: 800,
+            version: null,
+          },
     );
   }
 

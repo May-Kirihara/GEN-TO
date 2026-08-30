@@ -154,8 +154,8 @@ describe("ThumbnailStore", () => {
     const before = store.eventLog.length;
     ipc.emit("thumb:ready", {
       items: [
-        { asset_id: "7", size_class: "s256", cache_generation: 1 },
-        { asset_id: "8", size_class: "s256", cache_generation: 1 },
+        { asset_id: "7", size_class: "s256", cache_generation: 1, version: 11 },
+        { asset_id: "8", size_class: "s256", cache_generation: 1, version: 11 },
       ],
     });
     expect(store.readyCount).toBe(2);
@@ -180,7 +180,7 @@ describe("ThumbnailStore", () => {
     const { store, ipc, dispose } = await initStore();
     for (let i = 0; i < EVENT_LOG_MAX + 10; i += 1) {
       ipc.emit("thumb:ready", {
-        items: [{ asset_id: String(i), size_class: "s256", cache_generation: 1 }],
+        items: [{ asset_id: String(i), size_class: "s256", cache_generation: 1, version: 11 }],
       });
     }
     expect(store.eventLog.length).toBe(EVENT_LOG_MAX);

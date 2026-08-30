@@ -11,7 +11,7 @@ export type ImageState = "ready" | "unreadable" | "unsupported" | "corrupt";
 
 export type ThumbnailState = "missing" | "queued" | "ready" | "failed";
 
-/** get_catalog_page の項目DTO (Rust: gento_core::catalog::ImageListItem)。 */
+/** get_catalog_page の項目DTO (Rust: src-tauri catalog::CatalogItemDto)。 */
 export type ImageListItem = {
   /** u64を10進文字列化したもの (JS安全整数範囲の問題を回避)。 */
   id: string;
@@ -21,6 +21,9 @@ export type ImageListItem = {
   byteSize: number;
   state: ImageState;
   thumbnailState: ThumbnailState;
+  /** 内容感応URLバージョン (FG-1)。元ファイルのpath+size+mtimeと
+   *  アルゴリズムバージョンから決まる。original表示のURLなどに使う。 */
+  version: number;
 };
 
 /** get_catalog_page の戻り値 (Rust: gento_core::catalog::PageResult)。 */

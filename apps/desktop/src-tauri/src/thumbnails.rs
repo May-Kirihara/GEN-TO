@@ -40,6 +40,9 @@ pub struct ThumbReadyItem {
     pub asset_id: AssetId,
     pub size_class: String,
     pub cache_generation: u64,
+    /// 内容感応URLバージョン (FG-1 / F3)。フロントは `?v={version}` 付き
+    /// プロトコルURLを組み立てる。元ファイル (size/mtime) 変化で変わる。
+    pub version: u64,
 }
 
 /// `thumb:failed` の項目。
@@ -98,6 +101,9 @@ enum EmitterMsg {
 struct PendingRequest {
     assets: Vec<AssetId>,
     generation: u64,
+    /// このジョブのキャッシュキーに対応する内容感応バージョン。
+    /// 同一キーへ統合された要求者は全員同じ値を通知される。
+    version: u64,
     /// イベント送出時に埋めるサイズクラスIPC名。
     size_class: String,
 }
@@ -188,6 +194,7 @@ impl ThumbnailService {
             let fingerprint =
                 asset_fingerprint(&asset.source_path, asset.byte_size, asset.mtime_ms);
             let key = cache_key(&fingerprint, size_class);
+            let version = content_version_of(&fingerprint);
             match self.cache.lookup(&key) {
                 CacheLookup::Hit(_) => {
                     self.stats.record_hit();
@@ -196,6 +203,7 @@ impl ThumbnailService {
                         asset_id: asset.id,
                         size_class: size_class.ipc_name().to_string(),
                         cache_generation: self.cache_generation(),
+                        version,
                     });
                 }
                 CacheLookup::Miss => {
@@ -206,6 +214,7 @@ impl ThumbnailService {
                         let entry = registry.entry(key.hex.clone()).or_default();
                         entry.assets.push(asset.id);
                         entry.generation = self.cache_generation();
+                        entry.version = version;
                         entry.size_class = size_class.ipc_name().to_string();
                         let job = Arc::new(ThumbnailJob {
                             source: asset.source_path.clone(),
@@ -388,6 +397,12 @@ fn lock_registry(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// fingerprintからURLバージョンを計算する (キャッシュキー計算と同一入力から
+/// 導くため、キーが変われば必ずバージョンも変わる)。
+fn content_version_of(fingerprint: &gento_image::cache::AssetFingerprint) -> u64 {
+    gento_image::cache::content_version(fingerprint)
+}
+
 /// バッチング付きイベント送出スレッド。
 fn spawn_emitter(
     rx: Receiver<EmitterMsg>,
@@ -434,6 +449,7 @@ fn spawn_emitter(
                                             asset_id,
                                             size_class: p.size_class.clone(),
                                             cache_generation: p.generation,
+                                            version: p.version,
                                         });
                                     }
                                 }
@@ -719,16 +735,27 @@ pub fn get_thumbnail_stats(state: State<'_, AppState>) -> ThumbnailStatsDto {
 
 /// 開発用エラー注入 (WP-7 / フェーズ8)。mode = none|decode|cache_write、
 /// rate = 0.0..1.0。決定的 (キャッシュキー閾値) ため計測が再現可能。
+/// 計測ブリッジ (`GENTO_DEV_BRIDGE=1`) が無効なreleaseではErr (FG-1)。
 #[tauri::command]
 pub fn set_failure_injection(
     state: State<'_, AppState>,
     mode: String,
     rate: f64,
 ) -> Result<InjectionStatusDto, String> {
+    set_failure_injection_impl(&state, &mode, rate)
+}
+
+/// [`set_failure_injection`] のゲート付き本体 (単体テスト用にStateから切り出した)。
+pub(crate) fn set_failure_injection_impl(
+    state: &AppState,
+    mode: &str,
+    rate: f64,
+) -> Result<InjectionStatusDto, String> {
+    crate::dev_bridge_gate(state)?;
     if !(0.0..=1.0).contains(&rate) {
         return Err(format!("rate must be within 0.0..=1.0 (got {rate})"));
     }
-    let mode = InjectionMode::from_ipc(&mode)
+    let mode = InjectionMode::from_ipc(mode)
         .ok_or_else(|| format!("unknown injection mode {mode:?}: none|decode|cache_write"))?;
     state.thumbnails().set_injection(mode, rate);
     Ok(InjectionStatusDto {
@@ -1242,6 +1269,75 @@ mod tests {
             dto.queue_depths.interactive + dto.queue_depths.background,
             0
         );
+        svc.shutdown();
+    }
+
+    // ===== 内容感応バージョン (FG-1 / F3) =====
+
+    #[test]
+    fn ready_event_version_changes_when_source_file_changes() {
+        // 元ファイル変更 (内容違い→size/mtime変化) → 再要求 (rescan相当) で
+        // 同一assetIdのままreadyイベントのversionが変わること。
+        // URLが内容感応になることのRust側証明 (§12-5)。
+        let dir = TestDir::new("version");
+        let events = SharedEvents::default();
+        let svc = service(&dir, events.clone());
+        let png = dir.write_png("a.png", 64, 64);
+        let a = asset(1, &png, true);
+        svc.request(
+            std::slice::from_ref(&a),
+            SizeClass::S256,
+            Priority::Background,
+        );
+        let ready1 = events.wait_ready_count(1);
+        let v1 = ready1[0].version;
+        assert!(v1.to_string().len() <= 18, "v={v1}");
+
+        // 元ファイルを別内容へ書き換える (size/mtimeが変わる)
+        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(96, 48, |x, y| {
+            image::Rgba([(x % 251) as u8, (y % 241) as u8, 64, 255])
+        }));
+        img.save(&png).unwrap();
+        let changed = asset(1, &png, true); // 同一ID、新しいsize/mtime
+        let counters = svc.request(
+            std::slice::from_ref(&changed),
+            SizeClass::S256,
+            Priority::Background,
+        );
+        assert_eq!(counters.queued, 1, "新しいキャッシュキーでミスになる");
+        let ready2 = events.wait_ready_count(2);
+        let item = ready2
+            .iter()
+            .rev()
+            .find(|r| r.asset_id == AssetId::new(1))
+            .expect("second ready for asset 1");
+        assert_ne!(
+            item.version, v1,
+            "元ファイル変更でversion (=URL ?v=) が変わること"
+        );
+        // cache_generationはクリアしていないため不変 (versionとは独立)
+        assert_eq!(item.cache_generation, ready1[0].cache_generation);
+        svc.shutdown();
+    }
+
+    #[test]
+    fn cache_hit_ready_carries_version_too() {
+        // 即時ready (キャッシュヒット) にもversionが乗ること
+        let dir = TestDir::new("version-hit");
+        let events = SharedEvents::default();
+        let svc = service(&dir, events.clone());
+        let a = asset(1, &dir.write_png("a.png", 64, 64), true);
+        svc.request(
+            std::slice::from_ref(&a),
+            SizeClass::S256,
+            Priority::Background,
+        );
+        let first = events.wait_ready_count(1);
+        events.clear();
+        let second = svc.request(&[a], SizeClass::S256, Priority::Background);
+        assert_eq!(second.cache_hits, 1);
+        let hits = events.wait_ready_count(1);
+        assert_eq!(hits[0].version, first[0].version);
         svc.shutdown();
     }
 }
