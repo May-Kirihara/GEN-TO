@@ -4,7 +4,7 @@
 //! UIスレッドでファイルI/Oを行わない (走査・プローブは専用スレッド)。
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(any(debug_assertions, feature = "devtools"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -13,9 +13,10 @@ use std::time::Instant;
 #[cfg(any(debug_assertions, feature = "devtools"))]
 use gento_core::catalog::{build_virtual, VIRTUAL_CATALOG_COUNT};
 use gento_core::catalog::{
-    CatalogMode, CatalogState, ImageRecord, ImageState, PageError, PageResult, ThumbnailState,
-    Triage,
+    sort_records_by, CatalogMode, CatalogSort, CatalogState, ImageRecord, ImageState, PageError,
+    PageResult, ThumbnailState, Triage,
 };
+use gento_core::library::decode_library_asset_id;
 use gento_core::AssetId;
 use gento_image::cache::asset_version;
 use gento_image::format::{probe_image, ImageProbe};
@@ -29,7 +30,8 @@ const ERROR_SAMPLE_LIMIT: usize = 5;
 
 /// Tauri command間で共有する実行時状態。
 pub struct AppState {
-    pub dataset_path: PathBuf,
+    /// 現在閲覧中のフォルダ (一時走査の対象。`open_folder` で変更)。
+    pub dataset_path: Mutex<PathBuf>,
     pub catalog: Mutex<CatalogInner>,
     /// サムネイル生成サービス (WP-3)。setupで生成、Exitでshutdown。
     pub thumbnails: Option<Arc<crate::thumbnails::ThumbnailService>>,
@@ -57,6 +59,8 @@ pub struct CatalogInner {
     real: Vec<ImageRecord>,
     /// 登録ルート由来のスナップショット (WP-2。DBから再生成可能)。
     library: Vec<ImageRecord>,
+    /// 表示ソート (WP-4。走査バッチ・ソース切替・スナップショット反映に適用)。
+    sort: CatalogSort,
     progress: ProgressCounters,
     scan_started_at: Option<Instant>,
     last_scan_elapsed_ms: Option<u64>,
@@ -88,17 +92,23 @@ impl CatalogInner {
             state: CatalogState::new(),
             real: Vec::new(),
             library: Vec::new(),
+            sort: CatalogSort::default(),
             progress: ProgressCounters::default(),
             scan_started_at: None,
             last_scan_elapsed_ms: None,
         }
+    }
+
+    /// 現在のソートモードで表示レコードを並べ替える。
+    fn apply_sort(&mut self) {
+        sort_records_by(&mut self.state.records, self.sort);
     }
 }
 
 impl AppState {
     pub fn new(dataset_path: PathBuf) -> Self {
         Self {
-            dataset_path,
+            dataset_path: Mutex::new(dataset_path),
             catalog: Mutex::new(CatalogInner::new()),
             thumbnails: None,
             proto_stats: Arc::new(crate::protocol::ProtoStats::new()),
@@ -107,6 +117,14 @@ impl AppState {
             #[cfg(any(debug_assertions, feature = "devtools"))]
             dev_bridge: AtomicBool::new(crate::devtools::dev_bridge_enabled_strict()),
         }
+    }
+
+    /// 現在閲覧中フォルダのコピー (poisoning復旧付き)。
+    pub fn current_folder(&self) -> PathBuf {
+        self.dataset_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// カタログロックの取得 (poisoning復旧付き)。
@@ -151,6 +169,8 @@ pub struct CatalogSummary {
     pub scanned_count: u64,
     pub error_count: u64,
     pub last_scan_elapsed_ms: Option<u64>,
+    /// 現在の表示ソート (WP-4。"name" | "date_desc" | "size_desc")。
+    pub sort: CatalogSort,
 }
 
 /// `scan:progress` イベントペイロード。
@@ -185,6 +205,8 @@ pub enum CatalogChangeReason {
     ScanBatch,
     ScanDone,
     ModeSwitch,
+    /// ソート変更 (WP-4)。表示順のみ変化 (generationは進む)。
+    SortChange,
 }
 
 /// `catalog:changed` イベントペイロード。
@@ -217,6 +239,7 @@ fn summary_of(inner: &CatalogInner) -> CatalogSummary {
         scanned_count: inner.progress.scanned,
         error_count: inner.progress.errors,
         last_scan_elapsed_ms,
+        sort: inner.sort,
     }
 }
 
@@ -314,6 +337,8 @@ pub fn set_catalog_source(
                 CatalogMode::Virtual => unreachable!("target is Real|Library here"),
             }
             inner.state.mode = target;
+            // ソース切替後は現在のソートモードで並べ替える (WP-4)
+            inner.apply_sort();
             inner.state.generation += 1;
             ModeSwitchOutcome::Changed(summary_of(&inner))
         }
@@ -345,6 +370,7 @@ pub fn apply_library_snapshot(app: &AppHandle, records: Vec<ImageRecord>) {
         inner.library = records;
         if inner.state.mode == CatalogMode::Library && !inner.state.scanning {
             inner.state.records = inner.library.clone();
+            inner.apply_sort();
             inner.state.generation += 1;
             inner.state.generation
         } else {
@@ -368,7 +394,8 @@ pub fn get_catalog_summary(state: State<'_, AppState>) -> CatalogSummary {
 }
 
 /// `get_catalog_page` の項目DTO。gento-core `ImageListItem` + 内容感応version
-/// (FG-1 / F3)。version計算はキャッシュキー入力 (path+size+mtime) を必要と
+/// (FG-1 / F3) + 情報パネル用フィールド (WP-4)。
+/// version計算はキャッシュキー入力 (path+size+mtime) を必要と
 /// するため、gento-coreではなくthin adapter層で付与する。
 /// camelCaseは `ImageListItem` (本体計画 §9) に合わせる。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -387,6 +414,43 @@ pub struct CatalogItemDto {
     /// size/mtime・実体パス・アルゴリズムバージョンから決まる。
     /// フロントは original 表示やURL組み立てに使う。
     pub version: u64,
+    /// 実ファイルの絶対パス (情報パネル・OS連携。WP-4)。
+    pub path: String,
+    /// 更新日時 (Unixエポックms。情報パネル。WP-4)。
+    pub mtime_ms: u64,
+    /// プローブ由来MIME (未プローブはnull。WP-4)。
+    pub mime_type: Option<String>,
+    /// DB上の位置づけ (WP-4)。library表示: Asset確定済み / 仮ID(ハッシュ待ち)。
+    /// 一時走査・仮想: 未登録 (DB外)。
+    pub db_state: ItemDbState,
+    /// 選別状態 (WP-4。セッションの採用/除外カウント用。編集UIはWP-5)。
+    pub triage: Triage,
+}
+
+/// 項目のDB状態 (WP-4。AssetId符号化 gento-core library に基づく)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ItemDbState {
+    /// 登録済みでAsset確定 (タグ・評価等のライブラリ機能が有効)。
+    Asset,
+    /// 登録済みだがハッシュ未完了 (Asset未確定の仮ID)。
+    Provisional,
+    /// 未登録 (一時走査・仮想カタログ)。
+    Adhoc,
+}
+
+impl ItemDbState {
+    fn of(mode: CatalogMode, id: AssetId) -> Self {
+        match mode {
+            CatalogMode::Library => match decode_library_asset_id(id) {
+                gento_core::library::LibraryAssetRef::Asset(_) => ItemDbState::Asset,
+                gento_core::library::LibraryAssetRef::ProvisionalFile(_) => {
+                    ItemDbState::Provisional
+                }
+            },
+            CatalogMode::Real | CatalogMode::Virtual => ItemDbState::Adhoc,
+        }
+    }
 }
 
 /// `get_catalog_page` の戻り値DTO (`PageResult` + 項目のversion)。
@@ -399,18 +463,37 @@ pub struct CatalogPageDto {
     pub has_more: bool,
 }
 
-/// ページ項目へ内容感応versionを付与する。レコード列を1回走査して
-/// ページ内IDのversion表を作る (項目ごとの線形探索を避けるため)。
+/// ページ項目へ内容感応versionと情報パネル用フィールドを付与する。
+/// レコード列を1回走査してページ内IDの補助表を作る (項目ごとの線形探索を
+/// 避けるため)。
 fn augment_page_with_versions(state: &AppState, page: PageResult) -> CatalogPageDto {
-    let mut versions: HashMap<AssetId, u64> = HashMap::with_capacity(page.items.len());
+    struct RecordExtras {
+        version: u64,
+        path: String,
+        mtime_ms: u64,
+        mime_type: Option<String>,
+        db_state: ItemDbState,
+    }
+    let mut extras: HashMap<AssetId, RecordExtras> = HashMap::with_capacity(page.items.len());
     {
         let inner = state.lock_catalog();
+        let mode = inner.state.mode;
         let wanted: HashSet<AssetId> = page.items.iter().map(|item| item.id).collect();
         for record in inner.records() {
             if wanted.contains(&record.id) {
-                versions.insert(
+                extras.insert(
                     record.id,
-                    asset_version(&record.source_path, record.byte_size, record.mtime_ms),
+                    RecordExtras {
+                        version: asset_version(
+                            &record.source_path,
+                            record.byte_size,
+                            record.mtime_ms,
+                        ),
+                        path: record.source_path.to_string_lossy().into_owned(),
+                        mtime_ms: record.mtime_ms,
+                        mime_type: record.mime_type.clone(),
+                        db_state: ItemDbState::of(mode, record.id),
+                    },
                 );
             }
         }
@@ -423,16 +506,25 @@ fn augment_page_with_versions(state: &AppState, page: PageResult) -> CatalogPage
         items: page
             .items
             .into_iter()
-            .map(|item| CatalogItemDto {
-                version: versions.get(&item.id).copied().unwrap_or(0),
-                id: item.id,
-                display_name: item.display_name,
-                width: item.width,
-                height: item.height,
-                byte_size: item.byte_size,
-                state: item.state,
-                thumbnail_state: item.thumbnail_state,
-                is_animated: item.is_animated,
+            .map(|item| {
+                // レコード不在 (走査中の競合など) はversion 0・空pathで妥協する
+                let e = extras.get(&item.id);
+                CatalogItemDto {
+                    version: e.map(|e| e.version).unwrap_or(0),
+                    id: item.id,
+                    display_name: item.display_name,
+                    width: item.width,
+                    height: item.height,
+                    byte_size: item.byte_size,
+                    state: item.state,
+                    thumbnail_state: item.thumbnail_state,
+                    is_animated: item.is_animated,
+                    path: e.map(|e| e.path.clone()).unwrap_or_default(),
+                    mtime_ms: e.map(|e| e.mtime_ms).unwrap_or(0),
+                    mime_type: e.and_then(|e| e.mime_type.clone()),
+                    db_state: e.map(|e| e.db_state).unwrap_or(ItemDbState::Adhoc),
+                    triage: item.triage,
+                }
             })
             .collect(),
     }
@@ -458,14 +550,112 @@ pub fn start_scan(app: AppHandle, state: State<'_, AppState>) -> Result<(), Stri
         }
         begin_scan(&mut inner)
     };
+    let dataset = state.current_folder();
     tracing::info!(
-        dataset = %state.dataset_path.display(),
+        dataset = %dataset.display(),
         generation,
         "scan started"
     );
-    let dataset = state.dataset_path.clone();
     std::thread::spawn(move || run_scan(app, dataset, generation));
     Ok(())
+}
+
+/// 閲覧フォルダを切り替えて一時走査を開始する (WP-4。ツリー選択からの流入)。
+///
+/// - 指定パスが既存ディレクトリでない場合はエラー (UIは状態表示へ反映)
+/// - 成功時: `dataset_path` を更新し `start_scan` と同じ走査を非同期投入する
+///   (Realモードへ戻り、表示内容は新フォルダの走査結果で置き換わる)
+#[tauri::command]
+pub fn open_folder(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<CatalogSummary, String> {
+    let folder = validate_folder(Path::new(&path))?;
+    let summary = {
+        let mut inner = lock(&state.catalog);
+        if inner.state.scanning {
+            return Err("cannot switch folder while scanning".to_string());
+        }
+        *state
+            .dataset_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = folder.clone();
+        begin_scan(&mut inner);
+        summary_of(&inner)
+    };
+    tracing::info!(
+        folder = %folder.display(),
+        generation = summary.generation,
+        "folder opened (adhoc scan started)"
+    );
+    std::thread::spawn(move || run_scan(app, folder, summary.generation));
+    // begin_scan後・走査完了前のsummary (scanning=true) を返す
+    Ok(summary)
+}
+
+/// 走査対象として妥当なフォルダか検証する。表示用のエラー文言を返す。
+fn validate_folder(path: &Path) -> Result<PathBuf, String> {
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            if meta.is_dir() {
+                Ok(path.to_path_buf())
+            } else {
+                Err(format!("フォルダではありません: {}", path.display()))
+            }
+        }
+        Err(err) => match err.kind() {
+            std::io::ErrorKind::NotFound => {
+                Err(format!("フォルダが見つかりません: {}", path.display()))
+            }
+            std::io::ErrorKind::PermissionDenied => {
+                Err(format!("読み取り権限がありません: {}", path.display()))
+            }
+            _ => Err(format!(
+                "フォルダにアクセスできません: {} ({err})",
+                path.display()
+            )),
+        },
+    }
+}
+
+/// 表示ソートを切り替える (WP-4)。recordsを並べ替え、generationを進めて
+/// `catalog:changed` をemitする (ページ再取得で追従)。
+#[tauri::command]
+pub fn set_catalog_sort(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    sort: String,
+) -> Result<CatalogSummary, String> {
+    let parsed = CatalogSort::from_str_opt(&sort)
+        .ok_or_else(|| format!("unknown sort: {sort} (name|date_desc|size_desc)"))?;
+    let outcome = {
+        let mut inner = lock(&state.catalog);
+        if inner.state.scanning {
+            return Err("cannot change sort while scanning".to_string());
+        }
+        if inner.sort == parsed {
+            ModeSwitchOutcome::Unchanged(summary_of(&inner))
+        } else {
+            inner.sort = parsed;
+            inner.apply_sort();
+            inner.state.generation += 1;
+            ModeSwitchOutcome::Changed(summary_of(&inner))
+        }
+    };
+    match outcome {
+        ModeSwitchOutcome::Changed(summary) => {
+            let _ = app.emit(
+                "catalog:changed",
+                CatalogChangedPayload {
+                    generation: summary.generation,
+                    reason: CatalogChangeReason::SortChange,
+                },
+            );
+            Ok(summary)
+        }
+        ModeSwitchOutcome::Unchanged(summary) => Ok(summary),
+    }
 }
 
 #[cfg(any(debug_assertions, feature = "devtools"))]
@@ -554,7 +744,7 @@ fn run_scan(app: AppHandle, dataset: PathBuf, generation: u64) {
                 inner.progress.push_error(failure.clone());
             }
             inner.state.records.extend(records);
-            inner.state.sort_records();
+            inner.apply_sort();
             ScanProgressPayload {
                 scanned: inner.progress.scanned,
                 found: inner.progress.found,
@@ -820,11 +1010,12 @@ mod tests {
     #[test]
     fn page_dto_serialization_shape_keeps_camel_case_and_adds_version() {
         let state = AppState::new(PathBuf::from("/tmp/gento-test-dataset"));
-        state
-            .lock_catalog()
-            .state
-            .records
-            .push(record_with("/x/a.png", 42, 1234, 5));
+        {
+            let mut inner = state.lock_catalog();
+            let mut rec = record_with("/x/a.png", 42, 1234, 5);
+            rec.mime_type = Some("image/png".to_string());
+            inner.state.records.push(rec);
+        }
         let page = state.lock_catalog().state.page(1, 0, 10).expect("page");
         let dto = augment_page_with_versions(&state, page);
         let json = serde_json::to_value(&dto).unwrap();
@@ -840,7 +1031,136 @@ mod tests {
                 "thumbnailState": "missing",
                 "isAnimated": false,
                 "version": dto.items[0].version,
+                // WP-4: 情報パネル用フィールド
+                "path": "/x/a.png",
+                "mtimeMs": 5,
+                "mimeType": "image/png",
+                "dbState": "adhoc", // Real (一時走査) モード
+                "triage": "undecided",
             })
+        );
+    }
+
+    // ===== 情報パネル用DTO (WP-4) =====
+
+    #[test]
+    fn db_state_reflects_mode_and_asset_id_encoding() {
+        // Library + 平素なID = Asset確定
+        let state = AppState::new(PathBuf::from("/tmp/gento-test-dataset"));
+        {
+            let mut inner = state.lock_catalog();
+            inner.state.mode = CatalogMode::Library;
+            inner.state.records = vec![record_with("/r/a.png", 7, 1, 1)];
+        }
+        let page = state.lock_catalog().state.page(1, 0, 10).expect("page");
+        let dto = augment_page_with_versions(&state, page);
+        assert_eq!(dto.items[0].db_state, ItemDbState::Asset);
+        assert_eq!(
+            serde_json::to_value(dto.items[0].db_state).unwrap(),
+            serde_json::json!("asset")
+        );
+
+        // Library + bit63仮ID = Provisional (ハッシュ待ち)
+        {
+            let mut inner = state.lock_catalog();
+            inner.state.records = vec![record_with("/r/b.png", 1 << 63 | 9, 1, 1)];
+        }
+        let page = state.lock_catalog().state.page(1, 0, 10).expect("page");
+        let dto = augment_page_with_versions(&state, page);
+        assert_eq!(dto.items[0].db_state, ItemDbState::Provisional);
+        assert_eq!(
+            serde_json::to_value(dto.items[0].db_state).unwrap(),
+            serde_json::json!("provisional")
+        );
+
+        // Real = Adhoc (IDエンコードに依らない)
+        {
+            let mut inner = state.lock_catalog();
+            inner.state.mode = CatalogMode::Real;
+            inner.state.records = vec![record_with("/r/c.png", 1 << 63 | 9, 1, 1)];
+        }
+        let page = state.lock_catalog().state.page(1, 0, 10).expect("page");
+        let dto = augment_page_with_versions(&state, page);
+        assert_eq!(dto.items[0].db_state, ItemDbState::Adhoc);
+    }
+
+    // ===== ソート (WP-4) =====
+
+    #[test]
+    fn set_catalog_sort_logic_reorders_and_bumps_generation() {
+        let mut inner = CatalogInner::new();
+        inner.state.records = vec![
+            record_with("/x/a.png", 1, 10, 100),
+            record_with("/x/b.png", 2, 900, 50),
+        ];
+        inner.apply_sort();
+        let names: Vec<&str> = inner
+            .state
+            .records
+            .iter()
+            .map(|r| r.display_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["a.png", "b.png"], "既定は名前順");
+
+        inner.sort = CatalogSort::SizeDesc;
+        inner.apply_sort();
+        let names: Vec<&str> = inner
+            .state
+            .records
+            .iter()
+            .map(|r| r.display_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["b.png", "a.png"]);
+    }
+
+    #[test]
+    fn switch_source_applies_current_sort() {
+        let mut inner = CatalogInner::new();
+        inner.real = vec![record_with("/x/a.png", 1, 10, 100)];
+        inner.library = vec![
+            record_with("/r/z.png", 2, 10, 900),
+            record_with("/r/y.png", 3, 10, 100),
+        ];
+        inner.sort = CatalogSort::DateDesc;
+        inner.state.records = inner.real.clone();
+        inner.state.mode = CatalogMode::Real;
+        // set_catalog_sourceと同じ swap→sort→generation の流れ
+        inner.state.records = inner.library.clone();
+        inner.state.mode = CatalogMode::Library;
+        inner.apply_sort();
+        let names: Vec<&str> = inner
+            .state
+            .records
+            .iter()
+            .map(|r| r.display_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["z.png", "y.png"], "mtime降順が適用される");
+    }
+
+    // ===== open_folderの検証 (WP-4) =====
+
+    #[test]
+    fn validate_folder_classifies_errors() {
+        let dir = std::env::temp_dir().join(format!("gento-openfolder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(validate_folder(&dir), Ok(dir.clone()));
+        assert!(validate_folder(&dir.join("gone"))
+            .unwrap_err()
+            .contains("見つかりません"));
+        let file = dir.join("f.txt");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(validate_folder(&file)
+            .unwrap_err()
+            .contains("フォルダではありません"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sort_change_reason_serializes() {
+        assert_eq!(
+            serde_json::to_value(CatalogChangeReason::SortChange).unwrap(),
+            serde_json::json!("sort_change")
         );
     }
 
@@ -896,6 +1216,7 @@ mod tests {
             scanned_count: 1615,
             error_count: 0,
             last_scan_elapsed_ms: Some(999),
+            sort: CatalogSort::DateDesc,
         };
         assert_eq!(
             serde_json::to_value(&summary).unwrap(),
@@ -907,6 +1228,7 @@ mod tests {
                 "scanned_count": 1615,
                 "error_count": 0,
                 "last_scan_elapsed_ms": 999,
+                "sort": "date_desc",
             })
         );
     }

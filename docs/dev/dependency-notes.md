@@ -126,6 +126,24 @@
 
 - (WP-5で追加予定だった `@tanstack/svelte-virtual` は上記のとおり採用済み)
 
+## WP-4 (MVP) で追加した依存 (2026-08-30。製品UIシェルと通常ファイラー)
+
+- **`tauri-plugin-opener` =2.5.4** (Apache-2.0 OR MIT、tauri公式plugin):
+  OSファイルマネージャーで表示 (reveal) と外部アプリで開く (open) に使用。
+  選定理由: (1) reveal項目選択をLinux ( freedesktop FileManager1 D-Bus →
+  `xdg-open <親>`フォールバック)・Windows (explorer /select)・macOS (NSWorkspace)
+  で正しく実装済みの公式実装を再利用し、自前の`std::process::Command`群を
+  作らない (Windows/macOS対応はWP-17で実機確認)。要件のtauri ^2.10は
+  workspaceのtauri 2.11.5と適合。
+  (2) **Rust APIのみを使用** (`reveal_item_in_dir` / `open_path` を独自のthin
+  commandから呼ぶ)。JS側から `plugin:opener|*` commandを叩かないため
+  capability (default.json) への権限追加が不要で、「capability最小化」原則を
+  维持する。パスの存在検証・正規化は独自command側で行う。
+- **フロントエンドの新規npm依存なし**: クリップボードは
+  `navigator.clipboard.writeText` + `document.execCommand("copy")` フォールバック
+  の最小実装 (tauri-plugin-clipboard-managerを入れない)。ペイン状態・
+  選別セッションの永続化は既存localStorage。uuidは`crypto.randomUUID()`。
+
 ## WP-0での依存変更 (2026-08-30)
 
 - **追加なし (Rust/TS両方)**。devtools feature隔離・AppDirs・panic hook・

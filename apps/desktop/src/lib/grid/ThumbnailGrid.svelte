@@ -43,17 +43,23 @@
     overscanRows,
     onOpen,
     onSelectionChange,
+    onContextMenu,
+    showStats = true,
   }: {
     grid: GridStore;
     scrollStore: ScrollPositionStore;
-    /** スクロール位置保存キー (モード別)。 */
+    /** スクロール位置保存キー (モード・フォルダ別)。 */
     modeKey: string;
     cellClass: ThumbCellClass;
     overscanRows: number;
-    /** Enter/ダブルクリックでビューアを開く (WP-6)。indexを渡す。 */
+    /** ダブルクリック/中央キー(Enter)でビューアを開く (WP-6)。indexを渡す。 */
     onOpen?: (index: number) => void;
     /** 選択変化の通知 (比較表示の充填ソース用、WP-6)。 */
     onSelectionChange?: (snapshot: { ids: string[]; focusIndex: number | null }) => void;
+    /** セルのコンテキストメニュー要求 (WP-4)。 */
+    onContextMenu?: (event: MouseEvent, index: number) => void;
+    /** 診断行 (DOMセル数等) の表示。製品UIでは通常false。 */
+    showStats?: boolean;
   } = $props();
 
   // GridStoreはプレーンクラスのため、版番号でUIへ変更を伝える (WP-2の教訓)
@@ -84,8 +90,19 @@
   let domCells = $state(0);
 
   // モード切替・セルサイズ変更でコンポーネントを作り直す際の初期位置。
-  // 再起動直後はin-memoryが空なので先頭から (復元は開発パネルのボタン)。
-  const restoredOffset = scrollStore.peek(modeKey) ?? 0;
+  // in-memory優先、無ければlocalStorage (再起動後の自動復元、WP-4)。
+  // (関数内で読むことで「初期値のみ参照」の意図を明示する)
+  function computeRestoredOffset(): number {
+    const inMemory = scrollStore.peek(modeKey);
+    if (inMemory !== null) {
+      return inMemory;
+    }
+    return scrollStore.load(modeKey) ?? 0;
+  }
+  const restoredOffset = computeRestoredOffset();
+  // 起動直後 (フォルダ切替直後) はカタログが空でscrollTopが保持できないため、
+  // 内容が載った時点 (total>0) で改めて復元する
+  let pendingRestore: number | null = restoredOffset > 0 ? restoredOffset : null;
 
   const virtualizer = createVirtualizer({
     count: rowCount,
@@ -136,6 +153,17 @@
   // 測定キャッシュに反映されないためセルクラス変更では再生成する。
   $effect(() => {
     syncOptions();
+  });
+
+  // カタログが空の間はscrollTopを保持できないため、total>0になった時点で
+  // 復元位置へjumpする (起動・フォルダ切替直後の復元、WP-4)
+  $effect(() => {
+    void total;
+    if (pendingRestore !== null && total > 0 && virtualizerInstance !== null) {
+      const target = pendingRestore;
+      pendingRestore = null;
+      virtualizerInstance.scrollToOffset(target, { align: "start" });
+    }
   });
 
   // 幅は自前のResizeObserverで1回だけ反映 (コンテンツはスクロール要素の
@@ -199,14 +227,8 @@
   };
 
   function handleKeydown(event: KeyboardEvent): void {
-    if (event.key === "Enter") {
-      const focus = sel.focusIndex;
-      if (focus !== null) {
-        event.preventDefault();
-        onOpen?.(focus);
-      }
-      return;
-    }
+    // Enter (ビューア) とSpace (クイックプレビュー) はAppのKeyDispatcherが
+    // captureで先に処理する (WP-4の一元化)。ここでは選択移動のみ。
     const action = KEY_ACTIONS[event.key];
     if (!action) {
       return;
@@ -266,6 +288,31 @@
     if (Number.isInteger(index) && index >= 0 && index < total) {
       onOpen?.(index);
     }
+  }
+
+  function handleContextMenu(event: MouseEvent): void {
+    if (onContextMenu === undefined) {
+      return;
+    }
+    const cell = (event.target as HTMLElement).closest<HTMLElement>("[data-grid-cell]");
+    if (cell === null) {
+      return;
+    }
+    const index = Number(cell.dataset.index);
+    if (Number.isInteger(index) && index >= 0 && index < total) {
+      event.preventDefault();
+      onContextMenu(event, index);
+    }
+  }
+
+  /** プログラム選択 (セッション位置・クイックプレビュー移動の同期、WP-4)。 */
+  export function selectAndFocus(index: number): void {
+    if (!Number.isInteger(index) || index < 0 || index >= total) {
+      return;
+    }
+    sel = applyPointer(sel, index, { ctrl: false, shift: false }, total, idAt);
+    notifySelection();
+    followFocus();
   }
 
   // ===== テンプレートヘルパー (gridTickを読み変化を伝える) =====
@@ -339,64 +386,76 @@
   });
 </script>
 
-<div class="grid-stats">
-  <span>DOMセル数 <strong>{domCells}</strong></span>
-  <span>可視row {visRange === null ? "—" : `${visRange.start}..${visRange.end}`}</span>
-  <span>overscan {overscanRows}</span>
-  <span>列 {columns}</span>
-  <span>total {total.toLocaleString()}</span>
-  <span>scrollTop {Math.round(scrollTop)}</span>
-  <span>選択 {sel.selected.size.toLocaleString()}</span>
-  <span>需要 {statsLine()}</span>
-</div>
+<div class="grid-root">
+  {#if showStats}
+    <div class="grid-stats">
+      <span>DOMセル数 <strong>{domCells}</strong></span>
+      <span>可視row {visRange === null ? "—" : `${visRange.start}..${visRange.end}`}</span>
+      <span>overscan {overscanRows}</span>
+      <span>列 {columns}</span>
+      <span>total {total.toLocaleString()}</span>
+      <span>scrollTop {Math.round(scrollTop)}</span>
+      <span>選択 {sel.selected.size.toLocaleString()}</span>
+      <span>需要 {statsLine()}</span>
+    </div>
+  {/if}
 
-<div
-  bind:this={scrollEl}
-  class="grid-scroll"
-  role="grid"
-  aria-label="サムネイルグリッド"
-  tabindex="0"
-  onkeydown={handleKeydown}
-  onclick={handleClick}
-  ondblclick={handleDblClick}
->
-  <div class="grid-inner" style="height:{totalSize}px">
-    {#each vitems as row (row.key)}
-      <div
-        role="row"
-        class="grid-row"
-        style="position:absolute; top:0; left:0; width:100%; height:{row.size}px; transform:translateY({row.start}px); display:grid; grid-template-columns:repeat({columns}, {cellPx}px); gap:{GRID_GAP}px; justify-content:center"
-      >
-        {#each cellsOf(row.index) as cell (cell.key)}
-          {@const item = itemAt(cell.index)}
-          <div
-            role="gridcell"
-            class="cell"
-            class:cell-selected={item !== null && sel.selected.has(item.id)}
-            class:cell-focus={sel.focusIndex === cell.index}
-            class:cell-failed={item !== null && failed(item)}
-            data-grid-cell
-            data-index={cell.index}
-            style="width:{cellPx}px; height:{cellPx}px"
-            aria-selected={item !== null && sel.selected.has(item.id)}
-            title={item?.displayName ?? ""}
-          >
-            {#if item !== null}
-              {@const url = urlFor(item)}
-              {#if url !== null}
-                <img src={url} alt={item.displayName} loading="lazy" decoding="async" draggable="false" />
-              {:else if failed(item)}
-                <span class="cell-fail-mark" role="img" aria-label="サムネイル生成失敗">✕</span>
+  <div
+    bind:this={scrollEl}
+    class="grid-scroll"
+    role="grid"
+    aria-label="サムネイルグリッド"
+    tabindex="0"
+    onkeydown={handleKeydown}
+    onclick={handleClick}
+    ondblclick={handleDblClick}
+    oncontextmenu={handleContextMenu}
+  >
+    <div class="grid-inner" style="height:{totalSize}px">
+      {#each vitems as row (row.key)}
+        <div
+          role="row"
+          class="grid-row"
+          style="position:absolute; top:0; left:0; width:100%; height:{row.size}px; transform:translateY({row.start}px); display:grid; grid-template-columns:repeat({columns}, {cellPx}px); gap:{GRID_GAP}px; justify-content:center"
+        >
+          {#each cellsOf(row.index) as cell (cell.key)}
+            {@const item = itemAt(cell.index)}
+            <div
+              role="gridcell"
+              class="cell"
+              class:cell-selected={item !== null && sel.selected.has(item.id)}
+              class:cell-focus={sel.focusIndex === cell.index}
+              class:cell-failed={item !== null && failed(item)}
+              data-grid-cell
+              data-index={cell.index}
+              style="width:{cellPx}px; height:{cellPx}px"
+              aria-selected={item !== null && sel.selected.has(item.id)}
+              title={item?.displayName ?? ""}
+            >
+              {#if item !== null}
+                {@const url = urlFor(item)}
+                {#if url !== null}
+                  <img src={url} alt={item.displayName} loading="lazy" decoding="async" draggable="false" />
+                {:else if failed(item)}
+                  <span class="cell-fail-mark" role="img" aria-label="サムネイル生成失敗">✕</span>
+                {/if}
               {/if}
-            {/if}
-          </div>
-        {/each}
-      </div>
-    {/each}
+            </div>
+          {/each}
+        </div>
+      {/each}
+    </div>
   </div>
 </div>
 
 <style>
+  .grid-root {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+  }
+
   .grid-stats {
     display: flex;
     flex-wrap: wrap;
@@ -407,11 +466,13 @@
   }
 
   .grid-scroll {
-    height: 70vh;
+    flex: 1;
+    min-height: 0;
     overflow-y: auto;
     border: 1px solid light-dark(#d0d7de, #30363d);
     border-radius: 0.5rem;
     outline: none;
+    box-sizing: border-box;
   }
 
   .grid-scroll:focus-visible {

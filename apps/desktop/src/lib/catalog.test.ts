@@ -89,6 +89,7 @@ function makeSummary(overrides: Partial<CatalogSummary> = {}): CatalogSummary {
     scanned_count: 1615,
     error_count: 0,
     last_scan_elapsed_ms: 4321,
+    sort: "name",
     ...overrides,
   };
 }
@@ -109,6 +110,11 @@ function makePage(generation: number, offset: number, names: string[]): CatalogP
       thumbnailState: "missing" as const,
       isAnimated: false,
       version: 900_000 + offset + i,
+      path: `/dataset/${name}`,
+      mtimeMs: 1_700_000_000_000,
+      mimeType: "image/png",
+      dbState: "adhoc" as const,
+      triage: "undecided" as const,
     })),
   };
 }

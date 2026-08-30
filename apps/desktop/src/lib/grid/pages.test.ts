@@ -37,6 +37,11 @@ function makePage(offset: number, count: number, total: number, generation: numb
     thumbnailState: "missing" as const,
     isAnimated: false,
     version: 800_000 + offset + i,
+    path: `/dataset/item-${offset + i}.png`,
+    mtimeMs: 1000 + offset + i,
+    mimeType: "image/png",
+    dbState: "adhoc" as const,
+    triage: "undecided" as const,
   }));
   return { generation, total, offset, items, has_more: offset + count < total };
 }
@@ -58,6 +63,7 @@ function makeIpc(
           scanned_count: 1615,
           error_count: 0,
           last_scan_elapsed_ms: 1,
+          sort: "name",
         } as T;
       }
       if (command === "get_catalog_page") {

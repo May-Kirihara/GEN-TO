@@ -149,6 +149,11 @@
         event.preventDefault();
         store.nav(1);
         break;
+      case "f":
+      case "F":
+        event.preventDefault();
+        toggleFullscreen();
+        break;
       case "+":
       case "=":
         event.preventDefault();
@@ -177,6 +182,23 @@
 
   function centerPointer(): { x: number; y: number } {
     return { x: store.viewport.width / 2, y: store.viewport.height / 2 };
+  }
+
+  /** 全画面切替 (§9.1。オーバーレイ要素をフルスクリーン化)。 */
+  function toggleFullscreen(): void {
+    const element = overlayEl;
+    if (element === null) {
+      return;
+    }
+    if (document.fullscreenElement === element) {
+      void document.exitFullscreen().catch(() => undefined);
+    } else {
+      void element.requestFullscreen().catch(() => undefined);
+    }
+  }
+
+  function isFullscreen(): boolean {
+    return document.fullscreenElement === overlayEl;
   }
 
   function layerStyle(
@@ -272,6 +294,9 @@
     <button onclick={() => store.setMode("fit")}>fit (0)</button>
     <button onclick={() => store.setMode("actual")}>原寸 (1)</button>
     <button onclick={() => store.setMode("fit")}>リセット (r)</button>
+    <button onclick={() => toggleFullscreen()}>
+      全画面 (f){isFullscreen() ? " ✓" : ""}
+    </button>
     <button
       onclick={() => store.setOriginal(!(currentImg()?.isOriginal ?? false))}
       disabled={currentImg()?.isAnimated ?? false}

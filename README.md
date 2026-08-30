@@ -1,7 +1,7 @@
 # GEN-TO
 
 高速画像表示の技術検証プロトタイプ。Tauri 2 + Svelte 5 + TypeScript + Rust (Cargo workspace) で構成する。
-本リポジトリは製品MVPではなく、[技術検証計画](docs/technical-spike.md) に基づくスパイク実装。結果の要約は [技術検証結果報告書](docs/technical-spike-report.md)、詳細な計測値は [技術検証結果](docs/technical-spike-results.md) を参照。
+スパイク ([技術検証計画](docs/technical-spike.md)、[結果報告](docs/technical-spike-report.md)、[計測値](docs/technical-spike-results.md)) を母体に、MVP実装 ([MVP実装計画](docs/mvp-implementation-plan.md)) を進行中。
 
 ## リポジトリ構成
 
@@ -9,6 +9,25 @@
 - `crates/gento-db` — SQLite基盤 (migration・repository実装。メタデータの正本)
 - `crates/gento-image` — 画像パイプライン (走査・プローブ・BLAKE3・サムネイル・キャッシュ。Tauri非依存)
 - `apps/desktop` — Svelte 5 + Vite フロントエンドと `src-tauri` (Tauri 2 thin adapter)
+
+## 製品UIシェル (3ペイン、WP-4)
+
+アプリは3ペイン構成の画像ファイラーとして動作する:
+
+- **左ペイン**: フォルダツリー (ホーム/ファイルシステム起点の遅延ロード。
+  未登録フォルダも閲覧可能。登録ルートはバッジ表示) + 登録ルート管理 +
+  コレクション/保存済み検索のプレースホルダ (WP-6/8)
+- **中央ペイン**: パンくず + ソート + ビューア種別 + サムネイルサイズの
+  ツールバー、仮想サムネイルグリッド、ステータスバー
+- **右ペイン**: 選択画像の情報 (パス・寸法・容量・形式・更新日時・DB状態・
+  スキャン状態) + 選別セッション (順序・位置・確認済み/採用/除外/保留カウント、
+  途中終了→再開)
+
+キーボード: Space=クイックプレビュー、Enter/ダブルクリック=ビューア、
+Esc=閉じる、F2=リネーム/WP-7、Delete=ゴミ箱/WP-7。右クリックで
+コンテキストメニュー (OSのファイルマネージャーで表示 / 外部アプリで開く /
+パスをコピー)。ペイン幅・表示・サムネイルサイズ・スクロール位置は
+localStorageに永続化され再起動後に復元される。
 
 ## 登録ルート (永続ライブラリ、WP-2)
 
@@ -142,9 +161,9 @@ GENTO_LOG=info GENTO_DEV_BRIDGE=1 NO_COLOR=1 \
 - **計測用release buildには `--features devtools` が必須** (WP-0)。通常release
   buildには計測コマンドが存在しない。cargo直接ビルドでは frontendDist 埋め込みの
   `custom-protocol` も併せて指定すること (tauri CLI経由なら自動)
-- `GENTO_DEV_BRIDGE=1` (値は厳密に `1`) で計測ブリッジ (F2〜F12) とバックエンド計測コマンドが有効になる。dev buildでもこの環境変数が必要で、未指定・`0`・その他の値では無効
-- アプリ内開発パネルに 統計 (優先度別キューを含む) / long task・ロングフレーム / 起動タイムマーク / エラー注入 を表示
-- ブリッジは1秒周期の機械可読行を `devtest:` プレフィックスでログ出力する (`grep devtest:` で採取)
+- `GENTO_DEV_BRIDGE=1` (値は厳密に `1`) で計測ブリッジ (F2〜F12、ctrl+F1=UI状態リセット) とバックエンド計測コマンドが有効になる。dev buildでもこの環境変数が必要で、未指定・`0`・その他の値では無効
+- アプリ内開発パネル (ヘッダー右の「開発パネル」) に 統計 (優先度別キューを含む) / long task・ロングフレーム / 起動タイムマーク / エラー注入 を表示
+- ブリッジは1秒周期の機械可読行を `devtest:` プレフィックスでログ出力する (`grep devtest:` で採取。G=グリッド、T=サムネイル、V=ビューア、C=比較、P=パフォーマンス、U=UIシェル状態)
 - Rustプロセス+WebView子プロセスのRSS合計は `/proc` を読むスクリプトで測定 (例: `rss-sample.sh <pid>`)
 - SIGTERMでgraceful終了 (ワーカー排出・一時ファイル掃除)。終了後 `find <cache-dir> -name '.tmp-*'` が空であることを確認できる
 

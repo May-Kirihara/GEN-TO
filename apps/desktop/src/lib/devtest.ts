@@ -297,6 +297,20 @@ export function installDevBridge(stores: DevBridgeStores): void {
   let injectionState = 0; // 0=none 1=decode0.30 2=cache_write0.30
 
   const actions: Record<string, () => void> = {
+    // WP-4計測: WebViewのlocalStorage (レイアウト・フォルダ・セッション状態) を
+    // 消してリロードする (計測ドライバの初期状態を決定論化)
+    resetStorage: () => {
+      try {
+        for (const key of Object.keys(window.localStorage)) {
+          if (key.startsWith("gento:")) {
+            window.localStorage.removeItem(key);
+          }
+        }
+      } catch {
+        // localStorage不在環境では何もしない
+      }
+      window.location.reload();
+    },
     select2: () => {
       clickCell(0, false);
       clickCell(1, true);
@@ -400,6 +414,22 @@ export function installDevBridge(stores: DevBridgeStores): void {
     ];
   }
 
+  /** WP-4 UIシェル状態行 (メニュー・クイックプレビュー・通知の機械検証用)。 */
+  function uiLines(): string[] {
+    const menuEl = document.querySelector<HTMLElement>(".context-menu");
+    const menu = document.querySelectorAll(".context-menu").length;
+    const qp = document.querySelectorAll(".quick-preview-backdrop").length;
+    const notice = (document.querySelector(".header-notice")?.textContent ?? "-")
+      .trim()
+      .slice(0, 48);
+    const buttons = menuEl ? menuEl.querySelectorAll("button").length : 0;
+    const rect = menuEl?.getBoundingClientRect();
+    const mrect = rect
+      ? `${Math.round(rect.x)},${Math.round(rect.y)},${Math.round(rect.width)},${Math.round(rect.height)}`
+      : "0,0,0,0";
+    return [`U menu=${menu} mbtn=${buttons} mrect=${mrect} qp=${qp} note=${notice}`];
+  }
+
   /** V/C行 (ビューア・比較) の構築。dump表示とログ報告の両方で使う。 */
   function dumpLines(): string[] {
     const lines: string[] = [];
@@ -441,7 +471,7 @@ export function installDevBridge(stores: DevBridgeStores): void {
           ` sw=${c.stats.swaps} creq=${c.stats.requests}`,
       );
     }
-    lines.push(...gridLines(), ...thumbLines(), ...perfLines());
+    lines.push(...gridLines(), ...thumbLines(), ...perfLines(), ...uiLines());
     if (!lines.some((line) => line.startsWith("V ") || line.startsWith("C "))) {
       lines.push("idle (viewer closed)");
     }
@@ -474,6 +504,13 @@ export function installDevBridge(stores: DevBridgeStores): void {
       const key = event.key;
       let handled = true;
       switch (key) {
+        case "F1":
+          if (event.ctrlKey) {
+            actions.resetStorage();
+          } else {
+            handled = false;
+          }
+          break;
         case "F2":
           if (event.ctrlKey) {
             actions.focusGrid();

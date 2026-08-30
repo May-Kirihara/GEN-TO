@@ -24,6 +24,7 @@ function makeIpc(opts?: {
           scanned_count: 1615,
           error_count: 0,
           last_scan_elapsed_ms: 1,
+          sort: "name",
         } as T;
       }
       if (command === "get_catalog_page") {
@@ -39,6 +40,11 @@ function makeIpc(opts?: {
           thumbnailState: "missing" as const,
           isAnimated: false,
           version: 800_000 + offset + i,
+          path: `/dataset/item-${offset + i}.png`,
+          mtimeMs: 1000 + offset + i,
+          mimeType: "image/png",
+          dbState: "adhoc" as const,
+          triage: "undecided" as const,
         }));
         return {
           generation: args?.generation,
@@ -143,7 +149,7 @@ describe("GridStore — 需要スケジューリング", () => {
       invoke: async <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
         calls.push({ command, args });
         if (command === "get_catalog_summary") {
-          return { generation: 1, mode: "real", total, scanning: false, scanned_count: 0, error_count: 0, last_scan_elapsed_ms: null } as T;
+          return { generation: 1, mode: "real", total, scanning: false, scanned_count: 0, error_count: 0, last_scan_elapsed_ms: null, sort: "name" } as T;
         }
         if (command === "get_catalog_page") {
           const offset = args?.offset as number;
@@ -321,6 +327,7 @@ describe("GridStore — 需要スケジューリング", () => {
             scanned_count: 1615,
             error_count: 0,
             last_scan_elapsed_ms: 1,
+            sort: "name",
           } as T);
         }
         if (command === "get_catalog_page") {
@@ -393,6 +400,7 @@ describe("GridStore — 世代ガード", () => {
       scanned_count: 1615,
       error_count: 0,
       last_scan_elapsed_ms: 1,
+          sort: "name",
     });
     expect(grid.thumbUrlFor("3")).toBeNull();
   });
@@ -437,6 +445,7 @@ describe("GridStore — summary同期", () => {
       scanned_count: 10,
       error_count: 0,
       last_scan_elapsed_ms: null,
+      sort: "name",
     };
     grid.syncSummary(summary);
     expect(grid.summary?.total).toBe(1615);

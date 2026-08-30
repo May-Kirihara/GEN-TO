@@ -24,6 +24,10 @@ dirs = { workspace = true }
 libc = "0.2"
 # 登録ルートのフォルダ監視 (MVP WP-2)。Linux: inotify backend。
 notify = { workspace = true }
+# OSファイルマネージャーで表示・外部アプリで開く (MVP WP-4)。
+# Rust API (reveal_item_in_dir / open_path) のみ使用し、JS側plugin commandは
+# 叩かないため capability への権限追加は不要。
+tauri-plugin-opener = "=2.5.4"
 
 [dev-dependencies]
 serde_json = { workspace = true }

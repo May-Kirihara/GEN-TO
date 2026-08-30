@@ -12,3 +12,12 @@
 body {
   margin: 0;
 }
+
+/* 製品シェル (WP-4): ウィンドウ全体を使う3ペイン構成のため
+   html/body/#app をビューポート固定にする */
+html,
+body,
+#app {
+  height: 100%;
+}
+

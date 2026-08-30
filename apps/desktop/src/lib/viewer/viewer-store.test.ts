@@ -16,6 +16,11 @@ function item(index: number, overrides: Partial<ImageListItem> = {}): ImageListI
     thumbnailState: "ready",
     isAnimated: false,
     version: 100_000 + index,
+    path: `/dataset/item-${index}.png`,
+    mtimeMs: 1000 + index,
+    mimeType: "image/png",
+    dbState: "adhoc",
+    triage: "undecided",
     ...overrides,
   };
 }

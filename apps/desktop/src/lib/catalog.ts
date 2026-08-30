@@ -7,10 +7,16 @@
  * - staleGenerationエラー時は summary再取得 → 同一オフセットで1回再試行
  * - 型契約は docs/dev/api-contract.md (DTO camelCase、summary/event snake_case)
  */
-import type { CatalogPage, CatalogSummary, ScanProgressEvent } from "./catalog-types";
+import type {
+  CatalogPage,
+  CatalogSort,
+  CatalogSummary,
+  ScanProgressEvent,
+} from "./catalog-types";
 
 export type {
   CatalogPage,
+  CatalogSort,
   CatalogSummary,
   ImageListItem,
   ScanProgressEvent,
@@ -52,6 +58,8 @@ export class CatalogStore {
   pageOffset = 0;
   pageHasMore = false;
   lastError: string | null = null;
+  /** open_folder の失敗文言 (不在・権限等)。グリッド空状態の分岐に使う (WP-4)。 */
+  folderError: string | null = null;
 
   private readonly unlisteners: Array<() => void> = [];
   private readonly changeListeners = new Set<() => void>();
@@ -192,6 +200,39 @@ export class CatalogStore {
       this.summary = await this.ipc.invoke<CatalogSummary>("set_catalog_mode", { virtual });
       this.lastError = null;
       await this.loadPage(0);
+      return true;
+    } catch (error) {
+      this.lastError = toMessage(error);
+      this.notify();
+      return false;
+    }
+  }
+
+  /**
+   * 閲覧フォルダを切り替える (WP-4。ツリー選択)。
+   * 成功時は走査開始後のsummaryを受け取り、`folderError` を解消する。
+   * 失敗時 (不在・権限・走査中) は folderError へ文言を設定する。
+   */
+  async openFolder(path: string): Promise<boolean> {
+    this.folderError = null;
+    try {
+      this.summary = await this.ipc.invoke<CatalogSummary>("open_folder", { path });
+      this.lastError = null;
+      await this.loadPage(0);
+      return true;
+    } catch (error) {
+      this.folderError = toMessage(error);
+      this.notify();
+      return false;
+    }
+  }
+
+  /** 表示ソート切替 (WP-4)。成功時はsummaryを適用しページを引き直す。 */
+  async setSort(sort: CatalogSort): Promise<boolean> {
+    try {
+      this.summary = await this.ipc.invoke<CatalogSummary>("set_catalog_sort", { sort });
+      this.lastError = null;
+      await this.loadPage(this.pageOffset);
       return true;
     } catch (error) {
       this.lastError = toMessage(error);

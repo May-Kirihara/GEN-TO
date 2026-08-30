@@ -15,6 +15,11 @@ function makeItems(count: number): ImageListItem[] {
     thumbnailState: "ready" as const,
     isAnimated: false,
     version: 200_000 + i,
+    path: `/dataset/item-${i}.png`,
+    mtimeMs: 1000 + i,
+    mimeType: "image/png",
+    dbState: "adhoc",
+    triage: "undecided",
   }));
 }
 

@@ -164,6 +164,9 @@ pub struct ImageListItem {
     pub thumbnail_state: ThumbnailState,
     /// アニメーション付き画像か (WP-3。ビューアはoriginalを直接表示)。
     pub is_animated: bool,
+    /// 選別状態 (WP-4でDTOへ暴露。選別セッションの採用/除外カウント用。
+    /// マーク編集UI自体はWP-5)。
+    pub triage: Triage,
 }
 
 impl ImageRecord {
@@ -179,6 +182,7 @@ impl ImageRecord {
             state: self.state,
             thumbnail_state: self.thumb_state,
             is_animated: self.is_animated,
+            triage: self.triage,
         }
     }
 }
@@ -285,6 +289,61 @@ impl CatalogState {
 impl Default for CatalogState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// カタログ表示のソート mode (MVP WP-4)。
+///
+/// - Name: パス昇順 (`sort_records` と同一規則。フォルダ内ではファイル名順)
+/// - DateDesc: 更新日時 (mtime_ms) 降順。同値は名前昇順で安定化
+/// - SizeDesc: 容量降順。同値は名前昇順で安定化
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogSort {
+    #[default]
+    Name,
+    DateDesc,
+    SizeDesc,
+}
+
+impl CatalogSort {
+    /// IPC文字列表現 (`set_catalog_sort` / summaryの `sort` フィールド)。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CatalogSort::Name => "name",
+            CatalogSort::DateDesc => "date_desc",
+            CatalogSort::SizeDesc => "size_desc",
+        }
+    }
+
+    pub fn from_str_opt(value: &str) -> Option<Self> {
+        match value {
+            "name" => Some(CatalogSort::Name),
+            "date_desc" => Some(CatalogSort::DateDesc),
+            "size_desc" => Some(CatalogSort::SizeDesc),
+            _ => None,
+        }
+    }
+}
+
+/// レコード列を指定モードでソートする (Vec::sort_byは安定ソート)。
+pub fn sort_records_by(records: &mut [ImageRecord], sort: CatalogSort) {
+    match sort {
+        CatalogSort::Name => records.sort_by(|a, b| {
+            a.source_path
+                .to_string_lossy()
+                .cmp(&b.source_path.to_string_lossy())
+        }),
+        CatalogSort::DateDesc => records.sort_by(|a, b| {
+            b.mtime_ms
+                .cmp(&a.mtime_ms)
+                .then_with(|| a.display_name.cmp(&b.display_name))
+        }),
+        CatalogSort::SizeDesc => records.sort_by(|a, b| {
+            b.byte_size
+                .cmp(&a.byte_size)
+                .then_with(|| a.display_name.cmp(&b.display_name))
+        }),
     }
 }
 
@@ -469,6 +528,7 @@ mod tests {
                 "state": "ready",
                 "thumbnailState": "missing",
                 "isAnimated": false,
+                "triage": "undecided",
             })
         );
         let back: ImageListItem = serde_json::from_value(json).unwrap();
@@ -583,5 +643,73 @@ mod tests {
             let first_ids: Vec<String> = first.items.iter().map(|i| i.id.to_string()).collect();
             assert_eq!(first_ids, vec!["3", "4", "5"]);
         }
+    }
+
+    // ===== 表示ソート (MVP WP-4) =====
+
+    fn record_var(path: &str, id: u64, byte_size: u64, mtime_ms: u64) -> ImageRecord {
+        let mut r = record(path, id);
+        r.byte_size = byte_size;
+        r.mtime_ms = mtime_ms;
+        r
+    }
+
+    #[test]
+    fn catalog_sort_round_trip_strings() {
+        for sort in [
+            CatalogSort::Name,
+            CatalogSort::DateDesc,
+            CatalogSort::SizeDesc,
+        ] {
+            assert_eq!(CatalogSort::from_str_opt(sort.as_str()), Some(sort));
+        }
+        assert_eq!(CatalogSort::from_str_opt("other"), None);
+        assert_eq!(
+            serde_json::to_value(CatalogSort::DateDesc).unwrap(),
+            "date_desc"
+        );
+        // 既定はName (summary等での無指定互換)
+        assert_eq!(CatalogSort::default(), CatalogSort::Name);
+    }
+
+    #[test]
+    fn sort_by_date_desc_with_name_tiebreak() {
+        let mut records = vec![
+            record_var("/x/b.png", 1, 10, 1_000),
+            record_var("/x/a.png", 2, 10, 2_000),
+            record_var("/x/c.png", 3, 10, 2_000),
+        ];
+        sort_records_by(&mut records, CatalogSort::DateDesc);
+        let names: Vec<&str> = records.iter().map(|r| r.display_name.as_str()).collect();
+        // 同一mtime (2000) は名前昇順で安定
+        assert_eq!(names, vec!["a.png", "c.png", "b.png"]);
+    }
+
+    #[test]
+    fn sort_by_size_desc_with_name_tiebreak() {
+        let mut records = vec![
+            record_var("/x/big.png", 1, 900, 1),
+            record_var("/x/z-small.png", 2, 100, 2),
+            record_var("/x/a-small.png", 3, 100, 3),
+        ];
+        sort_records_by(&mut records, CatalogSort::SizeDesc);
+        let names: Vec<&str> = records.iter().map(|r| r.display_name.as_str()).collect();
+        assert_eq!(names, vec!["big.png", "a-small.png", "z-small.png"]);
+    }
+
+    #[test]
+    fn sort_by_name_matches_sort_records() {
+        let mut by_helper = vec![
+            record_var("/x/b.png", 1, 1, 1),
+            record_var("/x/a.png", 2, 2, 2),
+        ];
+        sort_records_by(&mut by_helper, CatalogSort::Name);
+        let mut state = CatalogState::new();
+        state.records = vec![
+            record_var("/x/b.png", 1, 1, 1),
+            record_var("/x/a.png", 2, 2, 2),
+        ];
+        state.sort_records();
+        assert_eq!(by_helper, state.records);
     }
 }

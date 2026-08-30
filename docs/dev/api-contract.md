@@ -968,3 +968,103 @@ type ImageListItem = {
 
 - 一時`temp`カタログは走査プローブから、`library`カタログは`assets.is_animated`
   から供給される。未プローブ (ハッシュ待ちの仮ID) は `false`
+
+# フォルダツリー・OS連携・UIシェル (WP-4 / 2026-08-30 追加)
+
+## 26. Commands
+
+### `fs_list_dirs` (WP-4)
+
+任意パスの直下ディレクトリ列挙 (フォルダツリーの遅延ロード用)。
+
+- 引数: `path: Option<String>` (`null` で起点ノード要求)
+- 応答:
+
+```json
+{
+  "path": "/home/user",
+  "parent": "/home",
+  "entries": [{ "name": "pictures", "path": "/home/user/pictures" }],
+  "error": null
+}
+```
+
+- 起点要求 (`path: null`): `entries` = [ホーム, `/`] (`name` は「ホーム」
+  「ファイルシステム (/)」)。`path` は空文字、`parent` は null
+- 隠しディレクトリ (`.` 始まり) は除外 (設定はWP-15)。シンボリックリンクは
+  リンク先がディレクトリなら含む (壊れたリンクは除外)
+- 名前は大文字小類を無視した昇順
+- 不在・権限不足は `entries: []` + `error` に文言 (UIは「読み取り不能」表示)
+- 親はパンくず/上位移動用 (`/` の親は null)
+
+### `open_folder` (WP-4)
+
+閲覧フォルダを切り替えて一時走査 (adhoc) を開始する。
+
+- 引数: `path: String` — 既存ディレクトリの絶対パス
+- 動作: 検証 (不在/非ディレクトリ/権限はエラー文言) → `dataset_path` 更新 →
+  `start_scan` と同じ非同期走査を投入 (Real モードへ移行し内容を置換)
+- 応答: 走査開始直後の `CatalogSummary` (`scanning: true`)
+- 走査中は拒否 (`cannot switch folder while scanning`)
+- 副作用: `catalog:changed` (scan_batch/scan_done) と `scan:progress` は
+  `start_scan` と同一
+
+### `set_catalog_sort` (WP-4)
+
+表示ソート切替。
+
+- 引数: `sort: "name" | "date_desc" | "size_desc"`
+- 動作: 表示レコードを並べ替え、generation を進めて `catalog:changed`
+  (reason: `sort_change`) をemit。以後の走査バッチ・ソース切替にも適用
+- 応答: 新 `CatalogSummary` (`sort` フィールドに現在値)
+- 走査中は拒否。同一ソート指定は無変化 (generation不変)
+
+### `reveal_in_file_manager` / `open_with_default_app` (WP-4)
+
+- 引数: `path: String` — 存在するファイル/ディレクトリ
+- `reveal`: OSのファイルマネージャーで当該項目を選択表示
+  (Linux: freedesktop FileManager1 D-Bus → `xdg-open <親>` フォールバック)
+- `open`: 既定アプリケーションで開く
+- 実装は `tauri-plugin-opener` のRust API (JS側plugin commandは使用しない
+  ため capability 追加なし。パス存在検証は本command側で実施)
+- 両者とも応答 `null` (エラー時は文字列)
+
+## 27. 既存APIの変更 (WP-4、後方互換の追加)
+
+### `get_catalog_page` 項目DTOの追加フィールド
+
+```json
+{
+  "path": "/abs/to/img.png",
+  "mtimeMs": 1748563200000,
+  "mimeType": "image/png",
+  "dbState": "asset | provisional | adhoc",
+  "triage": "undecided | keep | reject"
+}
+```
+
+- `dbState`: library表示ではAssetId符号化 (§17) から導出
+  (`asset` = assets.id / `provisional` = bit63仮ID=ハッシュ待ち)。
+  一時走査・仮想カタログは `adhoc` (DB管理外)
+- `triage`: WP-2でDBに保持していた選別状態の暴露 (選別セッションの
+  採用/除外カウント用。編集UIはWP-5)
+
+### `get_catalog_summary` の追加フィールド
+
+- `sort: "name" | "date_desc" | "size_desc"` — 現在の表示ソート
+
+### `catalog:changed` のreason追加
+
+- `"sort_change"` — `set_catalog_sort` による並べ替え (内容は不変)
+
+## 28. UIシェルの状態保持 (WP-4。commandではなくWebView側)
+
+- レイアウト (ペイン表示/幅/サムネイルサイズ): localStorage `gento:layout:v1`
+- 前回フォルダ・ツリー展開: localStorage `gento:folders:v1`
+  (起動時の走査対象は `--dataset` のまま決定論的。前回フォルダはツリーの
+  選択ハイライトとして復元)
+- スクロール位置: 既存 `gento:scroll:*` をフォルダ別キー
+  (`real:<path>` / `library`) で運用
+- 選別セッション: localStorage `gento:session:v1`
+  (uuidセッション名・順序付きID列・位置・確認済み集合。採用/除外の値自体は
+  DBのtriage由来)

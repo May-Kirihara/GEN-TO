@@ -123,7 +123,15 @@ Tauriに依存してよいのは `gento-tauri` のみ。逆方向の依存
   (`library_roots_*`/`scan_start`/`scan_stop`/`scan_status`)。setupで
   有効ルートの監視開始+初回スキャンを非同期投入、Exitでshutdown
 - `catalog.rs`: カタログcommand群 (summary/page/scan) と走査スレッド。
-  ページDTOへのversion付与もここ (thin adapter層の責務)
+  ページDTOへのversion付与もここ (thin adapter層の責務)。WP-4で
+  `open_folder` (閲覧フォルダ切替→一時走査)・`set_catalog_sort`
+  (表示ソート)・DTOの情報パネル用フィールド (path/mtime/mime/dbState/
+  triage) を追加
+- `fsview.rs` (WP-4): フォルダツリー用の直下ディレクトリ列挙
+  (`fs_list_dirs`。隠し除外・遅延ロード・権限エラーの文言化) と
+  OS連携 (`reveal_in_file_manager` / `open_with_default_app` —
+  tauri-plugin-openerのRust APIのみ使用。JS側plugin commandは叩かない
+  ためcapability追加なし)
 - `thumbnails.rs`: サムネイル生成サービス (要求の受付・dedup・イベント
   バッチング・統計DTO) とcommand群
 - `protocol.rs`: ローカル画像プロトコル3種 (gento-thumb/preview/original)。
@@ -133,7 +141,9 @@ Tauriに依存してよいのは `gento-tauri` のみ。逆方向の依存
 
 フロントエンド (`apps/desktop/src`) はSvelte 5 + TS。ストア層
 (catalog/thumbnails/grid/viewer/compare) はIPCを注入されたプレーンな
-クラスで、Svelteコンポーネントから利用する。
+クラスで、Svelteコンポーネントから利用する。WP-4で製品シェル
+(`App.svelte` + `lib/shell/*` の3ペイン構成、`lib/keys.ts` のキー割当
+一元化、`lib/preview`・`lib/session`・`lib/ui` の各ストア) を追加。
 
 ## SQLite運用方針 (WP-1確定。WP-2以降もこの方針に従う)
 

@@ -11,6 +11,7 @@ pub mod catalog;
 pub mod db;
 #[cfg(any(debug_assertions, feature = "devtools"))]
 pub mod devtools;
+pub mod fsview;
 pub mod library;
 pub mod protocol;
 pub mod thumbnails;
@@ -117,13 +118,13 @@ fn install_panic_hook(app_dirs: &AppDirs) {
 
 #[tauri::command]
 fn health(state: State<'_, AppState>) -> HealthInfo {
-    let path = &state.dataset_path;
+    let path = state.current_folder();
     tracing::debug!(dataset = %path.display(), "health requested");
     HealthInfo {
         app_name: APP_NAME.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         api_version: GENTO_API_VERSION,
-        dataset_path: Some(display_absolute(path)),
+        dataset_path: Some(display_absolute(&path)),
         dataset_exists: path.exists(),
         db_open: state.db.as_ref().is_some_and(|d| d.db.is_some()),
         timestamp_ms: epoch_ms(),
@@ -147,6 +148,8 @@ pub fn run() {
         catalog::start_scan,
         catalog::set_catalog_mode,
         catalog::set_catalog_source,
+        catalog::set_catalog_sort,
+        catalog::open_folder,
         library::library_roots_list,
         library::library_roots_add,
         library::library_roots_remove,
@@ -154,6 +157,9 @@ pub fn run() {
         library::scan_start,
         library::scan_stop,
         library::scan_status,
+        fsview::fs_list_dirs,
+        fsview::reveal_in_file_manager,
+        fsview::open_with_default_app,
         thumbnails::request_thumbnails,
         thumbnails::reprioritize_thumbnails,
         thumbnails::cancel_thumbnail_requests,
@@ -171,6 +177,8 @@ pub fn run() {
         catalog::get_catalog_page,
         catalog::start_scan,
         catalog::set_catalog_source,
+        catalog::set_catalog_sort,
+        catalog::open_folder,
         library::library_roots_list,
         library::library_roots_add,
         library::library_roots_remove,
@@ -178,6 +186,9 @@ pub fn run() {
         library::scan_start,
         library::scan_stop,
         library::scan_status,
+        fsview::fs_list_dirs,
+        fsview::reveal_in_file_manager,
+        fsview::open_with_default_app,
         thumbnails::request_thumbnails,
         thumbnails::reprioritize_thumbnails,
         thumbnails::cancel_thumbnail_requests,

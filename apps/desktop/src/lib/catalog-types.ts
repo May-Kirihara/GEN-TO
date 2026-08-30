@@ -8,9 +8,15 @@
 /** WP-2で "library" (登録ルートのDB由来カタログ) を追加。 */
 export type CatalogMode = "real" | "virtual" | "library";
 
+/** 表示ソート (WP-4。Rust: gento_core::catalog::CatalogSort)。 */
+export type CatalogSort = "name" | "date_desc" | "size_desc";
+
 export type ImageState = "ready" | "unreadable" | "unsupported" | "corrupt";
 
 export type ThumbnailState = "missing" | "queued" | "ready" | "failed";
+
+/** 項目のDB上の位置づけ (WP-4)。情報パネルの登録状態表示に使う。 */
+export type ItemDbState = "asset" | "provisional" | "adhoc";
 
 /** get_catalog_page の項目DTO (Rust: src-tauri catalog::CatalogItemDto)。 */
 export type ImageListItem = {
@@ -27,6 +33,17 @@ export type ImageListItem = {
   /** 内容感応URLバージョン (FG-1)。元ファイルのpath+size+mtimeと
    *  アルゴリズムバージョンから決まる。original表示のURLなどに使う。 */
   version: number;
+  /** 実ファイルの絶対パス (WP-4。情報パネル・OS連携)。 */
+  path: string;
+  /** 更新日時 (Unixエポックms。WP-4)。 */
+  mtimeMs: number;
+  /** プローブ由来MIME (未プローブはnull。WP-4)。 */
+  mimeType: string | null;
+  /** DB状態 (WP-4)。asset=登録済みAsset確定 / provisional=登録済みハッシュ待ち
+   *  / adhoc=未登録 (一時走査・仮想)。 */
+  dbState: ItemDbState;
+  /** 選別状態 (WP-4。セッションの採用/除外カウント用。編集UIはWP-5)。 */
+  triage: "undecided" | "keep" | "reject";
 };
 
 /** get_catalog_page の戻り値 (Rust: gento_core::catalog::PageResult)。 */
@@ -47,6 +64,8 @@ export type CatalogSummary = {
   scanned_count: number;
   error_count: number;
   last_scan_elapsed_ms: number | null;
+  /** 現在の表示ソート (WP-4)。 */
+  sort: CatalogSort;
 };
 
 /** scan:progress イベントペイロード (WP-2でライブラリスキャン用フィールド追加)。 */
@@ -72,7 +91,7 @@ export type ScanProgressEvent = {
 /** catalog:changed イベントペイロード。 */
 export type CatalogChangedEvent = {
   generation: number;
-  reason: "scan_batch" | "scan_done" | "mode_switch";
+  reason: "scan_batch" | "scan_done" | "mode_switch" | "sort_change";
 };
 
 /** get_catalog_page のエラー (Rust: gento_core::catalog::PageError)。 */
