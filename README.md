@@ -1,7 +1,7 @@
 # GEN-TO
 
 高速画像表示の技術検証プロトタイプ。Tauri 2 + Svelte 5 + TypeScript + Rust (Cargo workspace) で構成する。
-本リポジトリは製品MVPではなく、[技術検証計画](docs/technical-spike.md) に基づくスパイク実装。
+本リポジトリは製品MVPではなく、[技術検証計画](docs/technical-spike.md) に基づくスパイク実装。結果の要約は [技術検証結果報告書](docs/technical-spike-report.md)、詳細な計測値は [技術検証結果](docs/technical-spike-results.md) を参照。
 
 ## リポジトリ構成
 
