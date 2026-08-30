@@ -8,11 +8,13 @@
  *
  * - このモジュールは常にバンドルに含まれるが、**動的import + ランタイム
  *   フラグ**で起動時にのみ読み込まれる: dev build (import.meta.env.DEV)、
- *   またはreleaseで Rust側 `dev_bridge_enabled` がOkを返す場合
+ *   またはdevtoolsビルドのreleaseで Rust側 `dev_bridge_enabled` がOkを返す場合
  *   (環境変数 `GENTO_DEV_BRIDGE` の値が**厳密に "1"** のときのみ有効。
- *   `0`・`true`・空文字では無効)。フラグ無効時はRust側で
- *   `devtest_report` / `set_failure_injection` 等がErrを返す
- *   (FG-1: リリースでの常時呼び出しを無害化)。
+ *   `0`・`true`・空文字では無効)。通常releaseビルドではbackend側に
+ *   `dev_bridge_enabled` / `devtest_report` / `set_failure_injection` 等の
+ *   command自体がコンパイルされておらず (WP-0のdevtools feature隔離)、
+ *   invokeはrejectされるため本ブリッジは読み込まれない (安全なno-op)。
+ *   読み込まれた後も各invokeは `.catch` で黙殺する。
  * - wheel/pointerイベントは実リスナー (store.zoomAt / dragBy) を通る。
  *   setPointerCaptureだけは合成pointerIdでNotFoundになるため
  *   操作中のみ一時的にパッチする (本来の呼び出しは維持)
@@ -72,8 +74,9 @@ type ThumbLike = {
     p50_ms: number | null;
     p95_ms: number | null;
     p99_ms: number | null;
-    injection_mode: string;
-    injection_rate: number;
+    /** devtoolsビルドのみbackendが返す (WP-0)。 */
+    injection_mode?: string;
+    injection_rate?: number;
     proto_requests: number;
     proto_p50_ms: number | null;
     proto_p95_ms: number | null;
@@ -380,7 +383,7 @@ export function installDevBridge(stores: DevBridgeStores): void {
       `T q=${stats.queue_depth} qi=${q.interactive} qv=${q.viewport} qp=${q.prefetch}` +
         ` qo=${q.overscan} qb=${q.background}` +
         ` p50=${n(stats.p50_ms, 1)} p95=${n(stats.p95_ms, 1)} p99=${n(stats.p99_ms, 1)}`,
-      `T inj=${stats.injection_mode},${n(stats.injection_rate, 2)}` +
+      `T inj=${stats.injection_mode ?? "-"},${n(stats.injection_rate ?? null, 2)}` +
         ` proto=${stats.proto_requests} pp50=${n(stats.proto_p50_ms, 1)}` +
         ` pp95=${n(stats.proto_p95_ms, 1)} pp99=${n(stats.proto_p99_ms, 1)}`,
     ];

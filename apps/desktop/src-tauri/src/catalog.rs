@@ -5,13 +5,16 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+#[cfg(any(debug_assertions, feature = "devtools"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
+#[cfg(any(debug_assertions, feature = "devtools"))]
+use gento_core::catalog::{build_virtual, VIRTUAL_CATALOG_COUNT};
 use gento_core::catalog::{
-    build_virtual, CatalogMode, CatalogState, ImageRecord, ImageState, PageError, PageResult,
-    ThumbnailState, Triage, VIRTUAL_CATALOG_COUNT,
+    CatalogMode, CatalogState, ImageRecord, ImageState, PageError, PageResult, ThumbnailState,
+    Triage,
 };
 use gento_core::AssetId;
 use gento_image::cache::asset_version;
@@ -32,10 +35,11 @@ pub struct AppState {
     pub thumbnails: Option<Arc<crate::thumbnails::ThumbnailService>>,
     /// ローカル画像プロトコルの統計 (WP-4)。
     pub proto_stats: Arc<crate::protocol::ProtoStats>,
-    /// 計測ブリッジ (devtest) の有効フラグ (FG-1)。起動時に環境変数
-    /// `GENTO_DEV_BRIDGE` (値は厳密に "1") から確定し以後不変。
-    /// 危険コマンド (set_failure_injection / devtest_report /
+    /// 計測ブリッジ (devtest) の有効フラグ (FG-1)。devtoolsビルドのみ存在
+    /// (WP-0)。起動時に環境変数 `GENTO_DEV_BRIDGE` (値は厳密に "1") から
+    /// 確定し以後不変。危険コマンド (set_failure_injection / devtest_report /
     /// dev_bridge_enabled) のゲートとして使う。
+    #[cfg(any(debug_assertions, feature = "devtools"))]
     pub dev_bridge: AtomicBool,
 }
 
@@ -44,6 +48,8 @@ pub struct CatalogInner {
     /// 稼働モードに応じた「表示中」レコード列。
     state: CatalogState,
     /// 最後に完了した走査の実レコード (仮想カタログのソース)。
+    /// devtoolsビルドのみ (WP-0)。
+    #[cfg(any(debug_assertions, feature = "devtools"))]
     real: Vec<ImageRecord>,
     progress: ProgressCounters,
     scan_started_at: Option<Instant>,
@@ -74,6 +80,7 @@ impl CatalogInner {
     fn new() -> Self {
         Self {
             state: CatalogState::new(),
+            #[cfg(any(debug_assertions, feature = "devtools"))]
             real: Vec::new(),
             progress: ProgressCounters::default(),
             scan_started_at: None,
@@ -89,7 +96,8 @@ impl AppState {
             catalog: Mutex::new(CatalogInner::new()),
             thumbnails: None,
             proto_stats: Arc::new(crate::protocol::ProtoStats::new()),
-            dev_bridge: AtomicBool::new(crate::dev_bridge_enabled_strict()),
+            #[cfg(any(debug_assertions, feature = "devtools"))]
+            dev_bridge: AtomicBool::new(crate::devtools::dev_bridge_enabled_strict()),
         }
     }
 
@@ -98,7 +106,8 @@ impl AppState {
         lock(&self.catalog)
     }
 
-    /// 計測ブリッジが有効か (起動時に確定したフラグ)。
+    /// 計測ブリッジが有効か (起動時に確定したフラグ)。devtoolsビルドのみ。
+    #[cfg(any(debug_assertions, feature = "devtools"))]
     pub fn dev_bridge_enabled(&self) -> bool {
         self.dev_bridge.load(Ordering::SeqCst)
     }
@@ -203,6 +212,10 @@ fn begin_scan(inner: &mut CatalogInner) -> u64 {
     inner.state.generation
 }
 
+// ===== カタログモード切替 (devtools機能。仮想5万件カタログは計測用) =====
+// 通常releaseビルドでは set_catalog_mode commandごと存在しない (WP-0)。
+
+#[cfg(any(debug_assertions, feature = "devtools"))]
 #[derive(Debug)]
 enum ModeSwitchOutcome {
     Changed(CatalogSummary),
@@ -210,6 +223,7 @@ enum ModeSwitchOutcome {
     Unchanged(CatalogSummary),
 }
 
+#[cfg(any(debug_assertions, feature = "devtools"))]
 fn switch_mode(inner: &mut CatalogInner, want_virtual: bool) -> Result<ModeSwitchOutcome, String> {
     if inner.state.scanning {
         return Err("cannot switch catalog mode while scanning".to_string());
@@ -237,7 +251,6 @@ fn switch_mode(inner: &mut CatalogInner, want_virtual: bool) -> Result<ModeSwitc
     inner.state.generation += 1;
     Ok(ModeSwitchOutcome::Changed(summary_of(inner)))
 }
-
 #[tauri::command]
 pub fn get_catalog_summary(state: State<'_, AppState>) -> CatalogSummary {
     summary_of(&lock(&state.catalog))
@@ -341,6 +354,7 @@ pub fn start_scan(app: AppHandle, state: State<'_, AppState>) -> Result<(), Stri
     Ok(())
 }
 
+#[cfg(any(debug_assertions, feature = "devtools"))]
 #[tauri::command]
 pub fn set_catalog_mode(
     app: AppHandle,
@@ -450,7 +464,12 @@ fn run_scan(app: AppHandle, dataset: PathBuf, generation: u64) {
                 .push_error(format!("{}: {}", error.path.display(), error.reason));
         }
         inner.last_scan_elapsed_ms = Some(scan_elapsed_ms);
-        inner.real = inner.state.records.clone();
+        // 仮想カタログ (devtoolsビルド) のソースとして実レコードを保持する。
+        // 通常releaseではこの複製は行わない。
+        #[cfg(any(debug_assertions, feature = "devtools"))]
+        {
+            inner.real = inner.state.records.clone();
+        }
         ScanProgressPayload {
             scanned: inner.progress.scanned,
             found: inner.progress.found,
@@ -515,6 +534,9 @@ mod tests {
         assert!(inner.last_scan_elapsed_ms.is_none());
     }
 
+    // ===== モード切替 (devtools機能。debug/devtoolsビルドのみ) =====
+
+    #[cfg(any(debug_assertions, feature = "devtools"))]
     #[test]
     fn switch_mode_rejects_while_scanning() {
         let mut inner = CatalogInner::new();
@@ -523,6 +545,7 @@ mod tests {
         assert!(switch_mode(&mut inner, false).is_err());
     }
 
+    #[cfg(any(debug_assertions, feature = "devtools"))]
     #[test]
     fn switch_to_virtual_requires_real_records() {
         let mut inner = CatalogInner::new();
@@ -530,6 +553,7 @@ mod tests {
         assert!(err.contains("run start_scan"));
     }
 
+    #[cfg(any(debug_assertions, feature = "devtools"))]
     #[test]
     fn switch_mode_virtual_and_back() {
         let mut inner = CatalogInner::new();

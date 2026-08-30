@@ -29,3 +29,12 @@ image = { workspace = true }
 [features]
 # Tauri CLIがrelease build時に有効化する。絶対に削除しないこと。
 custom-protocol = ["tauri/custom-protocol"]
+# 計測・検証専用機能 (dev bridge・障害注入・仮想カタログ) をrelease buildへ
+# 入れるときに有効化する (WP-0)。debug buildではdebug_assertionsにより
+# 常に含まれる。計測用release build:
+#   cargo build --release -p gento-tauri --features custom-protocol,devtools
+#   pnpm tauri build --no-bundle -- --features devtools   (CLIはcustom-protocolを自動付与)
+# featureはworkspaceルートで一元管理する設計意图だが、cargoのfeatureは
+# crate単位のため、伝播チェーン (gento-tauri → gento-core/gento-image) を
+# ここで宣言する。
+devtools = ["gento-core/devtools", "gento-image/devtools"]

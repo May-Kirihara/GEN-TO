@@ -34,6 +34,9 @@
   let rawHealth: HealthInfo | null = $state(null);
   let fetchedAt = $state("");
   let scanNotice = $state("");
+  // 計測ブリッジ (dev bridge) が有効なビルド/セッションか。仮想カタログや
+  // エラー注入など開発専用UIの表示に使う (WP-0)。
+  let devBridgeActive = $state(false);
 
   // カタログストアはプレーンなTSクラス ($stateはクラスインスタンスを深く
   // プロキシしないため、変更通知でローカル$state変数へ同期する)。
@@ -430,8 +433,10 @@
     void grid.init().then((dispose) => {
       disposeGrid = dispose;
     });
-    // 実機検証ブリッジ (WP-6/WP-7)。dev build、またはreleaseで
-    // GENTO_DEV_BRIDGE=1 のときのみ有効 (計測 §16)
+    // 実機検証ブリッジ (WP-6/WP-7)。dev build、またはdevtoolsビルドのreleaseで
+    // GENTO_DEV_BRIDGE=1 のときのみ有効 (WP-0)。backend側にcommandが無い
+    // (通常release) 場合はinvokeがrejectされ、ブリッジも開発パネル (仮想
+    // カタログ・エラー注入) も無効のままになる
     void (async () => {
       let enabled = import.meta.env.DEV;
       if (!enabled) {
@@ -441,6 +446,7 @@
           enabled = false;
         }
       }
+      devBridgeActive = enabled;
       if (enabled) {
         const { installDevBridge } = await import("./lib/devtest");
         installDevBridge({
@@ -525,18 +531,22 @@
     {:else}
       <p>カタログ情報未取得</p>
     {/if}
-    <button
-      onclick={() => void switchMode(false)}
-      disabled={summary?.scanning ?? false}
-    >
-      実カタログ
-    </button>
-    <button
-      onclick={() => void switchMode(true)}
-      disabled={summary?.scanning ?? false}
-    >
-      仮想カタログ (5万件)
-    </button>
+    {#if devBridgeActive}
+      <!-- 仮想5万件カタログは計測用 (devtools機能)。通常releaseビルドでは
+           backendのset_catalog_modeが存在しないため表示しない -->
+      <button
+        onclick={() => void switchMode(false)}
+        disabled={summary?.scanning ?? false}
+      >
+        実カタログ
+      </button>
+      <button
+        onclick={() => void switchMode(true)}
+        disabled={summary?.scanning ?? false}
+      >
+        仮想カタログ (5万件)
+      </button>
+    {/if}
     {#if catalogError}
       <p class="error">エラー: {catalogError}</p>
     {/if}
@@ -625,30 +635,34 @@
         キャッシュ全削除
       </button>
     </div>
-    <div class="thumb-buttons">
-      <span class="notice">エラー注入 (WP-7):</span>
-      <button
-        class:active={thumbStats?.injection_mode === "none"}
-        onclick={() => void setInjection("none", 0)}
-        disabled={injectionBusy}
-      >
-        なし
-      </button>
-      <button
-        class:active={thumbStats?.injection_mode === "decode"}
-        onclick={() => void setInjection("decode", 0.3)}
-        disabled={injectionBusy}
-      >
-        decode失敗 30%
-      </button>
-      <button
-        class:active={thumbStats?.injection_mode === "cache_write"}
-        onclick={() => void setInjection("cache_write", 0.3)}
-        disabled={injectionBusy}
-      >
-        キャッシュ書込失敗 30%
-      </button>
-    </div>
+    {#if devBridgeActive}
+      <!-- エラー注入は計測用 (devtools機能)。通常releaseビルドではbackendの
+           set_failure_injectionが存在しないため表示しない -->
+      <div class="thumb-buttons">
+        <span class="notice">エラー注入 (WP-7):</span>
+        <button
+          class:active={thumbStats?.injection_mode === "none"}
+          onclick={() => void setInjection("none", 0)}
+          disabled={injectionBusy}
+        >
+          なし
+        </button>
+        <button
+          class:active={thumbStats?.injection_mode === "decode"}
+          onclick={() => void setInjection("decode", 0.3)}
+          disabled={injectionBusy}
+        >
+          decode失敗 30%
+        </button>
+        <button
+          class:active={thumbStats?.injection_mode === "cache_write"}
+          onclick={() => void setInjection("cache_write", 0.3)}
+          disabled={injectionBusy}
+        >
+          キャッシュ書込失敗 30%
+        </button>
+      </div>
+    {/if}
     {#if thumbNotice}
       <p class="notice">{thumbNotice}</p>
     {/if}

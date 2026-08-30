@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # WP-7 計測ドライバ共通ライブラリ (source して使う)
 # 環境: DISPLAY=:1 / X11。リリースバイナリ + GENTO_DEV_BRIDGE=1 で起動する。
+# WP-0以降: 計測にはdevtoolsビルドが必要 (README「計測」参照)。
+#   cargo build --release -p gento-tauri --features custom-protocol,devtools
+# (通常releaseビルドには計測commandが存在しない)
 
 BIN=/mnt/holyland/Project/GEN-TO/target/release/gento-tauri
 DATASET=/mnt/holyland/Project/GEN-TO/sample/dataset

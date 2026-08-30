@@ -9,6 +9,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+#[cfg(any(debug_assertions, feature = "devtools"))]
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
@@ -57,7 +58,11 @@ impl fmt::Display for ThumbnailError {
 
 impl std::error::Error for ThumbnailError {}
 
+// ===== 開発用エラー注入 (devtools機能。debug/devtoolsビルドのみ) =====
+// 通常releaseビルドからは完全に除去される (WP-0)。
+
 /// 開発用エラー注入のモード (WP-7 / フェーズ8「耐障害性」)。
+#[cfg(any(debug_assertions, feature = "devtools"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InjectionMode {
     None,
@@ -65,6 +70,7 @@ pub enum InjectionMode {
     CacheWrite,
 }
 
+#[cfg(any(debug_assertions, feature = "devtools"))]
 impl InjectionMode {
     pub const IPC_NAMES: [&'static str; 3] = ["none", "decode", "cache_write"];
 
@@ -94,6 +100,7 @@ impl InjectionMode {
 /// 1ジョブが複数の仮想assetIdに対応し得る (5万件仮想カタログ)。
 /// キャッシュキーは実ファイル+size+mtimeから決まるため同じ決定性を持ち、
 /// 実カタログ (1ファイル=1 asset) ではassetIdハッシュと同値になる。
+#[cfg(any(debug_assertions, feature = "devtools"))]
 #[derive(Debug, Default)]
 pub struct FailureInjection {
     mode: std::sync::atomic::AtomicU8,
@@ -101,6 +108,7 @@ pub struct FailureInjection {
     rate_micro: std::sync::atomic::AtomicU64,
 }
 
+#[cfg(any(debug_assertions, feature = "devtools"))]
 impl FailureInjection {
     pub fn new() -> Self {
         Self::default()
@@ -264,6 +272,8 @@ pub struct ThumbnailJob {
     pub cache: Arc<ThumbnailCache>,
     pub stats: Arc<ThumbStats>,
     /// 開発用エラー注入 (WP-7)。注入なしでも全ジョブが共通の設定を参照する。
+    /// devtoolsビルドのみ存在するフィールド (WP-0)。
+    #[cfg(any(debug_assertions, feature = "devtools"))]
     pub injection: Arc<FailureInjection>,
 }
 
@@ -271,6 +281,7 @@ impl Job for ThumbnailJob {
     fn run(&self, cancel: &CancelToken) -> Result<Vec<u8>, String> {
         let started = Instant::now();
         let key = cache_key(&self.fingerprint, self.size_class);
+        #[cfg(any(debug_assertions, feature = "devtools"))]
         if self.injection.should_inject(&key.hex) == Some(InjectionMode::Decode) {
             // キュー全体は停止しない: このジョブだけ個別failedになる
             return Err("decode failed: injected failure (decode)".to_string());
@@ -280,6 +291,7 @@ impl Job for ThumbnailJob {
             // エンコード完了後のキャンセル: 書き込まずに中断する
             return Err("cancelled".to_string());
         }
+        #[cfg(any(debug_assertions, feature = "devtools"))]
         if self.injection.should_inject(&key.hex) == Some(InjectionMode::CacheWrite) {
             // 実際に一時ファイルを作ってから失敗させる (Dropガードの後始末を通す)。
             // これにより「注入時も一時ファイルを残さない」ことを検証できる。
@@ -571,6 +583,7 @@ mod tests {
             size_class: SizeClass::S256,
             cache: Arc::clone(&cache),
             stats: Arc::clone(&stats),
+            #[cfg(any(debug_assertions, feature = "devtools"))]
             injection: Arc::new(FailureInjection::new()),
         };
         let bytes = job.run(&CancelToken::new()).unwrap();
@@ -597,6 +610,7 @@ mod tests {
             size_class: SizeClass::S512,
             cache,
             stats,
+            #[cfg(any(debug_assertions, feature = "devtools"))]
             injection: Arc::new(FailureInjection::new()),
         };
         let handle = pool
@@ -609,9 +623,10 @@ mod tests {
         pool.shutdown();
     }
 
-    // ===== エラー注入 (WP-7 / フェーズ8) =====
+    // ===== エラー注入 (WP-7 / フェーズ8。devtools機能) =====
 
     /// rate=0.5のとき閾値の両側に落ちる合成パスを探索する (決定性検証の素材)。
+    #[cfg(any(debug_assertions, feature = "devtools"))]
     fn find_split_paths(rate: f64) -> (PathBuf, PathBuf) {
         let mut below = None;
         let mut above = None;
@@ -637,11 +652,13 @@ mod tests {
         )
     }
 
+    #[cfg(any(debug_assertions, feature = "devtools"))]
     fn key_hex_of(path: &Path) -> String {
         let fp = fingerprint_of(path, 1000, 0);
         crate::cache::cache_key(&fp, SizeClass::S256).hex
     }
 
+    #[cfg(any(debug_assertions, feature = "devtools"))]
     #[test]
     fn injection_boundaries_none_and_full() {
         let inj = FailureInjection::new();
@@ -662,6 +679,7 @@ mod tests {
         assert_eq!(inj.should_inject(&hex), None);
     }
 
+    #[cfg(any(debug_assertions, feature = "devtools"))]
     #[test]
     fn injection_is_deterministic_per_key() {
         let inj = FailureInjection::new();
@@ -679,6 +697,7 @@ mod tests {
         assert_eq!(inj.should_inject(&yes_hex), None);
     }
 
+    #[cfg(any(debug_assertions, feature = "devtools"))]
     #[test]
     fn decode_injection_fails_job_individually_without_cache_file() {
         let dir = TestDir::new("inject-decode");
@@ -726,6 +745,7 @@ mod tests {
         assert_no_tmp_files(dir.path().join("cache").as_path());
     }
 
+    #[cfg(any(debug_assertions, feature = "devtools"))]
     #[test]
     fn cache_write_injection_fails_after_temp_creation_but_cleans_up() {
         let dir = TestDir::new("inject-cache");
@@ -760,6 +780,7 @@ mod tests {
     }
 
     /// キャッシュツリー全体に `.tmp-*` が無いことを検証する共有ヘルパ。
+    #[cfg(any(debug_assertions, feature = "devtools"))]
     fn assert_no_tmp_files(cache_root: &Path) {
         let mut tmp_count = 0;
         for shard in fs::read_dir(cache_root).unwrap() {
@@ -777,6 +798,7 @@ mod tests {
         assert_eq!(tmp_count, 0, "injected failure must not leave temp files");
     }
 
+    #[cfg(any(debug_assertions, feature = "devtools"))]
     #[test]
     fn injection_mode_ipc_round_trip() {
         for name in InjectionMode::IPC_NAMES {

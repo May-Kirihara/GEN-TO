@@ -6,6 +6,17 @@ members = [
     "apps/desktop/src-tauri",
 ]
 
+# devtools feature (WP-0): 計測・検証専用機能のコンパイル隔離。
+# cargoのfeatureはcrate単位のため、各memberの [features] で "devtools" を
+# 定義し、バイナリ側 (gento-tauri) の devtools が gento-core/gento-image の
+# 同名featureへ伝播する:
+#   gento-tauri devtools = ["gento-core/devtools", "gento-image/devtools"]
+# debug buildでは debug_assertions により常に有効扱い。releaseでは既定で
+# 無効 (dev系commandはinvoke handlerに存在しない)。計測用release buildは
+#   cargo build --release -p gento-tauri --features custom-protocol,devtools
+# (custom-protocol はtauri CLIがrelease buildで自動付与するfeature。
+#  cargo直接ビルドではfrontendDist埋め込みのために明示が必要)
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"

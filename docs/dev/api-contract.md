@@ -1,7 +1,7 @@
 # GEN-TO IPC API契約 (Phase 2 / WP-2時点)
 
 - 作成日: 2026-08-28 (WP-2)
-- 最終更新: 2026-08-30 (FG-1: §8/§9/§10/§12 version追加・§14 devブリッジゲートとrate検証の実際への合わせ込み)
+- 最終更新: 2026-08-30 (WP-0: §0/§1 healthへ `api_version` 追加・§14 devtools feature化・§15 APIバージョン互換方針追加)
 - 目的: Tauri command・イベント・ローカル画像プロトコルの形状をWP-3〜6の契約基準として固定する。
 - 整合性情報: 本書の型は `crates/gento-core/src/catalog.rs`、`apps/desktop/src-tauri/src/catalog.rs`
   (ページDTOのversion拡張もここ)、
@@ -79,11 +79,26 @@ export type CatalogPageError =
 
 ## 1. Commands
 
-### `health` (WP-1から変更なし)
+### `health` (WP-0で `api_version` を追加)
 
 ```ts
 invoke<HealthInfo>("health")
 ```
+
+```ts
+type HealthInfo = {
+  app_name: string;
+  version: string;
+  /** IPC DTO契約のAPIバージョン (§15。Rust: gento_core::GENTO_API_VERSION)。 */
+  api_version: number;
+  dataset_path: string | null;
+  dataset_exists: boolean;
+  timestamp_ms: number;
+};
+```
+
+- 常に成功する (読み取りのみ)。`api_version` は必須フィールド
+  (WP-0より前の形状はフロントの検証でerror扱い)。
 
 ### `get_catalog_summary`
 
@@ -517,12 +532,13 @@ durationサンプルは100,000件で打ち切り。
 
 ## 14. WP-7 (フェーズ8/9) で追加・拡張したAPI
 
-> FG-1: `set_failure_injection` / `devtest_report` / `dev_bridge_enabled` の
-> 3コマンドは**計測ブリッジのゲート**を持つ。起動時に環境変数
-> `GENTO_DEV_BRIDGE` (値が**厳密に `"1"`** のときのみ有効。`0`・`true`・
-> 空文字・未設定は無効) から `AppState` のフラグを確定し、無効な場合は
-> stringでrejectする (releaseで常に登録されていてもWebViewから呼べない)。
-> プロトコル・通常コマンドには影響しない。
+> WP-0で本節の全command (と `set_catalog_mode`、仮想カタログモード) は
+> **devtools機能**へ再分類された: `debug_assertions` または cargo feature
+> `devtools` (releaseは `--features custom-protocol,devtools` で明示有効化) でのみコンパイル
+> される。通常releaseビルドのinvoke handlerにこれらの識別子は存在しない
+> (`scripts/release-smoke.sh` がバイナリレベルで検証する)。
+> devtoolsビルド内では更に環境変数 `GENTO_DEV_BRIDGE` (値が**厳密に `"1"`**
+> のときのみ有効) がランタイムゲートとなり、無効ならstringでrejectする。
 
 ### `set_failure_injection`
 
@@ -553,9 +569,9 @@ invoke<boolean>("dev_bridge_enabled")
 ```
 
 - ブリッジ有効時は `Ok(true)`。**無効時はErr** (上記ゲート参照)。
-- release buildでも計測ブリッジ (devtest.ts) を有効化するための
+- devtoolsビルドのreleaseで計測ブリッジ (devtest.ts) を有効化するための
   ランタイムフラグ (既定無効。`GENTO_DEV_BRIDGE` は値が厳密に `"1"` の
-  ときのみ有効)。
+  ときのみ有効)。通常releaseビルドではこのcommand自体が存在しない。
 
 ### `devtest_report`
 
@@ -591,3 +607,18 @@ injection_rate: number;
 - SIGTERM/SIGINT → self-pipe (libc) → 監視スレッド → `AppHandle::exit(0)` →
   `RunEvent::Exit` → `ThumbnailService::shutdown()` (ワーカー排出・join・
   キューCancelled化)。ウィンドウ閉じと同じ経路。
+
+## 15. APIバージョン互換方針 (WP-0)
+
+- 定数: `gento_core::GENTO_API_VERSION` (現行 `1`)。`health` 応答の
+  `api_version` フィールドでフロントエンドが判定する。
+- **major** (破壊的): フィールド削除・リネイム・意味変更・列挙値の削除。
+  この値を +1 する。フロントは `api_version` 不一致で「バックエンド互換なし」
+  を表示して機能を落とす想定。
+- **minor** (追加): フィールド・列挙値・command・イベントの追加。この値は
+  変えない。フロントは未知のフィールドを無視する (health正規化の前方互換
+  テスト参照)。
+- devtoolsビルド限定のAPI (§14) はこのバージョニングの対象外
+  (計測ドライバと同時に更新するため)。
+- 互換方針の運用: 破壊的変更時はこの値・本契約書・`health.test.ts` を
+  同時に更新する。

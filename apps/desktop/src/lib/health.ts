@@ -8,6 +8,8 @@
 export type HealthInfo = {
   app_name: string;
   version: string;
+  /** IPC DTO契約のAPIバージョン (Rust: gento_core::GENTO_API_VERSION)。 */
+  api_version: number;
   dataset_path: string | null;
   dataset_exists: boolean;
   /** Unixエポックからのミリ秒 (JS安全整数範囲内) 。 */
@@ -36,6 +38,7 @@ function isHealthInfo(value: Record<string, unknown>): value is HealthInfo {
   return (
     typeof value["app_name"] === "string" &&
     typeof value["version"] === "string" &&
+    typeof value["api_version"] === "number" &&
     (typeof value["dataset_path"] === "string" || value["dataset_path"] === null) &&
     typeof value["dataset_exists"] === "boolean" &&
     typeof value["timestamp_ms"] === "number"

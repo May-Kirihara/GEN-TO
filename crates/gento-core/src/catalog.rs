@@ -13,8 +13,76 @@ use crate::AssetId;
 /// (5万件をフロントエンドへ一括転送しない、本体計画 §9)。
 pub const MAX_PAGE_LIMIT: u32 = 500;
 
-/// 仮想カタログの既定規模 (docs/implementation-plan.md §2)。
-pub const VIRTUAL_CATALOG_COUNT: usize = 50_000;
+/// 仮想5万件カタログ (UI負荷試験用) の構築。
+/// devtools機能: debug buildまたは `--features devtools` でのみコンパイルされる
+/// (WP-0。通常releaseビルドに計測用コードは含めない)。
+#[cfg(any(debug_assertions, feature = "devtools"))]
+pub mod virtual_catalog {
+    use super::ImageRecord;
+
+    /// 仮想カタログの既定規模 (docs/implementation-plan.md §2)。
+    pub const VIRTUAL_CATALOG_COUNT: usize = 50_000;
+
+    /// [`build_virtual`] のエラー: 実カタログが空 (未走査)。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct EmptyBaseCatalogError;
+
+    impl std::fmt::Display for EmptyBaseCatalogError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "real catalog is empty; run a scan before building the virtual catalog"
+            )
+        }
+    }
+
+    impl std::error::Error for EmptyBaseCatalogError {}
+
+    /// 仮想カタログ生成 (docs/implementation-plan.md §4.2)。
+    ///
+    /// - 実レコードを循環参照 (source_path共有)
+    /// - 一意IDは base 最後のID + 1 から連番
+    /// - 表示名は `virtual-{index:05}-{元表示名}`
+    /// - rating = index % 6、triage は index % 3 で決定的に変化
+    /// - 順序は生成順 (= ID昇順) で安定
+    pub fn build_virtual(
+        base: &[ImageRecord],
+        count: usize,
+    ) -> Result<Vec<ImageRecord>, EmptyBaseCatalogError> {
+        let last_id = base.last().ok_or(EmptyBaseCatalogError)?.id.value();
+        // IDは走査スレッドが1から採番するため+1が桁あふれする前提は不存在。
+        let first_id = last_id
+            .checked_add(1)
+            .expect("scan-assigned asset ids are far below u64::MAX");
+
+        let out = (0..count)
+            .map(|index| {
+                let src = &base[index % base.len()];
+                ImageRecord {
+                    id: super::AssetId::new(first_id + index as u64),
+                    source_path: src.source_path.clone(),
+                    display_name: format!("virtual-{index:05}-{}", src.display_name),
+                    width: src.width,
+                    height: src.height,
+                    byte_size: src.byte_size,
+                    mtime_ms: src.mtime_ms,
+                    state: src.state,
+                    thumb_state: super::ThumbnailState::Missing,
+                    rating: (index % 6) as u8,
+                    triage: match index % 3 {
+                        0 => super::Triage::Undecided,
+                        1 => super::Triage::Keep,
+                        _ => super::Triage::Reject,
+                    },
+                }
+            })
+            .collect();
+        Ok(out)
+    }
+}
+
+#[cfg(any(debug_assertions, feature = "devtools"))]
+pub use virtual_catalog::{build_virtual, EmptyBaseCatalogError, VIRTUAL_CATALOG_COUNT};
 
 /// 画像レコードの状態。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,63 +272,6 @@ impl Default for CatalogState {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// [`build_virtual`] のエラー: 実カタログが空 (未走査)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EmptyBaseCatalogError;
-
-impl std::fmt::Display for EmptyBaseCatalogError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "real catalog is empty; run a scan before building the virtual catalog"
-        )
-    }
-}
-
-impl std::error::Error for EmptyBaseCatalogError {}
-
-/// 仮想カタログ生成 (docs/implementation-plan.md §4.2)。
-///
-/// - 実レコードを循環参照 (source_path共有)
-/// - 一意IDは base 最後のID + 1 から連番
-/// - 表示名は `virtual-{index:05}-{元表示名}`
-/// - rating = index % 6、triage は index % 3 で決定的に変化
-/// - 順序は生成順 (= ID昇順) で安定
-pub fn build_virtual(
-    base: &[ImageRecord],
-    count: usize,
-) -> Result<Vec<ImageRecord>, EmptyBaseCatalogError> {
-    let last_id = base.last().ok_or(EmptyBaseCatalogError)?.id.value();
-    // IDは走査スレッドが1から採番するため+1が桁あふれする前提は不存在。
-    let first_id = last_id
-        .checked_add(1)
-        .expect("scan-assigned asset ids are far below u64::MAX");
-
-    let out = (0..count)
-        .map(|index| {
-            let src = &base[index % base.len()];
-            ImageRecord {
-                id: AssetId::new(first_id + index as u64),
-                source_path: src.source_path.clone(),
-                display_name: format!("virtual-{index:05}-{}", src.display_name),
-                width: src.width,
-                height: src.height,
-                byte_size: src.byte_size,
-                mtime_ms: src.mtime_ms,
-                state: src.state,
-                thumb_state: ThumbnailState::Missing,
-                rating: (index % 6) as u8,
-                triage: match index % 3 {
-                    0 => Triage::Undecided,
-                    1 => Triage::Keep,
-                    _ => Triage::Reject,
-                },
-            }
-        })
-        .collect();
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -466,86 +477,94 @@ mod tests {
         );
     }
 
-    #[test]
-    fn virtual_catalog_count_ids_and_paths() {
-        let base = [
-            record("b.png", 10),
-            record("c.png", 11),
-            record("d.png", 12),
-        ];
-        let v = build_virtual(&base, 10).unwrap();
-        assert_eq!(v.len(), 10);
+    // ===== 仮想カタログ (devtools機能。debug/devtoolsビルドのみ) =====
 
-        // ID一意、base最後のID+1から連番
-        let ids: Vec<u64> = v.iter().map(|r| r.id.value()).collect();
-        let expected: Vec<u64> = (13..=22).collect();
-        assert_eq!(ids, expected);
+    #[cfg(any(debug_assertions, feature = "devtools"))]
+    mod virtual_tests {
+        use super::super::virtual_catalog::*;
+        use super::*;
 
-        // source_pathは循環参照
-        for (index, rec) in v.iter().enumerate() {
-            assert_eq!(rec.source_path, base[index % base.len()].source_path);
-            assert_eq!(rec.width, Some(100));
-            assert_eq!(rec.byte_size, 1234);
+        #[test]
+        fn virtual_catalog_count_ids_and_paths() {
+            let base = [
+                record("b.png", 10),
+                record("c.png", 11),
+                record("d.png", 12),
+            ];
+            let v = build_virtual(&base, 10).unwrap();
+            assert_eq!(v.len(), 10);
+
+            // ID一意、base最後のID+1から連番
+            let ids: Vec<u64> = v.iter().map(|r| r.id.value()).collect();
+            let expected: Vec<u64> = (13..=22).collect();
+            assert_eq!(ids, expected);
+
+            // source_pathは循環参照
+            for (index, rec) in v.iter().enumerate() {
+                assert_eq!(rec.source_path, base[index % base.len()].source_path);
+                assert_eq!(rec.width, Some(100));
+                assert_eq!(rec.byte_size, 1234);
+            }
         }
-    }
 
-    #[test]
-    fn virtual_catalog_display_name_rating_triage() {
-        let base = [record("b.png", 10), record("c.png", 11)];
-        let v = build_virtual(&base, 8).unwrap();
-        assert_eq!(v[0].display_name, "virtual-00000-b.png");
-        assert_eq!(v[1].display_name, "virtual-00001-c.png");
-        assert_eq!(v[2].display_name, "virtual-00002-b.png");
-        assert_eq!(v[7].display_name, "virtual-00007-c.png");
+        #[test]
+        fn virtual_catalog_display_name_rating_triage() {
+            let base = [record("b.png", 10), record("c.png", 11)];
+            let v = build_virtual(&base, 8).unwrap();
+            assert_eq!(v[0].display_name, "virtual-00000-b.png");
+            assert_eq!(v[1].display_name, "virtual-00001-c.png");
+            assert_eq!(v[2].display_name, "virtual-00002-b.png");
+            assert_eq!(v[7].display_name, "virtual-00007-c.png");
 
-        for (index, rec) in v.iter().enumerate() {
-            assert_eq!(rec.rating as usize, index % 6);
-            let expected_triage = match index % 3 {
-                0 => Triage::Undecided,
-                1 => Triage::Keep,
-                _ => Triage::Reject,
-            };
-            assert_eq!(rec.triage, expected_triage);
-            assert_eq!(rec.thumb_state, ThumbnailState::Missing);
+            for (index, rec) in v.iter().enumerate() {
+                assert_eq!(rec.rating as usize, index % 6);
+                let expected_triage = match index % 3 {
+                    0 => Triage::Undecided,
+                    1 => Triage::Keep,
+                    _ => Triage::Reject,
+                };
+                assert_eq!(rec.triage, expected_triage);
+                assert_eq!(rec.thumb_state, ThumbnailState::Missing);
+            }
         }
-    }
 
-    #[test]
-    fn virtual_catalog_requires_non_empty_base() {
-        let err = build_virtual(&[], 5).unwrap_err();
-        assert_eq!(err, EmptyBaseCatalogError);
-        assert!(!err.to_string().is_empty());
-    }
+        #[test]
+        fn virtual_catalog_requires_non_empty_base() {
+            let err = build_virtual(&[], 5).unwrap_err();
+            assert_eq!(err, EmptyBaseCatalogError);
+            assert!(!err.to_string().is_empty());
+        }
 
-    #[test]
-    fn virtual_catalog_50k_last_page_and_uniqueness() {
-        let base = [record("b.png", 1), record("c.png", 2)];
-        let v = build_virtual(&base, VIRTUAL_CATALOG_COUNT).unwrap();
-        assert_eq!(v.len(), VIRTUAL_CATALOG_COUNT);
+        #[test]
+        fn virtual_catalog_50k_last_page_and_uniqueness() {
+            let base = [record("b.png", 1), record("c.png", 2)];
+            let v = build_virtual(&base, VIRTUAL_CATALOG_COUNT).unwrap();
+            assert_eq!(v.len(), VIRTUAL_CATALOG_COUNT);
 
-        let mut state = CatalogState::new();
-        state.records = v;
-        state.mode = CatalogMode::Virtual;
-        assert_eq!(state.total(), 50_000);
+            let mut state = CatalogState::new();
+            state.records = v;
+            state.mode = CatalogMode::Virtual;
+            assert_eq!(state.total(), 50_000);
 
-        // ID一意性 (全件)
-        let mut ids: Vec<u64> = state.records.iter().map(|r| r.id.value()).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        assert_eq!(ids.len(), VIRTUAL_CATALOG_COUNT);
-        assert_eq!(ids[0], 3);
-        assert_eq!(*ids.last().unwrap(), 2 + VIRTUAL_CATALOG_COUNT as u64);
+            // ID一意性 (全件)
+            let mut ids: Vec<u64> = state.records.iter().map(|r| r.id.value()).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(ids.len(), VIRTUAL_CATALOG_COUNT);
+            assert_eq!(ids[0], 3);
+            assert_eq!(*ids.last().unwrap(), 2 + VIRTUAL_CATALOG_COUNT as u64);
 
-        // 末尾ページ
-        let page = state.page(state.generation, 49_900, 200).unwrap();
-        assert_eq!(page.total, 50_000);
-        assert_eq!(page.items.len(), 100);
-        assert!(!page.has_more);
-        assert_eq!(page.items[99].display_name, "virtual-49999-c.png");
+            // 末尾ページ
+            let page = state.page(state.generation, 49_900, 200).unwrap();
+            assert_eq!(page.total, 50_000);
+            assert_eq!(page.items.len(), 100);
+            assert!(!page.has_more);
+            assert_eq!(page.items[99].display_name, "virtual-49999-c.png");
 
-        // 先頭ページはID昇順 (生成順)
-        let first = state.page(state.generation, 0, 3).unwrap();
-        let first_ids: Vec<String> = first.items.iter().map(|i| i.id.to_string()).collect();
-        assert_eq!(first_ids, vec!["3", "4", "5"]);
+            // 先頭ページはID昇順 (生成順)
+            let first = state.page(state.generation, 0, 3).unwrap();
+            let first_ids: Vec<String> = first.items.iter().map(|i| i.id.to_string()).collect();
+            assert_eq!(first_ids, vec!["3", "4", "5"]);
+        }
     }
 }

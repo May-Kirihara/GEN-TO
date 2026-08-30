@@ -4,6 +4,12 @@ description = "GEN-TO core domain types"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# 計測・検証専用機能 (仮想5万件カタログ) を含める。
+# debug build (debug_assertions) では常に有効扱いになるため、
+# このfeatureはrelease buildでの明示的有効化 (--features devtools) 用。
+devtools = []
+
 [dependencies]
 serde = { workspace = true }
 

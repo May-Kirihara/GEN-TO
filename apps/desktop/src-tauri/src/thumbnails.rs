@@ -21,7 +21,11 @@ use gento_core::{AssetId, Priority, SizeClass};
 use gento_image::cache::{asset_fingerprint, cache_key, CacheLookup, ThumbnailCache};
 use gento_image::pool::{OutcomeSummary, PoolConfig, WorkerPool};
 use gento_image::stats::ThumbStats;
-use gento_image::thumbnail::{FailureInjection, InjectionMode, ThumbnailJob};
+#[cfg(any(debug_assertions, feature = "devtools"))]
+use gento_image::thumbnail::FailureInjection;
+#[cfg(any(debug_assertions, feature = "devtools"))]
+use gento_image::thumbnail::InjectionMode;
+use gento_image::thumbnail::ThumbnailJob;
 use serde::Serialize;
 use tauri::{Emitter, State};
 
@@ -116,7 +120,8 @@ pub struct ThumbnailService {
     /// ジョブキー → 要求中アセット。完了 (ready/failed/cancelled) で消える。
     registry: Arc<Mutex<HashMap<String, PendingRequest>>>,
     cache_generation: AtomicU64,
-    /// 開発用エラー注入 (WP-7)。全ジョブが共有する。
+    /// 開発用エラー注入 (WP-7)。全ジョブが共有する。devtoolsビルドのみ (WP-0)。
+    #[cfg(any(debug_assertions, feature = "devtools"))]
     injection: Arc<FailureInjection>,
     emitter_tx: Sender<EmitterMsg>,
     emitter_stop: Arc<AtomicBool>,
@@ -161,6 +166,7 @@ impl ThumbnailService {
             stats,
             registry,
             cache_generation: AtomicU64::new(1),
+            #[cfg(any(debug_assertions, feature = "devtools"))]
             injection: Arc::new(FailureInjection::new()),
             emitter_tx,
             emitter_stop,
@@ -222,6 +228,7 @@ impl ThumbnailService {
                             size_class,
                             cache: Arc::clone(&self.cache),
                             stats: Arc::clone(&self.stats),
+                            #[cfg(any(debug_assertions, feature = "devtools"))]
                             injection: Arc::clone(&self.injection),
                         });
                         match self.pool.submit(&key.hex, priority, job) {
@@ -331,7 +338,9 @@ impl ThumbnailService {
             p95_ms: snapshot.p95_ms,
             p99_ms: snapshot.p99_ms,
             paused: self.pool.is_paused(),
+            #[cfg(any(debug_assertions, feature = "devtools"))]
             injection_mode: self.injection.mode().as_str().to_string(),
+            #[cfg(any(debug_assertions, feature = "devtools"))]
             injection_rate: self.injection.rate(),
             proto_requests: 0,
             proto_ok: 0,
@@ -343,6 +352,8 @@ impl ThumbnailService {
     }
 
     /// 開発用エラー注入の設定 (WP-7 / フェーズ8)。即時に全ワーカーへ反映される。
+    /// devtoolsビルドのみ (WP-0)。
+    #[cfg(any(debug_assertions, feature = "devtools"))]
     pub fn set_injection(&self, mode: InjectionMode, rate: f64) {
         self.injection.set(mode, rate);
         tracing::info!(mode = mode.as_str(), rate, "failure injection updated");
@@ -535,8 +546,10 @@ pub struct ThumbnailStatsDto {
     pub p95_ms: Option<f64>,
     pub p99_ms: Option<f64>,
     pub paused: bool,
-    /// 開発用エラー注入の現在値 (WP-7)。
+    /// 開発用エラー注入の現在値 (WP-7)。devtoolsビルドのみ (WP-0)。
+    #[cfg(any(debug_assertions, feature = "devtools"))]
     pub injection_mode: String,
+    #[cfg(any(debug_assertions, feature = "devtools"))]
     pub injection_rate: f64,
     // ローカル画像プロトコル統計 (WP-4。get_thumbnail_statsへ統合)
     pub proto_requests: u64,
@@ -558,6 +571,8 @@ pub struct QueueDepthsDto {
 }
 
 /// `set_failure_injection` の結果DTO (現在の設定を返す)。
+/// devtoolsビルドのみ (WP-0)。
+#[cfg(any(debug_assertions, feature = "devtools"))]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct InjectionStatusDto {
     pub mode: String,
@@ -735,7 +750,9 @@ pub fn get_thumbnail_stats(state: State<'_, AppState>) -> ThumbnailStatsDto {
 
 /// 開発用エラー注入 (WP-7 / フェーズ8)。mode = none|decode|cache_write、
 /// rate = 0.0..1.0。決定的 (キャッシュキー閾値) ため計測が再現可能。
-/// 計測ブリッジ (`GENTO_DEV_BRIDGE=1`) が無効なreleaseではErr (FG-1)。
+/// devtoolsビルドのみにコンパイルされる (WP-0)。ビルド内では計測ブリッジ
+/// (`GENTO_DEV_BRIDGE=1`) が無効な場合Err (FG-1)。
+#[cfg(any(debug_assertions, feature = "devtools"))]
 #[tauri::command]
 pub fn set_failure_injection(
     state: State<'_, AppState>,
@@ -746,12 +763,13 @@ pub fn set_failure_injection(
 }
 
 /// [`set_failure_injection`] のゲート付き本体 (単体テスト用にStateから切り出した)。
+#[cfg(any(debug_assertions, feature = "devtools"))]
 pub(crate) fn set_failure_injection_impl(
     state: &AppState,
     mode: &str,
     rate: f64,
 ) -> Result<InjectionStatusDto, String> {
-    crate::dev_bridge_gate(state)?;
+    crate::devtools::dev_bridge_gate(state)?;
     if !(0.0..=1.0).contains(&rate) {
         return Err(format!("rate must be within 0.0..=1.0 (got {rate})"));
     }
@@ -1150,6 +1168,9 @@ mod tests {
         svc.shutdown();
     }
 
+    // ===== 開発用エラー注入 (devtools機能。debug/devtoolsビルドのみ) =====
+
+    #[cfg(any(debug_assertions, feature = "devtools"))]
     #[test]
     fn failure_injection_fails_individually_and_recovers_at_zero_rate() {
         let dir = TestDir::new("inject");

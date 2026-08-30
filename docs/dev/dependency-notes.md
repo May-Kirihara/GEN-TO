@@ -1,6 +1,6 @@
 # 依存ライブラリメモ (Phase 2 / WP-2時点)
 
-- 記録日: 2026-08-28 (Phase 1 → WP-2更新 → WP-3更新 2026-08-29 → WP-4更新 2026-08-29 → WP-5更新 2026-08-29)
+- 記録日: 2026-08-28 (Phase 1 → WP-2更新 → WP-3更新 2026-08-29 → WP-4更新 2026-08-29 → WP-5更新 2026-08-29 → WP-0確認 2026-08-30)
 - 方針: バージョンはpin (npmは正確なバージョン指定、Cargoは `=` 付き + Cargo.lock)。追加・変更時に本メモへ記録する。
 
 ## Rust (workspace直依存)
@@ -125,6 +125,13 @@
 ## 将来WPでの追加予定
 
 - (WP-5で追加予定だった `@tanstack/svelte-virtual` は上記のとおり採用済み)
+
+## WP-0での依存変更 (2026-08-30)
+
+- **追加なし (Rust/TS両方)**。devtools feature隔離・AppDirs・panic hook・
+  APIバージョンはいずれも既存依存 (dirs / tracing / serde) の範囲で実装した。
+  ライセンス一覧の生成手段を `scripts/gen-licenses.sh` として追加
+  (成果物: [licenses.md](licenses.md))。
 
 ## WP-7で追加した依存
 

@@ -27,9 +27,10 @@ export type ThumbnailStats = {
   p95_ms: number | null;
   p99_ms: number | null;
   paused: boolean;
-  /** 開発用エラー注入の現在値 (WP-7)。 */
-  injection_mode: "none" | "decode" | "cache_write";
-  injection_rate: number;
+  /** 開発用エラー注入の現在値 (WP-7)。devtoolsビルドのみbackendが返す
+   *  (WP-0。通常releaseビルドのstatsにはこのフィールドが無い)。 */
+  injection_mode?: "none" | "decode" | "cache_write";
+  injection_rate?: number;
   /** ローカル画像プロトコル統計 (WP-4)。 */
   proto_requests: number;
   proto_ok: number;

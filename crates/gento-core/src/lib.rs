@@ -7,6 +7,7 @@ pub mod jobs;
 pub use jobs::{ParsePriorityError, ParseSizeClassError, Priority, SizeClass};
 
 use std::fmt;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -80,11 +81,37 @@ impl<'de> Deserialize<'de> for AssetId {
     }
 }
 
+/// GEN-TO IPC DTO契約のAPIバージョン (docs/dev/api-contract.md §15)。
+///
+/// 互換方針: major (この値の増分) は破壊的変更 (フィールド削除・意味変更)、
+/// minorは追加のみ。`health` 応答の `api_version` でフロントが判定する。
+pub const GENTO_API_VERSION: u32 = 1;
+
+// APIバージョンは単調増加である必要がある (0や負相当は契約違反)。
+const _: () = assert!(GENTO_API_VERSION >= 1);
+
+/// アプリケーション稼働ディレクトリの解決結果 (WP-0)。
+///
+/// 解決自体はTauriアダプター側 (dirs crate) で行い、コアは注入された
+/// 値のみを使う (コアをプラットフォームAPIに依存させない)。
+/// MVP-WP-1でSQLite DBは `data_dir` 直下へ置く予定。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppDirs {
+    /// 永続データ (設定・DB) の置き場所。MVP-WP-1のSQLite DBはここへ置く。
+    pub data_dir: PathBuf,
+    /// 再生成可能なキャッシュのベースディレクトリ。
+    pub cache_dir: PathBuf,
+    /// ログ・panic記録の出力先。
+    pub log_dir: PathBuf,
+}
+
 /// `health` commandが返すバックエンド健全性スナップショット。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthInfo {
     pub app_name: String,
     pub version: String,
+    /// IPC DTO契約のAPIバージョン (`GENTO_API_VERSION`)。
+    pub api_version: u32,
     /// データセットディレクトリのパス (UI表示用の絶対パス文字列)。
     /// 設定されていない場合は `null`。
     pub dataset_path: Option<String>,
@@ -155,6 +182,7 @@ mod tests {
         let info = HealthInfo {
             app_name: "GEN-TO 技術検証プロトタイプ".to_string(),
             version: "0.1.0".to_string(),
+            api_version: GENTO_API_VERSION,
             dataset_path: Some("/tmp/sample/dataset".to_string()),
             dataset_exists: true,
             timestamp_ms: 1_759_000_000_000,
@@ -165,6 +193,7 @@ mod tests {
             serde_json::json!({
                 "app_name": "GEN-TO 技術検証プロトタイプ",
                 "version": "0.1.0",
+                "api_version": GENTO_API_VERSION,
                 "dataset_path": "/tmp/sample/dataset",
                 "dataset_exists": true,
                 "timestamp_ms": 1_759_000_000_000u64
@@ -179,6 +208,7 @@ mod tests {
         let info = HealthInfo {
             app_name: "GEN-TO 技術検証プロトタイプ".to_string(),
             version: "0.1.0".to_string(),
+            api_version: GENTO_API_VERSION,
             dataset_path: None,
             dataset_exists: false,
             timestamp_ms: 1,
@@ -186,5 +216,47 @@ mod tests {
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["dataset_path"], serde_json::Value::Null);
         assert_eq!(json["dataset_exists"], false);
+    }
+
+    // ===== APIバージョン・アプリディレクトリ (WP-0) =====
+
+    #[test]
+    fn health_info_rejects_json_without_api_version() {
+        // api_versionは必須フィールド: 古い形状 (WP-0前) は拒否される
+        let legacy = serde_json::json!({
+            "app_name": "GEN-TO 技術検証プロトタイプ",
+            "version": "0.1.0",
+            "dataset_path": null,
+            "dataset_exists": false,
+            "timestamp_ms": 1,
+        });
+        assert!(serde_json::from_value::<HealthInfo>(legacy).is_err());
+    }
+
+    #[test]
+    fn api_version_const_matches_health_field() {
+        let info = HealthInfo {
+            app_name: "app".to_string(),
+            version: "0.1.0".to_string(),
+            api_version: GENTO_API_VERSION,
+            dataset_path: None,
+            dataset_exists: false,
+            timestamp_ms: 0,
+        };
+        assert_eq!(info.api_version, GENTO_API_VERSION);
+    }
+
+    #[test]
+    fn app_dirs_holds_injected_paths() {
+        let dirs = AppDirs {
+            data_dir: PathBuf::from("/xdg/data/gento"),
+            cache_dir: PathBuf::from("/xdg/cache/gento"),
+            log_dir: PathBuf::from("/xdg/cache/gento/log"),
+        };
+        assert_eq!(dirs.data_dir, PathBuf::from("/xdg/data/gento"));
+        assert_eq!(dirs.cache_dir, PathBuf::from("/xdg/cache/gento"));
+        assert_eq!(dirs.log_dir, PathBuf::from("/xdg/cache/gento/log"));
+        let cloned = dirs.clone();
+        assert_eq!(cloned, dirs);
     }
 }

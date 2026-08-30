@@ -6,6 +6,7 @@ describe("normalizeHealth", () => {
     const result = normalizeHealth({
       app_name: "GEN-TO 技術検証プロトタイプ",
       version: "0.1.0",
+      api_version: 1,
       dataset_path: "/home/user/GEN-TO/sample/dataset",
       dataset_exists: true,
       timestamp_ms: 1_759_000_000_000,
@@ -23,6 +24,7 @@ describe("normalizeHealth", () => {
     const result = normalizeHealth({
       app_name: "GEN-TO 技術検証プロトタイプ",
       version: "0.1.0",
+      api_version: 1,
       dataset_path: "/home/user/GEN-TO/sample/dataset",
       dataset_exists: false,
       timestamp_ms: 1_759_000_000_001,
@@ -40,6 +42,7 @@ describe("normalizeHealth", () => {
     const result = normalizeHealth({
       app_name: "GEN-TO 技術検証プロトタイプ",
       version: "0.1.0",
+      api_version: 1,
       dataset_path: null,
       dataset_exists: false,
       timestamp_ms: 1,
@@ -57,6 +60,7 @@ describe("normalizeHealth", () => {
     const result = normalizeHealth({
       app_name: "GEN-TO 技術検証プロトタイプ",
       version: "0.1.0",
+      api_version: 1,
       dataset_path: null,
       dataset_exists: false,
       timestamp_ms: 1,
@@ -71,6 +75,20 @@ describe("normalizeHealth", () => {
     });
   });
 
+  it("api_version欠如・型違反はerrorへ落とす (WP-0の必須フィールド)", () => {
+    const base = {
+      app_name: "GEN-TO 技術検証プロトタイプ",
+      version: "0.1.0",
+      dataset_path: null,
+      dataset_exists: false,
+      timestamp_ms: 1,
+    };
+    for (const broken of [{ ...base }, { ...base, api_version: "1" }]) {
+      const result = normalizeHealth(broken);
+      expect(result.kind).toBe("error");
+    }
+  });
+
   it("非オブジェクト応答をerror状態へ正規化する", () => {
     for (const invalid of [null, undefined, 42, "ok", []]) {
       const result = normalizeHealth(invalid);
@@ -82,6 +100,7 @@ describe("normalizeHealth", () => {
     const base = {
       app_name: "GEN-TO 技術検証プロトタイプ",
       version: "0.1.0",
+      api_version: 1,
       dataset_path: null,
       dataset_exists: false,
       timestamp_ms: 1,
