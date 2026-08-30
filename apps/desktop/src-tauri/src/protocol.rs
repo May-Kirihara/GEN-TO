@@ -217,7 +217,9 @@ pub fn parse_protocol_request(
 /// ファイル解決の結果。
 pub struct ServeSpec {
     pub path: PathBuf,
-    pub content_type: &'static str,
+    /// 応答MIME。thumb/previewは常に `image/webp`、originalはプローブ由来
+    /// (レコード未確定時のフォールバックを含む) のためString。
+    pub content_type: String,
     pub max_bytes: u64,
     pub cache_control: &'static str,
     /// 検証時 (`resolve_file` 内の `symlink_metadata`) の (dev, ino)。
@@ -276,7 +278,7 @@ pub fn resolve_file(
             let canonical_root = verify_within_cache_root(&path, cache.root())?;
             Ok(ServeSpec {
                 path,
-                content_type: "image/webp",
+                content_type: "image/webp".to_string(),
                 max_bytes: MAX_THUMB_BYTES,
                 cache_control,
                 file_id: (md.dev(), md.ino()),
@@ -298,7 +300,11 @@ pub fn resolve_file(
             }
             Ok(ServeSpec {
                 path: asset.source_path.clone(),
-                content_type: "image/png",
+                // 形式はアセットごとに異なる (image/gif, image/webp等)。
+                // WebKitの<img>ネイティブ再生 (アニメーション) にも正確な
+                // Content-Typeが必要。未確定はoctet-stream (nosniffで表示
+                // されない可能性があるが、誤ったsniffより安全側)。
+                content_type: asset.content_type.clone(),
                 max_bytes: MAX_ORIGINAL_BYTES,
                 cache_control,
                 file_id: (md.dev(), md.ino()),
@@ -466,7 +472,7 @@ pub fn process_request(
 }
 
 fn ok_response(spec: &ServeSpec, body: Vec<u8>) -> http::Response<Vec<u8>> {
-    response_with(StatusCode::OK, spec.content_type, spec.cache_control, body)
+    response_with(StatusCode::OK, &spec.content_type, spec.cache_control, body)
 }
 
 fn error_response(status: StatusCode) -> http::Response<Vec<u8>> {
@@ -638,6 +644,10 @@ fn handle_protocol_request<R: Runtime>(
             byte_size: record.byte_size,
             mtime_ms: record.mtime_ms,
             readable: record.state == ImageState::Ready,
+            content_type: record
+                .mime_type
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".to_string()),
         })
     };
     let cache = state
@@ -1156,6 +1166,15 @@ mod tests {
     }
 
     fn snapshot_for(id: u64, path: &Path, readable: bool) -> AssetSnapshot {
+        snapshot_with_type(id, path, readable, "image/png")
+    }
+
+    fn snapshot_with_type(
+        id: u64,
+        path: &Path,
+        readable: bool,
+        content_type: &str,
+    ) -> AssetSnapshot {
         let md = fs::metadata(path).unwrap();
         let mtime_ms = md
             .modified()
@@ -1169,6 +1188,7 @@ mod tests {
             byte_size: md.len(),
             mtime_ms,
             readable,
+            content_type: content_type.to_string(),
         }
     }
 
@@ -1288,6 +1308,24 @@ mod tests {
         assert_eq!(
             resp.headers().get(http::header::CONTENT_TYPE).unwrap(),
             "image/png"
+        );
+
+        // アニメーションGIF資産は image/gif で応答する (WP-3。WebKitの
+        // ネイティブ再生に正確なContent-Typeが必要)
+        let gif = dir.path().join("src.gif");
+        fs::write(&gif, b"GIF89a-fake").unwrap();
+        let gif_asset = snapshot_with_type(10, &gif, true, "image/gif");
+        let resp = process_request(
+            ProtoKind::Original,
+            &get(),
+            "gento-original://localhost/asset/10?v=1",
+            Some(&gif_asset),
+            Some(&cache),
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(http::header::CONTENT_TYPE).unwrap(),
+            "image/gif"
         );
     }
 

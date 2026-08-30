@@ -1,7 +1,7 @@
 # GEN-TO IPC API契約 (Phase 2 / WP-2時点)
 
 - 作成日: 2026-08-28 (WP-2)
-- 最終更新: 2026-08-30 (WP-0: §0/§1 healthへ `api_version` 追加・§14 devtools feature化・§15 APIバージョン互換方針追加 / WP-1: §1 healthへ `db_open` 追加・§16 `db_status` 追加 / WP-2: §17〜21 登録ルート・永続カタログ・`set_catalog_source`・`"library"`モード追加)
+- 最終更新: 2026-08-30 (WP-0: §0/§1 healthへ `api_version` 追加・§14 devtools feature化・§15 APIバージョン互換方針追加 / WP-1: §1 healthへ `db_open` 追加・§16 `db_status` 追加 / WP-2: §17〜21 登録ルート・永続カタログ・`set_catalog_source`・`"library"`モード追加 / **WP-3 (MVP): §22〜24 形式拡張・Orientation・アニメーション・透過背景・`isAnimated`フィールド追加**)
 - 目的: Tauri command・イベント・ローカル画像プロトコルの形状をWP-3〜6の契約基準として固定する。
 - 整合性情報: 本書の型は `crates/gento-core/src/catalog.rs`、`apps/desktop/src-tauri/src/catalog.rs`
   (ページDTOのversion拡張もここ)、
@@ -453,7 +453,7 @@ type ThumbReadyItem = {
 |---|---|---|---|---|
 | `gento-thumb` | `//localhost/asset/{id}/{s256\|s512}?v={version}` | サムネイルのキャッシュWebP | `image/webp` | 64MiB |
 | `gento-preview` | `//localhost/asset/{id}?v={version}` | preview2048キャッシュWebP | `image/webp` | 64MiB |
-| `gento-original` | `//localhost/asset/{id}?v={version}` | 登録済みカタログ資産の元PNG | `image/png` | 512MiB |
+| `gento-original` | `//localhost/asset/{id}?v={version}` | 登録済みカタログ資産の元ファイル (MVP全形式。WP-3からContent-Typeはアセットごと) | 形式ごと (`image/png` / `image/gif` / `image/webp` 等。プローブ由来) | 512MiB |
 
 `?v={version}` は**内容感応バージョン** (§10参照。元ファイルの
 path+size+mtimeとアルゴリズムバージョンから決まる)。任意の資産で
@@ -907,3 +907,64 @@ WP-5のメタデータ編集は**安定ID (assets.id) を指定して**行うこ
 | 8 | **ハッシュ会計 (FG-WP2)**: `pending_hash` は「submit成功 (新規Enqueued) 数 − プール完了通知数」で厳密に維持。減算は完了通知ドリブンの会計スレッドが行う | dedup統合 (同一file_idジョブのマージ)・queue満杯放棄・キャンセル・pool shutdown放棄のすべてで増減が1:1に対応し、終了時に厳密に0になる (`hash_accounting_is_exact_under_dedup_queue_saturation_and_shutdown`) |
 | 9 | **relocation失敗の伝播 (FG-WP2)**: `Duplicate`/`NotFound` は通常upsertへフォールバック (旧パス行はseen解除→不在化)。DB・制約エラーはスキャンエラーとして伝播・集計 | 失敗を黙って捨てると「移動でも不在化でもない」行が残る (Codex指摘) |
 | 10 | **メンテナンス周期 (60秒) の導入 (FG-WP2)**: watcher再確立・不在ルートのwatcher解放・degraded時のポーリング再スキャンをワーカーのアイドル時に実行 | inotify上限・ルート再出現への劣化運用。新規スレッドを増やさずワーカーループのrecv_timeoutで実現 |
+
+---
+
+# MVP画像形式・表示パイプライン (WP-3 / 2026-08-30 追加)
+
+## 22. 対応形式と形式判定
+
+- 対象: PNG / JPEG / GIF / BMP / TIFF / WebP (**AVIFはblocked-avif** —
+  `image` crate `avif-native` featureがシステムdav1dを要求し、本環境に
+  absentのため。PMがパッケージ入手を調整するまで`Unsupported`表示。
+  詳細は handoff 2026-08-30-mvp-wp3)
+- **形式判定はmagic (先頭バイト) が正本**。拡張子は走査列挙と
+  プローブ失敗時のMIMEフォールバックにのみ使用する
+- プローブ (`gento_image::format`) はmagic+寸法+alpha+アニメーション情報
+  (GIFフレーム数・WebP ANIM/ANMF走査) を返す。寸法上限
+  (`MAX_DECODE_DIMENSION=20000`) を超えるヘッダは`Corrupt`
+- 走査 (一時`temp`・登録ルート`library`両方) で全形式が列挙・プローブされ、
+  `assets`行の `width/height/mime_type/has_alpha/is_animated/frame_count`
+  へ保存 (schema #1の既存列のためmigration追加なし)
+- magicが既知形式に一致しないファイルは `state: "unsupported"`、
+  一致するが内容が不正 (切り詰め・破損・上限超過) は `"corrupt"`。
+  いずれもグリッドでは既存の失敗セル表示
+
+## 23. EXIF Orientation
+
+- JPEG APP1 / TIFF / PNG eXIf / WebP EXIFチャンクからOrientation (1..8) を
+  取得 (`kamadak-exif`)。**サムネイル・preview・ビューア表示で一貫して
+  decode後に適用** (回転・反転)。元ファイルは一切変更しない
+- 適用のため `ALGORITHM_VERSION` を **1→2** へ繰り上げ (§7のキャッシュキー・
+  §10/§12のversionに織り込み済み。v1キャッシュはキー不一致で自然無効化)
+- ICCプロファイル: MVPでは**色管理 (ICC適用) を行わない**。プロファイルの
+  読み取り・維持は画像デコード基盤に委ね、表示は既定色空間扱い。
+  対応範囲の拡大はWP-16以降の課題
+
+## 24. アニメーション表示・透過背景
+
+- **一覧サムネイル**: 常に静止画 (Rust側で先頭フレーム静止化。アニメGIF/WebP
+  とも)。グリッドの要求は常に `s256|s512` のみ (`isAnimated`項目でも
+  preview/original要求は発生しない — `grid-store.test.ts` で保証)
+- **単一ビューア**: `isAnimated` 項目は**previewを経由せずoriginalを直接表示**
+  (`gento-original://` + WebKit `<img>`ネイティブ再生)。昇格/復帰
+  (`setOriginal`) とactual自動昇格はanimatedでは**スキップ**。originalの
+  Content-Typeはプローブ由来の正確値 (例: `image/gif`)。
+  original読み込み失敗時は静的previewへ復帰せずエラー表示 (再生喪失のため)
+- **比較表示**: 静止画扱い (既存preview経路。アニメーション資産は先頭
+  フレーム) — **既知制限**として明記。段階アニメーション比較は将来課題
+- **透過背景**: ビューアで市松/白/黒を切替 (localStorage `gento.viewer.background`
+  に永続化。製品設定体系はWP-15)
+
+## 25. ページDTOへの追加フィールド (minor。`GENTO_API_VERSION` 据え置き)
+
+```ts
+type ImageListItem = {
+  // ... 既存フィールド ...
+  /** アニメーション付き画像か (WP-3)。ビューアのoriginal直表示判定。 */
+  isAnimated: boolean;
+};
+```
+
+- 一時`temp`カタログは走査プローブから、`library`カタログは`assets.is_animated`
+  から供給される。未プローブ (ハッシュ待ちの仮ID) は `false`

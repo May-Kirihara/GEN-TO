@@ -27,7 +27,8 @@ const FILE_COLUMNS: &str = "id, uuid, root_id, asset_id, rel_path, path_encoding
 
 /// assets行のSELECT列一覧 (map_assetと共通)。
 const ASSET_COLUMNS: &str = "id, uuid, content_hash, hash_algorithm, hash_state, mime_type, \
-     byte_size, width, height, rating, triage, favorite, created_at, updated_at";
+     byte_size, width, height, has_alpha, is_animated, frame_count, rating, triage, favorite, \
+     created_at, updated_at";
 
 /// 1接続ぶんのrepository集合。
 pub struct SqliteRepos<'a> {
@@ -196,6 +197,11 @@ fn map_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord> {
             .and_then(|v| u32::try_from(v).ok()),
         height: row
             .get::<_, Option<i64>>("height")?
+            .and_then(|v| u32::try_from(v).ok()),
+        has_alpha: row.get::<_, Option<i64>>("has_alpha")?.map(|v| v != 0),
+        is_animated: row.get::<_, Option<i64>>("is_animated")?.map(|v| v != 0),
+        frame_count: row
+            .get::<_, Option<i64>>("frame_count")?
             .and_then(|v| u32::try_from(v).ok()),
         rating: row.get::<_, i64>("rating")?.clamp(0, 5) as u8,
         triage,
@@ -586,6 +592,7 @@ impl FileRepo for SqliteRepos<'_> {
                     f.created_at AS f_created_at, f.updated_at AS f_updated_at,
                     a.id AS a_id, a.uuid AS a_uuid, a.content_hash, a.hash_algorithm,
                     a.hash_state, a.mime_type, a.byte_size AS a_byte_size, a.width, a.height,
+                    a.has_alpha, a.is_animated, a.frame_count,
                     a.rating, a.triage, a.favorite, a.created_at AS a_created_at,
                     a.updated_at AS a_updated_at
              FROM files f LEFT JOIN assets a ON f.asset_id = a.id
@@ -692,6 +699,11 @@ fn map_asset_prefixed(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord> 
         height: row
             .get::<_, Option<i64>>("height")?
             .and_then(|v| u32::try_from(v).ok()),
+        has_alpha: row.get::<_, Option<i64>>("has_alpha")?.map(|v| v != 0),
+        is_animated: row.get::<_, Option<i64>>("is_animated")?.map(|v| v != 0),
+        frame_count: row
+            .get::<_, Option<i64>>("frame_count")?
+            .and_then(|v| u32::try_from(v).ok()),
         rating: row.get::<_, i64>("rating")?.clamp(0, 5) as u8,
         triage,
         favorite: row.get::<_, i64>("favorite")? != 0,
@@ -707,8 +719,9 @@ impl AssetRepo for SqliteRepos<'_> {
             .execute(
                 "INSERT INTO assets
                     (uuid, content_hash, hash_algorithm, hash_state, mime_type,
-                     byte_size, width, height, rating, triage, favorite, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'done', ?4, ?5, ?6, ?7, 0, 'unselected', 0, ?8, ?8)",
+                     byte_size, width, height, has_alpha, is_animated, frame_count,
+                     rating, triage, favorite, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'done', ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, 'unselected', 0, ?11, ?11)",
                 params![
                     new_uuid_v7(),
                     asset.content_hash,
@@ -717,6 +730,9 @@ impl AssetRepo for SqliteRepos<'_> {
                     u64_to_i64(asset.byte_size, "byte_size")?,
                     u32_opt_to_i64(asset.width, "width")?,
                     u32_opt_to_i64(asset.height, "height")?,
+                    asset.has_alpha.map(|b| b as i64),
+                    asset.is_animated.map(|b| b as i64),
+                    u32_opt_to_i64(asset.frame_count, "frame_count")?,
                     now,
                 ],
             )
@@ -1137,6 +1153,9 @@ mod tests {
             mime_type: Some("image/png".to_string()),
             width: None,
             height: None,
+            has_alpha: None,
+            is_animated: None,
+            frame_count: None,
         }
     }
 
@@ -1154,6 +1173,10 @@ mod tests {
             let found = repos.find_by_hash("blake3:aa").unwrap().unwrap();
             assert_eq!(found.id, a.id);
             assert!(repos.find_by_hash("blake3:zz").unwrap().is_none());
+            // WP-3: プローブ由来列のNULL往復
+            assert_eq!(found.has_alpha, None);
+            assert_eq!(found.is_animated, None);
+            assert_eq!(found.frame_count, None);
 
             let err = repos.create_asset(new_asset("aa", 100)).unwrap_err();
             assert_eq!(err, RepoError::Duplicate, "content_hash一意");
@@ -1678,8 +1701,14 @@ mod tests {
                     mime_type: Some("image/png".to_string()),
                     width: Some(640),
                     height: Some(480),
+                    has_alpha: Some(true),
+                    is_animated: Some(false),
+                    frame_count: None,
                 })
                 .unwrap();
+            assert_eq!(asset.width, Some(640));
+            assert_eq!(asset.has_alpha, Some(true));
+            assert_eq!(asset.is_animated, Some(false));
             repos.link_file(linked.id, asset.id).unwrap();
             repos
                 .upsert_file(upsert(root.id, "unlinked.png", 2, 2))

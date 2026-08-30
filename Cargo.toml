@@ -30,8 +30,16 @@ serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 walkdir = "=2.5.0"
 png = "=0.18.1"
-image = { version = "=0.25.10", default-features = false, features = ["png"] }
+image = { version = "=0.25.10", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "bmp",
+    "tiff",
+    "webp",
+] }
 webp = { version = "=0.3.1", default-features = false }
+kamadak-exif = "=0.5.5"
 twox-hash = "=2.1.4"
 dirs = "=6.0.0"
 rusqlite = { version = "=0.31.0", features = ["bundled", "backup"] }

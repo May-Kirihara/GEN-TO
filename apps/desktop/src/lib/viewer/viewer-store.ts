@@ -58,6 +58,8 @@ export type ViewerImage = {
   height: number;
   url: string | null;
   isOriginal: boolean;
+  /** アニメーション画像 (original直表示・preview/昇格経路をskip。WP-3)。 */
+  isAnimated: boolean;
   note: string | null;
   /** ページDTO由来の内容感応バージョン (original昇格時のURLに使う。FG-1)。 */
   version: number | null;
@@ -73,6 +75,7 @@ function placeholderImage(navGen: number): ViewerImage {
     height: 0,
     url: null,
     isOriginal: false,
+    isAnimated: false,
     note: null,
     version: null,
   };
@@ -228,7 +231,17 @@ export class ViewerStore {
     cur.width = item.width;
     cur.height = item.height;
     cur.version = item.version;
+    cur.isAnimated = item.isAnimated;
     this.transform = fitTransform(this.viewport, { width: item.width, height: item.height });
+    if (item.isAnimated) {
+      // アニメーション資産はpreviewを経由せずoriginalを直接表示する
+      // (WebKitの<img>ネイティブ再生に委ねる)。昇格ロジックもskip。
+      cur.url = originalUrl(item.id, item.version ?? 1);
+      cur.isOriginal = true;
+      this.notify();
+      this.runPrefetch(index);
+      return;
+    }
     const readyVersion = this.ready.version(PREVIEW_CLASS, item.id);
     if (readyVersion !== null) {
       cur.url = previewUrl(item.id, readyVersion);
@@ -288,8 +301,11 @@ export class ViewerStore {
           item === null ||
           item.state !== "ready" ||
           item.width === null ||
-          item.height === null
+          item.height === null ||
+          item.isAnimated
         ) {
+          // アニメーション資産はpreviewの先読み対象外 (表示に使わないため。
+          // originalの先読みウォームは大容量化するため行わない)
           continue;
         }
         const readyVersion = this.ready.version(PREVIEW_CLASS, item.id);
@@ -383,6 +399,14 @@ export class ViewerStore {
     if (cur === null || cur.key !== key || cur.assetId === null) {
       return;
     }
+    if (cur.isAnimated) {
+      // アニメーションoriginalの失敗は静的previewへ落とさない (再生が失われる)
+      cur.url = null;
+      cur.note = "アニメーション画像の読み込みに失敗しました";
+      this.lastError = cur.note;
+      this.notify();
+      return;
+    }
     if (cur.isOriginal) {
       cur.isOriginal = false;
       const readyVersion = this.ready.version(PREVIEW_CLASS, cur.assetId);
@@ -468,6 +492,9 @@ export class ViewerStore {
     const cur = this.current;
     if (cur === null || cur.assetId === null || cur.width <= 0) {
       return;
+    }
+    if (cur.isAnimated) {
+      return; // アニメーションは常にoriginal直接表示 (昇格ロジック対象外)
     }
     if (useOriginal === cur.isOriginal) {
       return;

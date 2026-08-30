@@ -296,9 +296,15 @@ pub struct NewAsset {
     pub hash_algorithm: String,
     pub byte_size: u64,
     pub mime_type: Option<String>,
-    /// プローブ可能だった場合の寸法 (WP-2ではPNGのみ。他形式はNULL)。
+    /// プローブ可能だった場合の寸法 (WP-3で全MVP形式に拡大)。
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// カラータイプにalpha成分があるか (プローブ時点。未プローブはNone)。
+    pub has_alpha: Option<bool>,
+    /// アニメーション付きか (GIF/WebP。未プローブはNone)。
+    pub is_animated: Option<bool>,
+    /// フレーム数 (GIF/WebP。AVIF等の不明形式はNone)。
+    pub frame_count: Option<u32>,
 }
 
 /// 画像内容 (assets) のレコード。
@@ -314,6 +320,12 @@ pub struct AssetRecord {
     /// 寸法 (プローブ時点の値。未プローブは `None`)。
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// alpha成分の有無 (プローブ時点)。
+    pub has_alpha: Option<bool>,
+    /// アニメーション付きか。
+    pub is_animated: Option<bool>,
+    /// フレーム数 (不明形式はNone)。
+    pub frame_count: Option<u32>,
     pub rating: u8,
     pub triage: TriageState,
     pub favorite: bool,

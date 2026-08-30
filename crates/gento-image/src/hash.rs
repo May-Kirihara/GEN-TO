@@ -1,4 +1,4 @@
-//! ファイル内容のBLAKE3ハッシュ + PNGプローブ (MVP WP-2 / FG-WP2-2)。
+//! ファイル内容のBLAKE3ハッシュ + 形式プローブ (MVP WP-2 / WP-3 / FG-WP2-2)。
 //!
 //! Asset同一性判定の正本 (data-model §2.1「バイト列ハッシュ一致 = 同一Asset」)。
 //! ストリーミング (1MiBチャンク) で計算するためメモリ使用はファイルサイズに
@@ -8,8 +8,8 @@
 //! パスを再解決しないためrename/replace (inode差し替え) の影響を受けない。
 //! fdのfstatトークン (os_file_id, size, mtime_ns) が走査時観測 `expect` と
 //! 一致する場合のみ計算し、計算後に再びfstatしてトークン不変を検証する。
-//! プローブ (PNG署名+IHDR) も同一fdから読むため、ハッシュ対象バイトと
-//! 異なる寸法が混入することは構造的に不可能。不一致・変化は
+//! プローブ (magic+寸法+アニメーション情報) も同一fdから読むため、ハッシュ
+//! 対象バイトと異なる情報が混入することは構造的に不可能。不一致・変化は
 //! [`HashFileError::Stale`] として結果を破棄する (呼び出し側は要再提出)。
 
 use std::fs::File;
@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use blake3::Hasher;
 use gento_core::library::{FileContentHash, GenerationToken, HashFileError, HashedFile};
 
-use crate::probe::{probe_png_dimensions_at, ProbeResult};
+use crate::format::{probe_image_at, ImageProbe};
 use crate::scan::{os_file_id_of, system_time_to_ns};
 
 /// 読み取りチャンクサイズ。
@@ -38,11 +38,12 @@ fn fd_token(file: &File) -> Result<GenerationToken, HashFileError> {
     })
 }
 
-/// 1つの開いたfdからBLAKE3ハッシュとPNG寸法を束ねて計算する。
+/// 1つの開いたfdからBLAKE3ハッシュと形式プローブを束ねて計算する。
 ///
 /// - fdトークン ≠ `expect` → 計算前に [`HashFileError::Stale`] (無駄読みなし)
 /// - BLAKE3計算 (1MiBチャンク・協調キャンセル)
-/// - 同一fdからPNGヘッダを再読みして寸法を取得 (非PNG・破損は `None`)
+/// - 同一fdから形式プローブ (magic+寸法+アニメーション) を取得
+///   (非画像・破損は `None`)
 /// - 計算前後でfdトークン不変を検証 (in-place変更検出)。変化はStale
 ///
 /// 戻り値の `content_hash` は `blake3:<64hex小文字>` 形式。
@@ -79,13 +80,13 @@ pub fn hash_and_probe_file(
         }
         hasher.update(&buf[..read]);
     }
-    // プローブは同一fdから (パス再オープン禁止 = 置換ファイルの寸法混入が
+    // プローブは同一fdから (パス再オープン禁止 = 置換ファイルの情報混入が
     // 構造的に不可能)。ハッシュ読み取りでfd位置はEOFにあるため rewind して
     // ヘッダを読む。
-    let dims = match probe_png_dimensions_at(&file) {
-        ProbeResult::Ok { width, height } => Some((width, height)),
-        // PNG以外・読めない・壊れている: WP-2では寸法NULLで登録 (WP-3で形式拡張)
-        _ => None,
+    let probe = match probe_image_at(&mut file) {
+        ImageProbe::Ok(info) => Some(info),
+        // 非画像・読めない・壊れている: プローブNULLで登録 (寸法等はNULL)
+        ImageProbe::Unreadable | ImageProbe::Corrupt | ImageProbe::Unsupported => None,
     };
     let after = fd_token(&file)?;
     if after != before {
@@ -104,7 +105,7 @@ pub fn hash_and_probe_file(
             mtime_ns,
             os_file_id: before.os_file_id,
         },
-        dims,
+        probe,
     })
 }
 
@@ -147,7 +148,7 @@ mod tests {
             "blake3:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
         );
         assert_eq!(hashed.content.byte_size, 0);
-        assert_eq!(hashed.dims, None, "非PNGは寸法NULL");
+        assert_eq!(hashed.probe, None, "非画像はプローブNULL");
 
         let abc = dir.join("abc.bin");
         std::fs::write(&abc, b"abc").unwrap();
@@ -208,15 +209,26 @@ mod tests {
 
     #[test]
     fn dims_come_from_same_fd_as_hash() {
-        // PNGの寸法はハッシュと同一fdから得られる (API契約: 1呼び出しで
+        // プローブ情報はハッシュと同一fdから得られる (API契約: 1呼び出しで
         // hash+dimsが束ねて返る)。
+        use gento_core::library::{ProbedFormat, ProbedImage};
         let dir = temp_dir("dims");
         let file = dir.join("a.png");
         std::fs::write(&file, crate::probe::minimal_png_bytes(640, 480)).unwrap();
         let hashed =
             hash_and_probe_file(&file, &stat_token(&file).unwrap(), &AtomicBool::new(false))
                 .unwrap();
-        assert_eq!(hashed.dims, Some((640, 480)));
+        assert_eq!(
+            hashed.probe,
+            Some(ProbedImage {
+                format: ProbedFormat::Png,
+                width: 640,
+                height: 480,
+                has_alpha: true,
+                is_animated: false,
+                frame_count: None,
+            })
+        );
         // 同一内容のインメモリ計算と一致
         let bytes = std::fs::read(&file).unwrap();
         let mut hasher = blake3::Hasher::new();

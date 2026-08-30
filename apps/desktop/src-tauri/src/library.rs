@@ -1286,11 +1286,13 @@ pub fn build_library_snapshot(
         let Some(root_path) = root_paths.get(&file.root_id) else {
             continue;
         };
-        let (id, width, height, rating, triage) = match &asset {
+        let (id, width, height, mime, is_animated, rating, triage) = match &asset {
             Some(asset) => (
                 library_asset_id(asset.id),
                 asset.width,
                 asset.height,
+                asset.mime_type.clone(),
+                asset.is_animated.unwrap_or(false),
                 asset.rating,
                 match asset.triage {
                     gento_core::repo::TriageState::Unselected => Triage::Undecided,
@@ -1302,6 +1304,8 @@ pub fn build_library_snapshot(
                 provisional_file_asset_id(file.id),
                 None,
                 None,
+                None,
+                false,
                 0,
                 Triage::Undecided,
             ),
@@ -1314,6 +1318,8 @@ pub fn build_library_snapshot(
             height,
             byte_size: file.byte_size,
             mtime_ms: file.mtime_ms,
+            mime_type: mime,
+            is_animated,
             state: ImageState::Ready,
             thumb_state: ThumbnailState::Missing,
             rating,

@@ -14,6 +14,7 @@ function item(index: number, overrides: Partial<ImageListItem> = {}): ImageListI
     byteSize: 1000,
     state: "ready",
     thumbnailState: "ready",
+    isAnimated: false,
     version: 100_000 + index,
     ...overrides,
   };
@@ -329,6 +330,65 @@ describe("ViewerStore: original昇格とtransform", () => {
     store.nav(1);
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(store.current?.isOriginal).toBe(false);
+  });
+
+  // ===== アニメーション資産 (WP-3: original直表示・昇格skip) =====
+
+  it("animated項目はpreviewを要求せずoriginalを直接表示する", async () => {
+    const mock = makeIpc();
+    const items = makeItems(3);
+    items[0] = item(0, { isAnimated: true, version: 555_000 });
+    const store = makeStore(items, mock, () => 0);
+    await store.init();
+    await store.open(0);
+    expect(store.current?.isAnimated).toBe(true);
+    expect(store.current?.url).toContain("gento-original://");
+    expect(store.current?.url).toContain("v=555000");
+    expect(store.current?.isOriginal).toBe(true);
+    // preview2048の要求・先読み要求は一切発生しない (index0がanimatedで
+    // index1/2の先読みはanimatedでないため発生するがidsに"1"は含まれない)
+    const requests = mock.calls
+      .filter((c) => c.command === "request_thumbnails")
+      .flatMap((c) => (c.args?.ids as string[]) ?? []);
+    expect(requests).not.toContain("1");
+  });
+
+  it("animated項目はsetOriginal・thumb:readyの影響を受けない", async () => {
+    const mock = makeIpc();
+    const items = makeItems(3);
+    items[0] = item(0, { isAnimated: true });
+    const store = makeStore(items, mock, () => 0);
+    await store.init();
+    await store.open(0);
+    const url = store.current?.url;
+    store.setOriginal(false); // 昇格ロジックskip
+    expect(store.current?.isOriginal).toBe(true);
+    expect(store.current?.url).toBe(url);
+    mock.emit("thumb:ready", readyPayload("1")); // preview到着でも差し替わらない
+    expect(store.current?.url).toBe(url);
+    store.setMode("actual"); // actualも元々original
+    expect(store.current?.isOriginal).toBe(true);
+    store.setMode("fit"); // fit復帰でもpreviewへ戻さない
+    expect(store.current?.isOriginal).toBe(true);
+    expect(store.current?.url).toBe(url);
+  });
+
+  it("animated項目のoriginal読み込み失敗は静的previewへ復帰しない", async () => {
+    const mock = makeIpc();
+    const items = makeItems(3);
+    items[0] = item(0, { isAnimated: true });
+    const store = makeStore(items, mock, () => 0);
+    await store.init();
+    await store.open(0);
+    const key = store.current!.key;
+    store.noteLoadError(key);
+    expect(store.current?.url).toBeNull();
+    expect(store.current?.note).toContain("アニメーション");
+    // 対象 (id=1) へのpreview要求は発生しない (隣接項目の先読みのみ)
+    const requested = mock.calls
+      .filter((c) => c.command === "request_thumbnails")
+      .flatMap((c) => (c.args?.ids as string[]) ?? []);
+    expect(requested).not.toContain("1");
   });
 
   it("thumb:failed でpendingが解除され、再ナビで再要求される", async () => {

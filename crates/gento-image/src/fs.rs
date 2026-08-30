@@ -105,7 +105,7 @@ pub fn probe_dims(path: &Path, expect: &GenerationToken) -> Option<(u32, u32)> {
         return None;
     }
     match hash_and_probe_file(path, &current, &AtomicBool::new(false)) {
-        Ok(hashed) => hashed.dims,
+        Ok(hashed) => hashed.probe.map(|p| (p.width, p.height)),
         Err(_) => None,
     }
 }
@@ -292,7 +292,7 @@ mod tests {
         let hashed = fs
             .hash_and_probe(&png, &expect, &AtomicBool::new(false))
             .unwrap();
-        assert_eq!(hashed.dims, Some((640, 480)));
+        assert_eq!(hashed.probe.map(|p| (p.width, p.height)), Some((640, 480)));
         assert_eq!(hashed.content.token(), expect);
 
         // size不一致 → 計算前にStale
@@ -325,13 +325,13 @@ mod tests {
                 &AtomicBool::new(false),
             )
             .unwrap();
-        assert_eq!(hashed.dims, None);
+        assert_eq!(hashed.probe, None);
 
         let txt = dir.write("note.txt", b"hello");
         let hashed = fs
             .hash_and_probe(&txt, &stat_token(&txt).unwrap(), &AtomicBool::new(false))
             .unwrap();
-        assert_eq!(hashed.dims, None);
+        assert_eq!(hashed.probe, None);
     }
 
     #[cfg(unix)]
@@ -372,6 +372,6 @@ mod tests {
         let hashed = fs
             .hash_and_probe(&png, &fresh, &AtomicBool::new(false))
             .unwrap();
-        assert_eq!(hashed.dims, Some((20, 30)));
+        assert_eq!(hashed.probe.map(|p| (p.width, p.height)), Some((20, 30)));
     }
 }

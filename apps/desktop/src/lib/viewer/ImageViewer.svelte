@@ -12,6 +12,15 @@
    */
   import { onDestroy, onMount } from "svelte";
   import { toCss, type ViewTransform } from "./transform";
+  import {
+    backgroundCss,
+    backgroundLabel,
+    loadBackground,
+    nextBackground,
+    safeLocalStorage,
+    saveBackground,
+    type ViewerBackground,
+  } from "./background";
   import type { ViewerStore } from "./viewer-store";
 
   let {
@@ -25,9 +34,27 @@
   let overlayEl: HTMLElement | null = $state(null);
   let stageEl: HTMLElement | null = $state(null);
   let viewerTick = $state(0);
+  // 透過背景 (市松/白/黒)。localStorageから復元し切替時に永続化 (WP-3)
+  let background: ViewerBackground = $state(loadBackground(safeLocalStorage()));
   const stopNotify = store.onChange(() => {
     viewerTick++;
   });
+
+  function cycleBackground(): void {
+    background = nextBackground(background);
+    saveBackground(safeLocalStorage(), background);
+    viewerTick++;
+  }
+
+  function currentBackgroundLabel(): string {
+    void viewerTick;
+    return backgroundLabel(background);
+  }
+
+  function stageBackgroundCss(): string {
+    void viewerTick;
+    return backgroundCss(background);
+  }
 
   // ビューポート追従 (fitの再計算)
   $effect(() => {
@@ -215,7 +242,8 @@
       ` req=${store.stats.requests} preq=${store.stats.prefetchRequests}` +
       ` gen=${store.generation} index=${store.displayIndex}` +
       ` id=${store.current?.assetId ?? "—"}` +
-      ` ${store.current?.isOriginal ? "ORIG" : "PREV"}`
+      ` ${store.current?.isOriginal ? "ORIG" : "PREV"}` +
+      `${store.current?.isAnimated ? "+ANIM" : ""}`
     );
   }
 
@@ -244,9 +272,14 @@
     <button onclick={() => store.setMode("fit")}>fit (0)</button>
     <button onclick={() => store.setMode("actual")}>原寸 (1)</button>
     <button onclick={() => store.setMode("fit")}>リセット (r)</button>
-    <button onclick={() => store.setOriginal(!(currentImg()?.isOriginal ?? false))}>
+    <button
+      onclick={() => store.setOriginal(!(currentImg()?.isOriginal ?? false))}
+      disabled={currentImg()?.isAnimated ?? false}
+      title={currentImg()?.isAnimated ? "アニメーション画像は常にoriginal表示" : undefined}
+    >
       {currentImg()?.isOriginal ? "previewへ戻す" : "original昇格"}
     </button>
+    <button onclick={() => cycleBackground()}>背景: {currentBackgroundLabel()}</button>
     <button onclick={() => store.togglePrefetch()}>
       先読み: {prefetchOn() ? "ON" : "OFF"}
     </button>
@@ -259,6 +292,7 @@
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
     class="viewer-stage"
+    style={`background: ${stageBackgroundCss()};`}
     bind:this={stageEl}
     onpointerdown={onPointerDown}
     onpointermove={onPointerMove}
@@ -338,6 +372,8 @@
     flex: 1;
     overflow: hidden;
     cursor: grab;
+    /* backgroundは背景切替 (市松/白/黒) でstyle属性から上書きされる。
+       ここは初期フォールバック */
     background:
       repeating-conic-gradient(light-dark(#e3e6ea, #171a21) 0% 25%, light-dark(#eceff3, #1d212b) 0% 50%)
       0 / 24px 24px;

@@ -22,6 +22,8 @@ export type ImageListItem = {
   byteSize: number;
   state: ImageState;
   thumbnailState: ThumbnailState;
+  /** アニメーション付き画像か (WP-3。ビューアはoriginalを直接表示)。 */
+  isAnimated: boolean;
   /** 内容感応URLバージョン (FG-1)。元ファイルのpath+size+mtimeと
    *  アルゴリズムバージョンから決まる。original表示のURLなどに使う。 */
   version: number;

@@ -72,6 +72,8 @@ pub struct AssetSnapshot {
     pub mtime_ms: u64,
     /// ImageState::Ready相当か (デコード不能なレコードは要求を棄却)。
     pub readable: bool,
+    /// プローブ由来のMIME (original応答のContent-Type。WP-3)。
+    pub content_type: String,
 }
 
 /// 要求の受理内訳。
@@ -636,6 +638,10 @@ fn resolve_assets(state: &AppState, ids: &[AssetId]) -> (Vec<AssetSnapshot>, u64
                 byte_size: record.byte_size,
                 mtime_ms: record.mtime_ms,
                 readable: record.state == gento_core::catalog::ImageState::Ready,
+                content_type: record
+                    .mime_type
+                    .clone()
+                    .unwrap_or_else(|| "application/octet-stream".to_string()),
             }),
             None => unknown += 1,
         }
@@ -655,6 +661,10 @@ fn snapshot_all(state: &AppState) -> Vec<AssetSnapshot> {
             byte_size: record.byte_size,
             mtime_ms: record.mtime_ms,
             readable: record.state == gento_core::catalog::ImageState::Ready,
+            content_type: record
+                .mime_type
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".to_string()),
         })
         .collect()
 }
@@ -931,6 +941,7 @@ mod tests {
             byte_size,
             mtime_ms,
             readable,
+            content_type: "image/png".to_string(),
         }
     }
 

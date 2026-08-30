@@ -18,9 +18,9 @@ use gento_core::catalog::{
 };
 use gento_core::AssetId;
 use gento_image::cache::asset_version;
+use gento_image::format::{probe_image, ImageProbe};
 use gento_image::metrics::{log_scan_metrics, read_self_rss_kb, ScanMetrics};
-use gento_image::probe::{probe_png_dimensions, ProbeResult};
-use gento_image::scan::{scan_pngs, ScanBatch};
+use gento_image::scan::{scan_images_batch, ScanBatch};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -381,6 +381,8 @@ pub struct CatalogItemDto {
     pub byte_size: u64,
     pub state: ImageState,
     pub thumbnail_state: ThumbnailState,
+    /// アニメーション付き画像か (WP-3。ビューアはoriginalを直接表示)。
+    pub is_animated: bool,
     /// 内容感応URLバージョン (api-contract §12)。元ファイルの
     /// size/mtime・実体パス・アルゴリズムバージョンから決まる。
     /// フロントは original 表示やURL組み立てに使う。
@@ -430,6 +432,7 @@ fn augment_page_with_versions(state: &AppState, page: PageResult) -> CatalogPage
                 byte_size: item.byte_size,
                 state: item.state,
                 thumbnail_state: item.thumbnail_state,
+                is_animated: item.is_animated,
             })
             .collect(),
     }
@@ -499,12 +502,21 @@ fn run_scan(app: AppHandle, dataset: PathBuf, generation: u64) {
         let mut records = Vec::with_capacity(batch.files.len());
         for file in &batch.files {
             let probe_started = Instant::now();
-            let probe = probe_png_dimensions(&file.path);
+            let probe = probe_image(&file.path);
             probe_elapsed += probe_started.elapsed();
-            let (state, width, height) = match probe {
-                ProbeResult::Ok { width, height } => (ImageState::Ready, Some(width), Some(height)),
-                ProbeResult::Unreadable => (ImageState::Unreadable, None, None),
-                ProbeResult::Corrupt => (ImageState::Corrupt, None, None),
+            // magicが正本。AVIFはavif-native不在時Unsupportedになる
+            // (blocked-avif。handoff参照)
+            let (state, width, height, mime, is_animated) = match probe {
+                ImageProbe::Ok(info) => (
+                    ImageState::Ready,
+                    Some(info.width),
+                    Some(info.height),
+                    Some(info.format.mime().to_string()),
+                    info.is_animated,
+                ),
+                ImageProbe::Unreadable => (ImageState::Unreadable, None, None, None, false),
+                ImageProbe::Corrupt => (ImageState::Corrupt, None, None, None, false),
+                ImageProbe::Unsupported => (ImageState::Unsupported, None, None, None, false),
             };
             records.push(ImageRecord {
                 id: AssetId::new(next_id),
@@ -518,6 +530,8 @@ fn run_scan(app: AppHandle, dataset: PathBuf, generation: u64) {
                 height,
                 byte_size: file.size,
                 mtime_ms: file.mtime_ms,
+                mime_type: mime,
+                is_animated,
                 state,
                 thumb_state: ThumbnailState::Missing,
                 rating: 0,
@@ -566,7 +580,7 @@ fn run_scan(app: AppHandle, dataset: PathBuf, generation: u64) {
         );
     };
 
-    let result = scan_pngs(&dataset, sink);
+    let result = scan_images_batch(&dataset, sink);
     let scan_elapsed_ms = started.elapsed().as_millis() as u64;
     let rss_kb = read_self_rss_kb();
 
@@ -632,6 +646,8 @@ mod tests {
             height: Some(20),
             byte_size: 100,
             mtime_ms: 1,
+            mime_type: None,
+            is_animated: false,
             state: ImageState::Ready,
             thumb_state: ThumbnailState::Missing,
             rating: 0,
@@ -759,6 +775,8 @@ mod tests {
             height: Some(200),
             byte_size,
             mtime_ms,
+            mime_type: None,
+            is_animated: false,
             state: ImageState::Ready,
             thumb_state: ThumbnailState::Missing,
             rating: 0,
@@ -820,6 +838,7 @@ mod tests {
                 "byteSize": 1234,
                 "state": "ready",
                 "thumbnailState": "missing",
+                "isAnimated": false,
                 "version": dto.items[0].version,
             })
         );

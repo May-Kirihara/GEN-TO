@@ -202,13 +202,57 @@ impl FileContentHash {
     }
 }
 
-/// 1ファイルのハッシュ+プローブ結果。ハッシュと寸法は**同一の開いたfd**
+/// プローブで判別した画像形式 (WP-3)。実デコード基盤 (image crate) に
+/// 依存しない値オブジェクト — gento-coreは画像ライブラリへ依存しない
+/// (計画書§5) ため、対応表はgento-image側が持つ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbedFormat {
+    Png,
+    Jpeg,
+    Webp,
+    Gif,
+    Bmp,
+    Tiff,
+    Avif,
+}
+
+impl ProbedFormat {
+    /// 正式MIMEタイプ (プローブが正本。拡張子はフォールバック用)。
+    pub const fn mime(self) -> &'static str {
+        match self {
+            ProbedFormat::Png => "image/png",
+            ProbedFormat::Jpeg => "image/jpeg",
+            ProbedFormat::Webp => "image/webp",
+            ProbedFormat::Gif => "image/gif",
+            ProbedFormat::Bmp => "image/bmp",
+            ProbedFormat::Tiff => "image/tiff",
+            ProbedFormat::Avif => "image/avif",
+        }
+    }
+}
+
+/// プローブ結果 (magic判別 + ヘッダ寸法 + アニメーション情報)。
+/// 全項目が**同一fd**から観測される (ハッシュとの束ね契約は変えない)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbedImage {
+    pub format: ProbedFormat,
+    pub width: u32,
+    pub height: u32,
+    /// デコード時のカラータイプにalpha成分があるか (GIFは常にtrue扱い)。
+    pub has_alpha: bool,
+    /// GIF: frame_count > 1。WebP: ANIMチャンク存在。AVIF: avisブランド。
+    pub is_animated: bool,
+    /// GIF/WebPはフレーム数、AVIFは不明 (`None`)。
+    pub frame_count: Option<u32>,
+}
+
+/// 1ファイルのハッシュ+プローブ結果。ハッシュとプローブは**同一の開いたfd**
 /// から観測されており、別世代の混入は構造的に不可能。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HashedFile {
     pub content: FileContentHash,
-    /// PNGプローブの寸法 (プローブ失敗・非PNGは `None`)。
-    pub dims: Option<(u32, u32)>,
+    /// 形式プローブ (非画像・破損・未対応magicは `None`)。
+    pub probe: Option<ProbedImage>,
 }
 
 /// ファイルシステム操作の抽象 (実装: gento-image)。
@@ -227,8 +271,9 @@ pub trait ScanFs: Send + Sync {
     ///
     /// - fdのfstatトークンが `expect` (走査時観測) と一致しない場合は
     ///   計算前に [`HashFileError::Stale`] (無駄な読み取りをしない)。
-    /// - BLAKE3計算後、**同一fd** からPNGヘッダを再読みして寸法を得る
-    ///   (パスの再オープン禁止 — 置換ファイルの寸法混入を構造的に排除)。
+    /// - BLAKE3計算後、**同一fd** から形式プローブ (magic+寸法+アニメーション
+    ///   情報) を得る (パスの再オープン禁止 — 置換ファイルの寸法混入を
+    ///   構造的に排除)。
     /// - 計算前後でfdのトークンが不変であることを検証し、変化していれば
     ///   [`HashFileError::Stale`]。
     fn hash_and_probe(
@@ -806,8 +851,11 @@ pub fn hash_and_link_file(
 ) -> Result<AssetRecord, HashFileError> {
     let hashed = fs.hash_and_probe(path, expect, cancel)?;
     let content = hashed.content;
-    let dims = hashed.dims;
-    let mime = mime_of(path);
+    let probe = hashed.probe;
+    // プローブの形式が正本。非プローブ時のみ拡張子から推測する。
+    let mime = probe
+        .map(|p| p.format.mime().to_string())
+        .or_else(|| mime_of(path));
     let link = write_ret(store, |repos| {
         let Some(record) = repos.get_file(file_id)? else {
             return Err(LinkError::Repo(RepoError::NotFound));
@@ -820,8 +868,11 @@ pub fn hash_and_link_file(
             hash_algorithm: "blake3".to_string(),
             byte_size: content.byte_size,
             mime_type: mime.clone(),
-            width: dims.map(|d| d.0),
-            height: dims.map(|d| d.1),
+            width: probe.map(|p| p.width),
+            height: probe.map(|p| p.height),
+            has_alpha: probe.map(|p| p.has_alpha),
+            is_animated: probe.map(|p| p.is_animated),
+            frame_count: probe.and_then(|p| p.frame_count),
         })?;
         let asset_id = asset.id;
         repos.link_file(file_id, asset_id)?;
@@ -994,6 +1045,7 @@ pub struct CoalescedChanges {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::library::{ProbedFormat, ProbedImage};
     use crate::repo::{
         AssetRepo, HashState, LibraryRootRecord, LibraryRootRepo, RepoError, RootSettings,
         TriageState,
@@ -1290,6 +1342,9 @@ mod tests {
                 mime_type: asset.mime_type,
                 width: asset.width,
                 height: asset.height,
+                has_alpha: asset.has_alpha,
+                is_animated: asset.is_animated,
+                frame_count: asset.frame_count,
                 rating: 0,
                 triage: TriageState::Unselected,
                 favorite: false,
@@ -1359,7 +1414,7 @@ mod tests {
         walk_errors: StdMutex<Vec<WalkError>>,
         /// hash_and_probeの戻す検証済み観測 (トークン成分含む)。
         hash: StdMutex<Option<FileContentHash>>,
-        dims: StdMutex<Option<(u32, u32)>>,
+        probe: StdMutex<Option<ProbedImage>>,
         /// hash_and_probeの呼び出し回数 (fd単一APIの検証用)。
         hash_calls: std::sync::atomic::AtomicU64,
     }
@@ -1420,7 +1475,7 @@ mod tests {
             }
             Ok(HashedFile {
                 content,
-                dims: *self.dims.lock().unwrap(),
+                probe: *self.probe.lock().unwrap(),
             })
         }
     }
@@ -1531,6 +1586,9 @@ mod tests {
                 mime_type: None,
                 width: None,
                 height: None,
+                has_alpha: None,
+                is_animated: None,
+                frame_count: None,
             },
         )
         .unwrap();
@@ -1547,6 +1605,9 @@ mod tests {
                 mime_type: None,
                 width: None,
                 height: None,
+                has_alpha: None,
+                is_animated: None,
+                frame_count: None,
             },
         )
         .unwrap();
@@ -1822,6 +1883,9 @@ mod tests {
                 mime_type: None,
                 width: None,
                 height: None,
+                has_alpha: None,
+                is_animated: None,
+                frame_count: None,
             },
         )
         .unwrap();
@@ -1885,6 +1949,9 @@ mod tests {
                 mime_type: None,
                 width: None,
                 height: None,
+                has_alpha: None,
+                is_animated: None,
+                frame_count: None,
             },
         )
         .unwrap();
@@ -2189,7 +2256,14 @@ mod tests {
 
         // a.png: 寸法付きでリンク
         fs.hash_matches(None, 10, 5_000_000, "blake3:cafe");
-        *fs.dims.lock().unwrap() = Some((640, 480));
+        *fs.probe.lock().unwrap() = Some(ProbedImage {
+            format: ProbedFormat::Png,
+            width: 640,
+            height: 480,
+            has_alpha: true,
+            is_animated: false,
+            frame_count: None,
+        });
         let a = summary
             .pending_hash
             .iter()
@@ -2202,7 +2276,7 @@ mod tests {
 
         // b.png: プーブ失敗 (非PNG等) は寸法NULLでリンク
         fs.hash_matches(None, 10, 5_000_000, "blake3:beef");
-        *fs.dims.lock().unwrap() = None;
+        *fs.probe.lock().unwrap() = None;
         let b = summary
             .pending_hash
             .iter()

@@ -37,6 +37,7 @@ function makeIpc(opts?: {
           byteSize: 1000,
           state: "ready" as const,
           thumbnailState: "missing" as const,
+          isAnimated: false,
           version: 800_000 + offset + i,
         }));
         return {
@@ -129,6 +130,58 @@ describe("GridStore — 需要スケジューリング", () => {
     expect(requests[0]?.args?.sizeClass).toBe("s256");
     expect(requests[0]?.args?.ids).toEqual(["0", "1", "2", "3", "4", "5", "6", "7", "8"]);
     expect(grid.stats.requested).toBe(9);
+  });
+
+  it("アニメーション項目もグリッドは静的サムネイル (s256) のみ要求する", async () => {
+    // 一覧が高負荷にならないことの保証: isAnimated項目が含まれても
+    // グリッドの要求は常にサムネイル尺寸クラスのみ (original/previewは
+    // 要求しない — サムネイルはRust側で先頭フレーム静止画化される)
+    const listeners = new Map<string, Listener>();
+    const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+    const total = 30;
+    const ipc: GridIpc = {
+      invoke: async <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
+        calls.push({ command, args });
+        if (command === "get_catalog_summary") {
+          return { generation: 1, mode: "real", total, scanning: false, scanned_count: 0, error_count: 0, last_scan_elapsed_ms: null } as T;
+        }
+        if (command === "get_catalog_page") {
+          const offset = args?.offset as number;
+          const count = Math.min(200, total - offset);
+          const items = Array.from({ length: Math.max(0, count) }, (_, i) => ({
+            id: String(offset + i),
+            displayName: `item-${offset + i}`,
+            width: 100,
+            height: 100,
+            byteSize: 1000,
+            state: "ready" as const,
+            thumbnailState: "missing" as const,
+            isAnimated: (offset + i) % 2 === 0, // 偶数IDをanimatedにする
+            version: 800_000 + offset + i,
+          }));
+          return { generation: args?.generation, total, offset, items, has_more: offset + count < total } as CatalogPage as T;
+        }
+        if (command === "request_thumbnails") {
+          return { queued: (args?.ids as string[]).length, rejected_dup: 0, rejected_full: 0, cache_hits: 0, skipped_unreadable: 0, skipped_unknown: 0 } as T;
+        }
+        return {} as T;
+      },
+      listen: async <T>(event: string, handler: (event: { payload: T }) => void): Promise<() => void> => {
+        listeners.set(event, handler as Listener);
+        return () => listeners.delete(event);
+      },
+    };
+    const grid = new GridStore(ipc, { debounceMs: 150, prefetchRows: 0 });
+    await grid.init();
+    grid.viewportChanged({ start: 0, end: 2 }, 0, 0, 3);
+    await vi.advanceTimersByTimeAsync(200);
+    const requests = requestCalls(calls);
+    expect(requests).toHaveLength(1);
+    // animated混在でも通常どおりs256の静的サムネイル要求 (個別振り分けなし)
+    expect(requests[0]?.args?.sizeClass).toBe("s256");
+    expect((requests[0]?.args?.ids as string[]).length).toBeGreaterThan(0);
+    // preview/original系のURL・要求は一切発生しない
+    expect(calls.filter((c) => c.command !== "request_thumbnails" && c.command !== "get_catalog_summary" && c.command !== "get_catalog_page")).toHaveLength(0);
   });
 
   it("進行方向の先読み行をprefetch優先度で追加要求する", async () => {
@@ -286,6 +339,7 @@ describe("GridStore — 需要スケジューリング", () => {
                 byteSize: 1000,
                 state: "ready" as const,
                 thumbnailState: "missing" as const,
+                isAnimated: false,
                 version: 800_000 + offset + i,
               })),
             } as CatalogPage as T,

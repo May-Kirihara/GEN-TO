@@ -35,6 +35,7 @@ function makePage(offset: number, count: number, total: number, generation: numb
     byteSize: 1000,
     state: "ready" as const,
     thumbnailState: "missing" as const,
+    isAnimated: false,
     version: 800_000 + offset + i,
   }));
   return { generation, total, offset, items, has_more: offset + count < total };

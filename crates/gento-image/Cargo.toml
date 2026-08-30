@@ -17,5 +17,6 @@ walkdir = { workspace = true }
 png = { workspace = true }
 image = { workspace = true }
 webp = { workspace = true }
+kamadak-exif = { workspace = true }
 twox-hash = { workspace = true }
 blake3 = { workspace = true }

@@ -27,8 +27,10 @@ use crate::stats::ThumbStats;
 
 /// サムネイル生成アルゴリズムのバージョン。
 /// デコード・リサイズ・エンコード条件 (Orientation設定を含む) を変えたら
-/// インクリメントする。PNG対象外だが将来の設定差し込み用のプレースホルダ。
-pub const ALGORITHM_VERSION: u32 = 1;
+/// インクリメントする。
+/// - v1: PNGのみ・Orientation不変
+/// - v2: MVP 6形式デコード + EXIF Orientation適用 (WP-3。キャッシュ無効化)
+pub const ALGORITHM_VERSION: u32 = 2;
 
 /// プロトタイプのキャッシュ上限 (docs/implementation-plan.md §2)。
 pub const DEFAULT_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;

@@ -13,6 +13,7 @@ function makeItems(count: number): ImageListItem[] {
     byteSize: 1000,
     state: "ready" as const,
     thumbnailState: "ready" as const,
+    isAnimated: false,
     version: 200_000 + i,
   }));
 }

@@ -200,6 +200,32 @@
   stdのみ (trait `RepoStore`/`ScanFs` でDB実装とfs実装を注入。計画書§5
   「外部機能はtraitを介して注入」に従う)。
 
+## WP-3 (MVP) で追加・変更した依存 (2026-08-30。MVP画像形式と表示パイプライン)
+
+- **`image` =0.25.10 (default-features=false, features: png, jpeg, gif, bmp, tiff, webp) へfeature拡大**
+  - 用途: JPEG/GIF/BMP/TIFF/WebPのデコード (WP-3形式拡張。計画書§11)。
+    PNG専用だったfeature構成をMVP 6形式へ拡大。判定はmagic (先頭バイト)
+    ベースで `ImageReader::with_format` を明示指定 — 拡張子詐称にも
+    magicが正本。`Limits` (寸法20000・alloc 256MiB) は全形式へ適用。
+  - 追加される推移依存 (いずれもMIT OR Apache-2.0):
+    zune-core / zune-jpeg (JPEGデコード。pure Rust) /
+    gif =0.14 + color_quant (GIF) / tiff (TIFF) / image-webp =0.2 (WebP。
+    pure Rust。アニメーションWebPのフレーム分割デコード対応)。
+    `rayon` は引き続き無効 (サムネイル生成パスは非並列で十分)。
+  - AVIF: `avif-native` feature (mp4parse + dav1dシステムライブラリ) は
+    別ゲート (本環境にシステムdav1dが存在しないためblocked-avif。
+    詳細は docs/handoff/2026-08-30-mvp-wp3.md)。
+- **`kamadak-exif` =0.5.5 (gento-image, 通常依存)**
+  - 用途: EXIF Orientation読み取り (JPEG APP1 / TIFF / PNG eXIf / WebP EXIF)。
+    Orientation反映はdecode後のメモリ上変換のみで、元ファイルは変更しない。
+  - 入手元: crates.io (kamadak/exif-rs)。
+  - ライセンス: **BSD-2-Clause**。
+  - 依存するnative library: なし (pure Rust)。
+  - 対応プラットフォーム: 全主要OS。
+  - バージョンpin理由: 0.5系最新。コンテナ対応 (JPEG/TIFF) は0.5系で
+    安定。PNG/WebPのEXIFチャンクは本repo側で抽出してTIFF生体を渡す
+    (crateのコンテナ対応に依存しない)。
+
 ## WP-7で追加した依存
 
 - `libc = "0.2"` (gento-tauri, 通常依存)

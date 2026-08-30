@@ -451,6 +451,9 @@ mod tests {
                     mime_type: None,
                     width: None,
                     height: None,
+                    has_alpha: None,
+                    is_animated: None,
+                    frame_count: None,
                 })?;
                 repos.link_file(file.id, asset.id)?;
                 Ok(())
@@ -710,6 +713,9 @@ mod tests {
                     mime_type: None,
                     width: None,
                     height: None,
+                    has_alpha: None,
+                    is_animated: None,
+                    frame_count: None,
                 })?;
                 repos.link_file(file.id, asset.id)?;
                 Ok((root.id, file.id, asset.id))

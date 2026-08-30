@@ -54,9 +54,24 @@ pub struct ScanResult {
 
 /// PNGファイルを再帰列挙し、バッチごとに `sink` へ渡す。
 pub fn scan_pngs(root: &Path, sink: &mut dyn FnMut(ScanBatch)) -> ScanResult {
+    scan_batched(root, &is_png_entry, sink)
+}
+
+/// MVP対象7形式をバッチごとに `sink` へ渡して再帰列挙する (WP-3。
+/// 一時走査 (未登録フォルダ閲覧) 用。列挙のみでprobeは行わない)。
+pub fn scan_images_batch(root: &Path, sink: &mut dyn FnMut(ScanBatch)) -> ScanResult {
+    scan_batched(root, &is_image_entry, sink)
+}
+
+/// バッチ列挙の共通実装 (拡張子述語のみ差し替え)。
+fn scan_batched(
+    root: &Path,
+    matches: &dyn Fn(&Path) -> bool,
+    sink: &mut dyn FnMut(ScanBatch),
+) -> ScanResult {
     let started = Instant::now();
     let mut entries: u64 = 0;
-    let mut png_count: u64 = 0;
+    let mut found: u64 = 0;
     let mut errors: Vec<ScanEntryError> = Vec::new();
     let mut pending: Vec<ScannedFile> = Vec::with_capacity(SCAN_BATCH_SIZE);
 
@@ -79,7 +94,7 @@ pub fn scan_pngs(root: &Path, sink: &mut dyn FnMut(ScanBatch)) -> ScanResult {
             continue;
         }
         entries += 1;
-        if !is_png_entry(entry.path()) {
+        if !matches(entry.path()) {
             continue;
         }
         match entry.metadata() {
@@ -90,7 +105,7 @@ pub fn scan_pngs(root: &Path, sink: &mut dyn FnMut(ScanBatch)) -> ScanResult {
             }),
         }
         if pending.len() >= SCAN_BATCH_SIZE {
-            png_count += pending.len() as u64;
+            found += pending.len() as u64;
             sink(ScanBatch {
                 entries_walked: entries,
                 files: std::mem::take(&mut pending),
@@ -98,7 +113,7 @@ pub fn scan_pngs(root: &Path, sink: &mut dyn FnMut(ScanBatch)) -> ScanResult {
         }
     }
     if !pending.is_empty() {
-        png_count += pending.len() as u64;
+        found += pending.len() as u64;
         sink(ScanBatch {
             entries_walked: entries,
             files: pending,
@@ -107,7 +122,7 @@ pub fn scan_pngs(root: &Path, sink: &mut dyn FnMut(ScanBatch)) -> ScanResult {
 
     ScanResult {
         entries,
-        png_count,
+        png_count: found,
         errors,
         elapsed_ms: started.elapsed().as_millis() as u64,
     }
@@ -139,7 +154,7 @@ pub(crate) fn is_png_entry(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// MVP対象の画像拡張子 (計画書§11の7形式。実デコードはWP-3)。
+/// MVP対象の画像拡張子 (計画書§11の7形式+別名。AVIFの実デコードはblocked-avif)。
 pub const IMAGE_EXTENSIONS: [&str; 9] = [
     "png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "avif",
 ];
@@ -510,5 +525,38 @@ mod tests {
         assert!(!is_png_entry(Path::new("/a/b.txt")));
         assert!(!is_png_entry(Path::new("/a/png")));
         assert!(!is_png_entry(Path::new("/a/.png")));
+    }
+
+    #[test]
+    fn scan_images_batch_enumerates_all_mvp_extensions_in_batches() {
+        let dir = TestDir::new("imgbatch");
+        for (i, ext) in [
+            "png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "avif",
+        ]
+        .iter()
+        .enumerate()
+        {
+            dir.write(&format!("f{i:02}.{ext}"), PNG_BYTES);
+        }
+        dir.write("skip.txt", b"x");
+
+        let mut batches = Vec::new();
+        let result = scan_images_batch(dir.path(), &mut |b| batches.push(b));
+        let mut names: Vec<String> = batches
+            .iter()
+            .flat_map(|b| {
+                b.files
+                    .iter()
+                    .map(|f| f.path.file_name().unwrap().to_string_lossy().into_owned())
+            })
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 9);
+        assert!(names.contains(&"f00.png".to_string()));
+        assert!(names.contains(&"f08.avif".to_string()));
+        assert!(!names.iter().any(|n| n == "skip.txt"));
+        assert!(batches.iter().all(|b| b.files.len() <= SCAN_BATCH_SIZE));
+        assert_eq!(result.png_count, 9);
+        assert_eq!(result.entries, 10);
     }
 }

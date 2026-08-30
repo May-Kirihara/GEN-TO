@@ -66,6 +66,8 @@ pub mod virtual_catalog {
                     height: src.height,
                     byte_size: src.byte_size,
                     mtime_ms: src.mtime_ms,
+                    mime_type: src.mime_type.clone(),
+                    is_animated: src.is_animated,
                     state: src.state,
                     thumb_state: super::ThumbnailState::Missing,
                     rating: (index % 6) as u8,
@@ -137,6 +139,10 @@ pub struct ImageRecord {
     pub byte_size: u64,
     /// キャッシュキー用の更新日時 (Unixエポックミリ秒、内部用)。
     pub mtime_ms: u64,
+    /// プローブ由来のMIME (original応答のContent-Type。未プローブはNone)。
+    pub mime_type: Option<String>,
+    /// アニメーション付き画像か (ビューアのoriginal直表示判定。WP-3)。
+    pub is_animated: bool,
     pub state: ImageState,
     pub thumb_state: ThumbnailState,
     /// 仮の評価 (0..=5)。
@@ -156,10 +162,13 @@ pub struct ImageListItem {
     pub byte_size: u64,
     pub state: ImageState,
     pub thumbnail_state: ThumbnailState,
+    /// アニメーション付き画像か (WP-3。ビューアはoriginalを直接表示)。
+    pub is_animated: bool,
 }
 
 impl ImageRecord {
-    /// IPC DTOへの変換。内部フィールド (source_path, mtime_ms) は出さない。
+    /// IPC DTOへの変換。内部フィールド (source_path, mtime_ms, mime_type) は
+    /// 出さない。
     pub fn to_list_item(&self) -> ImageListItem {
         ImageListItem {
             id: self.id,
@@ -169,6 +178,7 @@ impl ImageRecord {
             byte_size: self.byte_size,
             state: self.state,
             thumbnail_state: self.thumb_state,
+            is_animated: self.is_animated,
         }
     }
 }
@@ -291,6 +301,8 @@ mod tests {
             height: Some(200),
             byte_size: 1234,
             mtime_ms: 1_700_000_000_000,
+            mime_type: None,
+            is_animated: false,
             state: ImageState::Ready,
             thumb_state: ThumbnailState::Missing,
             rating: 0,
@@ -456,6 +468,7 @@ mod tests {
                 "byteSize": 1234,
                 "state": "ready",
                 "thumbnailState": "missing",
+                "isAnimated": false,
             })
         );
         let back: ImageListItem = serde_json::from_value(json).unwrap();

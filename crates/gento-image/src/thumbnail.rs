@@ -1,13 +1,18 @@
-//! サムネイル・previewの生成 (Phase 4 / WP-3)。
+//! サムネイル・previewの生成 (Phase 4 / MVP WP-3)。
 //!
-//! パイプライン: デコード (`image` crate、Limits付きでdecompression bomb対策)
-//! → リサイズ (長辺基準・アスペクト維持・拡大なし)
+//! パイプライン: デコード (`image` crate、magic判定+Limits付きで
+//! decompression bomb対策) → EXIF Orientation適用 (メモリ上変換のみ。
+//! 元ファイル不変) → リサイズ (長辺基準・アスペクト維持・拡大なし)
 //! → エンコード (`webp` crate、lossy quality 80、明示的RGBAバッファ渡し)
 //! → キャッシュ書き込み (一時ファイル+アトミックrename)。
 //!
-//! OrientationはPNG対象外のため不変 (ALGORITHM_VERSIONに織り込み済み)。
+//! アニメーションGIF/WebPは**先頭フレーム**が静止化される (一覧=静止画の
+//! 仕様。ビューアのネイティブ再生はoriginal表示で行う)。
+//! Orientation反映で出力が変わるため `ALGORITHM_VERSION` は2 (v1キャッシュ
+//! はキー不一致で自然無効化)。
 
 use std::fmt;
+use std::io::Seek as _;
 use std::path::{Path, PathBuf};
 #[cfg(any(debug_assertions, feature = "devtools"))]
 use std::sync::atomic::Ordering;
@@ -169,14 +174,50 @@ pub struct ThumbnailOutput {
     pub height: u32,
 }
 
-/// PNG (形式は推定) を上限付きでデコードする。
-pub fn decode_png_with_limits(path: &Path) -> Result<DynamicImage, ThumbnailError> {
-    let mut reader = ImageReader::open(path)
-        .map_err(|e| ThumbnailError::Unreadable(e.to_string()))?
-        .with_guessed_format()
+/// ファイル (形式はmagic判定) を上限付きでデコードし、EXIF Orientationを
+/// 適用して返す。アニメーションは先頭フレーム。
+///
+/// 形式判定は拡張子ではなく**magic**で行う (拡張子詐称の一貫扱い)。
+pub fn decode_with_limits(path: &Path) -> Result<DynamicImage, ThumbnailError> {
+    let mut file =
+        std::fs::File::open(path).map_err(|e| ThumbnailError::Unreadable(e.to_string()))?;
+    let mut head = [0u8; 64];
+    let read =
+        head_read(&mut file, &mut head).map_err(|e| ThumbnailError::Unreadable(e.to_string()))?;
+    let format = crate::format::sniff_format(&head[..read]).ok_or_else(|| {
+        ThumbnailError::Decode(ImageError::Unsupported(
+            image::error::UnsupportedError::from_format_and_kind(
+                image::error::ImageFormatHint::Unknown,
+                image::error::UnsupportedErrorKind::Format(image::error::ImageFormatHint::Unknown),
+            ),
+        ))
+    })?;
+    // Orientationはデコードと同一fdから読む (読み取り後にrewindする)
+    let orientation = crate::orientation::read_orientation_at(&mut file);
+    file.rewind()
         .map_err(|e| ThumbnailError::Unreadable(e.to_string()))?;
+    let mut reader = ImageReader::with_format(
+        std::io::BufReader::new(file),
+        crate::format::image_format_of(format),
+    );
     reader.limits(decode_limits());
-    reader.decode().map_err(ThumbnailError::Decode)
+    let decoded = reader.decode().map_err(ThumbnailError::Decode)?;
+    match orientation {
+        Some(value) => Ok(crate::orientation::apply_orientation(decoded, value)),
+        None => Ok(decoded),
+    }
+}
+
+/// EOFは成功 (短いファイル) として扱う先頭読み取り。
+fn head_read(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match std::io::Read::read(file, &mut buf[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    Ok(filled)
 }
 
 /// デコード制限の構成。
@@ -244,7 +285,7 @@ pub fn generate(
     if cancel.is_cancelled() {
         return Err(ThumbnailError::Cancelled);
     }
-    let decoded = decode_png_with_limits(path)?;
+    let decoded = decode_with_limits(path)?;
     if cancel.is_cancelled() {
         return Err(ThumbnailError::Cancelled);
     }
@@ -465,6 +506,154 @@ mod tests {
         assert_eq!((out.width, out.height), (171, 256));
     }
 
+    /// MVP各形式 (AVIF除く6形式) の実ファイルからサムネイルが生成できる。
+    #[test]
+    fn generate_supports_all_mvp_formats() {
+        let dir = TestDir::new("formats");
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(400, 260, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 77])
+        }));
+        for (name, format) in [
+            ("a.png", image::ImageFormat::Png),
+            ("a.jpg", image::ImageFormat::Jpeg),
+            ("a.bmp", image::ImageFormat::Bmp),
+            ("a.tiff", image::ImageFormat::Tiff),
+        ] {
+            let path = dir.path().join(name);
+            img.save_with_format(&path, format)
+                .unwrap_or_else(|e| panic!("{name} encode: {e}"));
+            let out = generate(&path, SizeClass::S256, &CancelToken::new())
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!((out.width, out.height), (256, 167), "{name}");
+        }
+
+        // GIF (1フレーム)
+        let gif_path = dir.path().join("a.gif");
+        {
+            let mut buf = Vec::new();
+            {
+                let mut encoder = image::codecs::gif::GifEncoder::new(&mut buf);
+                encoder
+                    .encode_frame(image::Frame::new(image::RgbaImage::from_fn(
+                        400,
+                        260,
+                        |x, y| image::Rgba([(x % 256) as u8, (y % 256) as u8, 77, 255]),
+                    )))
+                    .unwrap();
+            }
+            fs::write(&gif_path, &buf).unwrap();
+        }
+        let out = generate(&gif_path, SizeClass::S256, &CancelToken::new()).unwrap();
+        assert_eq!((out.width, out.height), (256, 167), "gif");
+
+        // WebP (lossless)
+        let webp_path = dir.path().join("a.webp");
+        {
+            let rgba = image::RgbaImage::from_fn(400, 260, |x, y| {
+                image::Rgba([(x % 256) as u8, (y % 256) as u8, 77, 255])
+            });
+            let encoded = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
+                .encode_lossless();
+            fs::write(&webp_path, &*encoded).unwrap();
+        }
+        let out = generate(&webp_path, SizeClass::S256, &CancelToken::new()).unwrap();
+        assert_eq!((out.width, out.height), (256, 167), "webp");
+    }
+
+    /// アニメーションGIFは先頭フレームで静止化される (一覧=静止画の仕様)。
+    #[test]
+    fn animated_gif_thumbnail_is_static_first_frame() {
+        use image::codecs::gif::{GifEncoder, Repeat};
+        use image::{Delay, Frame};
+        let dir = TestDir::new("anim-gif");
+        let path = dir.path().join("anim.gif");
+        {
+            let mut buf = Vec::new();
+            {
+                let mut encoder = GifEncoder::new(&mut buf);
+                encoder.set_repeat(Repeat::Infinite).unwrap();
+                for i in 0..3u8 {
+                    let frame = image::RgbaImage::from_fn(300, 200, |x, y| {
+                        // フレームごとに左上の色が変わる (先頭フレーム判定用)
+                        let marker = if x < 40 && y < 40 { 255 - i * 60 } else { 30 };
+                        image::Rgba([marker, marker, marker, 255])
+                    });
+                    encoder
+                        .encode_frame(Frame::from_parts(
+                            frame,
+                            0,
+                            0,
+                            Delay::from_numer_denom_ms(20, 1),
+                        ))
+                        .unwrap();
+                }
+            }
+            fs::write(&path, &buf).unwrap();
+        }
+        // プローブ: アニメーション検出
+        match crate::format::probe_image(&path) {
+            crate::format::ImageProbe::Ok(p) => {
+                assert!(p.is_animated);
+                assert_eq!(p.frame_count, Some(3));
+            }
+            other => panic!("probe: {other:?}"),
+        }
+        // サムネイル: 先頭フレーム (marker=255) の静的WebP
+        let out = generate(&path, SizeClass::S256, &CancelToken::new()).unwrap();
+        assert_eq!((out.width, out.height), (256, 171));
+        let decoded = decode_webp(&out.bytes);
+        let px = decoded[0]; // 左上 = marker
+        assert!(px > 200, "先頭フレーム (白マーカー) であること: {px}");
+    }
+
+    /// EXIF Orientation=6 のJPEGサムネイルは時計回り90°回転されて
+    /// 出力される (幅高さの転置で検証)。
+    #[test]
+    fn oriented_jpeg_thumbnail_applies_rotation() {
+        let dir = TestDir::new("orient");
+        let path = dir.path().join("o.jpg");
+        // 400x200 (横長) のJPEGを作り、Orientation=6 (時計回り90°) を
+        // APP1セグメントで挿入する — 適用後は 200x400 (縦長)
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(400, 200, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 9])
+        }));
+        let mut jpeg = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut jpeg),
+            image::ImageFormat::Jpeg,
+        )
+        .unwrap();
+        // IFD0にOrientation (tag 0x0112, SHORT) のみのTIFF EXIFブロック
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(&[0x49, 0x49, 0x2A, 0x00]);
+        tiff.extend_from_slice(&8u32.to_le_bytes());
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&0x0112u16.to_le_bytes());
+        tiff.extend_from_slice(&3u16.to_le_bytes());
+        tiff.extend_from_slice(&1u32.to_le_bytes());
+        tiff.extend_from_slice(&6u16.to_le_bytes());
+        tiff.extend_from_slice(&[0u8; 2]);
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        let mut payload = b"Exif\0\0".to_vec();
+        payload.extend_from_slice(&tiff);
+        let mut with_exif = Vec::new();
+        with_exif.extend_from_slice(&jpeg[..2]);
+        with_exif.extend_from_slice(&[0xFF, 0xE1]);
+        with_exif.extend_from_slice(&u16::try_from(payload.len() + 2).unwrap().to_be_bytes());
+        with_exif.extend_from_slice(&payload);
+        with_exif.extend_from_slice(&jpeg[2..]);
+        fs::write(&path, &with_exif).unwrap();
+
+        let out = generate(&path, SizeClass::S256, &CancelToken::new()).unwrap();
+        // 400x200 → orientation 6 → 200x400 → S256 → (128, 256)
+        assert_eq!((out.width, out.height), (128, 256));
+        // Orientationなしの同画像は (256, 128) — 適用済みであることの対証
+        let plain = dir.path().join("plain.jpg");
+        fs::write(&plain, &jpeg).unwrap();
+        let out2 = generate(&plain, SizeClass::S256, &CancelToken::new()).unwrap();
+        assert_eq!((out2.width, out2.height), (256, 128));
+    }
+
     #[test]
     fn webp_round_trip_preserves_dimensions_and_alpha_range() {
         let dir = TestDir::new("roundtrip");
@@ -556,6 +745,138 @@ mod tests {
                 assert!(msg.contains("exceeds limit"), "{msg}");
             }
             other => panic!("expected limits error, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn jpeg_dimension_bomb_is_rejected_by_limits() {
+        // SOF0で65500x65500を主張するJPEGヘッダ (データ本体は最小)。
+        // デコード時のtotal_bytes予約 (256MiB上限) または寸法検査で拒否される。
+        let mut jpeg = Vec::new();
+        jpeg.extend_from_slice(&[0xFF, 0xD8]); // SOI
+        jpeg.extend_from_slice(&[0xFF, 0xE0, 0, 4, b'J', b'F']); // APP0 (短い)
+                                                                 // SOF0: 精度1 + 高さ2 + 幅2 (65500) + コンポーネント数1 + [id, 0x11, 0]
+        let mut sof = vec![8u8];
+        sof.extend_from_slice(&65_500u16.to_be_bytes());
+        sof.extend_from_slice(&65_500u16.to_be_bytes());
+        sof.extend_from_slice(&[1, 1, 0x11, 0]);
+        jpeg.extend_from_slice(&[0xFF, 0xC0]);
+        jpeg.extend_from_slice(&(u16::try_from(sof.len() + 2).unwrap()).to_be_bytes());
+        jpeg.extend_from_slice(&sof);
+        jpeg.extend_from_slice(&[0xFF, 0xD9]); // EOI
+        let dir = TestDir::new("bomb-jpeg");
+        let path = dir.path().join("bomb.jpg");
+        fs::write(&path, &jpeg).unwrap();
+        let err = generate(&path, SizeClass::S256, &CancelToken::new()).unwrap_err();
+        // いずれの経路でもErrであれば「過大確保なし」の要件は満たす
+        // (Limits or Decoding)。panicしないこと自体が本質。
+        assert!(matches!(err, ThumbnailError::Decode(_)), "{err}");
+    }
+
+    /// 固定シードの簡易LCG (依存追加なしの変異源。format.rsと同一方式)。
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0
+        }
+    }
+
+    #[test]
+    fn mutated_inputs_never_panic_decode() {
+        // 各形式の正当ファイルを固定シードLCGで変異させ、decode_with_limits
+        // が常にErrまたは成功のどちらかで**panicしない**ことを検証する
+        // (fuzz相当のスモーク。全成功/全失敗は要求しない)。
+        let dir = TestDir::new("fuzz");
+        let mut seeds: Vec<PathBuf> = Vec::new();
+
+        let png = write_test_png(&dir, "seed.png", 48, 32, true);
+        seeds.push(png);
+
+        let jpg = dir.path().join("seed.jpg");
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(48, 32, |x, y| {
+            image::Rgb([(x * 5 % 256) as u8, (y * 3 % 256) as u8, 42])
+        }))
+        .save(&jpg)
+        .unwrap();
+        seeds.push(jpg);
+
+        let gif = dir.path().join("seed.gif");
+        {
+            let mut buf = Vec::new();
+            {
+                let mut encoder = image::codecs::gif::GifEncoder::new(&mut buf);
+                encoder
+                    .encode_frame(image::Frame::new(image::RgbaImage::from_fn(
+                        48,
+                        32,
+                        |x, y| image::Rgba([x as u8, y as u8, 9, 255]),
+                    )))
+                    .unwrap();
+            }
+            fs::write(&gif, &buf).unwrap();
+        }
+        seeds.push(gif);
+
+        let bmp = dir.path().join("seed.bmp");
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(48, 32, |x, y| {
+            image::Rgb([x as u8, y as u8, 5])
+        }))
+        .save(&bmp)
+        .unwrap();
+        seeds.push(bmp);
+
+        let tiff = dir.path().join("seed.tiff");
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(48, 32, |x, y| {
+            image::Rgb([x as u8, y as u8, 6])
+        }))
+        .save(&tiff)
+        .unwrap();
+        seeds.push(tiff);
+
+        let webp = dir.path().join("seed.webp");
+        {
+            let rgba =
+                image::RgbaImage::from_fn(48, 32, |x, y| image::Rgba([x as u8, y as u8, 7, 255]));
+            let encoded = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
+                .encode_lossless();
+            fs::write(&webp, &*encoded).unwrap();
+        }
+        seeds.push(webp);
+
+        let mut rng = Lcg(0x5EED_0000_FFFF_0001);
+        for (si, seed) in seeds.iter().enumerate() {
+            let bytes = fs::read(seed).unwrap();
+            for i in 0..48u32 {
+                let mut mutated = bytes.clone();
+                let flips = (rng.next() % 5) + 1;
+                for _ in 0..flips {
+                    let pos = (rng.next() as usize) % mutated.len();
+                    mutated[pos] ^= ((rng.next() % 255) + 1) as u8;
+                }
+                let mut truncated = mutated.clone();
+                let cut = (rng.next() as usize) % (truncated.len() + 1);
+                truncated.truncate(cut);
+                for (label, payload) in [("mut", &mutated), ("trunc", &truncated)] {
+                    let path = dir.path().join(format!(
+                        "f-{si}-{i}-{label}{}",
+                        seed.extension().unwrap().to_string_lossy()
+                    ));
+                    fs::write(&path, payload).unwrap();
+                    let result = std::panic::catch_unwind(|| {
+                        decode_with_limits(&path).map(|img| (img.width(), img.height()))
+                    });
+                    assert!(result.is_ok(), "{label} must not panic");
+                    // generate全体 (リサイズ+エンコードまで) もpanicしない
+                    let result = std::panic::catch_unwind(|| {
+                        generate(&path, SizeClass::S256, &CancelToken::new()).is_ok()
+                    });
+                    assert!(result.is_ok(), "{label} generate must not panic");
+                }
+            }
         }
     }
 
@@ -808,5 +1129,193 @@ mod tests {
         assert_eq!(InjectionMode::from_ipc("none"), Some(InjectionMode::None));
         assert_eq!(InjectionMode::from_ipc("network"), None);
         assert_eq!(InjectionMode::from_ipc(""), None);
+    }
+
+    /// E2Eスモーク用データセット生成 (WP-3 §7)。
+    /// `GENTO_E2E_DATASET_DIR` (既定 /tmp/gento-wp3-e2e/dataset) へ
+    /// 6ファイル (5形式の静止画 + アニメGIF) を書く。AVIFはblockedのため対象外。
+    /// 起動方法は docs/handoff/2026-08-30-mvp-wp3.md のE2E手順参照。
+    #[test]
+    #[ignore = "E2E用 (cargo test -p gento-image --lib write_e2e_dataset -- --ignored)"]
+    fn write_e2e_dataset() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("GENTO_E2E_DATASET_DIR")
+                .unwrap_or_else(|_| "/tmp/gento-wp3-e2e/dataset".to_string()),
+        );
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(220, 140, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
+        }));
+        // ファイル名順 = カタログ順 (00=bmp, 01=animated gif, ...)
+        img.save_with_format(dir.join("00-a.bmp"), image::ImageFormat::Bmp)
+            .unwrap();
+        {
+            let mut buf = Vec::new();
+            {
+                use image::codecs::gif::{GifEncoder, Repeat};
+                use image::{Delay, Frame};
+                let mut encoder = GifEncoder::new(&mut buf);
+                encoder.set_repeat(Repeat::Infinite).unwrap();
+                for i in 0..3u8 {
+                    let frame = image::RgbaImage::from_fn(220, 140, |x, y| {
+                        let v = (x + y + u32::from(i) * 40) % 256;
+                        image::Rgba([v as u8, (255 - v) as u8, 128, 255])
+                    });
+                    encoder
+                        .encode_frame(Frame::from_parts(
+                            frame,
+                            0,
+                            0,
+                            Delay::from_numer_denom_ms(20, 1),
+                        ))
+                        .unwrap();
+                }
+            }
+            fs::write(dir.join("01-anim.gif"), &buf).unwrap();
+        }
+        img.save_with_format(dir.join("02-a.jpg"), image::ImageFormat::Jpeg)
+            .unwrap();
+        img.save_with_format(dir.join("03-a.png"), image::ImageFormat::Png)
+            .unwrap();
+        img.save_with_format(dir.join("04-a.tiff"), image::ImageFormat::Tiff)
+            .unwrap();
+        {
+            let rgba = image::RgbaImage::from_fn(220, 140, |x, y| {
+                image::Rgba([(x % 256) as u8, (y % 256) as u8, 77, 255])
+            });
+            let encoded = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
+                .encode_lossless();
+            fs::write(dir.join("05-a.webp"), &*encoded).unwrap();
+        }
+        let count = fs::read_dir(&dir).unwrap().count();
+        println!("e2e dataset: {count} files in {}", dir.display());
+        assert_eq!(count, 6);
+    }
+
+    // ===== WebP q80 preview品質の比較資料生成 (WP-3 §6。文書化タスク) =====
+    //
+    // `cargo test -p gento-image --lib preview_quality_material -- --ignored --nocapture`
+    // で実行。sample/datasetから数種を読み取り (読み取り専用)、preview2048
+    // (WebP q80) とoriginalを /tmp/gento-preview-quality/ へ並べて出力し、
+    // サイズ比と簡易fidelity指標をstdoutへ出す。判断は
+    // docs/dev/preview-quality-note.md に記録する。
+
+    /// 元画像を同寸法へ**可逆リサイズ**した基準との平均絶対誤差 (0-255)。
+    /// q80の視覚品質の定量的代理指標 (PSNR等の厳密計算は意図的に省略。
+    /// 目視判断の補助)。
+    fn mean_abs_diff(a: &image::RgbaImage, b: &image::RgbaImage) -> f64 {
+        assert_eq!((a.width(), a.height()), (b.width(), b.height()));
+        let mut total = 0u64;
+        let mut count = 0u64;
+        for (pa, pb) in a.pixels().zip(b.pixels()) {
+            for ch in 0..3 {
+                total += u64::from(pa[ch].abs_diff(pb[ch]));
+                count += 1;
+            }
+        }
+        total as f64 / count.max(1) as f64
+    }
+
+    #[test]
+    #[ignore = "比較資料生成専用 (通常のテスト実行には含めない。sample/dataset依存)"]
+    fn preview_quality_material() {
+        // cargo testはcrate dirをcwdにするためmanifest基準で解決する
+        let dataset = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sample/dataset");
+        let mut sources: Vec<PathBuf> = fs::read_dir(dataset)
+            .expect("sample/datasetが見つからない (repo rootで実行すること)")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("png")))
+            .collect();
+        sources.sort();
+        assert!(!sources.is_empty(), "datasetが空");
+
+        // 多様性のため最初・中央・最後 + 中間の4点 (決定的選択)
+        let mid = sources.len() / 2;
+        let picks = [
+            sources[0].clone(),
+            sources[mid].clone(),
+            sources[sources.len() * 3 / 4].clone(),
+            sources[sources.len() - 1].clone(),
+        ];
+
+        let out_root = std::env::temp_dir().join("gento-preview-quality");
+        let _ = fs::remove_dir_all(&out_root);
+        fs::create_dir_all(&out_root).unwrap();
+
+        println!(
+            "=== preview品質比較資料 (出力先: {}) ===",
+            out_root.display()
+        );
+        println!(
+            "{:<44} {:>9} {:>9} {:>7} {:>8}",
+            "file", "orig[B]", "prev[B]", "ratio", "meanAbs"
+        );
+        for (i, src) in picks.iter().enumerate() {
+            let name = src.file_name().unwrap().to_string_lossy().into_owned();
+            let Ok(output) = generate(src, SizeClass::Preview2048, &CancelToken::new()) else {
+                println!("{name:<44} (生成失敗 — スキップ)");
+                continue;
+            };
+            // originalのコピー (jpg埋め込み等は無いPNG前提。そのままコピー)
+            let orig_out = out_root.join(format!("{i:02}-original-{name}"));
+            fs::copy(src, &orig_out).unwrap();
+            let prev_out = out_root.join(format!("{i:02}-preview-{name}.webp"));
+            fs::write(&prev_out, &output.bytes).unwrap();
+
+            // 基準: 元を同一寸法へ可逆縮小 (Lanczos3) したもの
+            let original = image::open(src).unwrap();
+            let resized_reference = if original.width() > original.height() {
+                if original.width() > 2048 {
+                    original.resize_exact(
+                        output.width,
+                        output.height,
+                        image::imageops::FilterType::Lanczos3,
+                    )
+                } else {
+                    original
+                }
+            } else if original.height() > 2048 {
+                original.resize_exact(
+                    output.width,
+                    output.height,
+                    image::imageops::FilterType::Lanczos3,
+                )
+            } else {
+                original
+            };
+            let preview_decoded =
+                image::load_from_memory_with_format(&output.bytes, image::ImageFormat::WebP)
+                    .unwrap()
+                    .to_rgba8();
+            let reference = resized_reference.to_rgba8();
+            // 寸法が食い違う場合 (切り上げ丸め) は基準を合わせる
+            let reference = if (reference.width(), reference.height())
+                != (preview_decoded.width(), preview_decoded.height())
+            {
+                image::DynamicImage::ImageRgba8(reference)
+                    .resize_exact(
+                        preview_decoded.width(),
+                        preview_decoded.height(),
+                        image::imageops::FilterType::Lanczos3,
+                    )
+                    .to_rgba8()
+            } else {
+                reference
+            };
+            let mad = mean_abs_diff(&preview_decoded, &reference);
+            let ratio = output.bytes.len() as f64 / fs::metadata(src).unwrap().len() as f64;
+            println!(
+                "{:<44} {:>9} {:>9} {:>6.1}% {:>8.2}",
+                name,
+                fs::metadata(src).unwrap().len(),
+                output.bytes.len(),
+                ratio * 100.0,
+                mad
+            );
+            let _ = prev_out;
+        }
+        println!("=== 判断は docs/dev/preview-quality-note.md に記録 ===");
     }
 }
