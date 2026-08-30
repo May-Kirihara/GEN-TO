@@ -15,6 +15,30 @@ use walkdir::WalkDir;
 /// sinkへ渡すバッチの最大件数。
 pub const SCAN_BATCH_SIZE: usize = 64;
 
+/// 一時走査の深さ上限 (ルート相対。ルート直下のファイルが深さ1)。
+/// `/` 起点クリック等の際限ない再帰を防ぐ (QA-WP4 Major-1)。
+pub const SCAN_MAX_DEPTH: usize = 16;
+
+/// 1走査の画像列挙件数上限。到達時は走査を打ち切り、結果に
+/// `truncated` として反映する (QA-WP4 Major-1)。
+pub const SCAN_MAX_FILES: u64 = 200_000;
+
+/// 一時走査 (バッチ列挙系) の安全ガード (QA-WP4)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanLimits {
+    pub max_depth: usize,
+    pub max_files: u64,
+}
+
+impl Default for ScanLimits {
+    fn default() -> Self {
+        Self {
+            max_depth: SCAN_MAX_DEPTH,
+            max_files: SCAN_MAX_FILES,
+        }
+    }
+}
+
 /// 走査で列挙した1ファイル。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScannedFile {
@@ -50,32 +74,49 @@ pub struct ScanResult {
     /// 個別エラー (権限不足、metadata失敗等)。
     pub errors: Vec<ScanEntryError>,
     pub elapsed_ms: u64,
+    /// 件数上限 (`ScanLimits::max_files`) 到達で打ち切ったか。
+    /// sink中止 (キャンセル) による打ち切りでは false。
+    pub truncated: bool,
 }
 
 /// PNGファイルを再帰列挙し、バッチごとに `sink` へ渡す。
-pub fn scan_pngs(root: &Path, sink: &mut dyn FnMut(ScanBatch)) -> ScanResult {
+/// `sink` がfalseを返したら走査を中止する (世代切替・キャンセル)。
+pub fn scan_pngs(root: &Path, sink: &mut dyn FnMut(ScanBatch) -> bool) -> ScanResult {
     scan_batched(root, &is_png_entry, sink)
 }
 
 /// MVP対象7形式をバッチごとに `sink` へ渡して再帰列挙する (WP-3。
 /// 一時走査 (未登録フォルダ閲覧) 用。列挙のみでprobeは行わない)。
-pub fn scan_images_batch(root: &Path, sink: &mut dyn FnMut(ScanBatch)) -> ScanResult {
+/// `sink` がfalseを返したら走査を中止する。
+pub fn scan_images_batch(root: &Path, sink: &mut dyn FnMut(ScanBatch) -> bool) -> ScanResult {
     scan_batched(root, &is_image_entry, sink)
 }
 
-/// バッチ列挙の共通実装 (拡張子述語のみ差し替え)。
+/// バッチ列挙の共通実装 (拡張子述語のみ差し替え。既定ガード適用)。
 fn scan_batched(
     root: &Path,
     matches: &dyn Fn(&Path) -> bool,
-    sink: &mut dyn FnMut(ScanBatch),
+    sink: &mut dyn FnMut(ScanBatch) -> bool,
+) -> ScanResult {
+    scan_batched_with_limits(root, matches, sink, ScanLimits::default())
+}
+
+/// ガード上限を明示するバッチ列挙 (主に試験用)。
+fn scan_batched_with_limits(
+    root: &Path,
+    matches: &dyn Fn(&Path) -> bool,
+    sink: &mut dyn FnMut(ScanBatch) -> bool,
+    limits: ScanLimits,
 ) -> ScanResult {
     let started = Instant::now();
     let mut entries: u64 = 0;
     let mut found: u64 = 0;
+    let mut truncated = false;
+    let mut cancelled = false;
     let mut errors: Vec<ScanEntryError> = Vec::new();
     let mut pending: Vec<ScannedFile> = Vec::with_capacity(SCAN_BATCH_SIZE);
 
-    for entry in WalkDir::new(root).into_iter() {
+    for entry in WalkDir::new(root).max_depth(limits.max_depth).into_iter() {
         let entry = match entry {
             Ok(e) => e,
             Err(err) => {
@@ -106,13 +147,24 @@ fn scan_batched(
         }
         if pending.len() >= SCAN_BATCH_SIZE {
             found += pending.len() as u64;
-            sink(ScanBatch {
+            if !sink(ScanBatch {
                 entries_walked: entries,
                 files: std::mem::take(&mut pending),
-            });
+            }) {
+                cancelled = true;
+                break;
+            }
+        }
+        if found + pending.len() as u64 > limits.max_files {
+            // 上限を超えて列挙した分は頭切り (総数を上限ちょうどに揃える)。
+            // 総数が上限以下に収まる自然終了とは区別する (truncated)。
+            let keep = limits.max_files.saturating_sub(found) as usize;
+            pending.truncate(keep);
+            truncated = true;
+            break;
         }
     }
-    if !pending.is_empty() {
+    if !cancelled && !pending.is_empty() {
         found += pending.len() as u64;
         sink(ScanBatch {
             entries_walked: entries,
@@ -125,6 +177,7 @@ fn scan_batched(
         png_count: found,
         errors,
         elapsed_ms: started.elapsed().as_millis() as u64,
+        truncated: truncated && !cancelled,
     }
 }
 
@@ -249,6 +302,8 @@ pub fn scan_images(root: &Path, sink: &mut dyn FnMut(ScannedImage)) -> ScanResul
         png_count: image_count,
         errors,
         elapsed_ms: started.elapsed().as_millis() as u64,
+        // 登録ルート走査は件数ガードの対象外 (QA-WP4は一時走査の防御)
+        truncated: false,
     }
 }
 
@@ -327,7 +382,10 @@ mod tests {
     fn empty_directory_yields_nothing() {
         let dir = TestDir::new("empty");
         let mut batches = Vec::new();
-        let result = scan_pngs(dir.path(), &mut |b| batches.push(b));
+        let result = scan_pngs(dir.path(), &mut |b| {
+            batches.push(b);
+            true
+        });
         assert!(batches.is_empty());
         assert_eq!(result.entries, 0);
         assert_eq!(result.png_count, 0);
@@ -339,7 +397,10 @@ mod tests {
         let dir = TestDir::new("missing");
         let root = dir.path().join("does-not-exist");
         let mut batches = Vec::new();
-        let result = scan_pngs(&root, &mut |b| batches.push(b));
+        let result = scan_pngs(&root, &mut |b| {
+            batches.push(b);
+            true
+        });
         assert!(batches.is_empty());
         assert_eq!(result.png_count, 0);
         assert_eq!(result.errors.len(), 1);
@@ -359,7 +420,10 @@ mod tests {
         fs::write(sub.join("nested.png"), PNG_BYTES).unwrap();
 
         let mut files = Vec::new();
-        let result = scan_pngs(dir.path(), &mut |b| files.extend(b.files));
+        let result = scan_pngs(dir.path(), &mut |b| {
+            files.extend(b.files);
+            true
+        });
         let mut names: Vec<String> = files
             .iter()
             .map(|f| f.path.file_name().unwrap().to_string_lossy().into_owned())
@@ -383,6 +447,7 @@ mod tests {
         let result = scan_pngs(dir.path(), &mut |b| {
             batch_sizes.push(b.files.len());
             files += b.files.len();
+            true
         });
         assert!(batch_sizes.iter().all(|n| *n <= SCAN_BATCH_SIZE));
         assert_eq!(files, total);
@@ -399,6 +464,7 @@ mod tests {
         scan_pngs(dir.path(), &mut |b| {
             progress.push(b.entries_walked);
             files.extend(b.files);
+            true
         });
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].size, PNG_BYTES.len() as u64);
@@ -421,7 +487,10 @@ mod tests {
         fs::set_permissions(&sub, fs::Permissions::from_mode(0o000)).unwrap();
 
         let mut files = Vec::new();
-        let result = scan_pngs(dir.path(), &mut |b| files.extend(b.files));
+        let result = scan_pngs(dir.path(), &mut |b| {
+            files.extend(b.files);
+            true
+        });
         // 後片付け: Dropでの削除に失敗しないよう権限を戻す
         fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -541,7 +610,10 @@ mod tests {
         dir.write("skip.txt", b"x");
 
         let mut batches = Vec::new();
-        let result = scan_images_batch(dir.path(), &mut |b| batches.push(b));
+        let result = scan_images_batch(dir.path(), &mut |b| {
+            batches.push(b);
+            true
+        });
         let mut names: Vec<String> = batches
             .iter()
             .flat_map(|b| {
@@ -558,5 +630,123 @@ mod tests {
         assert!(batches.iter().all(|b| b.files.len() <= SCAN_BATCH_SIZE));
         assert_eq!(result.png_count, 9);
         assert_eq!(result.entries, 10);
+        assert!(!result.truncated);
+    }
+
+    // ===== 走査ガードとキャンセル (QA-WP4 Major-1) =====
+
+    #[test]
+    fn default_limits_bound_depth_and_files() {
+        assert_eq!(SCAN_MAX_DEPTH, 16);
+        assert_eq!(SCAN_MAX_FILES, 200_000);
+        assert_eq!(
+            ScanLimits::default(),
+            ScanLimits {
+                max_depth: SCAN_MAX_DEPTH,
+                max_files: SCAN_MAX_FILES,
+            }
+        );
+    }
+
+    #[test]
+    fn scan_respects_max_depth_limit() {
+        let dir = TestDir::new("depth");
+        // ルート直下=深さ1。d/f1.png=深さ2、d/d/f2.png=深さ3、…と階層を掘る
+        let mut rel = String::new();
+        for depth in 1..=5 {
+            rel.push_str("d/");
+            let p = format!("{rel}f{depth}.png");
+            if let Some(parent) = Path::new(&p).parent() {
+                fs::create_dir_all(dir.path().join(parent)).unwrap();
+            }
+            dir.write(&p, PNG_BYTES);
+        }
+        let mut files = Vec::new();
+        let result = scan_batched_with_limits(
+            dir.path(),
+            &is_png_entry,
+            &mut |b| {
+                files.extend(b.files);
+                true
+            },
+            ScanLimits {
+                max_depth: 3,
+                max_files: 100,
+            },
+        );
+        let mut names: Vec<String> = files
+            .iter()
+            .map(|f| f.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        // 深さ3までのf1・f2のみ。深さ4以上は列挙されない (打ち切りではない)
+        assert_eq!(names, vec!["f1.png", "f2.png"]);
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn scan_stops_at_max_files_and_marks_truncated() {
+        let dir = TestDir::new("cap");
+        for i in 0..10 {
+            dir.write(&format!("f{i:02}.png"), PNG_BYTES);
+        }
+        let mut count = 0usize;
+        let result = scan_batched_with_limits(
+            dir.path(),
+            &is_png_entry,
+            &mut |b| {
+                count += b.files.len();
+                true
+            },
+            ScanLimits {
+                max_depth: 16,
+                max_files: 5,
+            },
+        );
+        assert_eq!(count, 5, "上限ちょうどで打ち切る (残りは破棄)");
+        assert_eq!(result.png_count, 5);
+        assert!(result.truncated);
+    }
+
+    #[test]
+    fn max_files_boundary_exact_is_not_truncated() {
+        let dir = TestDir::new("cap-exact");
+        for i in 0..5 {
+            dir.write(&format!("f{i:02}.png"), PNG_BYTES);
+        }
+        let mut count = 0usize;
+        let result = scan_batched_with_limits(
+            dir.path(),
+            &is_png_entry,
+            &mut |b| {
+                count += b.files.len();
+                true
+            },
+            ScanLimits {
+                max_depth: 16,
+                max_files: 5,
+            },
+        );
+        assert_eq!(count, 5);
+        assert_eq!(result.png_count, 5);
+        // 総件数が上限ちょうど → 打ち切り警告なし
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn sink_returning_false_cancels_walk() {
+        let dir = TestDir::new("cancel");
+        for i in 0..(SCAN_BATCH_SIZE * 3) {
+            dir.write(&format!("f{i:04}.png"), PNG_BYTES);
+        }
+        let mut batches = 0usize;
+        let result = scan_pngs(dir.path(), &mut |_b| {
+            batches += 1;
+            false
+        });
+        assert_eq!(batches, 1, "最初のバッチで中止");
+        // 中止された走査は打ち切り (truncated) 扱いにしない
+        assert!(!result.truncated);
+        assert_eq!(result.png_count, SCAN_BATCH_SIZE as u64);
     }
 }

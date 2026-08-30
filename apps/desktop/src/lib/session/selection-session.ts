@@ -16,6 +16,34 @@ export type SessionTriage = "keep" | "reject" | "undecided";
 /** カタログ項目のtriage表現 (gento-core Triageの文字列化と同じ)。 */
 export type TriageLike = "keep" | "reject" | "undecided";
 
+/** 表示ソート値 (backend CatalogSort のIPC文字列と同じ)。 */
+export type CatalogSortValue = "name" | "date_desc" | "size_desc";
+
+export const CATALOG_SORT_VALUES: readonly CatalogSortValue[] = [
+  "name",
+  "date_desc",
+  "size_desc",
+];
+
+/**
+ * セッションの開始 origin 詳細 (QA-WP4 Major-2)。
+ * adhoc (一時走査) のIDはフォルダ・ソート・走査順の組でしか安定しない
+ * ため、再開時の復元・検証に必要な情報を保存する。
+ * library は安定AssetIdなので復元不要。
+ */
+export type SessionOriginDetail =
+  | {
+      kind: "adhoc-folder";
+      folderPath: string;
+      sort: CatalogSortValue;
+    }
+  | {
+      kind: "adhoc-selection";
+      folderPath: string;
+      sort: CatalogSortValue;
+    }
+  | { kind: "library" };
+
 export type PersistedSession = {
   v: 1;
   /** セッション名 (uuid)。 */
@@ -25,6 +53,8 @@ export type PersistedSession = {
   /** 確認済みの位置index (昇順を保証しない。Set的に扱う)。 */
   visited: number[];
   origin: string;
+  /** 開始時のorigin詳細 (保存時の構造。旧データではnull)。 */
+  detail: SessionOriginDetail | null;
   updatedAt: number;
 };
 
@@ -50,6 +80,33 @@ export function generateSessionId(): string {
   }
   // テスト・非セキュア文脈フォールバック (一意性のみで十分)
   return `session-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function parseOriginDetail(
+  value: unknown,
+): SessionOriginDetail | null {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+  const kind = (value as Record<string, unknown>)["kind"];
+  if (kind === "library") {
+    return { kind: "library" };
+  }
+  if (kind !== "adhoc-folder" && kind !== "adhoc-selection") {
+    return null;
+  }
+  const folderPath = (value as Record<string, unknown>)["folderPath"];
+  const sort = (value as Record<string, unknown>)["sort"];
+  if (typeof folderPath !== "string" || folderPath.length === 0) {
+    return null;
+  }
+  if (
+    typeof sort !== "string" ||
+    !CATALOG_SORT_VALUES.includes(sort as CatalogSortValue)
+  ) {
+    return null;
+  }
+  return { kind, folderPath, sort: sort as CatalogSortValue };
 }
 
 /** 保存値のパース。不正・非対応バージョンはnull。 */
@@ -83,11 +140,62 @@ export function parsePersistedSession(raw: string | null): PersistedSession | nu
       position,
       visited,
       origin: value.origin,
+      detail: parseOriginDetail(value.detail),
       updatedAt: typeof value.updatedAt === "number" ? value.updatedAt : 0,
     };
   } catch {
     return null;
   }
+}
+
+/** adhocセッション再開前の比較対象 (現在のUI状態)。 */
+export type ResumeCurrentState = {
+  source: "temp" | "library";
+  folderPath: string | null;
+  sort: CatalogSortValue;
+};
+
+/** 再開の判定結果。 */
+export type ResumePlan =
+  | { action: "resume" }
+  /** 保存時のフォルダ・ソートへ戻してから再開する。 */
+  | { action: "restore"; folderPath: string; sort: CatalogSortValue };
+
+/**
+ * adhocセッションを再開してよいか判定する (QA-WP4 Major-2)。
+ * source・フォルダ・ソートのいずれかが保存時と異なる場合は、保存済みの
+ * フルダ+ソートを復元してからID解決する (誤画像へのサイレント再開防止)。
+ * library由来・旧データ (detailなし) はそのまま再開してよい。
+ */
+export function planAdhocResume(
+  persisted: PersistedSession,
+  current: ResumeCurrentState,
+): ResumePlan {
+  const detail = persisted.detail;
+  if (detail === null || detail.kind === "library") {
+    return { action: "resume" };
+  }
+  const sameFolder =
+    current.source === "temp" && current.folderPath === detail.folderPath;
+  if (sameFolder && current.sort === detail.sort) {
+    return { action: "resume" };
+  }
+  return { action: "restore", folderPath: detail.folderPath, sort: detail.sort };
+}
+
+/**
+ * 保存時の件数と現在件数のずれが許容範囲 (既定5%)を超えたか。
+ * adhocフォルダ全体セッションの再開中止判定に使う。
+ */
+export function sessionCountDrifted(
+  savedCount: number,
+  currentTotal: number,
+  threshold = 0.05,
+): boolean {
+  if (savedCount <= 0) {
+    return false;
+  }
+  return Math.abs(currentTotal - savedCount) / savedCount > threshold;
 }
 
 function toMessage(value: unknown): string {
@@ -138,8 +246,18 @@ export class SelectionSessionStore {
     };
   }
 
+  /** 永続化されたセッションの全体 (再開計画・検証用)。 */
+  peekPersistedSession(): PersistedSession | null {
+    return parsePersistedSession(this.storage.getItem(SESSION_STORAGE_KEY));
+  }
+
   /** セッション開始。idsは表示順 (順序付きasset列)。 */
-  start(ids: string[], origin: string, position = 0): void {
+  start(
+    ids: string[],
+    origin: string,
+    position = 0,
+    detail: SessionOriginDetail | null = null,
+  ): void {
     if (ids.length === 0) {
       this.lastError = "セッション対象が空です";
       this.notify();
@@ -154,6 +272,7 @@ export class SelectionSessionStore {
       position: clamped,
       visited: [clamped],
       origin,
+      detail,
       updatedAt: Date.now(),
     };
     this.scheduleSave();
@@ -262,6 +381,19 @@ export class SelectionSessionStore {
   end(): void {
     this.session = null;
     this.storage.removeItem(SESSION_STORAGE_KEY);
+    if (this.saveTimer !== null) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
+    this.notify();
+  }
+
+  /**
+   * 再開検証失敗時の非活性化 (QA-WP4)。永続化されたデータは残す
+   * (誤再開防止だけで、保存済みセッション自体は消さない)。
+   */
+  abort(): void {
+    this.session = null;
     if (this.saveTimer !== null) {
       clearTimeout(this.saveTimer);
       this.saveTimer = null;

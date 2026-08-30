@@ -31,13 +31,16 @@
   import QuickPreview from "./lib/preview/QuickPreview.svelte";
   import {
     SelectionSessionStore,
+    planAdhocResume,
+    sessionCountDrifted,
     type SessionCounts,
+    type SessionOriginDetail,
   } from "./lib/session/selection-session";
   import {
     LayoutPrefsStore,
     clampPaneWidth,
   } from "./lib/ui/layout-prefs";
-  import { FolderPrefsStore } from "./lib/ui/folder-prefs";
+  import { FolderPrefsStore, LIBRARY_SORT_KEY } from "./lib/ui/folder-prefs";
   import { copyText } from "./lib/ui/clipboard";
   import { KeyDispatcher } from "./lib/keys";
   import ContextMenu, { type MenuAction } from "./lib/ui/ContextMenu.svelte";
@@ -213,8 +216,27 @@
 
   // ===== フォルダ閲覧 (ツリー・パンくず) =====
 
-  /** フォルダ選択: 登録済みならライブラリソース、未登録なら一時走査へ切替。 */
-  async function selectFolder(path: string): Promise<void> {
+  /** 現在のソート保存キー (一時走査=フォルダパス / ライブラリ="library")。 */
+  function sortPrefsKey(): string | null {
+    if (catalogSource === "library") {
+      return LIBRARY_SORT_KEY;
+    }
+    return currentFolder;
+  }
+
+  /** 保存値のソートを検証 (破損したlocalStorage値の伝播防止)。 */
+  function safeSort(value: string | undefined): CatalogSort | undefined {
+    return value === "name" || value === "date_desc" || value === "size_desc"
+      ? value
+      : undefined;
+  }
+
+  /**
+   * フォルダ選択: 登録済みならライブラリソース、未登録なら一時走査へ切替。
+   * 走査中の切替はbackendが旧走査を世代無効化する (QA-WP4 Major-1)。
+   * `sortOverride` はセッション復元等の明示指定 (保存済みソート優先)。
+   */
+  async function selectFolder(path: string, sortOverride?: CatalogSort): Promise<boolean> {
     osNotice = "";
     const registered = registeredStateFor(path, libraryRoots) !== null;
     tree.select(path);
@@ -223,29 +245,48 @@
       if (ok) {
         catalogSource = "library";
         currentFolder = path;
+        gridSelection = { ids: [], focusIndex: null };
+        await applySavedSort(LIBRARY_SORT_KEY, sortOverride);
         await catalog.refreshSummary();
         await catalog.loadPage(0);
         saveFolderPrefs();
-      } else {
-        libraryError = library.lastError ?? "ライブラリ表示へ切替できませんでした";
+        return true;
       }
-      return;
+      libraryError = library.lastError ?? "ライブラリ表示へ切替できませんでした";
+      return false;
     }
-    const ok = await catalog.openFolder(path);
+    // フォルダ別保存ソート (QA-WP4 Major-2)。走査開始時点でbackendへ反映
+    // する (走査中はset_catalog_sortを使えないためopen_folder経由)。
+    const wantedSort = sortOverride ?? safeSort(folderStore.sortFor(path));
+    const ok = await catalog.openFolder(path, wantedSort);
     if (ok) {
       catalogSource = "temp";
       currentFolder = path;
       gridSelection = { ids: [], focusIndex: null };
       saveFolderPrefs();
-    } else {
-      folderNotice = catalog.folderError ?? "フォルダを開けませんでした";
+      return true;
+    }
+    folderNotice = catalog.folderError ?? "フォルダを開けませんでした";
+    return false;
+  }
+
+  /** 保存済みソートを現在カタログへ適用 (ライブラリ表示の再適用用)。 */
+  async function applySavedSort(key: string, override?: CatalogSort): Promise<void> {
+    const wanted = override ?? safeSort(folderStore.sortFor(key));
+    if (wanted === undefined) {
+      return;
+    }
+    if ((summary?.sort ?? "name") !== wanted) {
+      await catalog.setSort(wanted);
     }
   }
 
   function saveFolderPrefs(): void {
+    // sortsはフォルダ別設定なので保存対象外 (saveSortで管理される)
     folderStore.save({
       lastFolder: currentFolder,
       expanded: tree.expandedPaths(),
+      sorts: folderStore.load().sorts,
     });
   }
 
@@ -254,6 +295,29 @@
     const ok = await catalog.startScan();
     if (!ok) {
       folderNotice = catalog.lastError ?? "スキャン開始に失敗しました";
+    }
+  }
+
+  /** 実行中の一時走査をキャンセル (部分結果は残る。QA-WP4)。 */
+  async function cancelScan(): Promise<void> {
+    const ok = await catalog.cancelScan();
+    if (!ok) {
+      folderNotice = catalog.lastError ?? "走査のキャンセルに失敗しました";
+    }
+  }
+
+  /** 一時走査の完了を待つ (セッション再開の検証前に全件が必要)。 */
+  async function waitForScanSettled(timeoutMs = 30000): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      await catalog.refreshSummary();
+      if (!(catalog.summary?.scanning ?? false)) {
+        return true;
+      }
+      if (Date.now() >= deadline) {
+        return false;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
     }
   }
 
@@ -381,6 +445,18 @@
     return `${place} (${count.toLocaleString()}件)`;
   }
 
+  /** セッション開始時のorigin詳細 (再開時のフォルダ/ソート復元用。QA-WP4)。 */
+  function sessionOriginDetail(): SessionOriginDetail {
+    if (catalogSource === "library") {
+      return { kind: "library" };
+    }
+    return {
+      kind: "adhoc-folder",
+      folderPath: currentFolder ?? "",
+      sort: sortValue,
+    };
+  }
+
   async function startSessionFolder(): Promise<void> {
     sessionNotice = "";
     const ids = await collectAllIds();
@@ -390,7 +466,7 @@
     }
     sessionIndex.clear();
     ids.forEach((id, index) => sessionIndex.set(id, index));
-    session.start(ids, sessionOriginLabel(ids.length));
+    session.start(ids, sessionOriginLabel(ids.length), 0, sessionOriginDetail());
     await focusSessionPosition();
   }
 
@@ -405,16 +481,53 @@
     for (const [id, index] of found) {
       sessionIndex.set(id, index);
     }
+    const detail: SessionOriginDetail =
+      catalogSource === "library"
+        ? { kind: "library" }
+        : { kind: "adhoc-selection", folderPath: currentFolder ?? "", sort: sortValue };
     session.start(
       [...gridSelection.ids],
       `選択画像 (${gridSelection.ids.length.toLocaleString()}件)`,
       gridSelection.focusIndex ?? 0,
+      detail,
     );
     void focusSessionPosition();
   }
 
+  /**
+   * セッション再開 (QA-WP4 Major-2)。
+   * adhocセッションは保存時のフォルダ+ソートを復元してからID解決する。
+   * 復元後も件数ずれ (>5%) や現在位置のID解決失敗がある場合は警告表示して
+   * 再開を中止する (誤画像へのサイレント再開防止)。
+   */
   async function resumeSession(): Promise<void> {
     sessionNotice = "";
+    const persisted = session.peekPersistedSession();
+    if (persisted === null || persisted.ids.length === 0) {
+      sessionNotice = "再開できるセッションがありません";
+      return;
+    }
+    const detail = persisted.detail;
+    if (detail !== null && detail.kind !== "library") {
+      const plan = planAdhocResume(persisted, {
+        source: catalogSource,
+        folderPath: currentFolder,
+        sort: sortValue,
+      });
+      if (plan.action === "restore") {
+        sessionNotice = "セッションのフォルダ・並びへ戻します…";
+        const ok = await selectFolder(plan.folderPath, plan.sort);
+        if (!ok) {
+          sessionNotice = "セッションのフォルダを開けなかったため再開を中止しました";
+          return;
+        }
+      }
+      // 復元したフォルダの走査完了を待つ (検証に全件が必要)
+      if (!(await waitForScanSettled())) {
+        sessionNotice = "フォルダの走査が完了しないため再開を中止しました";
+        return;
+      }
+    }
     if (!session.resume()) {
       sessionNotice = "再開できるセッションがありません";
       return;
@@ -422,6 +535,22 @@
     // 全IDのindexを解決 (前回の閲覧状態と現在カタログの対応付け)
     await collectAllIds();
     rebuildSessionIndex();
+    if (detail?.kind === "adhoc-folder") {
+      const total = grid.summary?.total ?? 0;
+      if (sessionCountDrifted(persisted.ids.length, total)) {
+        session.abort();
+        sessionNotice =
+          `フォルダの内容が保存時と大きく異なるため再開を中止しました ` +
+          `(保存時 ${persisted.ids.length.toLocaleString()}件 / 現在 ${total.toLocaleString()}件)`;
+        return;
+      }
+    }
+    const currentId = session.currentId();
+    if (currentId !== null && sessionIndex.get(currentId) === undefined) {
+      session.abort();
+      sessionNotice = "セッション位置の画像が現在の一覧に見つからないため再開を中止しました";
+      return;
+    }
     await focusSessionPosition();
   }
 
@@ -678,7 +807,16 @@
   }
 
   function onSortChange(sort: CatalogSort): void {
-    void catalog.setSort(sort);
+    void catalog.setSort(sort).then((ok) => {
+      if (!ok) {
+        return;
+      }
+      // フォルダ別にソートを保存し、再オープン時に再適用する (QA-WP4)
+      const key = sortPrefsKey();
+      if (key !== null) {
+        folderStore.saveSort(key, sort);
+      }
+    });
   }
 
   // ペインリサイズ (ドラッグ)。pointer captureで要素外移動にも追従。
@@ -785,6 +923,8 @@
           getPerf: () => perf,
           getGridComponent: () => gridComponent,
           getSelection: () => gridSelection,
+          getSession: () => session,
+          getSessionNotice: () => sessionNotice,
           invoke,
         });
       }
@@ -877,9 +1017,18 @@
     {#if osNotice}
       <span class="header-notice">{osNotice}</span>
     {/if}
-    <button onclick={() => void startScan()} disabled={scanBusy}>
-      スキャン開始
-    </button>
+    {#if summary?.scanning}
+      <button
+        onclick={() => void cancelScan()}
+        title="実行中の一時走査を中止します (確定済みの結果は残ります)"
+      >
+        走査をキャンセル
+      </button>
+    {:else}
+      <button onclick={() => void startScan()} disabled={scanBusy}>
+        スキャン開始
+      </button>
+    {/if}
     <button class:active={leftVisible} onclick={toggleLeft} title="フォルダツリーの表示切替">
       左ペイン
     </button>

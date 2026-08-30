@@ -166,7 +166,7 @@ pass "control strings present (production commands)"
 # 不在 (devtools機能)
 for absent in "devtest_report" "set_failure_injection" "dev_bridge_enabled" \
               "GENTO_DEV_BRIDGE" "set_catalog_mode" \
-              "run start_scan before switching to virtual" "virtual-" "injected failure"; do
+              "仮想カタログへ切替する前にスキャンを実行してください" "virtual-" "injected failure"; do
   if has_string "$BIN" "$absent"; then
     fail "dev identifier leaked into featureless release binary: $absent"
   fi

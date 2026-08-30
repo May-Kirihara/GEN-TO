@@ -37,12 +37,16 @@ export type DevBridgeStores = {
   getGridComponent: () => GridComponentLike | null;
   /** WP-7: App側の選択スナップショット (計測・診断用)。 */
   getSelection: () => { ids: string[]; focusIndex: number | null } | null;
+  /** QA-WP4: 選別セッションストア (再開検証の実機E2E用)。 */
+  getSession: () => SessionLike | null;
+  /** QA-WP4: セッション通知文言 (再開中止警告の検証用)。 */
+  getSessionNotice: () => string;
   /** WP-7: invoke (エラー注入など)。App.svelteのcore invokeを流用。 */
   invoke: <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
 };
 
 type GridLike = {
-  summary: { total: number; mode: string } | null;
+  summary: { total: number; mode: string; sort?: string } | null;
   stats: {
     requested: number;
     batches: number;
@@ -54,6 +58,17 @@ type GridLike = {
   };
   pager: { stats: { fetched: number; errors: number }; generation: number | null };
   thumbUrlFor(id: string): string | null;
+  getItem(index: number): { id: string; displayName: string } | null;
+};
+
+type SessionLike = {
+  active: boolean;
+  session: {
+    ids: string[];
+    position: number;
+    origin: string;
+  } | null;
+  currentId(): string | null;
 };
 
 type ThumbLike = {
@@ -358,6 +373,56 @@ export function installDevBridge(stores: DevBridgeStores): void {
       const [mode, rate] = modes[injectionState];
       void stores.invoke("set_failure_injection", { mode, rate }).catch(() => undefined);
     },
+    // QA-WP4: 選別セッション操作 (実機E2Eの再開シナリオ用)
+    sessionStartFolder: () => clickButton("現在の一覧で開始"),
+    sessionResume: () => clickButton("再開 ("),
+    sessionNext: () => clickButton("次へ →"),
+    // QA-WP4: ソート順巡回 (toolbarのselectを本物のchangeイベントで駆動)
+    cycleSort: () => {
+      const select = document.querySelector<HTMLSelectElement>(".sort-label select");
+      if (select === null) {
+        return;
+      }
+      const order = ["name", "date_desc", "size_desc"];
+      const next = order[(order.indexOf(select.value) + 1) % order.length] ?? "name";
+      select.value = next;
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    },
+    // QA-WP4: 走査キャンセルボタン (走査中のみ出現)
+    cancelScan: () => clickButton("走査をキャンセル"),
+    // QA-WP4: ツリー行クリック (xdotoolポインタが環境により不安定なため
+    // 本物のtree-labelボタンをDOM clickで駆動。selectFolder→open_folder
+    // の生産経路を通る)
+    openTreeFsRoot: () => {
+      document.querySelector<HTMLButtonElement>('.tree-label[title="/"]')?.click();
+    },
+    openFirstHomeChild: () => {
+      const labels = Array.from(document.querySelectorAll<HTMLElement>(".tree-label"));
+      const home = labels[0]?.title;
+      if (home === undefined) {
+        return;
+      }
+      const childPrefix = `${home}/`;
+      const clickChild = (): void => {
+        const rows = Array.from(document.querySelectorAll<HTMLElement>(".tree-label"));
+        rows
+          .slice(1)
+          .find((label) => label.title.startsWith(childPrefix))
+          ?.click();
+      };
+      const already = labels.slice(1).some((label) => label.title.startsWith(childPrefix));
+      if (already) {
+        clickChild();
+        return;
+      }
+      // 折りたたみ中: 展開して子の遅延ロード後にクリック (冪等: 再実行は
+      // already経路を通る)
+      labels[0]
+        .closest(".tree-row")
+        ?.querySelector<HTMLButtonElement>(".tree-expander")
+        ?.click();
+      setTimeout(clickChild, 700);
+    },
   };
 
   function gridLines(): string[] {
@@ -373,6 +438,7 @@ export function installDevBridge(stores: DevBridgeStores): void {
     const s = grid.stats;
     return [
       `G tot=${grid.summary?.total ?? 0} mode=${grid.summary?.mode ?? "-"}` +
+        ` srt=${grid.summary?.sort ?? "-"}` +
         ` req=${s.requested} bat=${s.batches} rej=${s.rejectedFull}` +
         ` rdy=${s.readyReceived} fail=${s.failedReceived} can=${s.cancelled} canB=${s.cancelBatches}`,
       `G pf=${grid.pager.stats.fetched} pe=${grid.pager.stats.errors}` +
@@ -380,6 +446,24 @@ export function installDevBridge(stores: DevBridgeStores): void {
         ` st=${Math.round(scrollEl?.scrollTop ?? -1)}` +
         ` ae=${ae === null ? "-" : `${ae.tagName}.${String(ae.className).split(" ")[0]}`}` +
         ` selN=${sel?.ids.length ?? -1} foc=${sel?.focusIndex ?? -1}`,
+    ];
+  }
+
+  /** QA-WP4: 選別セッション状態行 (再開シナリオの実機E2E用)。 */
+  function sessionLines(): string[] {
+    const session = stores.getSession();
+    if (session === null) {
+      return [];
+    }
+    const sel = stores.getSelection();
+    const grid = stores.getGrid();
+    const focusItem =
+      sel !== null && sel.focusIndex !== null ? grid?.getItem(sel.focusIndex) : null;
+    return [
+      `S act=${session.active ? 1 : 0} pos=${session.session?.position ?? -1}` +
+        ` tot=${session.session?.ids.length ?? 0} cur=${session.currentId() ?? "-"}` +
+        ` foc=${sel?.focusIndex ?? -1} fn=${focusItem?.displayName ?? "-"}` +
+        ` note=${stores.getSessionNotice().slice(0, 48)}`,
     ];
   }
 
@@ -471,7 +555,7 @@ export function installDevBridge(stores: DevBridgeStores): void {
           ` sw=${c.stats.swaps} creq=${c.stats.requests}`,
       );
     }
-    lines.push(...gridLines(), ...thumbLines(), ...perfLines(), ...uiLines());
+    lines.push(...gridLines(), ...thumbLines(), ...perfLines(), ...uiLines(), ...sessionLines());
     if (!lines.some((line) => line.startsWith("V ") || line.startsWith("C "))) {
       lines.push("idle (viewer closed)");
     }
@@ -514,6 +598,8 @@ export function installDevBridge(stores: DevBridgeStores): void {
         case "F2":
           if (event.ctrlKey) {
             actions.focusGrid();
+          } else if (event.shiftKey) {
+            actions.sessionStartFolder();
           } else {
             actions.select2();
           }
@@ -521,11 +607,17 @@ export function installDevBridge(stores: DevBridgeStores): void {
         case "F3":
           if (event.ctrlKey) {
             actions.select3();
+          } else if (event.shiftKey) {
+            actions.sessionResume();
           } else {
             actions.openViewer();
           }
           break;
         case "F4": {
+          if (event.shiftKey) {
+            actions.sessionNext();
+            break;
+          }
           const el = interactionEl();
           if (el !== null) {
             wheelAt(el, 0.25, 0.35, 3, event.ctrlKey ? 100 : -100);
@@ -533,6 +625,10 @@ export function installDevBridge(stores: DevBridgeStores): void {
           break;
         }
         case "F5": {
+          if (event.shiftKey) {
+            actions.cycleSort();
+            break;
+          }
           const el = interactionEl();
           if (el !== null) {
             void dragSequence(el, 0.3, 0.5, 240, 160, 24);
@@ -542,12 +638,20 @@ export function installDevBridge(stores: DevBridgeStores): void {
         case "F6":
           if (event.ctrlKey) {
             actions.resetStats();
+          } else if (event.shiftKey) {
+            actions.cancelScan();
           } else {
             actions.prefetchToggle();
           }
           break;
         case "F7":
-          actions.cycleChoice();
+          if (event.ctrlKey) {
+            actions.openTreeFsRoot();
+          } else if (event.shiftKey) {
+            actions.openFirstHomeChild();
+          } else {
+            actions.cycleChoice();
+          }
           break;
         case "F8":
           if (event.shiftKey) {

@@ -132,12 +132,14 @@ invoke<CatalogPage>("get_catalog_page", { generation: number, offset: number, li
 invoke<null>("start_scan")
 ```
 
-- 失敗 (string reject): 走査中の二重開始 ` "scan already in progress"`。
 - 成功時の効果:
   1. カタログ内容をクリアし、モードを Real へ戻す
   2. `generation` を +1
   3. バックグラウンドスレッドで走査開始 (UIスレッドでファイルI/Oは行わない)
+- **走査中の再投入も成功する** (QA-WP4): 旧走査は世代トークンで無効化され、
+  旧ワーカーの結果は破棄される。中止する場合は `cancel_scan`。
 - 走査は `--dataset` で指定したルートを再帰走査する。シンボリックリンクは辿らない。
+  深さ上限16・画像200,000件で打ち切り (QA-WP4ガード)。
 - ルート不存在はエラー扱いにならず、走査エラー (error_count) として報告される。
 - 応答後にフロントは `get_catalog_summary` を再取得すること (generationが変わるため)。
   `scan started` イベントは発火しない (start_scanの呼び出し元自身が理由を知っているため)。
@@ -148,9 +150,9 @@ invoke<null>("start_scan")
 invoke<CatalogSummary>("set_catalog_mode", { virtual: boolean })
 ```
 
-- 失敗 (string reject):
-  - 走査中: `"cannot switch catalog mode while scanning"`
-  - 実カタログ空に仮想へ切替: `"real catalog is empty; run start_scan before switching to virtual"`
+- 失敗 (string reject。devtoolsビルドのみ):
+  - 走査中: 「走査中はカタログモードを切替できません」
+  - 実カタログ空に仮想へ切替: 「実カタログが空です。仮想カタログへ切替する前にスキャンを実行してください」
 - 成功時の効果 (モードが実際に変化した場合のみ):
   - `records` を仮想50,000件 / 実レコードへ差し替え、`generation` を +1、`catalog:changed`
     (reason `mode_switch`) をemitし、新 `CatalogSummary` を返す。
@@ -767,7 +769,7 @@ type LibraryScanStatus = {
   キューイングで再試行状態はリセットされる)。
 
 - `scan_start` はワーカー処理中 (`scanning: true`) の呼び出しを
-  `"scan already in progress"` で拒否。既定ではUIから非同期で完了する。
+  「スキャンが既に進行中です」で拒否。既定ではUIから非同期で完了する。
 - `scan_stop` は協調キャンセル (walk中止・不在化確定前の打ち切り・ハッシュ
   中止)。**再開 = `scan_start` 再呼び出し** (進行状況はDBが正本のため、
   差分スキャンが続きを冪等に拾う。ハッシュ待ちも `asset_id IS NULL` から
@@ -785,12 +787,13 @@ invoke<CatalogSummary>("set_catalog_source", { source: "temp" | "library" })
   - `temp`: `--dataset` 一時走査の結果 (従来のReal。未登録フォルダ閲覧)
   - `library`: 登録ルートのDB由来スナップショット (永続カタログ)
   - (virtual: devtools機能。`set_catalog_mode` のまま。Library表示中から
-    の切替は `"switch to temp source..."` で拒否)
+    の切替は「仮想カタログへ切替する前に一時走査へ戻してください
+    (set_catalog_source)」で拒否)
 - モードが実際に変化した場合のみ `generation` を +1 して `catalog:changed`
   (reason `mode_switch`) をemit。同一ソースへの切替はno-op。
-- 一時走査の実行中 (`scanning`) は `"cannot switch catalog source while
-  scanning"` で拒否。ライブラリスキャン中の切替は可 (スナップショットは
-  次の更新で上書きされる)。
+- 一時走査の実行中 (`scanning`) は「走査中はカタログソースを切替できません」
+  で拒否 (中止するには `cancel_scan`)。ライブラリスキャン中の切替は可
+  (スナップショットは次の更新で上書きされる)。
 - `CatalogMode` (`CatalogSummary.mode`) に `"library"` を追加 (列挙値追加 =
   minor。`GENTO_API_VERSION` は据え置き)。
 
@@ -997,17 +1000,46 @@ type ImageListItem = {
 - 不在・権限不足は `entries: []` + `error` に文言 (UIは「読み取り不能」表示)
 - 親はパンくず/上位移動用 (`/` の親は null)
 
-### `open_folder` (WP-4)
+### `open_folder` (WP-4 / QA-WP4改訂)
 
 閲覧フォルダを切り替えて一時走査 (adhoc) を開始する。
 
-- 引数: `path: String` — 既存ディレクトリの絶対パス
+- 引数:
+  - `path: String` — 既存ディレクトリの絶対パス
+  - `sort: Option<"name" | "date_desc" | "size_desc">` (省略可。QA-WP4) —
+    走査開始時点の表示ソート。フォルダ別保存ソートの再適用に使う
+    (走査中は `set_catalog_sort` を使えないため開始時に反映する)
 - 動作: 検証 (不在/非ディレクトリ/権限はエラー文言) → `dataset_path` 更新 →
   `start_scan` と同じ非同期走査を投入 (Real モードへ移行し内容を置換)
 - 応答: 走査開始直後の `CatalogSummary` (`scanning: true`)
-- 走査中は拒否 (`cannot switch folder while scanning`)
+- **走査中でも成功する** (QA-WP4): 既存走査は世代トークンで無効化され、
+  旧ワーカーの以降のバッチ・完了確定は破棄される (旧結果の混入なし。
+  旧ワーカーは技術ログ `scan abandoned (superseded by newer scan)` を出す)
 - 副作用: `catalog:changed` (scan_batch/scan_done) と `scan:progress` は
   `start_scan` と同一
+
+### `cancel_scan` (QA-WP4)
+
+実行中の一時走査 (adhoc) をキャンセルする。
+
+- 引数: なし
+- 動作: 走査トークンを無効化して走査ワーカーを中止 (walk打ち切り)。
+  確定済みの部分結果はそのまま表示に残る (`scanning: false` に確定)
+- 応答: 確定後の `CatalogSummary`。走査中でない場合もエラーにせず
+  現在のsummaryを返す
+- 副作用: キャンセル実行時のみ `scan:progress` (`done: true`) と
+  `catalog:changed` (reason: `scan_done`) をemit
+- 登録ルート (ライブラリ) 走査のキャンセルは既存 `scan_stop` を使う
+
+### 一時走査の安全ガード (QA-WP4)
+
+`start_scan` / `open_folder` の走査 (gento-image `scan_images_batch`) は:
+
+- 深さ上限 16 (ルート相対。`/` 起点の際限ない再帰を防止)
+- 画像列挙 200,000件で打ち切り (`ScanResult.truncated`。進捗の
+  `error_samples` に「件数上限…打ち切りました」警告が反映される)
+- 走査の再投入 (`open_folder` / `start_scan`) と `cancel_scan` は
+  旧走査を協調キャンセルする (sinkがfalseを返しwalkを中止)
 
 ### `set_catalog_sort` (WP-4)
 
@@ -1017,7 +1049,8 @@ type ImageListItem = {
 - 動作: 表示レコードを並べ替え、generation を進めて `catalog:changed`
   (reason: `sort_change`) をemit。以後の走査バッチ・ソース切替にも適用
 - 応答: 新 `CatalogSummary` (`sort` フィールドに現在値)
-- 走査中は拒否。同一ソート指定は無変化 (generation不変)
+- 走査中は拒否 (フォルダ開設時のソート指定は `open_folder` の `sort` を使用)。
+  同一ソート指定は無変化 (generation不変)
 
 ### `reveal_in_file_manager` / `open_with_default_app` (WP-4)
 
@@ -1063,8 +1096,19 @@ type ImageListItem = {
 - 前回フォルダ・ツリー展開: localStorage `gento:folders:v1`
   (起動時の走査対象は `--dataset` のまま決定論的。前回フォルダはツリーの
   選択ハイライトとして復元)
+- **フォルダ別ソート** (QA-WP4): `gento:folders:v1` の `sorts`
+  (キー=フォルダ絶対パス / ライブラリ表示は `"library"`。上限128エントリ)。
+  フォルダ再オープン時に `open_folder` の `sort` 引数で再適用する
+  (backendには状態を持たせない)
 - スクロール位置: 既存 `gento:scroll:*` をフォルダ別キー
   (`real:<path>` / `library`) で運用
 - 選別セッション: localStorage `gento:session:v1`
   (uuidセッション名・順序付きID列・位置・確認済み集合。採用/除外の値自体は
   DBのtriage由来)
+- **セッションorigin詳細** (QA-WP4): `gento:session:v1` の `detail` —
+  adhocセッションは `{kind: "adhoc-folder"|"adhoc-selection", folderPath, sort}`、
+  ライブラリは `{kind: "library"}` を保存。再開時に現在のsource/フォルダ/
+  ソートと一致しない場合は保存済みフォルダ+ソートを復元してからID解決する。
+  復元後も件数ずれ (>5%) や現在位置のID解決失敗があれば警告表示して
+  再開を中止する (adhocの走査連番IDはフォルダ+ソート+走査順の組でのみ
+  安定なため。誤画像へのサイレント再開防止)

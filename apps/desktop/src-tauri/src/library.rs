@@ -1452,7 +1452,7 @@ pub fn library_roots_set_enabled(
 pub fn scan_start(state: State<'_, AppState>) -> Result<(), String> {
     let controller = controller(&state)?;
     if controller.is_scanning() {
-        return Err("scan already in progress".to_string());
+        return Err("スキャンが既に進行中です".to_string());
     }
     controller.enqueue_scan_all();
     Ok(())

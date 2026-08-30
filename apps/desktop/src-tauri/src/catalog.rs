@@ -21,7 +21,7 @@ use gento_core::AssetId;
 use gento_image::cache::asset_version;
 use gento_image::format::{probe_image, ImageProbe};
 use gento_image::metrics::{log_scan_metrics, read_self_rss_kb, ScanMetrics};
-use gento_image::scan::{scan_images_batch, ScanBatch};
+use gento_image::scan::{scan_images_batch, ScanBatch, ScanEntryError, SCAN_MAX_FILES};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -61,6 +61,9 @@ pub struct CatalogInner {
     library: Vec<ImageRecord>,
     /// 表示ソート (WP-4。走査バッチ・ソース切替・スナップショット反映に適用)。
     sort: CatalogSort,
+    /// 現在の一時走査トークン (世代。QA-WP4)。`begin_scan` で進み、
+    /// 旧トークンを持つ走査ワーカーの結果は破棄される。
+    scan_token: u64,
     progress: ProgressCounters,
     scan_started_at: Option<Instant>,
     last_scan_elapsed_ms: Option<u64>,
@@ -93,6 +96,7 @@ impl CatalogInner {
             real: Vec::new(),
             library: Vec::new(),
             sort: CatalogSort::default(),
+            scan_token: 0,
             progress: ProgressCounters::default(),
             scan_started_at: None,
             last_scan_elapsed_ms: None,
@@ -243,17 +247,115 @@ fn summary_of(inner: &CatalogInner) -> CatalogSummary {
     }
 }
 
-/// 走査開始の状態遷移。呼び出し前に `scanning == false` を確認すること。
-fn begin_scan(inner: &mut CatalogInner) -> u64 {
+/// 走査開始の状態遷移。旧走査トークンを無効化し (走査中でも再投入可能。
+/// QA-WP4)、新トークンを返す。
+fn begin_scan(inner: &mut CatalogInner) -> (u64, u64) {
     inner.state.scanning = true;
     // 再走査はカタログを置き換えるためRealモードへ戻し、内容をクリアする
     inner.state.records.clear();
     inner.state.mode = CatalogMode::Real;
     inner.state.generation += 1;
+    inner.scan_token += 1;
     inner.progress = ProgressCounters::default();
     inner.scan_started_at = Some(Instant::now());
     inner.last_scan_elapsed_ms = None;
-    inner.state.generation
+    (inner.state.generation, inner.scan_token)
+}
+
+/// 走査バッチをカタログへ反映する。トークンが無効化されていたら反映せず
+/// falseを返す (呼び出し元の走査ワーカーは走査を中止する)。
+fn apply_scan_batch(
+    inner: &mut CatalogInner,
+    token: u64,
+    records: Vec<ImageRecord>,
+    entries_walked: u64,
+    probe_failures: &[String],
+) -> bool {
+    if token != inner.scan_token {
+        return false;
+    }
+    inner.progress.scanned = entries_walked;
+    inner.progress.found += records.len() as u64;
+    for failure in probe_failures {
+        inner.progress.push_error(failure.clone());
+    }
+    inner.state.records.extend(records);
+    inner.apply_sort();
+    true
+}
+
+/// 走査完了の確定 (`scanning=false`・実レコード確定・最終進捗)。
+/// トークンが無効化されていたら確定せず None (新走査が状態を支配中)。
+fn finish_scan(
+    inner: &mut CatalogInner,
+    token: u64,
+    scan_elapsed_ms: u64,
+    entries: u64,
+    errors: &[ScanEntryError],
+    truncated: bool,
+) -> Option<ScanProgressPayload> {
+    if token != inner.scan_token {
+        return None;
+    }
+    inner.state.scanning = false;
+    inner.progress.scanned = entries;
+    for error in errors {
+        inner
+            .progress
+            .push_error(format!("{}: {}", error.path.display(), error.reason));
+    }
+    if truncated {
+        inner.progress.push_error(format!(
+            "件数上限 ({SCAN_MAX_FILES}件) に達したため走査を打ち切りました"
+        ));
+    }
+    inner.last_scan_elapsed_ms = Some(scan_elapsed_ms);
+    // Realモード復帰用に実レコードを保持する (set_catalog_sourceが
+    // production経路で使用するため無条件。仮想カタログのソースでもある)。
+    inner.real = inner.state.records.clone();
+    Some(ScanProgressPayload {
+        scanned: inner.progress.scanned,
+        found: inner.progress.found,
+        errors: inner.progress.errors,
+        elapsed_ms: scan_elapsed_ms,
+        done: true,
+        error_samples: inner.progress.error_samples.clone(),
+        updated: 0,
+        relocated: 0,
+        missing: 0,
+        hashed: 0,
+        pending_hash: 0,
+        phase: None,
+    })
+}
+
+/// 一時走査のキャンセル確定 (QA-WP4)。トークンを無効化して走査ワーカーを
+/// 停止させ、確定済みの部分結果はそのまま表示に残す。
+/// 走査中でなければ None (何もしない)。
+fn cancel_scan_transition(inner: &mut CatalogInner) -> Option<ScanProgressPayload> {
+    if !inner.state.scanning {
+        return None;
+    }
+    inner.scan_token += 1;
+    inner.state.scanning = false;
+    if let Some(started) = inner.scan_started_at.take() {
+        inner.last_scan_elapsed_ms = Some(started.elapsed().as_millis() as u64);
+    }
+    inner.real = inner.state.records.clone();
+    Some(ScanProgressPayload {
+        scanned: inner.progress.scanned,
+        found: inner.progress.found,
+        errors: inner.progress.errors,
+        elapsed_ms: inner.last_scan_elapsed_ms.unwrap_or_default(),
+        done: true,
+        error_samples: inner.progress.error_samples.clone(),
+        updated: 0,
+        relocated: 0,
+        missing: 0,
+        hashed: 0,
+        pending_hash: 0,
+        phase: None,
+    })
 }
 
 // ===== カタログモード切替 (devtools機能。仮想5万件カタログは計測用) =====
@@ -269,13 +371,13 @@ enum ModeSwitchOutcome {
 #[cfg(any(debug_assertions, feature = "devtools"))]
 fn switch_mode(inner: &mut CatalogInner, want_virtual: bool) -> Result<ModeSwitchOutcome, String> {
     if inner.state.scanning {
-        return Err("cannot switch catalog mode while scanning".to_string());
+        return Err("走査中はカタログモードを切替できません".to_string());
     }
     if inner.state.mode == CatalogMode::Library {
         // devtoolsのreal↔virtual切替は一時走査カタログ上の操作。
         // Library表示中は set_catalog_source で temp へ戻してから。
         return Err(
-            "switch to temp source (set_catalog_source) before using virtual mode".to_string(),
+            "仮想カタログへ切替する前に一時走査へ戻してください (set_catalog_source)".to_string(),
         );
     }
     let target = if want_virtual {
@@ -289,7 +391,8 @@ fn switch_mode(inner: &mut CatalogInner, want_virtual: bool) -> Result<ModeSwitc
     if want_virtual {
         if inner.real.is_empty() {
             return Err(
-                "real catalog is empty; run start_scan before switching to virtual".to_string(),
+                "実カタログが空です。仮想カタログへ切替する前にスキャンを実行してください"
+                    .to_string(),
             );
         }
         inner.state.records =
@@ -317,16 +420,12 @@ pub fn set_catalog_source(
     let target = match source.as_str() {
         "temp" => CatalogMode::Real,
         "library" => CatalogMode::Library,
-        other => {
-            return Err(format!(
-                "unknown catalog source: {other} (expected temp|library)"
-            ))
-        }
+        other => return Err(format!("不明なカタログソースです: {other} (temp|library)")),
     };
     let outcome = {
         let mut inner = lock(&state.catalog);
         if inner.state.scanning {
-            return Err("cannot switch catalog source while scanning".to_string());
+            return Err("走査中はカタログソースを切替できません".to_string());
         }
         if inner.state.mode == target {
             ModeSwitchOutcome::Unchanged(summary_of(&inner))
@@ -543,11 +642,10 @@ pub fn get_catalog_page(
 
 #[tauri::command]
 pub fn start_scan(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    let generation = {
+    let (generation, token) = {
         let mut inner = lock(&state.catalog);
-        if inner.state.scanning {
-            return Err("scan already in progress".to_string());
-        }
+        // 走査中の再投入も許可: begin_scanが旧トークンを無効化し、
+        // 旧走査ワーカーの結果は破棄される (QA-WP4)
         begin_scan(&mut inner)
     };
     let dataset = state.current_folder();
@@ -556,13 +654,41 @@ pub fn start_scan(app: AppHandle, state: State<'_, AppState>) -> Result<(), Stri
         generation,
         "scan started"
     );
-    std::thread::spawn(move || run_scan(app, dataset, generation));
+    std::thread::spawn(move || run_scan(app, dataset, generation, token));
     Ok(())
+}
+
+/// 実行中の一時走査をキャンセルする (QA-WP4)。確定済みの部分結果は
+/// そのまま表示に残る。登録ルート (ライブラリ) 走査のキャンセルは
+/// 既存 `scan_stop` を使う。
+#[tauri::command]
+pub fn cancel_scan(app: AppHandle, state: State<'_, AppState>) -> Result<CatalogSummary, String> {
+    let (summary, final_payload) = {
+        let mut inner = lock(&state.catalog);
+        let payload = cancel_scan_transition(&mut inner);
+        (summary_of(&inner), payload)
+    };
+    if let Some(payload) = final_payload {
+        tracing::info!(generation = summary.generation, "adhoc scan cancelled");
+        let _ = app.emit("scan:progress", payload);
+        let _ = app.emit(
+            "catalog:changed",
+            CatalogChangedPayload {
+                generation: summary.generation,
+                reason: CatalogChangeReason::ScanDone,
+            },
+        );
+    }
+    Ok(summary)
 }
 
 /// 閲覧フォルダを切り替えて一時走査を開始する (WP-4。ツリー選択からの流入)。
 ///
 /// - 指定パスが既存ディレクトリでない場合はエラー (UIは状態表示へ反映)
+/// - 走査中でも切替可能: 既存走査はトークン無効化で破棄され、新フォルダの
+///   走査に置き換わる (旧結果は混入しない。QA-WP4)
+/// - `sort` 指定時は走査開始時点のソートへ反映する (走査中は
+///   `set_catalog_sort` を使えないため。QA-WP4 Major-2)
 /// - 成功時: `dataset_path` を更新し `start_scan` と同じ走査を非同期投入する
 ///   (Realモードへ戻り、表示内容は新フォルダの走査結果で置き換わる)
 #[tauri::command]
@@ -570,26 +696,34 @@ pub fn open_folder(
     app: AppHandle,
     state: State<'_, AppState>,
     path: String,
+    sort: Option<String>,
 ) -> Result<CatalogSummary, String> {
     let folder = validate_folder(Path::new(&path))?;
-    let summary = {
+    let parsed_sort = match sort.as_deref() {
+        None => None,
+        Some(value) => Some(
+            CatalogSort::from_str_opt(value)
+                .ok_or_else(|| format!("不明なソートです: {value} (name|date_desc|size_desc)"))?,
+        ),
+    };
+    let (summary, token) = {
         let mut inner = lock(&state.catalog);
-        if inner.state.scanning {
-            return Err("cannot switch folder while scanning".to_string());
+        if let Some(parsed) = parsed_sort {
+            inner.sort = parsed;
         }
         *state
             .dataset_path
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = folder.clone();
-        begin_scan(&mut inner);
-        summary_of(&inner)
+        let (_generation, token) = begin_scan(&mut inner);
+        (summary_of(&inner), token)
     };
     tracing::info!(
         folder = %folder.display(),
         generation = summary.generation,
         "folder opened (adhoc scan started)"
     );
-    std::thread::spawn(move || run_scan(app, folder, summary.generation));
+    std::thread::spawn(move || run_scan(app, folder, summary.generation, token));
     // begin_scan後・走査完了前のsummary (scanning=true) を返す
     Ok(summary)
 }
@@ -628,11 +762,11 @@ pub fn set_catalog_sort(
     sort: String,
 ) -> Result<CatalogSummary, String> {
     let parsed = CatalogSort::from_str_opt(&sort)
-        .ok_or_else(|| format!("unknown sort: {sort} (name|date_desc|size_desc)"))?;
+        .ok_or_else(|| format!("不明なソートです: {sort} (name|date_desc|size_desc)"))?;
     let outcome = {
         let mut inner = lock(&state.catalog);
         if inner.state.scanning {
-            return Err("cannot change sort while scanning".to_string());
+            return Err("走査中はソートを変更できません".to_string());
         }
         if inner.sort == parsed {
             ModeSwitchOutcome::Unchanged(summary_of(&inner))
@@ -682,13 +816,15 @@ pub fn set_catalog_mode(
 }
 
 /// バックグラウンド走査スレッドの本体。UIスレッドで実行しないこと。
-fn run_scan(app: AppHandle, dataset: PathBuf, generation: u64) {
+/// `token` はこの走査の世代。`open_folder` / `cancel_scan` で無効化された
+/// 場合、以降のバッチは破棄され走査を中止する (QA-WP4)。
+fn run_scan(app: AppHandle, dataset: PathBuf, generation: u64, token: u64) {
     let started = Instant::now();
     // プローブ1件は1ms未満のため、Duration累積でないとms換算時に0に落ちる
     let mut probe_elapsed = std::time::Duration::ZERO;
     let mut next_id: u64 = 1;
 
-    let sink = &mut |batch: ScanBatch| {
+    let sink = &mut |batch: ScanBatch| -> bool {
         let mut records = Vec::with_capacity(batch.files.len());
         for file in &batch.files {
             let probe_started = Instant::now();
@@ -738,13 +874,16 @@ fn run_scan(app: AppHandle, dataset: PathBuf, generation: u64) {
         let payload = {
             let state = app.state::<AppState>();
             let mut inner = lock(&state.catalog);
-            inner.progress.scanned = batch.entries_walked;
-            inner.progress.found += batch.files.len() as u64;
-            for failure in &probe_failures {
-                inner.progress.push_error(failure.clone());
+            if !apply_scan_batch(
+                &mut inner,
+                token,
+                records,
+                batch.entries_walked,
+                &probe_failures,
+            ) {
+                // 新しい走査 (フォルダ切替・再投入) が支配中。結果を捨てて中止。
+                return false;
             }
-            inner.state.records.extend(records);
-            inner.apply_sort();
             ScanProgressPayload {
                 scanned: inner.progress.scanned,
                 found: inner.progress.found,
@@ -768,6 +907,7 @@ fn run_scan(app: AppHandle, dataset: PathBuf, generation: u64) {
                 reason: CatalogChangeReason::ScanBatch,
             },
         );
+        true
     };
 
     let result = scan_images_batch(&dataset, sink);
@@ -777,50 +917,42 @@ fn run_scan(app: AppHandle, dataset: PathBuf, generation: u64) {
     let final_payload = {
         let state = app.state::<AppState>();
         let mut inner = lock(&state.catalog);
-        inner.state.scanning = false;
-        inner.progress.scanned = result.entries;
-        for error in &result.errors {
-            inner
-                .progress
-                .push_error(format!("{}: {}", error.path.display(), error.reason));
-        }
-        inner.last_scan_elapsed_ms = Some(scan_elapsed_ms);
-        // Realモード復帰用に実レコードを保持する (set_catalog_sourceが
-        // production経路で使用するため無条件。仮想カタログのソースでもある)。
-        inner.real = inner.state.records.clone();
-        ScanProgressPayload {
-            scanned: inner.progress.scanned,
-            found: inner.progress.found,
-            errors: inner.progress.errors,
-            elapsed_ms: scan_elapsed_ms,
-            done: true,
-            error_samples: inner.progress.error_samples.clone(),
-            updated: 0,
-            relocated: 0,
-            missing: 0,
-            hashed: 0,
-            pending_hash: 0,
-            phase: None,
-        }
+        finish_scan(
+            &mut inner,
+            token,
+            scan_elapsed_ms,
+            result.entries,
+            &result.errors,
+            result.truncated,
+        )
     };
 
-    log_scan_metrics(&ScanMetrics {
-        root: &dataset,
-        found: final_payload.found,
-        errors: final_payload.errors,
-        scan_elapsed_ms: result.elapsed_ms,
-        probe_elapsed_ms: probe_elapsed.as_millis() as u64,
-        rss_kb,
-    });
-    let _ = app.emit("scan:progress", final_payload);
-    let _ = app.emit(
-        "catalog:changed",
-        CatalogChangedPayload {
-            generation,
-            reason: CatalogChangeReason::ScanDone,
-        },
-    );
-    tracing::info!(generation, "scan thread finished");
+    match final_payload {
+        Some(payload) => {
+            // 完了した走査のみ計測を出す (計測ドライバは "scan metrics" を
+            // 走査完了の合図にgrepするため、破棄分では出力しない)
+            log_scan_metrics(&ScanMetrics {
+                root: &dataset,
+                found: result.png_count,
+                errors: result.errors.len() as u64,
+                scan_elapsed_ms: result.elapsed_ms,
+                probe_elapsed_ms: probe_elapsed.as_millis() as u64,
+                rss_kb,
+            });
+            let _ = app.emit("scan:progress", payload);
+            let _ = app.emit(
+                "catalog:changed",
+                CatalogChangedPayload {
+                    generation,
+                    reason: CatalogChangeReason::ScanDone,
+                },
+            );
+            tracing::info!(generation, "scan thread finished");
+        }
+        None => {
+            tracing::info!(generation, "scan abandoned (superseded by newer scan)");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -850,7 +982,7 @@ mod tests {
         let mut inner = CatalogInner::new();
         let gen0 = inner.state.generation;
         inner.state.records.push(record("a.png"));
-        let gen1 = begin_scan(&mut inner);
+        let (gen1, token1) = begin_scan(&mut inner);
         assert_eq!(gen1, gen0 + 1);
         assert!(inner.state.scanning);
         assert!(inner.state.records.is_empty());
@@ -858,6 +990,102 @@ mod tests {
         assert_eq!(inner.progress.found, 0);
         assert!(inner.scan_started_at.is_some());
         assert!(inner.last_scan_elapsed_ms.is_none());
+
+        // 再投入は旧トークンを無効化する (走査中のフォルダ切替。QA-WP4)
+        let (gen2, token2) = begin_scan(&mut inner);
+        assert_eq!(gen2, gen0 + 2);
+        assert_ne!(token1, token2);
+    }
+
+    // ===== 走査トークン (世代切替・キャンセル。QA-WP4 Major-1) =====
+
+    #[test]
+    fn apply_scan_batch_discards_stale_token() {
+        let mut inner = CatalogInner::new();
+        let (_, token) = begin_scan(&mut inner);
+        assert!(apply_scan_batch(
+            &mut inner,
+            token,
+            vec![record("a.png")],
+            1,
+            &[]
+        ));
+        assert_eq!(inner.state.records.len(), 1);
+        assert_eq!(inner.progress.found, 1);
+
+        // 新規走査の開始 (open_folderでの切替) 後、旧トークンのバッチは破棄
+        begin_scan(&mut inner);
+        assert!(!apply_scan_batch(
+            &mut inner,
+            token,
+            vec![record("b.png")],
+            2,
+            &[]
+        ));
+        assert_eq!(
+            inner.state.records.len(),
+            0,
+            "新走査のカタログへ旧結果が混入しない"
+        );
+        assert_eq!(inner.progress.found, 0);
+    }
+
+    #[test]
+    fn finish_scan_ignores_stale_token_and_keeps_new_scan_state() {
+        let mut inner = CatalogInner::new();
+        let (_, old_token) = begin_scan(&mut inner);
+        let (_, new_token) = begin_scan(&mut inner);
+        assert!(finish_scan(&mut inner, old_token, 10, 5, &[], false).is_none());
+        assert!(
+            inner.state.scanning,
+            "新走査の進行状態を旧ワーカーの完了確定が壊さない"
+        );
+        assert!(finish_scan(&mut inner, new_token, 10, 5, &[], false).is_some());
+        assert!(!inner.state.scanning);
+    }
+
+    #[test]
+    fn finish_scan_reports_truncation_warning() {
+        let mut inner = CatalogInner::new();
+        let (_, token) = begin_scan(&mut inner);
+        let payload = finish_scan(&mut inner, token, 25, 7, &[], true).unwrap();
+        assert!(payload.done);
+        assert!(!inner.state.scanning);
+        assert!(
+            inner
+                .progress
+                .error_samples
+                .iter()
+                .any(|m| m.contains("打ち切りました")),
+            "件数上限到達は結果 (エラーサンプル) へ警告反映される"
+        );
+        assert_eq!(inner.last_scan_elapsed_ms, Some(25));
+    }
+
+    #[test]
+    fn cancel_scan_transition_stops_and_keeps_partial_records() {
+        let mut inner = CatalogInner::new();
+        let (_, token) = begin_scan(&mut inner);
+        apply_scan_batch(
+            &mut inner,
+            token,
+            vec![record("a.png"), record("b.png")],
+            2,
+            &[],
+        );
+        let payload = cancel_scan_transition(&mut inner).unwrap();
+        assert!(payload.done);
+        assert!(!inner.state.scanning);
+        assert_eq!(
+            inner.state.records.len(),
+            2,
+            "確定済みの部分結果は表示に残す"
+        );
+        assert_ne!(inner.scan_token, token, "旧走査ワーカーは無効化される");
+        // 旧ワーカーの完了確定は無視される
+        assert!(finish_scan(&mut inner, token, 99, 9, &[], false).is_none());
+        // 非走査時のキャンセルは何もしない
+        assert!(cancel_scan_transition(&mut inner).is_none());
     }
 
     // ===== モード切替 (devtools機能。debug/devtoolsビルドのみ) =====
@@ -876,7 +1104,7 @@ mod tests {
     fn switch_to_virtual_requires_real_records() {
         let mut inner = CatalogInner::new();
         let err = switch_mode(&mut inner, true).unwrap_err();
-        assert!(err.contains("run start_scan"));
+        assert!(err.contains("スキャンを実行"));
     }
 
     #[cfg(any(debug_assertions, feature = "devtools"))]

@@ -333,6 +333,79 @@ describe("CatalogStore", () => {
     expect(store.summary?.scanning).toBe(true);
   });
 
+  it("openFolder: pathのみ (sortなし) で呼び出し、成功時はsummary適用と先頭ページ再取得", async () => {
+    const { ipc, store } = setup();
+    ipc.enqueue("get_catalog_summary", makeSummary({ generation: 2 }));
+    await store.refreshSummary();
+
+    const opened = makeSummary({ generation: 3, scanning: true, total: 0 });
+    ipc.enqueue("open_folder", opened);
+    ipc.enqueue("get_catalog_page", makePage(3, 0, []));
+
+    const ok = await store.openFolder("/home/u/pictures");
+    expect(ok).toBe(true);
+    expect(ipc.argsOf("open_folder")).toEqual([{ path: "/home/u/pictures" }]);
+    expect(store.summary).toEqual(opened);
+    expect(store.folderError).toBeNull();
+    expect(ipc.argsOf("get_catalog_page").at(-1)).toEqual({
+      generation: 3,
+      offset: 0,
+      limit: 200,
+    });
+  });
+
+  it("openFolder: 保存済みソート指定時はsort引数も渡す (QA-WP4)", async () => {
+    const { ipc, store } = setup();
+    ipc.enqueue("get_catalog_summary", makeSummary({ generation: 2 }));
+    await store.refreshSummary();
+
+    ipc.enqueue("open_folder", makeSummary({ generation: 3, scanning: true, sort: "date_desc" }));
+    ipc.enqueue("get_catalog_page", makePage(3, 0, []));
+
+    const ok = await store.openFolder("/home/u/pictures", "date_desc");
+    expect(ok).toBe(true);
+    expect(ipc.argsOf("open_folder")).toEqual([
+      { path: "/home/u/pictures", sort: "date_desc" },
+    ]);
+  });
+
+  it("openFolder: 失敗時はfolderErrorへ文言", async () => {
+    const { ipc, store } = setup();
+    ipc.enqueue("get_catalog_summary", makeSummary({ generation: 2 }));
+    await store.refreshSummary();
+
+    ipc.enqueue("open_folder", new Error("フォルダが見つかりません: /gone"));
+    const ok = await store.openFolder("/gone");
+    expect(ok).toBe(false);
+    expect(store.folderError).toContain("見つかりません");
+  });
+
+  it("cancelScan: cancel_scanを呼び出し、応答summaryを適用する (QA-WP4)", async () => {
+    const { ipc, store } = setup();
+    ipc.enqueue("get_catalog_summary", makeSummary({ generation: 4, scanning: true, total: 120 }));
+    await store.refreshSummary();
+
+    ipc.enqueue("cancel_scan", makeSummary({ generation: 4, scanning: false, total: 120 }));
+    ipc.enqueue("get_catalog_page", makePage(4, 0, ["a.png"]));
+
+    const ok = await store.cancelScan();
+    expect(ok).toBe(true);
+    expect(ipc.argsOf("cancel_scan")).toEqual([undefined]);
+    expect(store.summary?.scanning).toBe(false);
+    expect(store.lastError).toBeNull();
+  });
+
+  it("cancelScan: エラー時はlastErrorへ文言してfalse", async () => {
+    const { ipc, store } = setup();
+    ipc.enqueue("get_catalog_summary", makeSummary({ generation: 4 }));
+    await store.refreshSummary();
+
+    ipc.enqueue("cancel_scan", new Error("走査のキャンセルに失敗"));
+    const ok = await store.cancelScan();
+    expect(ok).toBe(false);
+    expect(store.lastError).toContain("キャンセル");
+  });
+
   it("onChange: 状態変化ごとに通知され、解除すると来なくなる", async () => {
     const { ipc, store } = setup();
     const snapshots: number[] = [];

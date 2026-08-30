@@ -211,17 +211,38 @@ export class CatalogStore {
   /**
    * 閲覧フォルダを切り替える (WP-4。ツリー選択)。
    * 成功時は走査開始後のsummaryを受け取り、`folderError` を解消する。
-   * 失敗時 (不在・権限・走査中) は folderError へ文言を設定する。
+   * 失敗時 (不在・権限) は folderError へ文言を設定する。
+   * 走査中の切替はbackendが旧走査を世代無効化するため常に成功する
+   * (QA-WP4)。`sort` 指定時は走査開始時点のソートへ反映する
+   * (フォルダ別保存ソートの再適用。Major-2)。
    */
-  async openFolder(path: string): Promise<boolean> {
+  async openFolder(path: string, sort?: CatalogSort): Promise<boolean> {
     this.folderError = null;
     try {
-      this.summary = await this.ipc.invoke<CatalogSummary>("open_folder", { path });
+      const args: Record<string, unknown> = { path };
+      if (sort !== undefined) {
+        args.sort = sort;
+      }
+      this.summary = await this.ipc.invoke<CatalogSummary>("open_folder", args);
       this.lastError = null;
       await this.loadPage(0);
       return true;
     } catch (error) {
       this.folderError = toMessage(error);
+      this.notify();
+      return false;
+    }
+  }
+
+  /** 実行中の一時走査をキャンセルする (QA-WP4。部分結果は残る)。 */
+  async cancelScan(): Promise<boolean> {
+    try {
+      this.summary = await this.ipc.invoke<CatalogSummary>("cancel_scan");
+      this.lastError = null;
+      await this.loadPage(0);
+      return true;
+    } catch (error) {
+      this.lastError = toMessage(error);
       this.notify();
       return false;
     }
