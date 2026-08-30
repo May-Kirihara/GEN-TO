@@ -3,8 +3,13 @@
 
 pub mod catalog;
 pub mod jobs;
+pub mod repo;
 
 pub use jobs::{ParsePriorityError, ParseSizeClassError, Priority, SizeClass};
+pub use repo::{
+    AssetRecord, AssetRepo, FileRecord, FileRepo, FileUpsert, HashState, LibraryRootRecord,
+    LibraryRootRepo, NewAsset, ParseScanStateError, RepoError, ScanState, TriageState,
+};
 
 use std::fmt;
 use std::path::PathBuf;
@@ -118,6 +123,8 @@ pub struct HealthInfo {
     /// `dataset_path` が指すディレクトリが存在するかどうか。
     /// 不存在でも起動は継続する (docs/implementation-plan.md §4.1)。
     pub dataset_exists: bool,
+    /// SQLite DBを開けているか (WP-1。詳細は `db_status` command)。
+    pub db_open: bool,
     /// 心拍時刻 (Unixエポックからのミリ秒)。UI側で書式化する。
     /// ミリ秒u64はJS安全整数範囲内に収まる。
     pub timestamp_ms: u64,
@@ -185,6 +192,7 @@ mod tests {
             api_version: GENTO_API_VERSION,
             dataset_path: Some("/tmp/sample/dataset".to_string()),
             dataset_exists: true,
+            db_open: true,
             timestamp_ms: 1_759_000_000_000,
         };
         let json = serde_json::to_value(&info).unwrap();
@@ -196,6 +204,7 @@ mod tests {
                 "api_version": GENTO_API_VERSION,
                 "dataset_path": "/tmp/sample/dataset",
                 "dataset_exists": true,
+                "db_open": true,
                 "timestamp_ms": 1_759_000_000_000u64
             })
         );
@@ -211,11 +220,13 @@ mod tests {
             api_version: GENTO_API_VERSION,
             dataset_path: None,
             dataset_exists: false,
+            db_open: false,
             timestamp_ms: 1,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["dataset_path"], serde_json::Value::Null);
         assert_eq!(json["dataset_exists"], false);
+        assert_eq!(json["db_open"], false);
     }
 
     // ===== APIバージョン・アプリディレクトリ (WP-0) =====
@@ -234,6 +245,20 @@ mod tests {
     }
 
     #[test]
+    fn health_info_rejects_json_without_db_open() {
+        // db_openも必須フィールド (WP-1追加): 欠如はerror扱い
+        let legacy = serde_json::json!({
+            "app_name": "GEN-TO 技術検証プロトタイプ",
+            "version": "0.1.0",
+            "api_version": 1,
+            "dataset_path": null,
+            "dataset_exists": false,
+            "timestamp_ms": 1,
+        });
+        assert!(serde_json::from_value::<HealthInfo>(legacy).is_err());
+    }
+
+    #[test]
     fn api_version_const_matches_health_field() {
         let info = HealthInfo {
             app_name: "app".to_string(),
@@ -241,6 +266,7 @@ mod tests {
             api_version: GENTO_API_VERSION,
             dataset_path: None,
             dataset_exists: false,
+            db_open: false,
             timestamp_ms: 0,
         };
         assert_eq!(info.api_version, GENTO_API_VERSION);

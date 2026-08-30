@@ -2,7 +2,7 @@
  * Rust `health` command (gento-core HealthInfo) とのDTO契約とUI状態への正規化。
  *
  * ID類 (将来の画像ID等) はRust側u64をJSON数値で渡すとJSの安全な整数範囲
- * (2^53 - 1) を超えるため、IPC DTOでは文字列とする
+ * (2^53) を超えるため、IPC DTOでは文字列とする
  * (docs/implementation-plan.md §9 DTO候補参照)。
  */
 export type HealthInfo = {
@@ -12,6 +12,8 @@ export type HealthInfo = {
   api_version: number;
   dataset_path: string | null;
   dataset_exists: boolean;
+  /** SQLite DBを開けているか (WP-1。詳細は db_status command)。 */
+  db_open: boolean;
   /** Unixエポックからのミリ秒 (JS安全整数範囲内) 。 */
   timestamp_ms: number;
 };
@@ -23,6 +25,8 @@ export type HealthUiState =
       datasetPresent: boolean;
       /** UI表示用の絶対パス。未設定ならnull。 */
       datasetPath: string | null;
+      /** SQLite DBを開けているか (WP-1)。 */
+      dbOpen: boolean;
       timestampMs: number;
     }
   | {
@@ -41,6 +45,7 @@ function isHealthInfo(value: Record<string, unknown>): value is HealthInfo {
     typeof value["api_version"] === "number" &&
     (typeof value["dataset_path"] === "string" || value["dataset_path"] === null) &&
     typeof value["dataset_exists"] === "boolean" &&
+    typeof value["db_open"] === "boolean" &&
     typeof value["timestamp_ms"] === "number"
   );
 }
@@ -57,6 +62,7 @@ export function normalizeHealth(response: unknown): HealthUiState {
     kind: "ok",
     datasetPresent: response["dataset_exists"],
     datasetPath: response["dataset_path"],
+    dbOpen: response["db_open"],
     timestampMs: response["timestamp_ms"],
   };
 }

@@ -13,6 +13,7 @@
 | クレート | バージョン | license | 入手元 |
 |---|---|---|---|
 | adler2 | 2.0.1 | 0BSD OR MIT OR Apache-2.0 | https://github.com/oyvindln/adler2 |
+| ahash | 0.8.12 | MIT OR Apache-2.0 | https://github.com/tkaitchuck/ahash |
 | aho-corasick | 1.1.5 | Unlicense OR MIT | https://github.com/BurntSushi/aho-corasick |
 | alloc-no-stdlib | 2.0.4 | BSD-3-Clause | https://github.com/dropbox/rust-alloc-no-stdlib |
 | alloc-stdlib | 0.2.4 | BSD-3-Clause | https://github.com/dropbox/rust-alloc-no-stdlib |
@@ -96,6 +97,8 @@
 | embed_plist | 1.2.2 | MIT OR Apache-2.0 | https://github.com/nvzqz/embed-plist-rs |
 | equivalent | 1.0.2 | Apache-2.0 OR MIT | https://github.com/indexmap-rs/equivalent |
 | erased-serde | 0.4.10 | MIT OR Apache-2.0 | https://github.com/dtolnay/erased-serde |
+| fallible-iterator | 0.3.0 | MIT/Apache-2.0 | https://github.com/sfackler/rust-fallible-iterator |
+| fallible-streaming-iterator | 0.1.9 | MIT/Apache-2.0 | https://github.com/sfackler/fallible-streaming-iterator |
 | fastrand | 2.5.0 | Apache-2.0 OR MIT | https://github.com/smol-rs/fastrand |
 | fdeflate | 0.3.7 | MIT OR Apache-2.0 | https://github.com/image-rs/fdeflate |
 | field-offset | 0.3.6 | MIT OR Apache-2.0 | https://github.com/Diggsey/rust-field-offset |
@@ -124,6 +127,7 @@
 | gdkx11-sys | 0.18.2 | MIT | https://github.com/gtk-rs/gtk3-rs |
 | generic-array | 0.14.7 | MIT | https://github.com/fizyk20/generic-array.git |
 | gento-core | 0.1.0 | (workspace) | (このリポジトリ) |
+| gento-db | 0.1.0 | (workspace) | (このリポジトリ) |
 | gento-image | 0.1.0 | (workspace) | (このリポジトリ) |
 | gento-tauri | 0.1.0 | (workspace) | (このリポジトリ) |
 | getrandom | 0.2.17 | MIT OR Apache-2.0 | https://github.com/rust-random/getrandom |
@@ -140,7 +144,9 @@
 | gtk-sys | 0.18.2 | MIT | https://github.com/gtk-rs/gtk3-rs |
 | gtk3-macros | 0.18.2 | MIT | https://github.com/gtk-rs/gtk3-rs |
 | hashbrown | 0.12.3 | MIT OR Apache-2.0 | https://github.com/rust-lang/hashbrown |
+| hashbrown | 0.14.5 | MIT OR Apache-2.0 | https://github.com/rust-lang/hashbrown |
 | hashbrown | 0.17.1 | MIT OR Apache-2.0 | https://github.com/rust-lang/hashbrown |
+| hashlink | 0.9.1 | MIT OR Apache-2.0 | https://github.com/kyren/hashlink |
 | heck | 0.4.1 | MIT OR Apache-2.0 | https://github.com/withoutboats/heck |
 | heck | 0.5.0 | MIT OR Apache-2.0 | https://github.com/withoutboats/heck |
 | hex | 0.4.3 | MIT OR Apache-2.0 | https://github.com/KokaKiwi/rust-hex |
@@ -193,6 +199,7 @@
 | libdbus-sys | 0.2.7 | Apache-2.0/MIT | https://github.com/diwic/dbus-rs |
 | libloading | 0.7.4 | ISC | https://github.com/nagisa/rust_libloading/ |
 | libredox | 0.1.21 | MIT | https://gitlab.redox-os.org/redox-os/libredox.git |
+| libsqlite3-sys | 0.28.0 | MIT | https://github.com/rusqlite/rusqlite |
 | libwebp-sys | 0.9.6 | MIT | https://github.com/NoXF/libwebp-sys |
 | litemap | 0.8.3 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | lock_api | 0.4.14 | MIT OR Apache-2.0 | https://github.com/Amanieu/parking_lot |
@@ -276,6 +283,7 @@
 | regex-automata | 0.4.18 | MIT OR Apache-2.0 | https://github.com/rust-lang/regex |
 | regex-syntax | 0.8.11 | MIT OR Apache-2.0 | https://github.com/rust-lang/regex |
 | reqwest | 0.13.4 | MIT OR Apache-2.0 | https://github.com/seanmonstar/reqwest |
+| rusqlite | 0.31.0 | MIT | https://github.com/rusqlite/rusqlite |
 | rustc-hash | 2.1.3 | Apache-2.0 OR MIT | https://github.com/rust-lang/rustc-hash |
 | rustc_version | 0.4.1 | MIT OR Apache-2.0 | https://github.com/djc/rustc-version-rs |
 | rustversion | 1.0.23 | MIT OR Apache-2.0 | https://github.com/dtolnay/rustversion |
@@ -385,6 +393,7 @@
 | utf8_iter | 1.0.4 | Apache-2.0 OR MIT | https://github.com/hsivonen/utf8_iter |
 | uuid | 1.26.0 | Apache-2.0 OR MIT | https://github.com/uuid-rs/uuid |
 | valuable | 0.1.1 | MIT | https://github.com/tokio-rs/valuable |
+| vcpkg | 0.2.15 | MIT/Apache-2.0 | https://github.com/mcgoo/vcpkg-rs |
 | version-compare | 0.2.1 | MIT | https://gitlab.com/timvisee/version-compare |
 | version_check | 0.9.5 | MIT/Apache-2.0 | https://github.com/SergioBenitez/version_check |
 | vswhom | 0.1.0 | MIT | https://github.com/nabijaczleweli/vswhom.rs |
@@ -459,6 +468,8 @@
 | x11-dl | 2.21.0 | MIT | https://github.com/AltF02/x11-rs.git |
 | yoke | 0.8.3 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | yoke-derive | 0.8.2 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
+| zerocopy | 0.8.56 | BSD-2-Clause OR Apache-2.0 OR MIT | https://github.com/google/zerocopy |
+| zerocopy-derive | 0.8.56 | BSD-2-Clause OR Apache-2.0 OR MIT | https://github.com/google/zerocopy |
 | zerofrom | 0.1.8 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | zerofrom-derive | 0.1.7 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | zerotrie | 0.2.5 | Unicode-3.0 | https://github.com/unicode-org/icu4x |

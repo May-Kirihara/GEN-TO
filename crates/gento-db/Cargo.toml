@@ -1,0 +1,14 @@
+[package]
+name = "gento-db"
+description = "GEN-TO SQLite foundation: connections, migrations, repositories, diagnostics"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gento-core = { workspace = true }
+rusqlite = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

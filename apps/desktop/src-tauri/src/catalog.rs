@@ -35,6 +35,9 @@ pub struct AppState {
     pub thumbnails: Option<Arc<crate::thumbnails::ThumbnailService>>,
     /// ローカル画像プロトコルの統計 (WP-4)。
     pub proto_stats: Arc<crate::protocol::ProtoStats>,
+    /// SQLite DB状態 (WP-1)。setupで生成。開けなくてもアプリは続行
+    /// (通常ファイラー機能はDB非依存のため)。
+    pub db: Option<crate::db::DbState>,
     /// 計測ブリッジ (devtest) の有効フラグ (FG-1)。devtoolsビルドのみ存在
     /// (WP-0)。起動時に環境変数 `GENTO_DEV_BRIDGE` (値は厳密に "1") から
     /// 確定し以後不変。危険コマンド (set_failure_injection / devtest_report /
@@ -96,6 +99,7 @@ impl AppState {
             catalog: Mutex::new(CatalogInner::new()),
             thumbnails: None,
             proto_stats: Arc::new(crate::protocol::ProtoStats::new()),
+            db: None,
             #[cfg(any(debug_assertions, feature = "devtools"))]
             dev_bridge: AtomicBool::new(crate::devtools::dev_bridge_enabled_strict()),
         }

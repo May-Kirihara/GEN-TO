@@ -489,6 +489,10 @@
         {healthStatus.datasetPath ?? "(未設定)"}
         ({healthStatus.datasetPresent ? "あり" : "なし"})
       </p>
+      <p>
+        データベース:
+        {healthStatus.dbOpen ? "接続" : "エラー (詳細はdb_status)"}
+      </p>
     {:else}
       <p class="error">接続エラー: {healthStatus.message}</p>
     {/if}

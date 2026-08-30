@@ -133,6 +133,40 @@
   ライセンス一覧の生成手段を `scripts/gen-licenses.sh` として追加
   (成果物: [licenses.md](licenses.md))。
 
+## WP-1で追加した依存 (2026-08-30。SQLite基盤)
+
+- **`rusqlite` =0.31.0 (features: `bundled`, `backup`)** (gento-db, 通常依存)
+  - 用途: SQLiteアクセス (WAL・foreign_keys・busy_timeout・migration)。
+    `backup` featureはSQLite Backup API用に有効化 (migration前backupの実装選択肢。
+    実際のbackupは `VACUUM INTO` を使用しているが、接続間copyの正規手段として feature確保)。
+  - 入手元: crates.io (`rusqlite`。wrappers/rusqliteリポジトリの派生版)。
+  - ライセンス: **MIT OR Apache-2.0** (Rustラッパー部分)。
+  - 同梱SQLiteのlicense表記: `libsqlite3-sys` (下記) のbundledビルドがリンクする
+    **SQLite amalgamationはパブリックドメイン** (https://sqlite.org/copyright.html)。
+    再配布義務・NOTICE要件なし (帰属表示の義務も法的には無いが、
+    licenses.mdへ明記して帰属を保持する)。
+  - 依存するnative library: **なし** (システムSQLiteにリンクしない bundledビルド。
+    `cc` crateで同梱 `sqlite3.c` をコンパイル。openssl等の外部ライブラリ不使用)。
+  - 対応プラットフォーム: Linux / macOS / Windows (ccでコンパイルできる環境すべて。
+    WebView環境非依存のためCLI/workerからも使用可)。
+  - **FTS5**: bundledビルドのコンパイルフラグに `SQLITE_ENABLE_FTS5` が含まれる
+    (libsqlite3-sys 0.28.0 build.rsで確認。実行時可用性テストもあり:
+    `gento-db` のFTS5テスト)。
+  - バージョンpin理由: 0.32以降で `Connection` APIの一部が変わるため、
+    動作検証済みの0.31系をpin (Cargo.lockで完全固定)。
+- **`libsqlite3-sys` =0.28.0 (rusqlite bundled経由の推移依存)**
+  - ライセンス: MIT OR Apache-2.0 (build.rs・バインディング部分) +
+    SQLite amalgamation (パブリックドメイン)。
+  - native依存: `cc` (MIT OR Apache-2.0) のみ。bindgen/clang不要
+    (事前生成bindings使用)。
+- **`uuid` =1.26.0 (features: `v7`)** (gento-db, 通常依存)
+  - 用途: UUIDv7生成 (36文字小文字TEXT。PM計画§6-4)。
+    一意性のみ保証 (単調性は保証しない——crate docに制約明記)。
+  - ライセンス: MIT OR Apache-2.0。
+  - 推移依存: `getrandom` (MIT OR Apache-2.0。OS乱数取得のみでnative libなし)、
+    `zerocopy` + `zerocopy-derive` (MIT OR Apache-2.0)。
+  - 対応プラットフォーム: 全主要OS (getrandomが各OSのシステム乱数APIを使用)。
+
 ## WP-7で追加した依存
 
 - `libc = "0.2"` (gento-tauri, 通常依存)

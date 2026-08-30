@@ -1,6 +1,6 @@
-# アーキテクチャ (WP-0時点の実装に即した要約)
+# アーキテクチャ (WP-1時点の実装に即した要約)
 
-- 作成日: 2026-08-30 (WP-0)
+- 作成日: 2026-08-30 (WP-0。WP-1で gento-db 追加)
 - 目的: crate責務・依存方向・公開APIの要点・devtools featureの境界を
   実装に即して1枚で把握するためのもの。詳細な契約は
   [api-contract.md](api-contract.md) を参照。
@@ -8,29 +8,63 @@
 ## 依存方向
 
 ```
-gento-core  (ドメイン型。Tauri非依存)
-    ↑
-gento-image (画像パイプライン。Tauri非依存。gento-coreに依存)
-    ↑
-gento-tauri (Tauri thin adapter。gento-core + gento-imageに依存)
+gento-core  (ドメイン型・repository trait。Tauri非依存)
+    ↑           ↑
+gento-image  gento-db   (画像パイプライン / SQLite基盤。いずれもgento-coreに依存)
+    ↑           ↑
+gento-tauri (Tauri thin adapter。gento-core + gento-image + gento-dbに依存)
 ```
 
 Tauriに依存してよいのは `gento-tauri` のみ。逆方向の依存
-(gento-core/image → tauri) は禁止。
+(gento-core/image/db → tauri) は禁止。`gento-core` はDB実装にも
+依存しない (repository traitのみ定義し、実装は `gento-db`)。
 
 ## 各crateの責務と公開APIの要点
 
-### `crates/gento-core` — ドメイン型・カタログ
+### `crates/gento-core` — ドメイン型・カタログ・repository抽象
 
 - `AssetId` (u64新type。IPCでは10進文字列化してJS安全整数問題を回避)
-- `HealthInfo` (`health` commandのDTO。`api_version` 含む)
+- `HealthInfo` (`health` commandのDTO。`api_version`・`db_open` 含む)
 - `GENTO_API_VERSION` 定数と `AppDirs` (data/cache/logディレクトリの
-  解決結果を保持するだけの構造。解決はアダプター側。MVP-WP-1のSQLite DBは
-  `data_dir` 直下へ置く予定)
+  解決結果を保持するだけの構造。解決はアダプター側。WP-1のSQLite DBは
+  `data_dir` 直下)
 - `jobs`: `SizeClass` / `Priority` (ジョブ系の基本型)
 - `catalog`: `ImageRecord`・`CatalogState` (安定順序・generation付き
   ページング・上限500件強制)・ページDTOとエラー形状
 - `catalog::virtual_catalog` (**devtools**): 5万件仮想カタログ生成
+- `repo` (WP-1): 永続化repository trait (`LibraryRootRepo` /
+  `FileRepo` / `AssetRepo`) とレコード型 (`LibraryRootRecord` /
+  `FileRecord` / `AssetRecord`)、`ScanState`・`TriageState`・
+  `HashState`・`RepoError`、`path_is_within` (親子パス判定)。
+  SQLite実装はgento-db (依存方向: gento-db → gento-core)
+
+### `crates/gento-db` — SQLite基盤 (WP-1。メタデータの正本)
+
+- `Db::open(path)` / `Db::open_with(path, DbOptions)`: 親ディレクトリ
+  作成 + migration適用まで行う。新規作成・既存オープン両対応
+- migration (migrate.rs): `PRAGMA user_version` 管理・順方向のみ・
+  1件=1トランザクション・失敗時rollback・冪等スキップ。
+  データ保有DBへの未適用migrationがある場合、適用前に `VACUUM INTO`
+  によるWAL安全backupを作成し、integrity_checkで検証、世代保持
+  (既定3世代、`db-backups/` 配下 `library-pre-v{N}-{時刻}.sqlite3`)。
+  `user_version=0` で非管理テーブルが存在するDBは拒否
+- migration #1 (schema.rs): 12テーブル (`library_roots` / `assets` /
+  `files` / `tags` / `asset_tags` / `captions` / `collections` /
+  `collection_items` / `asset_metadata` / `jobs` / `file_operations` /
+  `embeddings`) と検索用インデックス。DDLはdocs/data-model.md §2〜§12
+  準拠。AiProfile/AiRunはWP-10の追加migration
+- `SqliteRepos`: gento-coreの3 repository traitのSQLite実装。
+  WP-2が必要とする最小範囲 (root追加/一覧/有効化/解除/親子検出雛形、
+  file upsert (root_id+rel_pathキー)・scan_state更新・missing一覧、
+  asset作成 (content_hash一意)・hash検索・file↔assetリンク)
+- `Db::diagnose()`: `PRAGMA integrity_check`・`foreign_key_check`・
+  schema version・journal_mode・テーブル行数・DB/WALファイルサイズ
+- `percent_encode_bytes` / `percent_decode_to_bytes`: backup/restore用
+  正準表現 (パーセントエスケープUTF-8。WP-13で使用)
+- 格納規約: UUIDv7 TEXT 36文字小文字 (一意性のみ保証、単調性は保証
+  しない)、DBレコード時刻はUTC RFC3339 TEXT (ファイル由来時刻はepoch ms
+  整数)、enumはTEXT + CHECK制約、パスは生バイトBLOB + `path_encoding`
+  ('unix-bytes'|'utf8') + 表示名TEXT (lossy) 分離で非UTF-8パスを保持
 
 ### `crates/gento-image` — 画像パイプライン (Tauri非依存)
 
@@ -50,6 +84,8 @@ Tauriに依存してよいのは `gento-tauri` のみ。逆方向の依存
 - `lib.rs`: アプリ本体。`AppDirs` 解決 (dirs crate)、ログ初期化
   (`GENTO_LOG`)、panic hook (panic.log)、SIGTERM graceful終了、
   invoke handler登録 (devtoolsビルドのみ計測commandを追加)、`health`
+- `db.rs` (WP-1): DBパス解決 (`--db` / `GENTO_DB` / 既定)・`DbState`
+  保持 (setupでオープン。失敗時もアプリ継続)・`db_status` command
 - `catalog.rs`: カタログcommand群 (summary/page/scan) と走査スレッド。
   ページDTOへのversion付与もここ (thin adapter層の責務)
 - `thumbnails.rs`: サムネイル生成サービス (要求の受付・dedup・イベント
@@ -62,6 +98,28 @@ Tauriに依存してよいのは `gento-tauri` のみ。逆方向の依存
 フロントエンド (`apps/desktop/src`) はSvelte 5 + TS。ストア層
 (catalog/thumbnails/grid/viewer/compare) はIPCを注入されたプレーンな
 クラスで、Svelteコンポーネントから利用する。
+
+## SQLite運用方針 (WP-1確定。WP-2以降もこの方針に従う)
+
+- **並行性**: 書き込みは単一writer接続に集約 (`Db::with_writer` が
+  Mutexで直列化。scan/UI編集/AIジョブ/backupの全書き込みがこの経路)。
+  読み取りは分離接続 (`Db::with_reader`。WALなのでwriterをブロック
+  しない。idle 2本、貸出集中時のみ追加接続を開き返却時に閉じる)。
+  busy_timeout 5000ms (外部プロセスとの競合猶予)
+- **PRAGMA**: WAL / `foreign_keys=ON` (全接続で毎回) /
+  `synchronous=NORMAL` (WAL組み合わせの標準推奨。アプリ異常終了で
+  破損しない。電源断では直近トランザクションを失い得る)
+- **配置**: `AppDirs.data_dir/library.sqlite3` (`~/.local/share/gento-spike/`)。
+  上書き: `--db <PATH>` 引数 > `GENTO_DB` 環境変数。backupは
+  `data_dir/db-backups/`
+- **異常時挙動**: DBを閉じずにプロセス死亡 → 次回オープンでWAL自動回復
+  (クラッシュシミュレーションテストあり)。migration失敗 → rollback +
+  backup保持で元DB不変。DB open失敗 → アプリは続行し `health.db_open`
+  / `db_status` で観測。非管理DB (user_version=0で他テーブルあり) は
+  拒否して上書きしない
+- **破損・権限・disk full**: integrity_check/foreign_key_checkは
+  `db_status` で常時観測可能。disk fullはSQLiteエラーとして各書き込みが
+  失敗する (RepoError::Db)。移行時のbackup検証失敗はmigrationを中止する
 
 ## devtools featureの境界 (WP-0)
 
@@ -95,12 +153,13 @@ cargo直接のreleaseビルドでは `custom-protocol` featureの明示も必要
 
 | 用途 | 既定位置 (Linux) | 備考 |
 |---|---|---|
-| `data_dir` | `~/.local/share/gento-spike` | MVP-WP-1のSQLite DBはここへ |
+| `data_dir` | `~/.local/share/gento-spike` | SQLite DBは `data_dir/library.sqlite3`、migration前backupは `data_dir/db-backups/` (WP-1) |
 | `cache_dir` | `~/.cache/gento-spike` | サムネイルは `cache_dir/thumbnails` |
 | `log_dir` | `~/.cache/gento-spike/log` | `panic.log` |
 
 `--cache-dir <PATH>` 起動引数はサムネイルルートのみ上書きする
-(計測ドライバ互換。data/log位置は動かない)。
+(計測ドライバ互換。data/log位置は動かない)。DB位置の上書きは
+`--db <PATH>` または `GENTO_DB` 環境変数 (WP-1。テスト・計測用)。
 
 ## ログ・診断 (WP-0)
 

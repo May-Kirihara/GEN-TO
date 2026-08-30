@@ -8,6 +8,7 @@
 //! のときのみコンパイルされる。通常releaseビルドからは完全に除去される。
 
 pub mod catalog;
+pub mod db;
 #[cfg(any(debug_assertions, feature = "devtools"))]
 pub mod devtools;
 pub mod protocol;
@@ -123,6 +124,7 @@ fn health(state: State<'_, AppState>) -> HealthInfo {
         api_version: GENTO_API_VERSION,
         dataset_path: Some(display_absolute(path)),
         dataset_exists: path.exists(),
+        db_open: state.db.as_ref().is_some_and(|d| d.db.is_some()),
         timestamp_ms: epoch_ms(),
     }
 }
@@ -136,6 +138,7 @@ pub fn run() {
     #[cfg(any(debug_assertions, feature = "devtools"))]
     let builder = builder.invoke_handler(tauri::generate_handler![
         health,
+        db::db_status,
         devtools::dev_bridge_enabled,
         devtools::devtest_report,
         catalog::get_catalog_summary,
@@ -154,6 +157,7 @@ pub fn run() {
     #[cfg(not(any(debug_assertions, feature = "devtools")))]
     let builder = builder.invoke_handler(tauri::generate_handler![
         health,
+        db::db_status,
         catalog::get_catalog_summary,
         catalog::get_catalog_page,
         catalog::start_scan,
@@ -185,6 +189,14 @@ pub fn run() {
                 "dataset resolved"
             );
             tracing::info!(cache_dir = %thumbnail_root.display(), "thumbnail cache dir resolved");
+            // DBオープン + migration (WP-1)。失敗時もアプリは続行する
+            // (db_status と health.db_open で状態を観測できる)。
+            let db_path = db::resolve_db_path(&args, &app_dirs);
+            tracing::info!(db = %db_path.display(), "database path resolved");
+            let db_state = db::DbState::open(db_path);
+            if let Some(err) = &db_state.open_error {
+                tracing::warn!(error = %err, "database unavailable; continuing without DB");
+            }
             let events = Box::new(thumbnails::TauriThumbEvents {
                 app: app.handle().clone(),
             });
@@ -199,6 +211,7 @@ pub fn run() {
             };
             let mut state = AppState::new(dataset_path);
             state.thumbnails = Some(service);
+            state.db = Some(db_state);
             app.manage(state);
             if app.get_webview_window("main").is_some() {
                 tracing::info!("main window created");
@@ -271,7 +284,8 @@ fn resolve_dataset_path(args: &[String]) -> PathBuf {
 }
 
 /// フラグ形式 `--name value` の値を取り出す。値なしの場合は既定へフォールバックしwarn。
-fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+/// db.rs の `--db` 解決からも使うため crate内公開。
+pub(crate) fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         if arg == name {

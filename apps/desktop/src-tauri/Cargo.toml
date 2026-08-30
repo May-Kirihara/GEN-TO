@@ -13,6 +13,7 @@ tauri-build = { workspace = true }
 
 [dependencies]
 gento-core = { workspace = true }
+gento-db = { workspace = true }
 gento-image = { workspace = true }
 serde = { workspace = true }
 tauri = { workspace = true }

@@ -1,7 +1,7 @@
 # GEN-TO IPC API契約 (Phase 2 / WP-2時点)
 
 - 作成日: 2026-08-28 (WP-2)
-- 最終更新: 2026-08-30 (WP-0: §0/§1 healthへ `api_version` 追加・§14 devtools feature化・§15 APIバージョン互換方針追加)
+- 最終更新: 2026-08-30 (WP-0: §0/§1 healthへ `api_version` 追加・§14 devtools feature化・§15 APIバージョン互換方針追加 / WP-1: §1 healthへ `db_open` 追加・§16 `db_status` 追加)
 - 目的: Tauri command・イベント・ローカル画像プロトコルの形状をWP-3〜6の契約基準として固定する。
 - 整合性情報: 本書の型は `crates/gento-core/src/catalog.rs`、`apps/desktop/src-tauri/src/catalog.rs`
   (ページDTOのversion拡張もここ)、
@@ -79,7 +79,7 @@ export type CatalogPageError =
 
 ## 1. Commands
 
-### `health` (WP-0で `api_version` を追加)
+### `health` (WP-0で `api_version`、WP-1で `db_open` を追加)
 
 ```ts
 invoke<HealthInfo>("health")
@@ -93,12 +93,14 @@ type HealthInfo = {
   api_version: number;
   dataset_path: string | null;
   dataset_exists: boolean;
+  /** SQLite DBを開けているか (WP-1)。詳細は §16 `db_status`。 */
+  db_open: boolean;
   timestamp_ms: number;
 };
 ```
 
-- 常に成功する (読み取りのみ)。`api_version` は必須フィールド
-  (WP-0より前の形状はフロントの検証でerror扱い)。
+- 常に成功する (読み取りのみ)。`api_version`・`db_open` は必須フィールド
+  (各追加WPより前の形状はフロントの検証でerror扱い)。
 
 ### `get_catalog_summary`
 
@@ -622,3 +624,42 @@ injection_rate: number;
   (計測ドライバと同時に更新するため)。
 - 互換方針の運用: 破壊的変更時はこの値・本契約書・`health.test.ts` を
   同時に更新する。
+
+## 16. データベース状態 (WP-1)
+
+### `health.db_open` フィールド (§1参照)
+
+SQLite DBを開けていれば `true`。開けなかった場合もアプリは続行する
+(通常ファイラー機能はDB非依存のため) ため、このフィールドでUIが状態を
+判別する。
+
+### `db_status`
+
+```ts
+invoke<DbStatusDto>("db_status")
+```
+
+```ts
+type DbStatusDto = {
+  path: string;                        // 解決済みDBファイルパス
+  open: boolean;                       // DBを開いているか
+  open_error: string | null;           // 開けなかった理由 (開いていればnull)
+  schema_version: number | null;       // PRAGMA user_version (未開時null)
+  journal_mode: string | null;         // "wal" 期待
+  integrity_check: string | null;      // "ok" または問題要約
+  foreign_key_violations: number | null; // PRAGMA foreign_key_checkの違反行数
+  table_row_counts: Record<string, number> | null; // 12テーブルの行数
+  db_bytes: number | null;             // DB本体のファイルサイズ
+  wal_bytes: number | null;            // -walファイルのサイズ
+  busy_timeout_ms: number | null;      // 既定5000
+};
+```
+
+- 常に成功する (読み取りのみ)。productionビルドにも含まれる診断command
+  (devtools対象外)。§14の計測系とは無関係。
+- `open: true` でも `open_error` が入り得る (開いた後の診断失敗 —
+  ディスク障害等。その場合は統計系フィールドが `null`)。
+- DBパスの解決順位: `--db <PATH>` 起動引数 > `GENTO_DB` 環境変数 >
+  `AppDirs.data_dir/library.sqlite3` (テスト・計測用の上書き)。
+- DBの並行性・backup仕様は [architecture.md](architecture.md) および
+  `gento-db` crate doc参照。
