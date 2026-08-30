@@ -33,7 +33,7 @@
 //! ワーカーはアイドル時にメンテナンス (watcher再確立・劣化ポーリング) を
 //! 実行する。
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -41,8 +41,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gento_core::library::{
-    self, hash_and_link_file, scan_root, FsChange, ScanFs, ScanOptions, ScanPhase, ScanProgress,
-    WatchBuffer,
+    hash_and_link_file, scan_root, FsChange, GenerationToken, HashFileError, PendingHash, ScanFs,
+    ScanOptions, ScanPhase, ScanProgress, WatchBuffer,
 };
 use gento_core::repo::{FileRepo, LibraryRootRecord, LibraryRootRepo, RepoError, RootSettings};
 use gento_core::Priority;
@@ -67,8 +67,20 @@ const MAX_MERGED_SCOPES: usize = 24;
 /// ハッシュ進捗イベントの最小間隔 (イベント嵐対策)。
 const HASH_PROGRESS_INTERVAL_MS: u64 = 100;
 
-/// メンテナンス周期 (watcher再確立・劣化ポーリング再スキャン)。
+/// メンテナンス周期 (watcher再確立・劣化ポーリング再スキャン・
+/// 未リンクpresentファイルのハッシュ再提出)。
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// ハッシュジョブ1ファイルあたりのStale再試行上限 (FG-WP2-2)。
+/// 到達したファイルは断念し `scan_status.hash_retry_exhausted` へ露出。
+/// 次のスキャンでの再キューイング (新世代トークン) で解除される。
+const HASH_RETRY_MAX_ATTEMPTS: u32 = 8;
+
+/// 再提出時のキュー空きマージン (capacity - depth がこれ未満なら再提出しない)。
+const HASH_RESUBMIT_MARGIN: usize = 64;
+
+/// 1回の再提出で纏めて取り出すアイテム数の上限。
+const HASH_RESUBMIT_BATCH: usize = 256;
 
 /// ライブラリ側からUIへの通知境界 (本実装: AppHandle。テスト: 記録用)。
 pub trait LibraryHost: Send + Sync {
@@ -128,6 +140,48 @@ enum LibCmd {
     Shutdown,
 }
 
+/// ハッシュジョブの決定論リトライ状態 (FG-WP2-2)。
+///
+/// queue満杯で拒否されたジョブとStale破棄されたファイルは `queue` へ入り、
+/// (a) プール完了による空き増加、(b) メンテナンス周期 (未リンクpresent
+/// ファイルの再提出) で決定論的に再提出される。Staleの試行回数は
+/// ファイルごとに数え、上限到達で断念 (status露出。次のスキャンで解除)。
+#[derive(Default)]
+struct HashRetry {
+    /// 再提出待ちアイテム。
+    queue: VecDeque<PendingHash>,
+    /// ファイルごとのStale試行回数。
+    attempts: HashMap<i64, u32>,
+    /// 断念済みfile_id (次のスキャンでのキューイングで解除)。
+    exhausted: HashSet<i64>,
+}
+
+impl HashRetry {
+    fn push(&mut self, item: PendingHash) {
+        if !self.exhausted.contains(&item.file_id) {
+            self.queue.push_back(item);
+        }
+    }
+
+    fn note_stale(&mut self, file_id: i64) -> bool {
+        let attempts = self.attempts.entry(file_id).or_insert(0);
+        *attempts += 1;
+        if *attempts >= HASH_RETRY_MAX_ATTEMPTS {
+            self.exhausted.insert(file_id);
+            self.queue.retain(|item| item.file_id != file_id);
+            return false;
+        }
+        true
+    }
+
+    /// スキャン由来の新規キューイングで再試行状態をリセットする
+    /// (新世代トークンのジョブは新規扱い)。
+    fn reset(&mut self, file_id: i64) {
+        self.attempts.remove(&file_id);
+        self.exhausted.remove(&file_id);
+    }
+}
+
 /// 共有状態 (ハッシュジョブからも参照される)。
 struct Shared {
     db: Arc<gento_db::Db>,
@@ -141,6 +195,10 @@ struct Shared {
     last_hash_emit: Mutex<Option<Instant>>,
     /// ワーカーがスキャン処理中 (scan_startの二重開始拒否・status表示)。
     scanning: AtomicBool,
+    /// ハッシュジョブの決定論リトライ状態 (FG-WP2-2)。
+    hash_retry: Mutex<HashRetry>,
+    /// ハッシュプールのキュー上限 (再提出の空き判定に使用)。
+    hash_queue_capacity: usize,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -189,20 +247,21 @@ impl LibraryController {
         host: Arc<dyn LibraryHost>,
         fs: Arc<dyn ScanFs>,
     ) -> Result<Arc<Self>, RepoError> {
-        Self::with_fs_maintenance(db, host, fs, MAINTENANCE_INTERVAL)
+        Self::with_fs_maintenance(db, host, fs, MAINTENANCE_INTERVAL, 8_192)
     }
 
-    /// テスト用: メンテナンス周期も指定する。
+    /// テスト用: メンテナンス周期・ハッシュキュー上限も指定する。
     fn with_fs_maintenance(
         db: Arc<gento_db::Db>,
         host: Arc<dyn LibraryHost>,
         fs: Arc<dyn ScanFs>,
         maintenance_interval: Duration,
+        hash_queue_capacity: usize,
     ) -> Result<Arc<Self>, RepoError> {
         let (tx, rx) = mpsc::channel::<LibCmd>();
         let (hash_pool, completions) = WorkerPool::new(PoolConfig {
             worker_count: 2,
-            queue_capacity: 8_192,
+            queue_capacity: hash_queue_capacity,
         });
         let shared = Arc::new(Shared {
             db,
@@ -213,11 +272,15 @@ impl LibraryController {
             hash_pending: AtomicU64::new(0),
             last_hash_emit: Mutex::new(None),
             scanning: AtomicBool::new(false),
+            hash_retry: Mutex::new(HashRetry::default()),
+            hash_queue_capacity,
         });
         // ハッシュ会計: submit成功 (Enqueued) 回数とプール完了通知を1:1で
         // 対応させ、pending_hash が恒久非ゼロにならないことを保証する
         // (dedup統合・queue満杯・キャンセル・shutdown放棄を含む)。
-        let accountant = spawn_hash_accountant(Arc::clone(&shared), completions);
+        // 完了ごとに再提出キューの空き駆動排液も行う (FG-WP2-2)。
+        let accountant =
+            spawn_hash_accountant(Arc::clone(&shared), completions, Arc::downgrade(&hash_pool));
         let watchers: Watchers = Arc::new(Mutex::new(HashMap::new()));
         let worker_shared = Arc::clone(&shared);
         let worker_pool = hash_pool;
@@ -400,6 +463,14 @@ impl LibraryController {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let pending = self.shared.hash_pending.load(Ordering::SeqCst);
+        let (retry_pending, retry_exhausted) = {
+            let retry = self
+                .shared
+                .hash_retry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            (retry.queue.len() as u64, retry.exhausted.len() as u64)
+        };
         let phase = if self.is_scanning() {
             Some(ScanPhase::Scanning.as_str().to_string())
         } else if pending > 0 {
@@ -418,6 +489,8 @@ impl LibraryController {
             pending_hash: pending,
             errors: progress.errors,
             watch_degraded: self.watch_degraded(),
+            hash_retry_pending: retry_pending,
+            hash_retry_exhausted: retry_exhausted,
         }
     }
 
@@ -705,6 +778,9 @@ fn worker_loop(
                 run_maintenance(shared_ref, watchers_ref, tx_ref, &|root| {
                     start_watcher(watchers_ref, shared_ref, tx_ref, root)
                 });
+                // 未リンクpresentファイルの決定論的再提出 (FG-WP2-2)。
+                // 監視イベントがない不変ファイルもここで解決される。
+                resubmit_unlinked_via_maintenance(shared_ref, &hash_pool);
                 continue;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -888,20 +964,137 @@ fn progress_payload(
 /// これによりpendingは「submit成功数 − 完了通知数」に厳密に一致し、
 /// dedup統合・queue満杯・キャンセル・pool shutdownのいずれでも
 /// 恒久非ゼロにならない。
+/// 各完了ごとに再提出キューの空き駆動排液も行う (FG-WP2-2: プール滞留の
+/// 減少 = 空きを見た決定論的再提出)。
 fn spawn_hash_accountant(
     shared: Arc<Shared>,
     completions: Receiver<JobCompletion>,
+    pool: std::sync::Weak<WorkerPool>,
 ) -> std::thread::JoinHandle<()> {
+    // プールはWeak参照でのみ持つ: 強参照だと会計スレッド自身が完了チャネルの
+    // 送信側を生存させ続け、recvが永久に閉じずjoinでデッドロックする。
     std::thread::Builder::new()
         .name("hash-accountant".into())
         .spawn(move || {
             while let Ok(completion) = completions.recv() {
                 if completion.key.starts_with("hash:") {
                     shared.hash_pending.fetch_sub(1, Ordering::SeqCst);
+                    if let Some(pool) = pool.upgrade() {
+                        resubmit_ready(&shared, &pool);
+                    }
                 }
             }
         })
         .expect("spawn hash accountant")
+}
+
+/// 再提出キューから空き容量ぶんだけプールへ戻す (完了駆動)。
+/// 1完了につき1回だけ試み、満杯なら残りはキューに戻る (次の完了で再試行)。
+fn resubmit_ready(shared: &Arc<Shared>, pool: &Arc<WorkerPool>) {
+    if shared.cancel.load(Ordering::SeqCst) {
+        return;
+    }
+    // マージンは容量の1/4までに縮める (小容量キューで再提出が恒久的に
+    // 起きなくならないように)。
+    let margin = HASH_RESUBMIT_MARGIN.min(shared.hash_queue_capacity / 4);
+    let free = shared
+        .hash_queue_capacity
+        .saturating_sub(pool.queue_depth())
+        .saturating_sub(margin);
+    if free == 0 {
+        return;
+    }
+    let items: Vec<PendingHash> = {
+        let mut retry = shared.hash_retry.lock().unwrap_or_else(|p| p.into_inner());
+        let take = free.min(HASH_RESUBMIT_BATCH).min(retry.queue.len());
+        retry.queue.drain(..take).collect()
+    };
+    if items.is_empty() {
+        return;
+    }
+    submit_hash_jobs(shared, pool, items, false);
+}
+
+/// メンテナンス周期での未リンクpresentファイル再提出 (FG-WP2-2)。
+/// 監視イベントが来ない不変ファイルも、ここで「永続未解決」にならない。
+/// 断念済み (exhausted) ファイルは次のスキャンでの再キューイングまで跳ばす。
+fn resubmit_unlinked_via_maintenance(shared: &Arc<Shared>, pool: &Arc<WorkerPool>) {
+    if shared.cancel.load(Ordering::SeqCst) {
+        return;
+    }
+    let Ok(roots) = shared.db.with_reader(|repos| repos.list_roots()) else {
+        return;
+    };
+    for root in roots.iter().filter(|root| root.enabled) {
+        let Ok(unlinked) = shared
+            .db
+            .with_reader(|repos| repos.list_files_without_asset(root.id))
+        else {
+            continue;
+        };
+        let items: Vec<PendingHash> = {
+            let retry = shared.hash_retry.lock().unwrap_or_else(|p| p.into_inner());
+            unlinked
+                .into_iter()
+                .filter(|record| !retry.exhausted.contains(&record.id))
+                .map(|record| PendingHash {
+                    file_id: record.id,
+                    path: root.path.join(&record.rel_path),
+                    token: GenerationToken::from_record(&record),
+                })
+                .collect()
+        };
+        submit_hash_jobs(shared, pool, items, false);
+    }
+}
+
+/// Stale破棄されたジョブの再提出登録 (FG-WP2-2)。
+/// 行の現在トークンを読み直して次回試行に使い、リンク済み・不在・削除済み
+/// は再提出しない。試行回数が上限に達したファイルは断念する。
+fn requeue_after_stale(shared: &Arc<Shared>, file_id: i64) {
+    let still_retryable = shared
+        .hash_retry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .note_stale(file_id);
+    if !still_retryable {
+        tracing::warn!(
+            file_id,
+            attempts = HASH_RETRY_MAX_ATTEMPTS,
+            "hash retries exhausted; awaiting next scan"
+        );
+        return;
+    }
+    let Ok(record) = shared
+        .db
+        .with_reader(|repos| repos.get_file(file_id))
+        .map_err(|err| {
+            tracing::error!(file_id, error = %err, "requeue: get_file failed");
+            err
+        })
+    else {
+        return;
+    };
+    let Some(record) = record else { return };
+    if record.asset_id.is_some() || record.scan_state != gento_core::repo::ScanState::Present {
+        return;
+    }
+    let Ok(roots) = shared.db.with_reader(|repos| repos.list_roots()) else {
+        return;
+    };
+    let Some(root) = roots.iter().find(|root| root.id == record.root_id) else {
+        return;
+    };
+    let item = PendingHash {
+        file_id,
+        path: root.path.join(&record.rel_path),
+        token: GenerationToken::from_record(&record),
+    };
+    shared
+        .hash_retry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(item);
 }
 
 /// ハッシュジョブ (Background優先度)。完了でhashed進捗を進める。
@@ -911,6 +1104,8 @@ struct HashJob {
     shared: Arc<Shared>,
     file_id: i64,
     path: PathBuf,
+    /// 走査時観測の世代トークン (FG-WP2-2)。
+    token: GenerationToken,
 }
 
 impl Job for HashJob {
@@ -923,6 +1118,7 @@ impl Job for HashJob {
             &*self.shared.fs,
             self.file_id,
             &self.path,
+            &self.token,
             &self.shared.cancel,
         ) {
             Ok(_asset) => {
@@ -970,14 +1166,15 @@ impl Job for HashJob {
                 let _ = hashed;
                 Ok(Vec::new())
             }
-            // 世代検証で破棄: エラーではなく「要再走査」。ファイルは未リンクの
-            // まま次回スキャンで再キューされる (監視・メンテナンスが再スキャン
-            // を発火する)。
-            Err(gento_core::library::HashFileError::Stale(msg)) => {
-                tracing::debug!(file_id = self.file_id, reason = %msg, "hash stale; will rehash on next scan");
+            // 世代検証で破棄: エラーではなく「要再提出」。決定論リトライ
+            // (FG-WP2-2) で行の現在トークンとともに再提出される。監視・
+            // メンテナンス・次回スキャンも併せて収束させる。
+            Err(HashFileError::Stale(msg)) => {
+                tracing::debug!(file_id = self.file_id, reason = %msg, "hash stale; queued for deterministic retry");
+                requeue_after_stale(&self.shared, self.file_id);
                 Err(format!("stale: {msg}"))
             }
-            Err(gento_core::library::HashFileError::Cancelled) => Err("cancelled".to_string()),
+            Err(HashFileError::Cancelled) => Err("cancelled".to_string()),
             Err(err) => {
                 update_progress(&self.shared, |current| current.errors += 1);
                 Err(err.to_string())
@@ -986,14 +1183,23 @@ impl Job for HashJob {
     }
 }
 
-/// ハッシュジョブをプールへ投入する。`hash_pending` は実際の投入成功
+/// スキャン由来のハッシュジョブ投入。`hash_pending` は実際の投入成功
 /// (新規Enqueued) のみ増やす: dedup統合 (MergedExisting) は元ジョブの
-/// 完了通知で減算されるため二重計上しない。満杯・shutdownで拒否された
-/// 分は次回スキャンのresumeに任せる (resume = `asset_id IS NULL` 再構成)。
-fn enqueue_hash_jobs(
+/// 完了通知で減算されるため二重計上しない。満杯で拒否された分と残りは
+/// 決定論リトライキューへ移され、プール空き駆動・メンテナンス周期で
+/// 再提出される (FG-WP2-2)。スキャン由来のキューイングは再試行回数を
+/// リセットする (新世代トークンのジョブは新規扱い)。
+fn enqueue_hash_jobs(shared: &Arc<Shared>, hash_pool: &Arc<WorkerPool>, pending: Vec<PendingHash>) {
+    submit_hash_jobs(shared, hash_pool, pending, true);
+}
+
+/// ジョブ投入の実体。`reset_attempts` はスキャン由来 (新規) の場合のみtrue
+/// (リトライ経路でtrueにすると試行上限が機能しなくなる)。
+fn submit_hash_jobs(
     shared: &Arc<Shared>,
     hash_pool: &Arc<WorkerPool>,
-    pending: Vec<library::PendingHash>,
+    pending: Vec<PendingHash>,
+    reset_attempts: bool,
 ) {
     if pending.is_empty() {
         return;
@@ -1001,12 +1207,22 @@ fn enqueue_hash_jobs(
     let mut enqueued = 0u64;
     let mut merged = 0u64;
     let mut rejected = 0u64;
-    for item in pending {
+    let mut rest: Vec<PendingHash> = pending;
+    for index in 0..rest.len() {
+        let item = rest[index].clone();
+        if reset_attempts {
+            shared
+                .hash_retry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .reset(item.file_id);
+        }
         shared.hash_pending.fetch_add(1, Ordering::SeqCst);
         let job = Arc::new(HashJob {
             shared: Arc::clone(shared),
             file_id: item.file_id,
             path: item.path,
+            token: item.token,
         });
         let key = format!("hash:{}", item.file_id);
         match hash_pool.submit(&key, Priority::Background, job) {
@@ -1022,10 +1238,17 @@ fn enqueue_hash_jobs(
                 rejected += 1;
                 match err {
                     SubmitError::QueueFull => {
-                        // バックプレッシャー: 残りは次回スキャンのresumeに任せる
+                        // バックプレッシャー: 残り (本件含む) は決定論リトライ
+                        // キューへ。プール空き駆動・メンテナンス周期で再提出。
                         tracing::warn!(
-                            "hash queue full; remaining files will be retried on next scan"
+                            remaining = rest.len() - index,
+                            "hash queue full; remaining files queued for deterministic retry"
                         );
+                        let queued: Vec<PendingHash> = rest.split_off(index);
+                        let mut retry = shared.hash_retry.lock().unwrap_or_else(|p| p.into_inner());
+                        for item in queued {
+                            retry.push(item);
+                        }
                         break;
                     }
                     SubmitError::Shutdown => break,
@@ -1155,6 +1378,12 @@ pub struct LibraryScanStatusDto {
     /// true = watcher未確立の有効ルートがある (inotify上限等の劣化。
     /// メンテナンス周期のポーリング再スキャンで運用継続)。
     pub watch_degraded: bool,
+    /// 再提出待ちハッシュジョブ数 (queue満杯拒否・Stale破棄分。
+    /// FG-WP2-2)。
+    pub hash_retry_pending: u64,
+    /// Stale再試行上限に到達し断念したファイル数 (次のスキャンで再試行
+    /// 状態はリセットされる)。
+    pub hash_retry_exhausted: u64,
 }
 
 fn controller(state: &State<'_, AppState>) -> Result<Arc<LibraryController>, String> {
@@ -1245,6 +1474,8 @@ pub fn scan_status(state: State<'_, AppState>) -> LibraryScanStatusDto {
             pending_hash: 0,
             errors: 0,
             watch_degraded: false,
+            hash_retry_pending: 0,
+            hash_retry_exhausted: 0,
         },
     }
 }
@@ -1252,7 +1483,9 @@ pub fn scan_status(state: State<'_, AppState>) -> LibraryScanStatusDto {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gento_core::repo::{FileRepo, ScanState};
+    use gento_core::library;
+    use gento_core::library::{HashedFile, ScanEntry, WalkOutcome};
+    use gento_core::repo::{FileRepo, FileUpsert, ScanState};
     use std::sync::Mutex as StdMutex;
 
     /// イベント記録型テストホスト (AppHandle不要)。
@@ -1759,6 +1992,8 @@ mod tests {
             hash_pending: AtomicU64::new(0),
             last_hash_emit: Mutex::new(None),
             scanning: AtomicBool::new(false),
+            hash_retry: Mutex::new(HashRetry::default()),
+            hash_queue_capacity: 8_192,
         })
     }
 
@@ -1801,9 +2036,10 @@ mod tests {
         // (c) pool shutdownの放棄分も完了通知 (Cancelled) で相殺されて0になる。
         let (db_path, _dir) = temp_db("accounting");
         let shared = make_shared(&db_path);
-        let pending_of = |id: i64| library::PendingHash {
+        let pending_of = |id: i64| PendingHash {
             file_id: id,
             path: PathBuf::from("/nonexistent/does-not-matter.png"),
+            token: GenerationToken::default(),
         };
 
         // (a) dedup: 同一file_idの再提出はMergedExisting → pending増えない
@@ -1812,7 +2048,8 @@ mod tests {
             queue_capacity: 8,
         });
         pool_a.set_paused(true);
-        let accountant_a = spawn_hash_accountant(Arc::clone(&shared), rx_a);
+        let accountant_a =
+            spawn_hash_accountant(Arc::clone(&shared), rx_a, Arc::downgrade(&pool_a));
         enqueue_hash_jobs(&shared, &pool_a, vec![pending_of(1)]);
         assert_eq!(shared.hash_pending.load(Ordering::SeqCst), 1);
         enqueue_hash_jobs(&shared, &pool_a, vec![pending_of(1)]);
@@ -1833,13 +2070,15 @@ mod tests {
         let _ = accountant_a.join();
 
         // (b) queue満杯: capacity=2 に5件 → 2件のみ計上
+        // (FG-WP2-2: 拒否された3件は決定論リトライキューへ移される)
         shared.hash_pending.store(0, Ordering::SeqCst);
         let (pool_b, rx_b) = WorkerPool::new(PoolConfig {
             worker_count: 1,
             queue_capacity: 2,
         });
         pool_b.set_paused(true);
-        let accountant_b = spawn_hash_accountant(Arc::clone(&shared), rx_b);
+        let accountant_b =
+            spawn_hash_accountant(Arc::clone(&shared), rx_b, Arc::downgrade(&pool_b));
         enqueue_hash_jobs(
             &shared,
             &pool_b,
@@ -1849,6 +2088,11 @@ mod tests {
             shared.hash_pending.load(Ordering::SeqCst),
             2,
             "満杯で拒否された3件は計上しない"
+        );
+        assert_eq!(
+            shared.hash_retry.lock().unwrap().queue.len(),
+            3,
+            "拒否分はリトライキューへ"
         );
 
         // (c) shutdown放棄: キュー残りはCancelled完了通知で相殺 → 厳密に0
@@ -1981,6 +2225,7 @@ mod tests {
             host.clone(),
             fs,
             Duration::from_millis(200),
+            8_192,
         )
         .unwrap();
         let (root, _) = controller.add_root(data.path()).unwrap();
@@ -2113,5 +2358,304 @@ mod tests {
             0,
             "終了时会計0"
         );
+    }
+
+    // ===== FG-WP2-2: 破棄/拒否ジョブの決定論リトライ =====
+
+    /// hash_and_probe差し替えフック: (path, 呼び出し回数) → 差し替え結果。
+    type HashRig =
+        Box<dyn Fn(&Path, u64) -> Option<Result<HashedFile, HashFileError>> + Send + Sync>;
+
+    /// PlatformFsへ委譲しつつ hash_and_probe を差し替え可能なfs
+    /// (リトライ試験用)。`(path, これまでの呼び出し回数)` → Some(result) で
+    /// 差し替え、Noneなら実処理へ委譲。遅延注入も可能。
+    struct RiggedHashFs {
+        rig: HashRig,
+        delay_ms: u64,
+        hash_calls: StdMutex<HashMap<PathBuf, u64>>,
+        walk_calls: AtomicU64,
+    }
+
+    impl RiggedHashFs {
+        fn new(rig: HashRig) -> Self {
+            Self {
+                rig,
+                delay_ms: 0,
+                hash_calls: StdMutex::new(HashMap::new()),
+                walk_calls: AtomicU64::new(0),
+            }
+        }
+
+        fn with_delay(mut self, delay_ms: u64) -> Self {
+            self.delay_ms = delay_ms;
+            self
+        }
+
+        fn hash_calls_of(&self, path: &Path) -> u64 {
+            *self.hash_calls.lock().unwrap().get(path).unwrap_or(&0)
+        }
+    }
+
+    impl ScanFs for RiggedHashFs {
+        fn walk(
+            &self,
+            root: &Path,
+            scope: Option<&Path>,
+            sink: &mut dyn FnMut(ScanEntry),
+        ) -> WalkOutcome {
+            self.walk_calls.fetch_add(1, Ordering::SeqCst);
+            PlatformFs.walk(root, scope, sink)
+        }
+        fn hash_and_probe(
+            &self,
+            path: &Path,
+            expect: &GenerationToken,
+            cancel: &AtomicBool,
+        ) -> Result<HashedFile, HashFileError> {
+            let calls = {
+                let mut map = self.hash_calls.lock().unwrap();
+                let entry = map.entry(path.to_path_buf()).or_insert(0);
+                *entry += 1;
+                *entry
+            };
+            if let Some(result) = (self.rig)(path, calls) {
+                return result;
+            }
+            if self.delay_ms > 0 {
+                std::thread::sleep(Duration::from_millis(self.delay_ms));
+            }
+            PlatformFs.hash_and_probe(path, expect, cancel)
+        }
+    }
+
+    /// リンク済み (asset_id非NULL) のpresentファイル数 (全ルート)。
+    fn linked_count(controller: &LibraryController) -> u64 {
+        controller
+            .db()
+            .with_reader(|repos| {
+                let joined = repos.list_present_joined()?;
+                Ok(joined.iter().filter(|(_, a)| a.is_some()).count() as u64)
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn queue_full_jobs_complete_via_completion_driven_retry() {
+        // FG-WP2-2: queue満杯で拒否されたジョブは、監視イベント・再スキャンが
+        // なくてもプール完了駆動の再提出で最終的にハッシュ完了する。
+        let (db_path, _dir) = temp_db("retry-queuefull");
+        let data = TestDir::new("retry-queuefull-data");
+        for i in 0..20 {
+            data.write(&format!("f{i:02}.png"), PNG_A);
+        }
+        // 遅延ハッシュで走査のsubmitループ中にキューを確実に満杯にする
+        let fs: Arc<dyn ScanFs> =
+            Arc::new(RiggedHashFs::new(Box::new(|_path, _calls| None)).with_delay(30));
+        let db = Arc::new(gento_db::Db::open(&db_path).unwrap());
+        let host = TestHost::new();
+        let controller = LibraryController::with_fs_maintenance(
+            db,
+            host.clone(),
+            fs,
+            Duration::from_secs(3600), // メンテナンス経路を排し完了駆動のみで証明
+            4,                         // 小容量キューで確実に満杯にする
+        )
+        .unwrap();
+        let (root, _) = controller.add_root(data.path()).unwrap();
+
+        // 待機中にretry経路を通ったことを観測 (status露出値のポーリング)
+        let mut saw_retry_pending = false;
+        let settled = wait_until(30, || {
+            let status = controller.status_dto();
+            saw_retry_pending |= status.hash_retry_pending > 0;
+            status.hash_retry_pending == 0
+                && status.pending_hash == 0
+                && !status.scanning
+                && linked_count(&controller) == 20
+        });
+        assert!(
+            settled,
+            "queue満杯 → 完了駆動再提出で全ファイル解決: status={:?}",
+            controller.status_dto()
+        );
+        assert!(
+            saw_retry_pending,
+            "テスト中にqueue満杯の拒否が実際に起きたこと"
+        );
+        assert_eq!(count_state(&controller, root.id, ScanState::Present), 20);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn stale_discarded_job_is_resubmitted_without_rescan() {
+        // FG-WP2-2: Stale破棄されたジョブは再スキャンなしで決定論的に再提出
+        // される (完了駆動)。2回目の試行で実ハッシュ → リンク。
+        let (db_path, _dir) = temp_db("retry-stale");
+        let data = TestDir::new("retry-stale-data");
+        let target = data.write("a.png", PNG_A);
+        let rigged_path = target.clone();
+        let fs = Arc::new(RiggedHashFs::new(Box::new(move |path, calls| {
+            if path == rigged_path && calls == 1 {
+                Some(Err(HashFileError::Stale(
+                    "injected first-attempt stale".into(),
+                )))
+            } else {
+                None
+            }
+        })));
+        let db = Arc::new(gento_db::Db::open(&db_path).unwrap());
+        let host = TestHost::new();
+        let controller = LibraryController::with_fs_maintenance(
+            db,
+            host.clone(),
+            fs.clone(),
+            Duration::from_secs(3600), // メンテナンス経路を排し完了駆動のみで証明
+            8_192,
+        )
+        .unwrap();
+        let (root, _) = controller.add_root(data.path()).unwrap();
+
+        assert!(
+            wait_until(20, || {
+                count_state(&controller, root.id, ScanState::Present) == 1
+                    && linked_count(&controller) == 1
+            }),
+            "Stale後の再提出でリンクされる: status={:?}",
+            controller.status_dto()
+        );
+        assert!(
+            fs.hash_calls_of(&target) >= 2,
+            "同一ファイルが再提出されている (calls={})",
+            fs.hash_calls_of(&target)
+        );
+        assert_eq!(
+            fs.walk_calls.load(Ordering::SeqCst),
+            1,
+            "再スキャンなしで解決 (walkは初回スキャンの1回のみ)"
+        );
+        assert_eq!(controller.status_dto().hash_retry_pending, 0);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn stale_retry_attempt_cap_is_exposed_and_scan_rearms() {
+        // FG-WP2-2: Stale試行上限到達は断念してstatusへ露出。次のスキャン
+        // (新世代トークンのキューイング) で再試行状態はリセットされる。
+        let (db_path, _dir) = temp_db("retry-cap");
+        let data = TestDir::new("retry-cap-data");
+        let target = data.write("a.png", PNG_A);
+        let always_stale = Arc::new(AtomicBool::new(true));
+        let flag = Arc::clone(&always_stale);
+        let rigged_path = target.clone();
+        let fs = Arc::new(RiggedHashFs::new(Box::new(move |path, _calls| {
+            if path == rigged_path && flag.load(Ordering::SeqCst) {
+                Some(Err(HashFileError::Stale(
+                    "injected persistent stale".into(),
+                )))
+            } else {
+                None
+            }
+        })));
+        let db = Arc::new(gento_db::Db::open(&db_path).unwrap());
+        let host = TestHost::new();
+        let controller = LibraryController::with_fs_maintenance(
+            db,
+            host.clone(),
+            fs.clone(),
+            Duration::from_secs(3600),
+            8_192,
+        )
+        .unwrap();
+        let (root, _) = controller.add_root(data.path()).unwrap();
+        let _ = root;
+
+        // 上限到達 → 断念がstatusに露出し、再試行も止まる
+        assert!(
+            wait_until(20, || {
+                let status = controller.status_dto();
+                status.hash_retry_exhausted >= 1 && status.hash_retry_pending == 0
+            }),
+            "試行上限到達はstatusへ露出: status={:?}",
+            controller.status_dto()
+        );
+        let attempts_at_cap = fs.hash_calls_of(&target);
+        assert!(attempts_at_cap >= HASH_RETRY_MAX_ATTEMPTS as u64);
+
+        // 断念後は再提出されない (呼び出し回数が伸びない)
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(fs.hash_calls_of(&target), attempts_at_cap);
+
+        // 注入を解除して再スキャン → リセットされてリンクされる
+        always_stale.store(false, Ordering::SeqCst);
+        controller.enqueue_scan_all();
+        assert!(
+            wait_until(20, || linked_count(&controller) == 1),
+            "再スキャンで再試行状態がリセットされ解決: status={:?}",
+            controller.status_dto()
+        );
+        let status = controller.status_dto();
+        assert_eq!(status.hash_retry_exhausted, 0, "スキャンで解除");
+        controller.shutdown();
+    }
+
+    #[test]
+    fn maintenance_resolves_immutable_unlinked_file_without_watch_events() {
+        // FG-WP2-2: 監視健全な通常ルートでも「不変な未リンクファイル」が
+        // 永続未解決にならない。スキャン・監視イベントなしで、メンテナンス
+        // 周期の未リンクpresentファイル再提出だけで解決する。
+        let (db_path, _dir) = temp_db("retry-maintenance");
+        let data = TestDir::new("maintenance-data");
+        let file = data.write("a.png", PNG_A);
+
+        // DBへルート + 未リンクfile行を事前シード (実ファイルと同一トークン)
+        let db = Arc::new(gento_db::Db::open(&db_path).unwrap());
+        let root = db.with_writer(|repos| repos.add_root(data.path())).unwrap();
+        let token = gento_image::hash::stat_token(&file).expect("stat token");
+        db.with_writer(|repos| {
+            repos.upsert_file(FileUpsert {
+                root_id: root.id,
+                rel_path: PathBuf::from("a.png"),
+                display_name: "a.png".to_string(),
+                byte_size: token.byte_size,
+                mtime_ms: token.mtime_ns / 1_000_000,
+                mtime_ns: token.mtime_ns,
+                scan_state: ScanState::Present,
+                os_file_id: token.os_file_id,
+                detach_asset: false,
+            })
+        })
+        .unwrap();
+
+        let fs = Arc::new(RiggedHashFs::new(Box::new(|_path, _calls| None)));
+        let host = TestHost::new();
+        // 短いメンテナンス周期 (200ms)。add_rootしない = 初回スキャンなし。
+        // 監視は健全に確立しておく (イベントは発生しない不変ファイル)。
+        let controller = LibraryController::with_fs_maintenance(
+            db,
+            host.clone(),
+            fs.clone(),
+            Duration::from_millis(200),
+            8_192,
+        )
+        .unwrap();
+        let (root_record, available) = controller
+            .list_roots()
+            .unwrap()
+            .into_iter()
+            .find(|(record, _)| record.id == root.id)
+            .expect("seeded root");
+        assert!(available);
+        controller.start_root_watcher(&root_record).unwrap();
+        assert!(
+            wait_until(20, || linked_count(&controller) == 1),
+            "メンテナンスの再提出だけで未リンクファイルが解決: status={:?}",
+            controller.status_dto()
+        );
+        assert_eq!(
+            fs.walk_calls.load(Ordering::SeqCst),
+            0,
+            "スキャンなしで解決 (walk呼び出しゼロ)"
+        );
+        controller.shutdown();
     }
 }

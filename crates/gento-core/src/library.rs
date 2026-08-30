@@ -29,9 +29,9 @@
 //! 4. asset未リンクのFile (新規・変更・ハッシュ未完了) をハッシュ待ちとして
 //!    返す。呼び出し側が低優先度 (Background) でBLAKE3を計算し
 //!    [`hash_and_link_file`] でAssetへ統合する。リンクは
-//!    「ハッシュ時の (size, mtime) がDBレコードの直近観測と一致する場合に
-//!    のみ」行われる (世代検証。古いジョブの完了が新しいスキャンを
-//!    追い越しても誤リンクしない)
+//!    「ハッシュ時の世代トークン (os_file_id, size, mtime_ns) がDBレコードの
+//!    現在トークンと一致する場合にのみ」行われる (世代検証。古いジョブの
+//!    完了が新しいスキャンを追い越しても誤リンクしない)
 //!
 //! # キャンセルと再開
 //!
@@ -71,6 +71,8 @@ pub struct ScanEntry {
     pub rel_path: PathBuf,
     pub byte_size: u64,
     pub mtime_ms: u64,
+    /// ns精度mtime (世代トークン成分)。
+    pub mtime_ns: u64,
     pub os_file_id: Option<OsFileId>,
 }
 
@@ -130,14 +132,83 @@ impl std::fmt::Display for HashFileError {
 
 impl std::error::Error for HashFileError {}
 
-/// ハッシュ計算結果。`mtime_ms` は計算時に変化なしを検証した観測値で、
-/// リンク時の世代検証 ([`hash_and_link_file`]) に使う。
+/// ファイル内容ハッシュの計算結果。検証メタデータ (byte_size, mtime_ns,
+/// os_file_id) は計算に使った開いたfdのfstat観測で、計算期間を通じて
+/// 不変だった値。リンク時の世代検証 ([`hash_and_link_file`]) に使う。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileContentHash {
     /// `blake3:<64hex小文字>` 形式。
     pub content_hash: String,
     pub byte_size: u64,
     pub mtime_ms: u64,
+    /// ns精度mtime (FG-WP2-2世代トークン成分)。
+    pub mtime_ns: u64,
+    /// fd観測のOSファイルID (Unix: dev+ino)。
+    pub os_file_id: Option<OsFileId>,
+}
+
+/// 不変世代トークン (FG-WP2-2): `(os_file_id, size, mtime_ns)`。
+///
+/// ファイル実体の同一性を表す。同パス再利用 (新inode) はトークン不一致で
+/// Stale扱いになり、同一inodeの移動・改名は同一バイト (トークン一致) として
+/// 正しくリンクされる。ms丸めによる同一ms内置換はns精度で識別される。
+/// mtime_nsは同一環境内の比較にのみ使う (取得不能環境の0詰めフォールバック
+/// と一貫するため)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GenerationToken {
+    pub os_file_id: Option<OsFileId>,
+    pub byte_size: u64,
+    pub mtime_ns: u64,
+}
+
+impl GenerationToken {
+    /// 走査エントリの観測から構成する。
+    pub fn from_scan_entry(entry: &ScanEntry) -> Self {
+        Self {
+            os_file_id: entry.os_file_id,
+            byte_size: entry.byte_size,
+            mtime_ns: entry.mtime_ns,
+        }
+    }
+
+    /// DB行の現在トークンから構成する。`mtime_ns` がNULL (migration #4より
+    /// 前の未再走査行) のレコードは実観測と決して一致しない値 (0) を返す —
+    /// 次の走査でnsが書き込まれ自己修復する。
+    pub fn from_record(record: &FileRecord) -> Self {
+        Self {
+            os_file_id: record.os_file_id,
+            byte_size: record.byte_size,
+            mtime_ns: record.mtime_ns.unwrap_or(0),
+        }
+    }
+
+    /// DB行の現在世代とこのトークンが一致するか (リンク可否の照合)。
+    /// NULL mtime_ns行 (未再走査) は一致しない。
+    pub fn matches_record(&self, record: &FileRecord) -> bool {
+        record.os_file_id == self.os_file_id
+            && record.byte_size == self.byte_size
+            && record.mtime_ns == Some(self.mtime_ns)
+    }
+}
+
+impl FileContentHash {
+    /// 検証済みfd観測のトークン成分。
+    pub fn token(&self) -> GenerationToken {
+        GenerationToken {
+            os_file_id: self.os_file_id,
+            byte_size: self.byte_size,
+            mtime_ns: self.mtime_ns,
+        }
+    }
+}
+
+/// 1ファイルのハッシュ+プローブ結果。ハッシュと寸法は**同一の開いたfd**
+/// から観測されており、別世代の混入は構造的に不可能。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HashedFile {
+    pub content: FileContentHash,
+    /// PNGプローブの寸法 (プローブ失敗・非PNGは `None`)。
+    pub dims: Option<(u32, u32)>,
 }
 
 /// ファイルシステム操作の抽象 (実装: gento-image)。
@@ -152,18 +223,20 @@ pub trait ScanFs: Send + Sync {
         sink: &mut dyn FnMut(ScanEntry),
     ) -> WalkOutcome;
 
-    /// 寸法プローブ (WP-2ではPNGのみ。他形式・失敗時は `None`)。
-    /// `expect` はハッシュ計算時に検証済みの (size, mtime)。プローブ前後で
-    /// メタデータが `expect` から乖離した場合 (プローブが別世代を読んだ) は
-    /// `None` を返し、寸法を破棄する (ハッシュ結果との不一致を防ぐ)。
-    fn probe_dims(&self, path: &Path, expect: &FileContentHash) -> Option<(u32, u32)>;
-
-    /// ファイル全体のBLAKE3ハッシュ。チャンクごとに `cancel` を検査する。
-    fn content_hash(
+    /// 1つの開いたfdからハッシュとプローブを束ねて計算する (FG-WP2-2)。
+    ///
+    /// - fdのfstatトークンが `expect` (走査時観測) と一致しない場合は
+    ///   計算前に [`HashFileError::Stale`] (無駄な読み取りをしない)。
+    /// - BLAKE3計算後、**同一fd** からPNGヘッダを再読みして寸法を得る
+    ///   (パスの再オープン禁止 — 置換ファイルの寸法混入を構造的に排除)。
+    /// - 計算前後でfdのトークンが不変であることを検証し、変化していれば
+    ///   [`HashFileError::Stale`]。
+    fn hash_and_probe(
         &self,
         path: &Path,
+        expect: &GenerationToken,
         cancel: &AtomicBool,
-    ) -> Result<FileContentHash, HashFileError>;
+    ) -> Result<HashedFile, HashFileError>;
 }
 
 /// 3 repository traitの統合ビュー (dyn運用用)。
@@ -286,6 +359,8 @@ pub struct PendingHash {
     pub file_id: i64,
     /// 絶対パス。
     pub path: PathBuf,
+    /// 走査時観測の世代トークン (ハッシュジョブが携帯する)。
+    pub token: GenerationToken,
 }
 
 /// スキャンオプション。
@@ -451,11 +526,18 @@ impl<'a> ScanCtx<'a> {
         let display_name = display_name_of(&entry.rel_path);
         if let Some(record) = self.existing.get(&entry.rel_path).cloned() {
             self.seen_ids.insert(record.id);
-            let changed = record.byte_size != entry.byte_size || record.mtime_ms != entry.mtime_ms;
+            // 世代トークン全体 (size, mtime_ms, mtime_ns, os_file_id) のいずれかが
+            // 変わったら内容変化の可能性として扱う。ns差のみの置換 (同一ms内の
+            // 差し替え) も検出するため、mtime_ns比較を省かない。os_file_id差は
+            // 実体が別ファイル (inode差し替え) のため再ハッシュする。
+            let changed = record.byte_size != entry.byte_size
+                || record.mtime_ms != entry.mtime_ms
+                || record.mtime_ns != Some(entry.mtime_ns)
+                || record.os_file_id != entry.os_file_id;
             let reappeared = record.scan_state == ScanState::Missing;
             if changed || reappeared {
-                // 変化時のみassetリンク解除。missing再出現でsize/mtimeが
-                // 同一なら内容不変とみなしリンクを保持する。
+                // 変化時のみassetリンク解除。missing再出現でトークン同一なら
+                // 内容不変とみなしリンクを保持する。
                 let detach = changed && record.asset_id.is_some();
                 if changed {
                     self.updated += 1;
@@ -466,6 +548,7 @@ impl<'a> ScanCtx<'a> {
                     display_name,
                     byte_size: entry.byte_size,
                     mtime_ms: entry.mtime_ms,
+                    mtime_ns: entry.mtime_ns,
                     scan_state: ScanState::Present,
                     os_file_id: entry.os_file_id,
                     detach_asset: detach,
@@ -479,13 +562,14 @@ impl<'a> ScanCtx<'a> {
             if let Some(old_rel) = self.by_os_file_id.get(&id).cloned() {
                 if let Some(old) = self.existing.get(&old_rel).cloned() {
                     if !self.seen_ids.contains(&old.id) {
-                        // inode一致だけでなくsize+mtimeも一致する場合のみ移動と
-                        // 判定する (ハードリンク・inode再利用・移動+内容変化から
-                        // uuid/assetリンクを保護。missing行の無期限保持下での
-                        // inode再利用対策を兼ねる)。不一致は新規扱いへ落下し、
-                        // 旧パス行はmark_missingが不在化する。
-                        let content_intact =
-                            old.byte_size == entry.byte_size && old.mtime_ms == entry.mtime_ms;
+                        // inode一致だけでなく世代トークン全体 (size+mtime_ns含む)
+                        // が一致する場合のみ移動と判定する (ハードリンク・inode
+                        // 再利用・移動+内容変化からuuid/assetリンクを保護。
+                        // missing行の無期限保持下でのinode再利用対策を兼ねる)。
+                        // 不一致は新規扱いへ落下し、旧パス行はmark_missingが不在化する。
+                        let content_intact = old.byte_size == entry.byte_size
+                            && old.mtime_ns == Some(entry.mtime_ns)
+                            && old.os_file_id == entry.os_file_id;
                         if content_intact {
                             self.seen_ids.insert(old.id);
                             self.relocated += 1;
@@ -498,6 +582,7 @@ impl<'a> ScanCtx<'a> {
                                     display_name,
                                     byte_size: entry.byte_size,
                                     mtime_ms: entry.mtime_ms,
+                                    mtime_ns: entry.mtime_ns,
                                     scan_state: ScanState::Present,
                                     os_file_id: entry.os_file_id,
                                     detach_asset: false,
@@ -517,6 +602,7 @@ impl<'a> ScanCtx<'a> {
             display_name,
             byte_size: entry.byte_size,
             mtime_ms: entry.mtime_ms,
+            mtime_ns: entry.mtime_ns,
             scan_state: ScanState::Present,
             os_file_id: entry.os_file_id,
             detach_asset: false,
@@ -574,11 +660,13 @@ impl<'a> ScanCtx<'a> {
             match result {
                 Ok(outcome) => {
                     // asset未リンクの結果行 (upsert・relocate両方) はハッシュ待ちへ。
+                    // トークンは結果行の現在観測から構成する。
                     for record in outcome.records.iter().chain(outcome.relocated.iter()) {
                         if record.asset_id.is_none() {
                             self.pending_hash.push(PendingHash {
                                 file_id: record.id,
                                 path: root_path.join(&record.rel_path),
+                                token: GenerationToken::from_record(record),
                             });
                         }
                     }
@@ -653,6 +741,7 @@ impl<'a> ScanCtx<'a> {
                 self.pending_hash.push(PendingHash {
                     file_id: record.id,
                     path: root_path.join(&record.rel_path),
+                    token: GenerationToken::from_record(&record),
                 });
             }
         }
@@ -698,27 +787,32 @@ impl From<RepoError> for LinkError {
 /// 1ファイルのハッシュ計算 + Asset統合 (新規なら作成) + リンク。
 /// ハッシュワーカー (Background優先度) から呼ばれる。
 ///
-/// 世代検証: [`ScanFs::content_hash`] は計算前後でメタデータ (size+mtime) が
-/// 不変であることを検証した観測値を返し、プローブ ([`ScanFs::probe_dims`]) も
-/// 同一メタデータに束ねられる。リンクは書き込みトランザクション内でDBレコード
-/// の (size, mtime) と突合し、一致する場合のみ実行する。これにより
-/// 「計算中の変更」「新しいスキャン後到着した古いジョブ」は誤リンクされず
-/// [`HashFileError::Stale`] として破棄され、次回スキャンで再ハッシュされる。
+/// 世代検証 (FG-WP2-2): [`ScanFs::hash_and_probe`] は走査時観測トークン
+/// `expect` と開いたfdのfstatトークンが一致する場合のみ計算を進め、
+/// ハッシュと寸法を同一fdから束ねて返す (計算前後のfdトークン不変も検証)。
+/// リンクは書き込みトランザクション内でDBレコードの現在トークンとfdトークン
+/// を突合し、一致する場合のみ実行する。これにより「同パス再利用 (新inode)」
+/// 「同一ms内の置換 (ns差)」「計算中の変更」「新しいスキャン後到着した古い
+/// ジョブ」はいずれも誤リンクされず [`HashFileError::Stale`] として破棄され、
+/// 再提出 (呼び出し側の決定論リトライ) または次回スキャンで再ハッシュされる。
+/// 同一inodeの移動・改名は同一バイトのためトークン一致で正しくリンクされる。
 pub fn hash_and_link_file(
     store: &dyn RepoStore,
     fs: &dyn ScanFs,
     file_id: i64,
     path: &Path,
+    expect: &GenerationToken,
     cancel: &AtomicBool,
 ) -> Result<AssetRecord, HashFileError> {
-    let content = fs.content_hash(path, cancel)?;
-    let dims = fs.probe_dims(path, &content);
+    let hashed = fs.hash_and_probe(path, expect, cancel)?;
+    let content = hashed.content;
+    let dims = hashed.dims;
     let mime = mime_of(path);
     let link = write_ret(store, |repos| {
         let Some(record) = repos.get_file(file_id)? else {
             return Err(LinkError::Repo(RepoError::NotFound));
         };
-        if record.byte_size != content.byte_size || record.mtime_ms != content.mtime_ms {
+        if !content.token().matches_record(&record) {
             return Err(LinkError::Stale);
         }
         let (asset, _created) = repos.create_or_get_asset(NewAsset {
@@ -979,6 +1073,7 @@ mod tests {
             {
                 existing.byte_size = file.byte_size;
                 existing.mtime_ms = file.mtime_ms;
+                existing.mtime_ns = Some(file.mtime_ns);
                 existing.scan_state = file.scan_state;
                 existing.os_file_id = file.os_file_id;
                 if file.detach_asset {
@@ -998,6 +1093,7 @@ mod tests {
                 extension: None,
                 byte_size: file.byte_size,
                 mtime_ms: file.mtime_ms,
+                mtime_ns: Some(file.mtime_ns),
                 scan_state: file.scan_state,
                 os_file_id: file.os_file_id,
                 last_seen_at: "2026-08-30T01:00:00.000Z".to_string(),
@@ -1089,6 +1185,7 @@ mod tests {
             record.display_name = file.display_name.clone();
             record.byte_size = file.byte_size;
             record.mtime_ms = file.mtime_ms;
+            record.mtime_ns = Some(file.mtime_ns);
             record.os_file_id = file.os_file_id;
             record.scan_state = file.scan_state;
             Ok(record.clone())
@@ -1251,26 +1348,32 @@ mod tests {
         }
     }
 
-    /// フェイクfs: 事前に登録したエントリ群を返す。ハッシュ結果・プローブ
-    /// 検証・走査エラーも設定可能 (世代検証の敵対的テスト用)。
+    /// フェイクfs: 事前に登録したエントリ群を返す。ハッシュ+プローブ結果・
+    /// 走査エラーも設定可能 (世代検証の敵対的テスト用)。
+    /// `hash_and_probe` は実装の契約を模倣する: 設定済みハッシュ結果の
+    /// トークンが `expect` と一致しなければStale、一致すればハッシュと寸法を
+    /// 1回の呼び出しで束ねて返す。
     #[derive(Default)]
     struct FakeFs {
         entries: StdMutex<Vec<ScanEntry>>,
         walk_errors: StdMutex<Vec<WalkError>>,
-        /// content_hashの戻り値 (byte_size/mtime_msはレコードとの世代検証に使う)。
+        /// hash_and_probeの戻す検証済み観測 (トークン成分含む)。
         hash: StdMutex<Option<FileContentHash>>,
-        /// プローブ時の「実メタデータ観測」。None = 常にexpectと一致。
-        probe_stat: StdMutex<Option<(u64, u64)>>,
         dims: StdMutex<Option<(u32, u32)>>,
+        /// hash_and_probeの呼び出し回数 (fd単一APIの検証用)。
+        hash_calls: std::sync::atomic::AtomicU64,
     }
 
     impl FakeFs {
-        /// レコードの (size, mtime) に合うハッシュ結果を設定する。
-        fn hash_matches(&self, size: u64, mtime: u64, hash: &str) {
+        /// 指定トークンに合うハッシュ結果を設定する (mtime_msはnsからの
+        /// 換算値を自動設定)。
+        fn hash_matches(&self, os: Option<(u64, u64)>, size: u64, mtime_ns: u64, hash: &str) {
             *self.hash.lock().unwrap() = Some(FileContentHash {
                 content_hash: hash.to_string(),
                 byte_size: size,
-                mtime_ms: mtime,
+                mtime_ms: mtime_ns / 1_000_000,
+                mtime_ns,
+                os_file_id: os.map(|(dev, ino)| OsFileId::new(dev, ino)),
             });
         }
     }
@@ -1293,31 +1396,53 @@ mod tests {
                 errors: self.walk_errors.lock().unwrap().clone(),
             }
         }
-        fn probe_dims(&self, _path: &Path, expect: &FileContentHash) -> Option<(u32, u32)> {
-            let stat = *self.probe_stat.lock().unwrap();
-            match stat {
-                Some((size, mtime)) if size != expect.byte_size || mtime != expect.mtime_ms => None,
-                _ => *self.dims.lock().unwrap(),
-            }
-        }
-        fn content_hash(
+        fn hash_and_probe(
             &self,
-            _path: &Path,
+            path: &Path,
+            expect: &GenerationToken,
             _cancel: &AtomicBool,
-        ) -> Result<FileContentHash, HashFileError> {
-            self.hash
+        ) -> Result<HashedFile, HashFileError> {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.hash_calls.fetch_add(1, Relaxed);
+            let content = self
+                .hash
                 .lock()
                 .unwrap()
                 .clone()
-                .ok_or(HashFileError::Io("hash not configured".to_string()))
+                .ok_or(HashFileError::Io("hash not configured".to_string()))?;
+            if content.token() != *expect {
+                return Err(HashFileError::Stale(format!(
+                    "{}: fd token {:?} != expect {:?}",
+                    path.display(),
+                    content.token(),
+                    expect
+                )));
+            }
+            Ok(HashedFile {
+                content,
+                dims: *self.dims.lock().unwrap(),
+            })
         }
     }
 
+    /// entry(rel, size, mtime_ms, os): nsはmsからの換算 (同一ms内差分は
+    /// entry_nsで明示指定する)。
     fn entry(rel: &str, size: u64, mtime: u64, os: Option<(u64, u64)>) -> ScanEntry {
+        entry_ns(rel, size, mtime, mtime * 1_000_000, os)
+    }
+
+    fn entry_ns(
+        rel: &str,
+        size: u64,
+        mtime: u64,
+        mtime_ns: u64,
+        os: Option<(u64, u64)>,
+    ) -> ScanEntry {
         ScanEntry {
             rel_path: PathBuf::from(rel),
             byte_size: size,
             mtime_ms: mtime,
+            mtime_ns,
             os_file_id: os.map(|(dev, ino)| OsFileId::new(dev, ino)),
         }
     }
@@ -1436,11 +1561,18 @@ mod tests {
         assert_eq!(summary.pending_hash.len(), 1, "再ハッシュ待ちに登録");
 
         // 再ハッシュ → 新内容と同一ハッシュの既存Assetへ再リンク
-        fs.hash_matches(99, 2, "blake3:cafe");
+        fs.hash_matches(None, 99, 2_000_000, "blake3:cafe");
         let cancel = AtomicBool::new(false);
         let pending = summary.pending_hash[0].clone();
-        let relinked =
-            hash_and_link_file(&*store, &*fs, pending.file_id, &pending.path, &cancel).unwrap();
+        let relinked = hash_and_link_file(
+            &*store,
+            &*fs,
+            pending.file_id,
+            &pending.path,
+            &pending.token,
+            &cancel,
+        )
+        .unwrap();
         assert_eq!(relinked.id, cafe.id, "同一内容の既存Assetを再利用");
         let record = repos.files_cloned()[0].clone();
         assert_eq!(record.asset_id, Some(cafe.id));
@@ -1607,10 +1739,18 @@ mod tests {
         ]);
         let summary = run_scan(&store, &fs, &root);
         assert_eq!(summary.pending_hash.len(), 2);
-        fs.hash_matches(10, 1, "blake3:cafe");
+        fs.hash_matches(None, 10, 1_000_000, "blake3:cafe");
         let cancel = AtomicBool::new(false);
         for pending in &summary.pending_hash {
-            hash_and_link_file(&*store, &*fs, pending.file_id, &pending.path, &cancel).unwrap();
+            hash_and_link_file(
+                &*store,
+                &*fs,
+                pending.file_id,
+                &pending.path,
+                &pending.token,
+                &cancel,
+            )
+            .unwrap();
         }
         let files = repos.files_cloned();
         assert_eq!(
@@ -1794,14 +1934,12 @@ mod tests {
                 errors: Vec::new(),
             }
         }
-        fn probe_dims(&self, _path: &Path, _expect: &FileContentHash) -> Option<(u32, u32)> {
-            None
-        }
-        fn content_hash(
+        fn hash_and_probe(
             &self,
             _path: &Path,
+            _expect: &GenerationToken,
             _cancel: &AtomicBool,
-        ) -> Result<FileContentHash, HashFileError> {
+        ) -> Result<HashedFile, HashFileError> {
             Err(HashFileError::Io("not configured".to_string()))
         }
     }
@@ -1822,6 +1960,7 @@ mod tests {
             extension: Some("png".to_string()),
             byte_size: 10,
             mtime_ms: 5,
+            mtime_ns: Some(5_000_000),
             scan_state: ScanState::Present,
             os_file_id: Some(OsFileId::new(7, 42)),
             last_seen_at: "2026-08-30T00:00:00.000Z".to_string(),
@@ -1840,6 +1979,7 @@ mod tests {
                     display_name: "b.png".to_string(),
                     byte_size: 1,
                     mtime_ms: 1,
+                    mtime_ns: 1_000,
                     scan_state: ScanState::Present,
                     os_file_id: None,
                     detach_asset: false,
@@ -1881,6 +2021,7 @@ mod tests {
             extension: Some("png".to_string()),
             byte_size: 10,
             mtime_ms: 5,
+            mtime_ns: Some(5_000_000),
             scan_state: ScanState::Present,
             os_file_id: Some(OsFileId::new(7, 42)),
             last_seen_at: "2026-08-30T00:00:00.000Z".to_string(),
@@ -1928,6 +2069,7 @@ mod tests {
             extension: Some("png".to_string()),
             byte_size: 10,
             mtime_ms: 5,
+            mtime_ns: Some(5_000_000),
             scan_state: ScanState::Present,
             os_file_id: Some(OsFileId::new(7, 42)),
             last_seen_at: "2026-08-30T00:00:00.000Z".to_string(),
@@ -1955,17 +2097,24 @@ mod tests {
 
     #[test]
     fn hash_discarded_when_generation_differs_from_record() {
-        // ハッシュ結果の (size, mtime) がDBレコードと不一致 → 破棄 (Stale)。
+        // ハッシュ結果のfdトークンがDBレコードと不一致 → 破棄 (Stale)。
         let (repos, store, fs, root) = setup();
         fs.entries.lock().unwrap().push(entry("a.png", 10, 5, None));
         let summary = run_scan(&store, &fs, &root);
         assert_eq!(summary.pending_hash.len(), 1);
 
-        // 計算中にmtimeが変わった状況を模擬 (検証済み観測がレコードとズレる)
-        fs.hash_matches(10, 6, "blake3:cafe");
+        // 計算中にmtimeが変わった状況を模擬 (fd観測nsがレコードとズレる)
+        fs.hash_matches(None, 10, 6_000_000, "blake3:cafe");
         let cancel = AtomicBool::new(false);
         let pending = summary.pending_hash[0].clone();
-        let result = hash_and_link_file(&*store, &*fs, pending.file_id, &pending.path, &cancel);
+        let result = hash_and_link_file(
+            &*store,
+            &*fs,
+            pending.file_id,
+            &pending.path,
+            &pending.token,
+            &cancel,
+        );
         assert!(
             matches!(result, Err(HashFileError::Stale(_))),
             "世代不一致はStale: {result:?}"
@@ -1989,7 +2138,7 @@ mod tests {
         assert_eq!(second.pending_hash.len(), 1);
 
         // 古い世代 (10,5) のジョブ結果 → 破棄
-        fs.hash_matches(10, 5, "blake3:old");
+        fs.hash_matches(None, 10, 5_000_000, "blake3:old");
         let cancel = AtomicBool::new(false);
         let old_pending = first.pending_hash[0].clone();
         let result = hash_and_link_file(
@@ -1997,19 +2146,21 @@ mod tests {
             &*fs,
             old_pending.file_id,
             &old_pending.path,
+            &old_pending.token,
             &cancel,
         );
         assert!(matches!(result, Err(HashFileError::Stale(_))), "{result:?}");
         assert_eq!(repos.files_cloned()[0].asset_id, None);
 
         // 新しい世代 (20,6) はリンクされる
-        fs.hash_matches(20, 6, "blake3:new");
+        fs.hash_matches(None, 20, 6_000_000, "blake3:new");
         let new_pending = second.pending_hash[0].clone();
         let linked = hash_and_link_file(
             &*store,
             &*fs,
             new_pending.file_id,
             &new_pending.path,
+            &new_pending.token,
             &cancel,
         )
         .unwrap();
@@ -2023,41 +2174,146 @@ mod tests {
     }
 
     #[test]
-    fn probe_bound_to_hash_metadata_drops_dims_on_mismatch() {
-        // プローブ時のメタデータ観測がハッシュ結果とズレたら寸法を破棄する
-        // (プローブとハッシュの別読み不一致対策)。
+    fn hash_and_probe_is_single_fd_bound_call() {
+        // FG-WP2-2: ハッシュとプローブは1回の hash_and_probe 呼び出しに束ねら
+        // れる (パス再オープンする独立プローブ経路は存在しない = 置換ファイル
+        // の寸法混入が構造的に不可能)。寸法はハッシュ結果と同じ呼び出しの
+        // ものでのみAssetへ載る。
         let (repos, store, fs, root) = setup();
         fs.entries
             .lock()
             .unwrap()
             .extend([entry("a.png", 10, 5, None), entry("b.png", 10, 5, None)]);
         let summary = run_scan(&store, &fs, &root);
-        fs.hash_matches(10, 5, "blake3:cafe");
-        *fs.dims.lock().unwrap() = Some((640, 480));
         let cancel = AtomicBool::new(false);
 
-        // a.png: プローブ観測がズレる → 寸法NULLでリンク
-        *fs.probe_stat.lock().unwrap() = Some((10, 6));
+        // a.png: 寸法付きでリンク
+        fs.hash_matches(None, 10, 5_000_000, "blake3:cafe");
+        *fs.dims.lock().unwrap() = Some((640, 480));
         let a = summary
             .pending_hash
             .iter()
             .find(|p| p.path.ends_with("a.png"))
             .unwrap();
-        let asset_a = hash_and_link_file(&*store, &*fs, a.file_id, &a.path, &cancel).unwrap();
-        assert_eq!(asset_a.width, None, "ズレたプローブの寸法は破棄");
+        let asset_a =
+            hash_and_link_file(&*store, &*fs, a.file_id, &a.path, &a.token, &cancel).unwrap();
+        assert_eq!(asset_a.width, Some(640));
+        assert_eq!(asset_a.height, Some(480));
 
-        // b.png: 観測一致 → 寸法採用 (別内容として独立Asset)
-        *fs.probe_stat.lock().unwrap() = Some((10, 5));
-        fs.hash_matches(10, 5, "blake3:beef");
+        // b.png: プーブ失敗 (非PNG等) は寸法NULLでリンク
+        fs.hash_matches(None, 10, 5_000_000, "blake3:beef");
+        *fs.dims.lock().unwrap() = None;
         let b = summary
             .pending_hash
             .iter()
             .find(|p| p.path.ends_with("b.png"))
             .unwrap();
-        let asset_b = hash_and_link_file(&*store, &*fs, b.file_id, &b.path, &cancel).unwrap();
-        assert_eq!(asset_b.width, Some(640));
-        assert_eq!(asset_b.height, Some(480));
+        let asset_b =
+            hash_and_link_file(&*store, &*fs, b.file_id, &b.path, &b.token, &cancel).unwrap();
+        assert_eq!(asset_b.width, None, "プローブ失敗は寸法NULL");
         let _ = repos;
+
+        // 2ファイル = 2呼び出しのみ (プローブの独立呼び出し経路なし)
+        assert_eq!(fs.hash_calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn path_reuse_with_fresh_inode_and_matching_ms_makes_job_stale() {
+        // FG-WP2-2: 同パス再利用 (新inode・同size・同一ms・ns近傍) の古い
+        // ジョブ結果はリンクされない。inode差し替え = 別ファイル実体。
+        let (repos, store, fs, root) = setup();
+        fs.entries
+            .lock()
+            .unwrap()
+            .push(entry_ns("a.png", 10, 5, 5_000, Some((1, 100))));
+        let first = run_scan(&store, &fs, &root);
+        assert_eq!(first.pending_hash.len(), 1);
+
+        // パス再利用: 新inode (1,999)・同size・同ms・nsが僅かにズレる
+        fs.entries.lock().unwrap()[0] = entry_ns("a.png", 10, 5, 5_400, Some((1, 999)));
+        let second = run_scan(&store, &fs, &root);
+        assert_eq!(second.progress.updated, 1, "トークン変化を検出");
+
+        // 旧ジョブ (inode 1,100 のfd観測) → 行トークン (1,999) と不一致でStale
+        fs.hash_matches(Some((1, 100)), 10, 5_000, "blake3:old-bytes");
+        let cancel = AtomicBool::new(false);
+        let old = first.pending_hash[0].clone();
+        let result = hash_and_link_file(&*store, &*fs, old.file_id, &old.path, &old.token, &cancel);
+        assert!(matches!(result, Err(HashFileError::Stale(_))), "{result:?}");
+        assert_eq!(repos.files_cloned()[0].asset_id, None, "誤リンクしない");
+        assert!(repos.assets.lock().unwrap().is_empty(), "Assetも作らない");
+
+        // 新ジョブはリンクされる
+        fs.hash_matches(Some((1, 999)), 10, 5_400, "blake3:new-bytes");
+        let new = second.pending_hash[0].clone();
+        let linked =
+            hash_and_link_file(&*store, &*fs, new.file_id, &new.path, &new.token, &cancel).unwrap();
+        assert_eq!(repos.files_cloned()[0].asset_id, Some(linked.id));
+    }
+
+    #[test]
+    fn mtime_ns_difference_alone_discards_result() {
+        // 同一inode・同size・同一msでもnsが違えば別世代 → Stale。
+        // (ms丸め問題: 同一ms内の置換を検出するのがns精度の役割)
+        let (repos, store, fs, root) = setup();
+        fs.entries
+            .lock()
+            .unwrap()
+            .push(entry_ns("a.png", 10, 5, 5_000, Some((1, 100))));
+        let summary = run_scan(&store, &fs, &root);
+        assert_eq!(summary.pending_hash.len(), 1);
+
+        // fd観測のnsだけがズレた (同一ms内のin-place変更) 結果 → Stale
+        fs.hash_matches(Some((1, 100)), 10, 5_001, "blake3:cafe");
+        let cancel = AtomicBool::new(false);
+        let pending = summary.pending_hash[0].clone();
+        let result = hash_and_link_file(
+            &*store,
+            &*fs,
+            pending.file_id,
+            &pending.path,
+            &pending.token,
+            &cancel,
+        );
+        assert!(matches!(result, Err(HashFileError::Stale(_))), "{result:?}");
+        assert_eq!(repos.files_cloned()[0].asset_id, None);
+    }
+
+    #[test]
+    fn same_inode_move_links_under_new_path() {
+        // FG-WP2-2: 同一inodeの移動・改名は同一バイト。移動後パスの行に
+        // 対して旧ジョブのfd観測 (トークン一致) は正しくリンクされる。
+        let (repos, store, fs, root) = setup();
+        fs.entries
+            .lock()
+            .unwrap()
+            .push(entry_ns("dir/a.png", 10, 5, 5_000, Some((7, 42))));
+        let first = run_scan(&store, &fs, &root);
+        assert_eq!(first.pending_hash.len(), 1);
+
+        // 外部移動 (同一inode・同一トークン) → relocation
+        fs.entries.lock().unwrap()[0] = entry_ns("moved/renamed.png", 10, 5, 5_000, Some((7, 42)));
+        let second = run_scan(&store, &fs, &root);
+        assert_eq!(second.progress.relocated, 1);
+        let record = repos.files_cloned()[0].clone();
+        assert_eq!(record.rel_path, PathBuf::from("moved/renamed.png"));
+
+        // 移動前に発行されたジョブのfd観測は同一トークン → リンクされる
+        fs.hash_matches(Some((7, 42)), 10, 5_000, "blake3:moved");
+        let cancel = AtomicBool::new(false);
+        let pending = first.pending_hash[0].clone();
+        let linked = hash_and_link_file(
+            &*store,
+            &*fs,
+            pending.file_id,
+            &pending.path,
+            &pending.token,
+            &cancel,
+        )
+        .unwrap();
+        let after = repos.files_cloned()[0].clone();
+        assert_eq!(after.asset_id, Some(linked.id), "同一実体は移動後もリンク");
+        assert_eq!(after.rel_path, PathBuf::from("moved/renamed.png"));
     }
 
     #[test]

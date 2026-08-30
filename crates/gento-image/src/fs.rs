@@ -1,23 +1,37 @@
-//! gento-core [`ScanFs`] の実装 (MVP WP-2)。
+//! gento-core [`ScanFs`] の実装 (MVP WP-2 / FG-WP2-2)。
 //!
-//! walkdirによる走査 (`scan::scan_images`)、PNGプローブ (`probe`)、
-//! BLAKE3 (`hash`) を組み合わせる。ハッシュ優先度の制御 (Background)
-//! は呼び出し側 (ワーカープール) の責務。
+//! walkdirによる走査 (`scan::scan_images`)、fd束ねのハッシュ+PNGプローブ
+//! (`hash::hash_and_probe_file`) を組み合わせる。ハッシュ優先度の制御
+//! (Background) は呼び出し側 (ワーカープール) の責務。
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use gento_core::library::{
-    FileContentHash, HashFileError, ScanEntry, ScanFs, WalkError, WalkOutcome,
+    GenerationToken, HashFileError, HashedFile, ScanEntry, ScanFs, WalkError, WalkOutcome,
 };
 
-use crate::hash::blake3_file_hash;
-use crate::probe::{probe_png_dimensions, ProbeResult};
+use crate::hash::{hash_and_probe_file, stat_token};
 use crate::scan::scan_images;
 
 /// 既定の実装 (ステートレス)。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PlatformFs;
+
+/// 走査エラー対象パスの不在化可否 (在不在の積極的証明)。
+///
+/// `Path::exists()` は権限・メタデータエラーでもfalseを返すため使わない。
+/// `symlink_metadata` の結果で分類する:
+/// - `Ok(_)`: パスは存在する (読めなければblocking)
+/// - `Err(NotFound)`: 不在が積極的に確定 (non-blocking)
+/// - `Err(その他)`: 判定不能 (親ディレクトリが読めない等) → 保守的にblocking
+fn error_path_blocks_missing(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
 
 impl ScanFs for PlatformFs {
     fn walk(
@@ -42,6 +56,7 @@ impl ScanFs for PlatformFs {
                 rel_path,
                 byte_size: image.size,
                 mtime_ms: image.mtime_ms,
+                mtime_ns: image.mtime_ns,
                 os_file_id: image.os_file_id,
             });
         });
@@ -56,10 +71,9 @@ impl ScanFs for PlatformFs {
                     .strip_prefix(root)
                     .map(|p| p.to_path_buf())
                     .unwrap_or_default();
-                // パスが消えた (走査中削除・ルート不在) は実際の不在のため
-                // missing化を妨げない。存在するが読めない (権限等) 場合のみ
-                // 保守的にブロックする。
-                let blocks_missing = e.path.exists();
+                // パスの不在を積極的に証明できた場合のみmissing化を許可。
+                // 存在するが読めない (権限等)・判定不能は保守的にブロック。
+                let blocks_missing = error_path_blocks_missing(&e.path);
                 WalkError {
                     rel_path,
                     reason: e.reason,
@@ -70,40 +84,29 @@ impl ScanFs for PlatformFs {
         outcome
     }
 
-    fn probe_dims(&self, path: &Path, expect: &FileContentHash) -> Option<(u32, u32)> {
-        let matches_expect =
-            |size: u64, mtime: u64| size == expect.byte_size && mtime == expect.mtime_ms;
-        let before = std::fs::metadata(path).ok()?;
-        if !matches_expect(
-            before.len(),
-            crate::scan::system_time_to_ms(before.modified()),
-        ) {
-            return None;
-        }
-        let dims = match probe_png_dimensions(path) {
-            ProbeResult::Ok { width, height } => Some((width, height)),
-            // PNG以外・読めない・壊れている: WP-2では寸法NULLで登録 (WP-3で形式拡張)
-            _ => None,
-        };
-        let after = std::fs::metadata(path).ok()?;
-        if !matches_expect(
-            after.len(),
-            crate::scan::system_time_to_ms(after.modified()),
-        ) {
-            return None;
-        }
-        dims
-    }
-
-    fn content_hash(
+    fn hash_and_probe(
         &self,
         path: &Path,
+        expect: &GenerationToken,
         cancel: &AtomicBool,
-    ) -> Result<FileContentHash, HashFileError> {
+    ) -> Result<HashedFile, HashFileError> {
         // サービス側キャンセル (scan_stop) も即時反映するためRelaxedで十分
         // (停止の線形化は呼び出し側が管理)。
         let _ = Ordering::Relaxed;
-        blake3_file_hash(path, cancel)
+        hash_and_probe_file(path, expect, cancel)
+    }
+}
+
+/// プローブ単体の便宜ラッパ (既存の probe_dims 相当)。内部でfd束ねAPIを
+/// 使用する — 現在のトークン観測が期待と一致する場合のみ寸法を返す。
+pub fn probe_dims(path: &Path, expect: &GenerationToken) -> Option<(u32, u32)> {
+    let current = stat_token(path)?;
+    if current != *expect {
+        return None;
+    }
+    match hash_and_probe_file(path, &current, &AtomicBool::new(false)) {
+        Ok(hashed) => hashed.dims,
+        Err(_) => None,
     }
 }
 
@@ -181,6 +184,18 @@ mod tests {
     }
 
     #[test]
+    fn walk_collects_ns_precision_mtime() {
+        // FG-WP2-2: 走査エントリはns精度のmtimeを観測する。
+        let dir = TestDir::new("ns");
+        let file = dir.write("a.png", BYTES);
+        let fs = PlatformFs;
+        let mut ns_values = Vec::new();
+        fs.walk(&dir.0, None, &mut |e| ns_values.push(e.mtime_ns));
+        assert_eq!(ns_values.len(), 1);
+        assert_eq!(ns_values[0], stat_token(&file).unwrap().mtime_ns);
+    }
+
+    #[test]
     fn walk_reports_missing_root_as_error() {
         let fs = PlatformFs;
         let outcome = fs.walk(Path::new("/nonexistent-gento-root"), None, &mut |_| {});
@@ -226,44 +241,137 @@ mod tests {
         assert!(err.blocks_missing, "存在するが読めない場合はブロック");
     }
 
-    fn stat_expect(path: &std::path::PathBuf) -> FileContentHash {
-        let md = std::fs::metadata(path).unwrap();
-        FileContentHash {
-            content_hash: String::new(),
-            byte_size: md.len(),
-            mtime_ms: crate::scan::system_time_to_ms(md.modified()),
+    // ===== 在不在の積極的証明 (3分岐) =====
+
+    #[test]
+    fn absence_classification_three_branches() {
+        // (1) 存在するパス → blocking (読めなければ現状維持が正)
+        let dir = TestDir::new("absence");
+        let existing = dir.write("exists.png", BYTES);
+        assert!(error_path_blocks_missing(&existing));
+
+        // (2) NotFound → 不在確定 → non-blocking
+        let gone = dir.0.join("definitely-gone.png");
+        assert!(!error_path_blocks_missing(&gone));
+
+        // (3) その他エラー (親ディレクトリが読めない等) → 判定不能 → blocking
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("Uid:"))
+                        .and_then(|l| l.split_whitespace().nth(1).map(|u| u == "0"))
+                })
+                .unwrap_or(false)
+            {
+                return; // rootは権限エラーが起きないため検証にならない
+            }
+            let locked = dir.0.join("locked-dir");
+            std::fs::create_dir_all(&locked).unwrap();
+            std::fs::write(locked.join("child.png"), BYTES).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // 親が読めない子のstatはPermissionDenied (NotFoundではない) → blocking
+            assert!(error_path_blocks_missing(&locked.join("child.png")));
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
     }
 
+    // ===== fd束ねハッシュ+プローブ =====
+
     #[test]
-    fn probe_dims_bound_to_expected_metadata() {
+    fn hash_and_probe_returns_bound_hash_and_dims() {
         let dir = TestDir::new("probe-meta");
         let png = dir.write("a.png", &crate::probe::minimal_png_bytes(640, 480));
+        let fs = PlatformFs;
 
-        // 期待メタデータ一致 → 寸法を返す
-        let expect = stat_expect(&png);
-        assert_eq!(PlatformFs.probe_dims(&png, &expect), Some((640, 480)));
+        // 期待トークン一致 → ハッシュ+寸法が1呼び出しで返る
+        let expect = stat_token(&png).unwrap();
+        let hashed = fs
+            .hash_and_probe(&png, &expect, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(hashed.dims, Some((640, 480)));
+        assert_eq!(hashed.content.token(), expect);
 
-        // size不一致 → 検証失敗でNone (寸法は破棄)
-        let mut stale_size = expect.clone();
-        stale_size.byte_size += 1;
-        assert_eq!(PlatformFs.probe_dims(&png, &stale_size), None);
+        // size不一致 → 計算前にStale
+        let mut stale = expect;
+        stale.byte_size += 1;
+        assert!(matches!(
+            fs.hash_and_probe(&png, &stale, &AtomicBool::new(false)),
+            Err(HashFileError::Stale(_))
+        ));
 
-        // mtime不一致 → None
-        let mut stale_mtime = expect.clone();
-        stale_mtime.mtime_ms += 1;
-        assert_eq!(PlatformFs.probe_dims(&png, &stale_mtime), None);
+        // ns不一致 (同一ms内差分) → Stale
+        let mut stale_ns = expect;
+        stale_ns.mtime_ns += 1;
+        assert!(matches!(
+            fs.hash_and_probe(&png, &stale_ns, &AtomicBool::new(false)),
+            Err(HashFileError::Stale(_))
+        ));
     }
 
     #[test]
-    fn probe_dims_only_png() {
+    fn hash_and_probe_non_png_returns_no_dims() {
         let dir = TestDir::new("probe");
-        // PNGシグネチャのみの破損ファイル → None
+        let fs = PlatformFs;
+        // PNGシグネチャのみの破損ファイル → 寸法None (ハッシュ自体は成功)
         let broken = dir.write("broken.png", b"not a png");
-        let expect = stat_expect(&broken);
-        assert_eq!(PlatformFs.probe_dims(&broken, &expect), None);
+        let hashed = fs
+            .hash_and_probe(
+                &broken,
+                &stat_token(&broken).unwrap(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(hashed.dims, None);
+
         let txt = dir.write("note.txt", b"hello");
-        let expect = stat_expect(&txt);
-        assert_eq!(PlatformFs.probe_dims(&txt, &expect), None);
+        let hashed = fs
+            .hash_and_probe(&txt, &stat_token(&txt).unwrap(), &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(hashed.dims, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hash_and_probe_rejects_replaced_file_with_matching_ms() {
+        // 同パス再利用 (新inode・同size・mtime完全一致) はos_file_id差でのみ
+        // 検出できる — トークン不一致でStale。実fsでinode差し替えを決定的に
+        // 再現する (旧観測トークンのまま新実体をハッシュしようとする場面)。
+        let dir = TestDir::new("replace");
+        let png = dir.write("a.png", &crate::probe::minimal_png_bytes(10, 10));
+        let old_token = stat_token(&png).unwrap();
+        let old_mtime = std::fs::metadata(&png).unwrap().modified().unwrap();
+
+        // 同パスへ別実体を置換 (write→rename差し替えで新inode) し、mtimeを
+        // 旧実体と完全一致させる (size・mtimeでは検出不能な敵対シナリオ)。
+        let tmp = dir.0.join(".a.png.tmp");
+        std::fs::write(&tmp, crate::probe::minimal_png_bytes(20, 30)).unwrap();
+        std::fs::rename(&tmp, &png).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&png)
+            .unwrap()
+            .set_modified(old_mtime)
+            .unwrap();
+
+        let fs = PlatformFs;
+        // 旧トークン (旧inode) での提出 → 新実体のfdトークンと不一致 → Stale
+        assert!(
+            matches!(
+                fs.hash_and_probe(&png, &old_token, &AtomicBool::new(false)),
+                Err(HashFileError::Stale(msg)) if msg.contains("before hashing")
+            ),
+            "置換後の実体を旧トークンでハッシュしようとしてもStale"
+        );
+        // 新実体の現在トークンなら成功し、新しい寸法が得られる
+        let fresh = stat_token(&png).unwrap();
+        assert_ne!(fresh.os_file_id, old_token.os_file_id, "inode差し替え前提");
+        let hashed = fs
+            .hash_and_probe(&png, &fresh, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(hashed.dims, Some((20, 30)));
     }
 }

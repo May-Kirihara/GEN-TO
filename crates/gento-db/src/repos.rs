@@ -22,7 +22,8 @@ const ROOT_COLUMNS: &str = "id, uuid, path, path_encoding, display_path, enabled
 
 /// files行のSELECT列一覧 (map_fileと共通)。
 const FILE_COLUMNS: &str = "id, uuid, root_id, asset_id, rel_path, path_encoding, display_name, \
-     extension, byte_size, mtime_ms, os_file_id, scan_state, last_seen_at, created_at, updated_at";
+     extension, byte_size, mtime_ms, mtime_ns, os_file_id, scan_state, last_seen_at, created_at, \
+     updated_at";
 
 /// assets行のSELECT列一覧 (map_assetと共通)。
 const ASSET_COLUMNS: &str = "id, uuid, content_hash, hash_algorithm, hash_state, mime_type, \
@@ -134,6 +135,9 @@ fn map_file(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
         extension: row.get("extension")?,
         byte_size: row.get::<_, i64>("byte_size")?.max(0) as u64,
         mtime_ms: row.get("mtime_ms")?,
+        mtime_ns: row
+            .get::<_, Option<i64>>("mtime_ns")?
+            .and_then(|v| u64::try_from(v).ok()),
         os_file_id: os_file_id_bytes.as_deref().and_then(OsFileId::from_bytes),
         scan_state,
         last_seen_at: row.get("last_seen_at")?,
@@ -307,20 +311,21 @@ impl FileRepo for SqliteRepos<'_> {
             .execute(
                 "INSERT INTO files
                     (uuid, root_id, asset_id, rel_path, path_encoding, display_name,
-                     extension, byte_size, mtime_ms, os_file_id, scan_state, last_seen_at,
-                     created_at, updated_at)
-                 VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?11)
-                 ON CONFLICT (root_id, path_encoding, rel_path) DO UPDATE SET
-                    display_name = excluded.display_name,
-                    extension = excluded.extension,
-                    byte_size = excluded.byte_size,
-                    mtime_ms = excluded.mtime_ms,
-                    os_file_id = excluded.os_file_id,
-                    scan_state = excluded.scan_state,
-                    last_seen_at = excluded.last_seen_at,
-                    -- 内容変化検出時のみassetリンク解除 (NULLへ)。それ以外は保持。
-                    asset_id = CASE WHEN ?12 THEN NULL ELSE files.asset_id END,
-                    updated_at = excluded.updated_at",
+                     extension, byte_size, mtime_ms, mtime_ns, os_file_id, scan_state,
+                     last_seen_at, created_at, updated_at)
+                  VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?12)
+                  ON CONFLICT (root_id, path_encoding, rel_path) DO UPDATE SET
+                     display_name = excluded.display_name,
+                     extension = excluded.extension,
+                     byte_size = excluded.byte_size,
+                     mtime_ms = excluded.mtime_ms,
+                     mtime_ns = excluded.mtime_ns,
+                     os_file_id = excluded.os_file_id,
+                     scan_state = excluded.scan_state,
+                     last_seen_at = excluded.last_seen_at,
+                     -- 内容変化検出時のみassetリンク解除 (NULLへ)。それ以外は保持。
+                     asset_id = CASE WHEN ?13 THEN NULL ELSE files.asset_id END,
+                     updated_at = excluded.updated_at",
                 params![
                     new_uuid_v7(),
                     file.root_id,
@@ -330,6 +335,7 @@ impl FileRepo for SqliteRepos<'_> {
                     extension,
                     u64_to_i64(file.byte_size, "byte_size")?,
                     u64_to_i64(file.mtime_ms, "mtime_ms")?,
+                    u64_to_i64(file.mtime_ns, "mtime_ns")?,
                     file.os_file_id.map(|id| id.to_bytes().to_vec()),
                     file.scan_state.as_str(),
                     now,
@@ -404,18 +410,19 @@ impl FileRepo for SqliteRepos<'_> {
                 .prepare(
                     "INSERT INTO files
                         (uuid, root_id, asset_id, rel_path, path_encoding, display_name,
-                         extension, byte_size, mtime_ms, os_file_id, scan_state, last_seen_at,
-                         created_at, updated_at)
-                     VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?11)
-                     ON CONFLICT (root_id, path_encoding, rel_path) DO UPDATE SET
+                         extension, byte_size, mtime_ms, mtime_ns, os_file_id, scan_state,
+                         last_seen_at, created_at, updated_at)
+                      VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?12)
+                      ON CONFLICT (root_id, path_encoding, rel_path) DO UPDATE SET
                         display_name = excluded.display_name,
                         extension = excluded.extension,
                         byte_size = excluded.byte_size,
                         mtime_ms = excluded.mtime_ms,
+                        mtime_ns = excluded.mtime_ns,
                         os_file_id = excluded.os_file_id,
                         scan_state = excluded.scan_state,
                         last_seen_at = excluded.last_seen_at,
-                        asset_id = CASE WHEN ?12 THEN NULL ELSE files.asset_id END,
+                        asset_id = CASE WHEN ?13 THEN NULL ELSE files.asset_id END,
                         updated_at = excluded.updated_at",
                 )
                 .map_err(map_err)?;
@@ -431,6 +438,7 @@ impl FileRepo for SqliteRepos<'_> {
                     extension_of(&file.display_name),
                     u64_to_i64(file.byte_size, "byte_size")?,
                     u64_to_i64(file.mtime_ms, "mtime_ms")?,
+                    u64_to_i64(file.mtime_ns, "mtime_ns")?,
                     file.os_file_id.map(|id| id.to_bytes().to_vec()),
                     file.scan_state.as_str(),
                     now,
@@ -478,8 +486,8 @@ impl FileRepo for SqliteRepos<'_> {
             .execute(
                 "UPDATE files SET
                     rel_path = ?2, path_encoding = ?3, display_name = ?4,
-                    extension = ?5, byte_size = ?6, mtime_ms = ?7, os_file_id = ?8,
-                    scan_state = ?9, last_seen_at = ?10, updated_at = ?10
+                    extension = ?5, byte_size = ?6, mtime_ms = ?7, mtime_ns = ?8,
+                    os_file_id = ?9, scan_state = ?10, last_seen_at = ?11, updated_at = ?11
                  WHERE id = ?1",
                 params![
                     file_id,
@@ -489,6 +497,7 @@ impl FileRepo for SqliteRepos<'_> {
                     extension_of(&file.display_name),
                     u64_to_i64(file.byte_size, "byte_size")?,
                     u64_to_i64(file.mtime_ms, "mtime_ms")?,
+                    u64_to_i64(file.mtime_ns, "mtime_ns")?,
                     file.os_file_id.map(|id| id.to_bytes().to_vec()),
                     file.scan_state.as_str(),
                     now,
@@ -573,8 +582,8 @@ impl FileRepo for SqliteRepos<'_> {
         const SQL: &str =
             "SELECT f.id AS f_id, f.uuid AS f_uuid, f.root_id, f.asset_id, f.rel_path,
                     f.path_encoding, f.display_name, f.extension, f.byte_size, f.mtime_ms,
-                    f.os_file_id, f.scan_state, f.last_seen_at, f.created_at AS f_created_at,
-                    f.updated_at AS f_updated_at,
+                    f.mtime_ns, f.os_file_id, f.scan_state, f.last_seen_at,
+                    f.created_at AS f_created_at, f.updated_at AS f_updated_at,
                     a.id AS a_id, a.uuid AS a_uuid, a.content_hash, a.hash_algorithm,
                     a.hash_state, a.mime_type, a.byte_size AS a_byte_size, a.width, a.height,
                     a.rating, a.triage, a.favorite, a.created_at AS a_created_at,
@@ -631,6 +640,9 @@ fn map_file_prefixed(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
         extension: row.get("extension")?,
         byte_size: row.get::<_, i64>("byte_size")?.max(0) as u64,
         mtime_ms: row.get("mtime_ms")?,
+        mtime_ns: row
+            .get::<_, Option<i64>>("mtime_ns")?
+            .and_then(|v| u64::try_from(v).ok()),
         os_file_id: os_file_id_bytes.as_deref().and_then(OsFileId::from_bytes),
         scan_state,
         last_seen_at: row.get("last_seen_at")?,
@@ -871,6 +883,7 @@ mod tests {
                     display_name: "b.png".to_string(),
                     byte_size: 10,
                     mtime_ms: 1,
+                    mtime_ns: 1_000,
                     scan_state: ScanState::Present,
                     os_file_id: None,
                     detach_asset: false,
@@ -927,6 +940,7 @@ mod tests {
                     display_name: "img.png".to_string(),
                     byte_size: 100,
                     mtime_ms: 1_700_000_000_000,
+                    mtime_ns: 1_700_000_000_000_000,
                     scan_state: ScanState::Present,
                     os_file_id: None,
                     detach_asset: false,
@@ -944,6 +958,7 @@ mod tests {
                     display_name: "img.png".to_string(),
                     byte_size: 999,
                     mtime_ms: 1_700_000_999_000,
+                    mtime_ns: 1_700_000_999_000_000,
                     scan_state: ScanState::Missing,
                     os_file_id: None,
                     detach_asset: false,
@@ -962,6 +977,7 @@ mod tests {
                     display_name: "other.png".to_string(),
                     byte_size: 1,
                     mtime_ms: 1,
+                    mtime_ns: 1_000,
                     scan_state: ScanState::Present,
                     os_file_id: None,
                     detach_asset: false,
@@ -978,6 +994,7 @@ mod tests {
                     display_name: "img.png".to_string(),
                     byte_size: 5,
                     mtime_ms: 1,
+                    mtime_ns: 1_000,
                     scan_state: ScanState::Present,
                     os_file_id: None,
                     detach_asset: false,
@@ -997,6 +1014,7 @@ mod tests {
                     display_name: "x.png".to_string(),
                     byte_size: 1,
                     mtime_ms: 1,
+                    mtime_ns: 1_000,
                     scan_state: ScanState::Present,
                     os_file_id: None,
                     detach_asset: false,
@@ -1019,6 +1037,7 @@ mod tests {
                 display_name: rel.to_string(),
                 byte_size: 1,
                 mtime_ms: 1,
+                mtime_ns: 1_000,
                 scan_state: state,
                 os_file_id: None,
                 detach_asset: false,
@@ -1058,6 +1077,7 @@ mod tests {
                     display_name: "x.png".to_string(),
                     byte_size: 1,
                     mtime_ms: 1,
+                    mtime_ns: 1_000,
                     scan_state: ScanState::Present,
                     os_file_id: None,
                     detach_asset: false,
@@ -1093,6 +1113,7 @@ mod tests {
                 display_name: name.to_string(),
                 byte_size: 1,
                 mtime_ms: 1,
+                mtime_ns: 1_000,
                 scan_state: ScanState::Present,
                 os_file_id: None,
                 detach_asset: false,
@@ -1151,6 +1172,7 @@ mod tests {
                     display_name: "i.png".to_string(),
                     byte_size: 42,
                     mtime_ms: 1,
+                    mtime_ns: 1_000,
                     scan_state: ScanState::Present,
                     os_file_id: None,
                     detach_asset: false,
@@ -1175,6 +1197,7 @@ mod tests {
                     display_name: "i.png".to_string(),
                     byte_size: 42,
                     mtime_ms: 1,
+                    mtime_ns: 1_000,
                     scan_state: ScanState::Present,
                     os_file_id: None,
                     detach_asset: false,
@@ -1206,6 +1229,7 @@ mod tests {
                     display_name: "i.png".to_string(),
                     byte_size: 1,
                     mtime_ms: 1,
+                    mtime_ns: 1_000,
                     scan_state: ScanState::Present,
                     os_file_id: None,
                     detach_asset: false,
@@ -1279,6 +1303,7 @@ mod tests {
                     display_name: String::from_utf8_lossy(b"\xff.png").into_owned(),
                     byte_size: 7,
                     mtime_ms: 9,
+                    mtime_ns: 9_000,
                     scan_state: ScanState::Present,
                     os_file_id: None,
                     detach_asset: false,
@@ -1297,6 +1322,7 @@ mod tests {
                     display_name: String::from_utf8_lossy(b"\xff.png").into_owned(),
                     byte_size: 8,
                     mtime_ms: 10,
+                    mtime_ns: 10_000,
                     scan_state: ScanState::Present,
                     os_file_id: None,
                     detach_asset: false,
@@ -1313,20 +1339,23 @@ mod tests {
         // i64範囲超えは明示的なErrとする。
         with_repos("overflow", |repos| {
             let root = repos.add_root(Path::new("/data/p")).unwrap();
-            let mk = |size: u64, mtime: u64| FileUpsert {
+            let mk = |size: u64, mtime: u64, mtime_ns: u64| FileUpsert {
                 root_id: root.id,
                 rel_path: PathBuf::from("big.png"),
                 display_name: "big.png".to_string(),
                 byte_size: size,
                 mtime_ms: mtime,
+                mtime_ns,
                 scan_state: ScanState::Present,
                 os_file_id: None,
                 detach_asset: false,
             };
-            let err = repos.upsert_file(mk(u64::MAX, 1)).unwrap_err();
+            let err = repos.upsert_file(mk(u64::MAX, 1, 1_000)).unwrap_err();
             assert!(err.to_string().contains("byte_size"), "{err}");
-            let err = repos.upsert_file(mk(1, u64::MAX)).unwrap_err();
+            let err = repos.upsert_file(mk(1, u64::MAX, 1_000)).unwrap_err();
             assert!(err.to_string().contains("mtime_ms"), "{err}");
+            let err = repos.upsert_file(mk(1, 1, u64::MAX)).unwrap_err();
+            assert!(err.to_string().contains("mtime_ns"), "{err}");
             let err = repos.create_asset(new_asset("dd", u64::MAX)).unwrap_err();
             assert!(err.to_string().contains("byte_size"), "{err}");
         });
@@ -1345,6 +1374,7 @@ mod tests {
                 display_name: "a.png".to_string(),
                 byte_size: 1,
                 mtime_ms: 1,
+                mtime_ns: 1_000,
                 scan_state: ScanState::Present,
                 os_file_id: None,
                 detach_asset: false,
@@ -1446,6 +1476,7 @@ mod tests {
             display_name: rel.rsplit('/').next().unwrap_or(rel).to_string(),
             byte_size: size,
             mtime_ms: mtime,
+            mtime_ns: mtime * 1_000_000,
             scan_state: ScanState::Present,
             os_file_id: None,
             detach_asset: false,

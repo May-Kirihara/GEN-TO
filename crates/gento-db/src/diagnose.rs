@@ -209,6 +209,7 @@ mod tests {
                 display_name: "a.png".to_string(),
                 byte_size: 1,
                 mtime_ms: 1,
+                mtime_ns: 1_000,
                 scan_state: ScanState::Present,
                 os_file_id: None,
                 detach_asset: false,

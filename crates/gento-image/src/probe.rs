@@ -5,7 +5,7 @@
 //! `Limits` でデコード制限 (安全弁) を設定する。
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Seek};
 use std::path::Path;
 
 use png::{Decoder, DecodingError, Limits};
@@ -34,8 +34,22 @@ pub fn probe_png_dimensions(path: &Path) -> ProbeResult {
         // 権限不足・不存在等は「読めない」
         Err(_) => return ProbeResult::Unreadable,
     };
+    probe_png_dimensions_at(&file)
+}
+
+/// 開いたfdからPNGヘッダ (IHDR) を読んで幅・高さを取得する (FG-WP2-2)。
+///
+/// ハッシュ計算に使った**同一fd**へのプローブ束ねに使用する — パスを
+/// 再オープンしないため、ハッシュ対象バイトと異なる置換ファイルの寸法が
+/// 混入することは構造的に不可能。読み取り位置は先頭に巻き戻す (fd自体は
+/// 呼び出し元と共有。ハッシュ完了後の呼び出しを想定し位置干渉はない)。
+pub fn probe_png_dimensions_at(file: &File) -> ProbeResult {
+    let mut file = file;
+    if file.rewind().is_err() {
+        return ProbeResult::Unreadable;
+    }
     let mut decoder = Decoder::new_with_limits(
-        BufReader::new(file),
+        BufReader::new(&mut file),
         Limits {
             bytes: PROBE_LIMIT_BYTES,
         },
@@ -189,6 +203,25 @@ mod tests {
     fn missing_file_is_unreadable() {
         let p = std::env::temp_dir().join("gento-probe-definitely-missing.png");
         assert_eq!(probe_png_dimensions(&p), ProbeResult::Unreadable);
+    }
+
+    #[test]
+    fn fd_probe_matches_path_probe() {
+        // FG-WP2-2: fd経由プローブはパス経由と同一結果を返す
+        // (hash_and_probeからの束ね呼び出しの土台)。
+        let ok = TestFile::new("fd-ok", &make_png_bytes(12, 34));
+        let file = File::open(&ok.0).unwrap();
+        assert_eq!(
+            probe_png_dimensions_at(&file),
+            ProbeResult::Ok {
+                width: 12,
+                height: 34
+            }
+        );
+
+        let garbage = TestFile::new("fd-garbage", b"not a png at all");
+        let file = File::open(&garbage.0).unwrap();
+        assert_eq!(probe_png_dimensions_at(&file), ProbeResult::Corrupt);
     }
 
     #[cfg(unix)]

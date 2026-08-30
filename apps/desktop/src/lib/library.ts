@@ -49,6 +49,10 @@ export type LibraryScanStatus = {
   errors: number;
   /** true = watcher未確立の有効ルートがある (inotify上限等の劣化運用中)。 */
   watch_degraded: boolean;
+  /** 再提出待ちハッシュジョブ数 (queue満杯拒否・Stale破棄分)。 */
+  hash_retry_pending: number;
+  /** Stale再試行上限に到達し断念したファイル数 (次スキャンでリセット)。 */
+  hash_retry_exhausted: number;
 };
 
 /** カタログ表示ソース (temp=一時走査 / library=登録ルートDB)。 */
@@ -65,6 +69,8 @@ export const EMPTY_SCAN_STATUS: LibraryScanStatus = {
   pending_hash: 0,
   errors: 0,
   watch_degraded: false,
+  hash_retry_pending: 0,
+  hash_retry_exhausted: 0,
 };
 
 function toMessage(value: unknown): string {

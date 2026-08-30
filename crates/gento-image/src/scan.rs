@@ -122,6 +122,17 @@ pub(crate) fn system_time_to_ms(t: std::io::Result<std::time::SystemTime>) -> u6
     .unwrap_or(0)
 }
 
+/// ns精度のmtime (FG-WP2-2世代トークン成分)。取得不能 (stat失敗・
+/// エポック前) は0 — 同一環境内の比較のみに使うため一貫していればよい。
+pub(crate) fn system_time_to_ns(t: std::io::Result<std::time::SystemTime>) -> u64 {
+    t.map(|t| {
+        t.duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos().min(u64::MAX as u128) as u64)
+            .unwrap_or(0)
+    })
+    .unwrap_or(0)
+}
+
 pub(crate) fn is_png_entry(path: &Path) -> bool {
     path.extension()
         .map(|ext| ext.eq_ignore_ascii_case("png"))
@@ -165,6 +176,8 @@ pub struct ScannedImage {
     pub size: u64,
     /// Unixエポックからのミリ秒。
     pub mtime_ms: u64,
+    /// Unixエポックからのナノ秒 (世代トークン成分)。
+    pub mtime_ns: u64,
     pub os_file_id: Option<gento_core::repo::OsFileId>,
 }
 
@@ -204,6 +217,7 @@ pub fn scan_images(root: &Path, sink: &mut dyn FnMut(ScannedImage)) -> ScanResul
                     path: entry.path().to_path_buf(),
                     size: md.len(),
                     mtime_ms: system_time_to_ms(md.modified()),
+                    mtime_ns: system_time_to_ns(md.modified()),
                     os_file_id: os_file_id_of(&md),
                 });
                 image_count += 1;

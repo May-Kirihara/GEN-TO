@@ -749,6 +749,8 @@ type LibraryScanStatus = {
   found: number; updated: number; relocated: number; missing: number;
   hashed: number; pending_hash: number; errors: number;
   watch_degraded: boolean;  // FG-WP2: watcher未確立の有効ルートあり (下記)
+  hash_retry_pending: number;    // FG-WP2-2: 再提出待ちジョブ数 (下記)
+  hash_retry_exhausted: number;  // FG-WP2-2: 再試行断念ファイル数 (下記)
 };
 ```
 
@@ -756,6 +758,13 @@ type LibraryScanStatus = {
   いないルートがある」場合にtrue (inotify上限到達等)。この状態でも
   メンテナンス周期 (60秒) のポーリング再スキャンで変更は拾われ続ける
   (即時性のみ劣化)。watcherの再確立も同じ周期で試行される。
+- **ハッシュジョブの決定論リトライ (FG-WP2-2)**: queue満杯で拒否された
+  ジョブとStale破棄 (世代トークン不一致) されたファイルは失われない。
+  (a) プール完了による空き駆動の再提出、(b) メンテナンス周期 (60秒) での
+  未リンクpresentファイル再提出、で決定論的に回収される。Staleの再試行は
+  ファイルごとに8回を上限とし、到達したファイルは断念して
+  `hash_retry_exhausted` へ露出する (次のスキャン = 新世代トークンの
+  キューイングで再試行状態はリセットされる)。
 
 - `scan_start` はワーカー処理中 (`scanning: true`) の呼び出しを
   `"scan already in progress"` で拒否。既定ではUIから非同期で完了する。
@@ -848,12 +857,32 @@ WP-5のメタデータ編集は**安定ID (assets.id) を指定して**行うこ
   来なくても** debounceスレッドの50ms tickで検出され、全体再スキャンが
   発火する (FG-WP2修正)。
 - スコープ差分スキャンはファイルシステムの最終状態のみに依存して冪等
-  (size+mtime高速判定 + os_file_id移動検出 + 未参照missing化) のため、
+  (世代トークン高速判定 + os_file_id移動検出 + 未参照missing化) のため、
   **大量イベント後も最終状態が一致する** (受入条件5。テスト
   `watcher_burst_of_many_events_converges` で実inotifyにより証明)。
-- **移動検出の内容検証 (FG-WP2)**: os_file_id (inode) 一致に加えて
-  size+mtime一致を必須とする。不一致は移動扱いせず新規登録+旧パスmissing化
-  (inode再利用・移動+内容変更からuuid/assetリンクを保護)。
+- **不変世代トークン (FG-WP2-2)**: ファイル実体の同一性は
+  `(os_file_id, size, mtime_ns)` — os_file_idはUnixでは (dev, ino)、
+  mtime_nsはナノ秒精度 (migration #4の `files.mtime_ns` 列。旧 `mtime_ms`
+  列は後方互換で残し走査は両方更新)。走査時にトークンを観測してfiles行へ
+  保存 → ハッシュジョブがトークンを携帯 → ハッシュは**開いたfdのfstat**
+  からトークンを取得 (パス再解決しない) し計算前後でfdトークン不変を検証
+  → リンク時 (書き込みトランザクション内) でDB行の現在トークンと一致する
+  場合のみリンク。不一致はStaleとして結果破棄・決定論リトライへ。これにより
+  同パス再利用 (新inode) はinode差で、同一ms内の置換はns差で、それぞれ
+  確実に検出される。同一inodeの移動・改名は同一バイトとして正しくリンク。
+- **プローブのfd束ね (FG-WP2-2)**: PNG寸法プローブはハッシュと**同一の
+  開いたfd**から読む (`hash_and_probe` 単一API。パス再オープン禁止)。
+  ハッシュ対象バイトと異なる置換ファイルの寸法混入は構造的に不可能。
+- **移動検出の内容検証 (FG-WP2-2強化)**: os_file_id (inode) 一致に加えて
+  世代トークン全体 (size+mtime_ns含む) の一致を必須とする。不一致は移動
+  扱いない新規登録+旧パスmissing化 (inode再利用・移動+内容変更から
+  uuid/assetリンクを保護)。
+- **在不在の積極的証明 (FG-WP2-2)**: 走査エラー対象パスの不在化可否は
+  `Path::exists()` (権限・メタデータエラーでもfalse) でなく
+  `symlink_metadata` で分類する: `Ok` = 存在 (読めなければblocking) /
+  `Err(NotFound)` = 不在確定 (non-blocking) / `Err(その他)` = 判定不能
+  (保守的にblocking)。権限エラーで既存サブツリーが誤ってmissing化
+  しない。
 - **不完全走査の保守的reconciliation (FG-WP2)**: 権限不足等で列挙に
   失敗したパス配下のレコードはmissing化しない (walkエラーは
   `scan_status.errors` と`error_samples`で警告として露出)。パス自体が

@@ -56,11 +56,16 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "wp2_root_os_file_id_index",
         sql: MIGRATION_V3_SQL,
     },
+    Migration {
+        version: 4,
+        name: "fgwp22_files_mtime_ns",
+        sql: MIGRATION_V4_SQL,
+    },
 ];
 
 /// 現在の最新schema version (`PRAGMA user_version` の目標値)。
 /// このbuildの [`crate::Db::open`] は既存DBを必ずこの値へ移行する。
-pub const LATEST_VERSION: i32 = 3;
+pub const LATEST_VERSION: i32 = 4;
 
 /// WP-2 (登録ルート・差分スキャン) のindex追加。
 /// 列追加は不要 — 設定列は#1に含まれ、os_file_idも#1でNULL可として定義済み。
@@ -84,6 +89,15 @@ CREATE INDEX idx_files_os_file_id ON files(os_file_id) WHERE os_file_id IS NOT N
 const MIGRATION_V3_SQL: &str = r"
 CREATE INDEX idx_files_root_os_file_id
     ON files(root_id, os_file_id) WHERE os_file_id IS NOT NULL;
+";
+
+/// FG-WP2-2 (レビューラウンド2): 不変世代トークン `(os_file_id, size,
+/// mtime_ns)` のns成分列。既存 `mtime_ms` 列は後方互換で残し、走査は
+/// 両方を更新する。NULL可 — migration前の行は次の走査でnsが埋まり、
+/// それまでの間トークン照合は不一致 (Stale) 扱いで安全側に倒れる。
+/// migration #1は凍結済みのため、greenfieldでも列追加は#4とする。
+const MIGRATION_V4_SQL: &str = r"
+ALTER TABLE files ADD COLUMN mtime_ns INTEGER NULL;
 ";
 
 const MIGRATION_V1_SQL: &str = r#"

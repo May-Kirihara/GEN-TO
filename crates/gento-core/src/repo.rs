@@ -247,6 +247,9 @@ pub struct FileUpsert {
     pub display_name: String,
     pub byte_size: u64,
     pub mtime_ms: u64,
+    /// ns精度mtime (FG-WP2-2世代トークン成分。走査時の観測。
+    /// 取得不能環境では0詰め — 同一環境内の比較のみに使うため一貫する)。
+    pub mtime_ns: u64,
     pub scan_state: ScanState,
     /// OSファイルID (取得可能な場合)。外部移動・改名の再発見に使用。
     pub os_file_id: Option<OsFileId>,
@@ -271,6 +274,9 @@ pub struct FileRecord {
     pub extension: Option<String>,
     pub byte_size: u64,
     pub mtime_ms: u64,
+    /// ns精度mtime (FG-WP2-2世代トークン成分)。migration #4より前の行
+    /// (未再走査) は `None`。
+    pub mtime_ns: Option<u64>,
     pub scan_state: ScanState,
     /// OSファイルID (Linux: dev+inode)。取得不能な環境・未走査は `None`。
     pub os_file_id: Option<OsFileId>,

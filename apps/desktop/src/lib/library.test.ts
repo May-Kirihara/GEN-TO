@@ -3,7 +3,12 @@
  * IPCをモックして状態遷移とcommand引数を検証する。
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { LibraryStore, type LibraryIpc, type LibraryRoot } from "./library";
+import {
+  EMPTY_SCAN_STATUS,
+  LibraryStore,
+  type LibraryIpc,
+  type LibraryRoot,
+} from "./library";
 
 function root(overrides: Partial<LibraryRoot> = {}): LibraryRoot {
   return {
@@ -48,6 +53,8 @@ function makeIpc(state: IpcState): LibraryIpc {
             pending_hash: 0,
             errors: 0,
             watch_degraded: false,
+            hash_retry_pending: 0,
+            hash_retry_exhausted: 0,
           } as T;
         default:
           return undefined as T;
@@ -216,6 +223,26 @@ describe("LibraryStore", () => {
     const degradedStore = new LibraryStore(ipc);
     await degradedStore.refreshStatus();
     expect(degradedStore.status.watch_degraded).toBe(true);
+  });
+
+  it("refreshStatus surfaces deterministic hash retry counters", async () => {
+    // FG-WP2-2: queue満杯拒否・Stale破棄の再提出状況はstatusの
+    // hash_retry_pending / hash_retry_exhausted で露出する。
+    const ipc = makeIpc(state);
+    ipc.invoke = async <T>(command: string): Promise<T> => {
+      if (command === "scan_status") {
+        return {
+          ...EMPTY_SCAN_STATUS,
+          hash_retry_pending: 12,
+          hash_retry_exhausted: 1,
+        } as T;
+      }
+      return makeIpc(state).invoke<T>(command);
+    };
+    const retryStore = new LibraryStore(ipc);
+    await retryStore.refreshStatus();
+    expect(retryStore.status.hash_retry_pending).toBe(12);
+    expect(retryStore.status.hash_retry_exhausted).toBe(1);
   });
 
   it("dispose stops polling and unlistens", async () => {
