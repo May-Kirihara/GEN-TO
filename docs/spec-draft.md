@@ -563,16 +563,16 @@ registered-root/
 
 ## 18. 技術構成
 
-第一候補として、Tauri 2、Svelte 5、TypeScriptおよびRustを採用する。
+技術スパイクの自動計測とLinux開発機での手動確認を通過したため、Tauri 2、Svelte 5、TypeScriptおよびRustをMVPの技術基盤として採用する。
 
 - デスクトップシェル: Tauri 2
 - フロントエンド: Svelte 5、TypeScript
 - アプリケーションコア: Rust
 - 永続化: SQLite
 
-技術構成は、大量画像表示の性能試作を通過した時点で正式決定する。試作全体では、数万件の仮想スクロール、1フォルダ内の大量画像、連続画像送り、巨大画像、2枚・4枚比較、バックグラウンド処理中の応答性およびOS間の挙動を段階的に確認する。
+大量画像表示の初期技術スパイクはLinux開発機上でPASSとなった。低スペック環境、実5万ファイル、巨大画像、WindowsおよびmacOSはMVP中の追加検証ゲートとする。
 
-初期試作は現在のLinux開発機と`sample/dataset`を使用する。詳細な範囲、暫定合格基準および計測方法は[高速画像表示 技術検証計画](./technical-spike.md)に定義する。Windows、macOS、巨大画像および形式混在の検証は、初期方式が成立した後に行う。
+初期試作はLinux開発機と`sample/dataset`を使用した。詳細な計画と結果は[高速画像表示 技術検証計画](./technical-spike.md)および[技術スパイク報告](./technical-spike-report.md)に記録する。MVPの実装順序と受け入れ条件は[MVP実装計画書](./mvp-implementation-plan.md)に定義する。
 
 ### 18.1 アーキテクチャ原則
 
