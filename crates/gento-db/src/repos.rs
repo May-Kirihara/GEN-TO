@@ -383,6 +383,14 @@ impl FileRepo for SqliteRepos<'_> {
             .map_err(map_err)
     }
 
+    fn get_file(&self, file_id: i64) -> Result<Option<FileRecord>, RepoError> {
+        let sql = format!("SELECT {FILE_COLUMNS} FROM files WHERE id = ?1");
+        self.conn
+            .query_row(&sql, [file_id], map_file)
+            .optional()
+            .map_err(map_err)
+    }
+
     fn upsert_files_batch(&self, files: &[FileUpsert]) -> Result<Vec<FileRecord>, RepoError> {
         if files.is_empty() {
             return Ok(Vec::new());
@@ -533,8 +541,14 @@ impl FileRepo for SqliteRepos<'_> {
         offset: u32,
         limit: u32,
     ) -> Result<(Vec<FileRecord>, u64), RepoError> {
-        let total: i64 = self
+        // countとpageを1スナップショットで読む (並行書き込みで2文の間に
+        // 行が増えると total < page.len() が起こる。差分走査のページング
+        // 一貫性に効くため文レベルではなくトランザクションで束ねる)。
+        let tx = self
             .conn
+            .unchecked_transaction()
+            .map_err(|e| RepoError::Db(e.to_string()))?;
+        let total: i64 = tx
             .query_row(
                 "SELECT count(*) FROM files WHERE root_id = ?1",
                 [root_id],
@@ -544,12 +558,14 @@ impl FileRepo for SqliteRepos<'_> {
         let sql = format!(
             "SELECT {FILE_COLUMNS} FROM files WHERE root_id = ?1 ORDER BY id LIMIT ?2 OFFSET ?3"
         );
-        let mut stmt = self.conn.prepare(&sql).map_err(map_err)?;
+        let mut stmt = tx.prepare(&sql).map_err(map_err)?;
         let rows = stmt
             .query_map(params![root_id, limit, offset], map_file)
             .map_err(map_err)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(map_err)?;
+        drop(stmt);
+        tx.commit().map_err(map_err)?;
         Ok((rows, total.max(0) as u64))
     }
 
@@ -1059,6 +1075,11 @@ mod tests {
                 .find_by_path(9999, &PathBuf::from("x.png"))
                 .unwrap()
                 .is_none());
+
+            // 主キー照合 (ハッシュリンク時の世代検証用)
+            let found = repos.get_file(1).unwrap().expect("id=1の行");
+            assert_eq!(found.rel_path, PathBuf::from("x.png"));
+            assert!(repos.get_file(9999).unwrap().is_none());
         });
     }
 

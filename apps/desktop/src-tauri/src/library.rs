@@ -17,15 +17,21 @@
 //!   影響を受けたディレクトリのスコープ差分スキャンとして適用される。
 //!   差分スキャンはファイルシステムの最終状態のみに依存して冪等のため、
 //!   バースト後も最終状態が一致する (inotifyイベント欠落を含む)。
-//! - イベント欠落 (overflow等) は全体再スキャンで収束。
-//! - ルート削除・アンマウント: watcherを停止し `roots:changed` を通知。
+//! - イベント欠落 (overflow等) は通常イベントが無くても検出・全体再スキャンで
+//!   収束する (overflowフラグはdebounceループのtickで拾われる)。
+//! - ルート削除・アンマウント: watcherを解放し `roots:changed` を通知。
 //!   DBのルート行とFile行は保持 (「不在ルート=無効表示、削除しない」)。
+//!   ルート再出現時はメンテナンス周期でwatcherを再確立する。
+//! - watcher確立失敗 (inotify上限等) は `scan_status.watch_degraded` で
+//!   露出し、メンテナンス周期でのポーリング再スキャンで劣化運用する。
 //!
 //! # スキャンの逐次化
 //!
 //! 全コマンド (全体スキャン・スコープ差分) は単一ワーカースレッドの
 //! キューへ投入され順次実行される。初回スキャン中に到着した監視イベントは
 //! キューへ蓄積され、スキャン完了後に適用される (バッファリング)。
+//! ワーカーはアイドル時にメンテナンス (watcher再確立・劣化ポーリング) を
+//! 実行する。
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -41,7 +47,7 @@ use gento_core::library::{
 use gento_core::repo::{FileRepo, LibraryRootRecord, LibraryRootRepo, RepoError, RootSettings};
 use gento_core::Priority;
 use gento_image::fs::PlatformFs;
-use gento_image::pool::{Job, PoolConfig, SubmitError, WorkerPool};
+use gento_image::pool::{Job, JobCompletion, PoolConfig, SubmitError, SubmitOutcome, WorkerPool};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use serde::Serialize;
 use tauri::{Manager, State};
@@ -60,6 +66,9 @@ const MAX_MERGED_SCOPES: usize = 24;
 
 /// ハッシュ進捗イベントの最小間隔 (イベント嵐対策)。
 const HASH_PROGRESS_INTERVAL_MS: u64 = 100;
+
+/// メンテナンス周期 (watcher再確立・劣化ポーリング再スキャン)。
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// ライブラリ側からUIへの通知境界 (本実装: AppHandle。テスト: 記録用)。
 pub trait LibraryHost: Send + Sync {
@@ -155,12 +164,17 @@ struct WatchState {
     stop: Arc<AtomicBool>,
 }
 
+/// ルートごとの監視状態表 (controller・worker・debouncerスレッドで共有)。
+type Watchers = Arc<Mutex<HashMap<i64, WatchState>>>;
+
 /// 登録ルート制御中枢。
 pub struct LibraryController {
     shared: Arc<Shared>,
     tx: Sender<LibCmd>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
-    watchers: Mutex<HashMap<i64, WatchState>>,
+    /// ハッシュ会計スレッド (プール完了通知でpendingを減算)。
+    hash_accountant: Mutex<Option<std::thread::JoinHandle<()>>>,
+    watchers: Watchers,
 }
 
 impl LibraryController {
@@ -175,12 +189,21 @@ impl LibraryController {
         host: Arc<dyn LibraryHost>,
         fs: Arc<dyn ScanFs>,
     ) -> Result<Arc<Self>, RepoError> {
+        Self::with_fs_maintenance(db, host, fs, MAINTENANCE_INTERVAL)
+    }
+
+    /// テスト用: メンテナンス周期も指定する。
+    fn with_fs_maintenance(
+        db: Arc<gento_db::Db>,
+        host: Arc<dyn LibraryHost>,
+        fs: Arc<dyn ScanFs>,
+        maintenance_interval: Duration,
+    ) -> Result<Arc<Self>, RepoError> {
         let (tx, rx) = mpsc::channel::<LibCmd>();
-        let hash_pool = WorkerPool::new(PoolConfig {
+        let (hash_pool, completions) = WorkerPool::new(PoolConfig {
             worker_count: 2,
             queue_capacity: 8_192,
-        })
-        .0;
+        });
         let shared = Arc::new(Shared {
             db,
             fs,
@@ -191,17 +214,34 @@ impl LibraryController {
             last_hash_emit: Mutex::new(None),
             scanning: AtomicBool::new(false),
         });
+        // ハッシュ会計: submit成功 (Enqueued) 回数とプール完了通知を1:1で
+        // 対応させ、pending_hash が恒久非ゼロにならないことを保証する
+        // (dedup統合・queue満杯・キャンセル・shutdown放棄を含む)。
+        let accountant = spawn_hash_accountant(Arc::clone(&shared), completions);
+        let watchers: Watchers = Arc::new(Mutex::new(HashMap::new()));
         let worker_shared = Arc::clone(&shared);
-        let worker_pool = Arc::clone(&hash_pool);
+        let worker_pool = hash_pool;
+        let worker_watchers = Arc::clone(&watchers);
+        let worker_tx = tx.clone();
         let worker = std::thread::Builder::new()
             .name("library-worker".into())
-            .spawn(move || worker_loop(worker_shared, worker_pool, rx))
+            .spawn(move || {
+                worker_loop(
+                    worker_shared,
+                    worker_pool,
+                    rx,
+                    worker_watchers,
+                    worker_tx,
+                    maintenance_interval,
+                )
+            })
             .map_err(|e| RepoError::Db(format!("spawn library worker: {e}")))?;
         Ok(Arc::new(Self {
             shared,
             tx,
             worker: Mutex::new(Some(worker)),
-            watchers: Mutex::new(HashMap::new()),
+            hash_accountant: Mutex::new(Some(accountant)),
+            watchers,
         }))
     }
 
@@ -267,7 +307,7 @@ impl LibraryController {
             .shared
             .db
             .with_writer(|repos| repos.set_root_settings(root.id, RootSettings::default()));
-        if let Err(err) = self.start_watcher(&root) {
+        if let Err(err) = self.start_root_watcher(&root) {
             tracing::warn!(root_id = root.id, error = %err, "watcher unavailable for root");
         }
         self.enqueue_scan_root(root.id);
@@ -297,7 +337,7 @@ impl LibraryController {
             let roots = self.list_roots().map_err(|e| e.to_string())?;
             if let Some((root, available)) = roots.iter().find(|(r, _)| r.id == root_id) {
                 if *available && root.watch_enabled {
-                    let _ = self.start_watcher(root);
+                    let _ = self.start_root_watcher(root);
                 }
                 self.enqueue_scan_root(root_id);
             }
@@ -315,82 +355,12 @@ impl LibraryController {
 
     /// ルートの監視を開始する (setup・有効化からも呼ぶ公開ラッパ)。
     pub fn start_root_watcher(&self, root: &LibraryRootRecord) -> Result<(), String> {
-        self.start_watcher(root)
-    }
-
-    /// ルートの監視を開始する。
-    fn start_watcher(&self, root: &LibraryRootRecord) -> Result<(), String> {
-        let mut watchers = self.watchers.lock().unwrap_or_else(|p| p.into_inner());
-        if watchers.contains_key(&root.id) {
-            return Ok(());
-        }
-        let buffer = Arc::new(WatchBuffer::new());
-        let (event_tx, event_rx) = mpsc::channel::<(FsChange, PathBuf)>();
-        let notify_buffer = Arc::clone(&buffer);
-        let root_path = root.path.clone();
-        let mut watcher =
-            notify::recommended_watcher(move |result: Result<Event, notify::Error>| match result {
-                Ok(event) => {
-                    for path in &event.paths {
-                        let change = match event.kind {
-                            EventKind::Create(_) => Some(FsChange::Created),
-                            EventKind::Modify(_) => Some(FsChange::Modified),
-                            EventKind::Remove(_) => Some(FsChange::Removed),
-                            EventKind::Access(_) => None,
-                            // 未知種 (Any/Other・inotify overflow等) は保守的に
-                            // 全体再スキャンへ逃がす
-                            _ => {
-                                notify_buffer.mark_overflow();
-                                None
-                            }
-                        };
-                        if let Some(change) = change {
-                            notify_buffer.push(change, path.clone());
-                            let _ = event_tx.send((change, path.clone()));
-                        }
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "watch error (treated as overflow)");
-                    notify_buffer.mark_overflow();
-                }
-            })
-            .map_err(|e| e.to_string())?;
-        watcher
-            .watch(&root.path, RecursiveMode::Recursive)
-            .map_err(|e| e.to_string())?;
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let debouncer = spawn_debouncer(
-            Arc::clone(&buffer),
-            event_rx,
-            Arc::clone(&stop),
-            root_path,
-            root.id,
-            Arc::clone(&self.shared),
-            self.tx.clone(),
-        );
-        watchers.insert(
-            root.id,
-            WatchState {
-                _watcher: watcher,
-                debouncer: Some(debouncer),
-                stop,
-            },
-        );
-        Ok(())
+        start_watcher(&self.watchers, &self.shared, &self.tx, root)
     }
 
     /// ルートの監視を停止する。
     fn stop_watcher(&self, root_id: i64) {
-        let mut watchers = self.watchers.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(mut state) = watchers.remove(&root_id) {
-            state.stop.store(true, Ordering::SeqCst);
-            if let Some(handle) = state.debouncer.take() {
-                let _ = handle.join();
-            }
-            // watcherはここでdropされinotify監視が解除される
-        }
+        stop_watcher(&self.watchers, root_id);
     }
 
     /// 監視を停止しワーカー・ハッシュプールを終了する (アプリ終了時)。
@@ -408,6 +378,17 @@ impl LibraryController {
         self.cancel_scan();
         let _ = self.tx.send(LibCmd::Shutdown);
         if let Some(handle) = self.worker.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            let _ = handle.join();
+        }
+        // workerのShutdown処理内でpoolがshutdownされ、完了通知 (放棄分の
+        // Cancelledを含む) が会計スレッドへ流れる。poolのArcが全dropされ
+        // チャネルが閉じた時点で会計スレッドも終了する。
+        if let Some(handle) = self
+            .hash_accountant
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
             let _ = handle.join();
         }
     }
@@ -436,12 +417,163 @@ impl LibraryController {
             hashed: progress.hashed,
             pending_hash: pending,
             errors: progress.errors,
+            watch_degraded: self.watch_degraded(),
+        }
+    }
+
+    /// watcher未確立の有効ルートがあるか (inotify上限等の劣化表示)。
+    fn watch_degraded(&self) -> bool {
+        let Ok(roots) = self.list_roots() else {
+            return false;
+        };
+        let watched: std::collections::HashSet<i64> = self
+            .watchers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .copied()
+            .collect();
+        roots.into_iter().any(|(root, available)| {
+            root.enabled && root.watch_enabled && available && !watched.contains(&root.id)
+        })
+    }
+}
+
+/// ルートの監視を開始する (controller各所・メンテナンスから呼ぶ)。
+fn start_watcher(
+    watchers: &Watchers,
+    shared: &Arc<Shared>,
+    tx: &Sender<LibCmd>,
+    root: &LibraryRootRecord,
+) -> Result<(), String> {
+    let mut guard = watchers.lock().unwrap_or_else(|p| p.into_inner());
+    if guard.contains_key(&root.id) {
+        return Ok(());
+    }
+    let buffer = Arc::new(WatchBuffer::new());
+    let (event_tx, event_rx) = mpsc::channel::<(FsChange, PathBuf)>();
+    let notify_buffer = Arc::clone(&buffer);
+    let root_path = root.path.clone();
+    let mut watcher =
+        notify::recommended_watcher(move |result: Result<Event, notify::Error>| match result {
+            Ok(event) => {
+                for path in &event.paths {
+                    let change = match event.kind {
+                        EventKind::Create(_) => Some(FsChange::Created),
+                        EventKind::Modify(_) => Some(FsChange::Modified),
+                        EventKind::Remove(_) => Some(FsChange::Removed),
+                        EventKind::Access(_) => None,
+                        // 未知種 (Any/Other・inotify overflow等) は保守的に
+                        // 全体再スキャンへ逃がす
+                        _ => {
+                            notify_buffer.mark_overflow();
+                            None
+                        }
+                    };
+                    if let Some(change) = change {
+                        notify_buffer.push(change, path.clone());
+                        let _ = event_tx.send((change, path.clone()));
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "watch error (treated as overflow)");
+                notify_buffer.mark_overflow();
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    watcher
+        .watch(&root.path, RecursiveMode::Recursive)
+        .map_err(|e| e.to_string())?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let debouncer = spawn_debouncer(DebouncerParams {
+        buffer,
+        event_rx,
+        stop: Arc::clone(&stop),
+        root: root_path,
+        root_id: root.id,
+        shared: Arc::clone(shared),
+        cmd_tx: tx.clone(),
+        watchers: Arc::clone(watchers),
+    });
+    guard.insert(
+        root.id,
+        WatchState {
+            _watcher: watcher,
+            debouncer: Some(debouncer),
+            stop,
+        },
+    );
+    Ok(())
+}
+
+/// ルートの監視を停止する。停止フラグの設定とjoinを分離し、debouncer側の
+/// 自己登録解除 (watchersロック取得) とデッドロックしないようにする。
+fn stop_watcher(watchers: &Watchers, root_id: i64) {
+    let state = watchers
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&root_id);
+    // watcherはここでdropされinotify監視が解除される
+    if let Some(mut state) = state {
+        state.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = state.debouncer.take() {
+            let _ = handle.join();
         }
     }
 }
 
-/// debounceスレッド: ウィンドウ内のイベントを結合しスコープ差分へ変換する。
-fn spawn_debouncer(
+/// メンテナンス (ワーカーのアイドル時に周期的に実行):
+/// - 不在ルートのwatcherを解放 (イベント欠落したアンマウントの掃除)
+/// - 再出現・watcher確立失敗からの復帰 (再確立できたら再スキャンを投入)
+/// - 確立できない有効ルートはポーリング再スキャンで劣化運用 (degraded)
+///
+/// `try_start` はwatcher確立の試行 (テストで失敗を注入できるよう分離)。
+fn run_maintenance(
+    shared: &Arc<Shared>,
+    watchers: &Watchers,
+    tx: &Sender<LibCmd>,
+    try_start: &dyn Fn(&LibraryRootRecord) -> Result<(), String>,
+) {
+    let Ok(roots) = shared.db.with_reader(|repos| repos.list_roots()) else {
+        return;
+    };
+    for root in roots.iter().filter(|root| root.enabled) {
+        let available = root.path.is_dir();
+        let watched = watchers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&root.id);
+        if !available {
+            if watched {
+                tracing::info!(root_id = root.id, "root unavailable; releasing watcher");
+                stop_watcher(watchers, root.id);
+                shared.host.roots_changed();
+            }
+            continue;
+        }
+        if root.watch_enabled && !watched {
+            match try_start(root) {
+                Ok(()) => {
+                    tracing::info!(root_id = root.id, "watcher re-established");
+                    let _ = tx.send(LibCmd::ScanRoot(root.id));
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        root_id = root.id,
+                        error = %err,
+                        "watcher unavailable; degraded polling rescan"
+                    );
+                    let _ = tx.send(LibCmd::ScanRoot(root.id));
+                }
+            }
+        }
+    }
+}
+
+/// debounceスレッドの起動引数。
+struct DebouncerParams {
     buffer: Arc<WatchBuffer>,
     event_rx: Receiver<(FsChange, PathBuf)>,
     stop: Arc<AtomicBool>,
@@ -449,7 +581,21 @@ fn spawn_debouncer(
     root_id: i64,
     shared: Arc<Shared>,
     cmd_tx: Sender<LibCmd>,
-) -> std::thread::JoinHandle<()> {
+    watchers: Watchers,
+}
+
+/// debounceスレッド: ウィンドウ内のイベントを結合しスコープ差分へ変換する。
+fn spawn_debouncer(params: DebouncerParams) -> std::thread::JoinHandle<()> {
+    let DebouncerParams {
+        buffer,
+        event_rx,
+        stop,
+        root,
+        root_id,
+        shared,
+        cmd_tx,
+        watchers,
+    } = params;
     std::thread::Builder::new()
         .name(format!("watch-debounce-{root_id}"))
         .spawn(move || {
@@ -464,7 +610,18 @@ fn spawn_debouncer(
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 }
-                let Some(last) = last_event else { continue };
+                // 通常イベントが無くてもoverflow (watcherエラー・未知イベント種
+                // を含む) は50ms tickで検出し、全体再スキャンへ収束させる。
+                let last = match last_event {
+                    Some(last) => last,
+                    None => {
+                        if buffer.is_overflow() {
+                            Instant::now()
+                        } else {
+                            continue;
+                        }
+                    }
+                };
                 if last.elapsed() < debounce && !buffer.is_overflow() {
                     continue;
                 }
@@ -473,15 +630,22 @@ fn spawn_debouncer(
                 if coalesced.changes.is_empty() && !coalesced.overflow {
                     continue;
                 }
-                // ルート自体の削除 (アンマウント含む): 監視停止 + 通知のみ。
+                // ルート自体の削除 (アンマウント含む): watcherを解放して終了。
+                // 自エントリを外すことで、再出現時にメンテナンスが再確立できる。
+                // (stop_watcherはjoinするため自己登録解除には使えない —
+                //  自己joinになる。ここではロックのみで外し、watcherのdropで
+                //  inotifyを解放する。joinハンドルはdetachされる)
                 if coalesced
                     .changes
                     .get(&root)
                     .is_some_and(|kind| *kind == FsChange::Removed)
                 {
                     shared.host.roots_changed();
-                    tracing::info!(root_id, "root removed; stopping watcher");
-                    // 自スレッドの停止フラグはstop_watcherが立てる
+                    tracing::info!(root_id, "root removed; releasing watcher");
+                    watchers
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&root_id);
                     return;
                 }
                 if coalesced.overflow {
@@ -521,9 +685,30 @@ fn spawn_debouncer(
 }
 
 /// 単一ワーカーループ。コマンドを逐次実行し、スキャン中に到着した
-/// スコープコマンドを次周でマージする。
-fn worker_loop(shared: Arc<Shared>, hash_pool: Arc<WorkerPool>, rx: Receiver<LibCmd>) {
-    while let Ok(cmd) = rx.recv() {
+/// スコープコマンドを次周でマージする。アイドルがメンテナンス周期に
+/// 達したらwatcher再確立・劣化ポーリングを実行する。
+fn worker_loop(
+    shared: Arc<Shared>,
+    hash_pool: Arc<WorkerPool>,
+    rx: Receiver<LibCmd>,
+    watchers: Watchers,
+    tx: Sender<LibCmd>,
+    maintenance_interval: Duration,
+) {
+    loop {
+        let cmd = match rx.recv_timeout(maintenance_interval) {
+            Ok(cmd) => cmd,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let shared_ref = &shared;
+                let watchers_ref = &watchers;
+                let tx_ref = &tx;
+                run_maintenance(shared_ref, watchers_ref, tx_ref, &|root| {
+                    start_watcher(watchers_ref, shared_ref, tx_ref, root)
+                });
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        };
         match cmd {
             LibCmd::Shutdown => {
                 hash_pool.shutdown();
@@ -698,7 +883,30 @@ fn progress_payload(
     }
 }
 
+/// ハッシュ会計スレッド: プールの完了通知 (実行完了・失敗・キャンセル・
+/// shutdown放棄のすべて) を `hash_pending` の減算と1:1で対応させる。
+/// これによりpendingは「submit成功数 − 完了通知数」に厳密に一致し、
+/// dedup統合・queue満杯・キャンセル・pool shutdownのいずれでも
+/// 恒久非ゼロにならない。
+fn spawn_hash_accountant(
+    shared: Arc<Shared>,
+    completions: Receiver<JobCompletion>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("hash-accountant".into())
+        .spawn(move || {
+            while let Ok(completion) = completions.recv() {
+                if completion.key.starts_with("hash:") {
+                    shared.hash_pending.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+        })
+        .expect("spawn hash accountant")
+}
+
 /// ハッシュジョブ (Background優先度)。完了でhashed進捗を進める。
+/// `hash_pending` の減算は会計スレッド (完了通知ドリブン) が行うため、
+/// ここでは進捗・通知のみを担う。
 struct HashJob {
     shared: Arc<Shared>,
     file_id: i64,
@@ -718,7 +926,6 @@ impl Job for HashJob {
             &self.shared.cancel,
         ) {
             Ok(_asset) => {
-                self.shared.hash_pending.fetch_sub(1, Ordering::SeqCst);
                 let hashed = {
                     update_progress(&self.shared, |current| current.hashed += 1);
                     self.shared
@@ -763,9 +970,15 @@ impl Job for HashJob {
                 let _ = hashed;
                 Ok(Vec::new())
             }
+            // 世代検証で破棄: エラーではなく「要再走査」。ファイルは未リンクの
+            // まま次回スキャンで再キューされる (監視・メンテナンスが再スキャン
+            // を発火する)。
+            Err(gento_core::library::HashFileError::Stale(msg)) => {
+                tracing::debug!(file_id = self.file_id, reason = %msg, "hash stale; will rehash on next scan");
+                Err(format!("stale: {msg}"))
+            }
             Err(gento_core::library::HashFileError::Cancelled) => Err("cancelled".to_string()),
             Err(err) => {
-                self.shared.hash_pending.fetch_sub(1, Ordering::SeqCst);
                 update_progress(&self.shared, |current| current.errors += 1);
                 Err(err.to_string())
             }
@@ -773,6 +986,10 @@ impl Job for HashJob {
     }
 }
 
+/// ハッシュジョブをプールへ投入する。`hash_pending` は実際の投入成功
+/// (新規Enqueued) のみ増やす: dedup統合 (MergedExisting) は元ジョブの
+/// 完了通知で減算されるため二重計上しない。満杯・shutdownで拒否された
+/// 分は次回スキャンのresumeに任せる (resume = `asset_id IS NULL` 再構成)。
 fn enqueue_hash_jobs(
     shared: &Arc<Shared>,
     hash_pool: &Arc<WorkerPool>,
@@ -781,34 +998,48 @@ fn enqueue_hash_jobs(
     if pending.is_empty() {
         return;
     }
-    let total = shared
-        .hash_pending
-        .fetch_add(pending.len() as u64, Ordering::SeqCst)
-        + pending.len() as u64;
-    tracing::debug!(
-        count = pending.len(),
-        total_pending = total,
-        "hash jobs enqueued"
-    );
+    let mut enqueued = 0u64;
+    let mut merged = 0u64;
+    let mut rejected = 0u64;
     for item in pending {
+        shared.hash_pending.fetch_add(1, Ordering::SeqCst);
         let job = Arc::new(HashJob {
             shared: Arc::clone(shared),
             file_id: item.file_id,
             path: item.path,
         });
         let key = format!("hash:{}", item.file_id);
-        if let Err(err) = hash_pool.submit(&key, Priority::Background, job) {
-            shared.hash_pending.fetch_sub(1, Ordering::SeqCst);
-            match err {
-                SubmitError::QueueFull => {
-                    // バックプレッシャー: 残りは次回スキャンのresumeに任せる
-                    tracing::warn!("hash queue full; remaining files will be retried on next scan");
-                    break;
+        match hash_pool.submit(&key, Priority::Background, job) {
+            Ok(SubmitOutcome::Enqueued(_)) => enqueued += 1,
+            Ok(SubmitOutcome::MergedExisting(_)) => {
+                // 元ジョブの完了通知1回でこの増分は相殺できない (元の増分しか
+                // 無い) ので、ここで戻す。
+                shared.hash_pending.fetch_sub(1, Ordering::SeqCst);
+                merged += 1;
+            }
+            Err(err) => {
+                shared.hash_pending.fetch_sub(1, Ordering::SeqCst);
+                rejected += 1;
+                match err {
+                    SubmitError::QueueFull => {
+                        // バックプレッシャー: 残りは次回スキャンのresumeに任せる
+                        tracing::warn!(
+                            "hash queue full; remaining files will be retried on next scan"
+                        );
+                        break;
+                    }
+                    SubmitError::Shutdown => break,
                 }
-                SubmitError::Shutdown => break,
             }
         }
     }
+    tracing::debug!(
+        enqueued,
+        merged,
+        rejected,
+        total_pending = shared.hash_pending.load(Ordering::SeqCst),
+        "hash jobs enqueued"
+    );
 }
 
 // ===== カタログスナップショット生成 =====
@@ -921,6 +1152,9 @@ pub struct LibraryScanStatusDto {
     pub hashed: u64,
     pub pending_hash: u64,
     pub errors: u64,
+    /// true = watcher未確立の有効ルートがある (inotify上限等の劣化。
+    /// メンテナンス周期のポーリング再スキャンで運用継続)。
+    pub watch_degraded: bool,
 }
 
 fn controller(state: &State<'_, AppState>) -> Result<Arc<LibraryController>, String> {
@@ -1010,6 +1244,7 @@ pub fn scan_status(state: State<'_, AppState>) -> LibraryScanStatusDto {
             hashed: 0,
             pending_hash: 0,
             errors: 0,
+            watch_degraded: false,
         },
     }
 }
@@ -1508,5 +1743,375 @@ mod tests {
                 .unwrap_or(false)
         }));
         controller.shutdown();
+    }
+
+    // ===== FG-WP2: overflow収束・ハッシュ会計・watcher寿命・劣化運用 =====
+
+    /// テスト用Shared直接構築 (debouncer・会計の単体試験)。
+    fn make_shared(db_path: &Path) -> Arc<Shared> {
+        let db = Arc::new(gento_db::Db::open(db_path).unwrap());
+        Arc::new(Shared {
+            db,
+            fs: Arc::new(PlatformFs),
+            host: TestHost::new(),
+            cancel: AtomicBool::new(false),
+            progress: Mutex::new(LibraryProgress::default()),
+            hash_pending: AtomicU64::new(0),
+            last_hash_emit: Mutex::new(None),
+            scanning: AtomicBool::new(false),
+        })
+    }
+
+    #[test]
+    fn overflow_without_normal_events_schedules_full_rescan() {
+        // overflow (watcherエラー・未知イベント種) 単独でも、通常イベントが
+        // 来なくても全体再スキャンが発火する (Blocker 4)。
+        let (db_path, _dir) = temp_db("overflow-only");
+        let shared = make_shared(&db_path);
+        let buffer = Arc::new(WatchBuffer::new());
+        let (event_tx, event_rx) = mpsc::channel::<(FsChange, PathBuf)>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (cmd_tx, cmd_rx) = mpsc::channel::<LibCmd>();
+        let watchers: Watchers = Arc::new(Mutex::new(HashMap::new()));
+        let handle = spawn_debouncer(DebouncerParams {
+            buffer: Arc::clone(&buffer),
+            event_rx,
+            stop,
+            root: PathBuf::from("/data/photos"),
+            root_id: 1,
+            shared: Arc::clone(&shared),
+            cmd_tx,
+            watchers,
+        });
+        // 通常イベントを1件も送らずoverflowのみ
+        buffer.mark_overflow();
+        match cmd_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(LibCmd::ScanRoot(root_id)) => assert_eq!(root_id, 1),
+            _other => panic!("overflow単独でScanRootが来るべき"),
+        }
+        drop(event_tx); // 切断でdebouncer終了
+        let _ = handle.join();
+        assert!(!buffer.is_overflow(), "drainでフラグ解除済み");
+    }
+
+    #[test]
+    fn hash_accounting_is_exact_under_dedup_queue_saturation_and_shutdown() {
+        // Blocker 5: pending_hash = submit成功数 − 完了通知数 が厳密に成立する。
+        // (a) dedup統合は二重計上しない (b) queue満杯の放棄分は数えない
+        // (c) pool shutdownの放棄分も完了通知 (Cancelled) で相殺されて0になる。
+        let (db_path, _dir) = temp_db("accounting");
+        let shared = make_shared(&db_path);
+        let pending_of = |id: i64| library::PendingHash {
+            file_id: id,
+            path: PathBuf::from("/nonexistent/does-not-matter.png"),
+        };
+
+        // (a) dedup: 同一file_idの再提出はMergedExisting → pending増えない
+        let (pool_a, rx_a) = WorkerPool::new(PoolConfig {
+            worker_count: 1,
+            queue_capacity: 8,
+        });
+        pool_a.set_paused(true);
+        let accountant_a = spawn_hash_accountant(Arc::clone(&shared), rx_a);
+        enqueue_hash_jobs(&shared, &pool_a, vec![pending_of(1)]);
+        assert_eq!(shared.hash_pending.load(Ordering::SeqCst), 1);
+        enqueue_hash_jobs(&shared, &pool_a, vec![pending_of(1)]);
+        assert_eq!(
+            shared.hash_pending.load(Ordering::SeqCst),
+            1,
+            "dedup統合で増えない"
+        );
+        pool_a.set_paused(false);
+        assert!(wait_until(10, || shared
+            .hash_pending
+            .load(Ordering::SeqCst)
+            == 0));
+        // workerがPoolInnerを保持するため、shutdownでworkerを止めないと
+        // 完了チャネルが閉じず会計スレッドが終了しない。
+        pool_a.shutdown();
+        drop(pool_a);
+        let _ = accountant_a.join();
+
+        // (b) queue満杯: capacity=2 に5件 → 2件のみ計上
+        shared.hash_pending.store(0, Ordering::SeqCst);
+        let (pool_b, rx_b) = WorkerPool::new(PoolConfig {
+            worker_count: 1,
+            queue_capacity: 2,
+        });
+        pool_b.set_paused(true);
+        let accountant_b = spawn_hash_accountant(Arc::clone(&shared), rx_b);
+        enqueue_hash_jobs(
+            &shared,
+            &pool_b,
+            (1..=5).map(pending_of).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            shared.hash_pending.load(Ordering::SeqCst),
+            2,
+            "満杯で拒否された3件は計上しない"
+        );
+
+        // (c) shutdown放棄: キュー残りはCancelled完了通知で相殺 → 厳密に0
+        pool_b.shutdown();
+        drop(pool_b);
+        let _ = accountant_b.join();
+        assert_eq!(
+            shared.hash_pending.load(Ordering::SeqCst),
+            0,
+            "終了时会計は厳密に0"
+        );
+    }
+
+    #[test]
+    fn cancelled_hash_jobs_settle_pending_to_zero() {
+        // キャンセル (ジョブ実行前・ハッシュ中の両形態) でも会計は0に収束。
+        let (db_path, _dir) = temp_db("cancel-accounting");
+        let data = TestDir::new("cancel-acc-data");
+        for i in 0..30 {
+            data.write(&format!("c{i:02}.png"), PNG_A);
+        }
+        let (controller, host) = make_controller(&db_path);
+        let (root, _) = controller.add_root(data.path()).unwrap();
+        // すぐキャンセル → 実行前キャンセルとハッシュ中キャンセルが混在
+        controller.cancel_scan();
+        assert!(wait_until(10, || !controller.is_scanning()));
+
+        for _ in 0..8 {
+            if wait_scan_settled(&controller, &host, 30) {
+                break;
+            }
+            controller.enqueue_scan_all();
+        }
+        assert!(
+            wait_until(15, || {
+                count_state(&controller, root.id, ScanState::Present) == 30
+                    && controller.shared.hash_pending.load(Ordering::SeqCst) == 0
+            }),
+            "再開で全ファイル収集・会計0: present={} pending={}",
+            count_state(&controller, root.id, ScanState::Present),
+            controller.shared.hash_pending.load(Ordering::SeqCst)
+        );
+        controller.shutdown();
+        assert_eq!(controller.shared.hash_pending.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn maintenance_degraded_polling_rescans_when_watcher_unavailable() {
+        // watcher確立失敗 (inotify上限等の模擬) でもメンテナンス周期で
+        // ポーリング再スキャンが投入され、放っておかれない (非ブロッカー10)。
+        let (db_path, _dir) = temp_db("degraded");
+        let data = TestDir::new("degraded-data");
+        data.write("a.png", PNG_A);
+        let db = Arc::new(gento_db::Db::open(&db_path).unwrap());
+        let root = db.with_writer(|repos| repos.add_root(data.path())).unwrap();
+        let shared = make_shared(&db_path);
+        let _ = db;
+        let (tx, rx) = mpsc::channel::<LibCmd>();
+        let watchers: Watchers = Arc::new(Mutex::new(HashMap::new()));
+
+        run_maintenance(&shared, &watchers, &tx, &|_| {
+            Err("inotify watch limit reached (simulated)".to_string())
+        });
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(LibCmd::ScanRoot(root_id)) => assert_eq!(root_id, root.id),
+            _other => panic!("劣化時もポーリング再スキャン"),
+        }
+        assert!(watchers.lock().unwrap().is_empty(), "確立失敗なら登録なし");
+
+        // 復帰後 (確立成功) も再スキャン + watcher登録
+        run_maintenance(&shared, &watchers, &tx, &|_| Ok(()));
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(LibCmd::ScanRoot(root_id)) => assert_eq!(root_id, root.id),
+            _other => panic!("復帰時も再スキャン"),
+        }
+    }
+
+    #[test]
+    fn watch_degraded_reflected_in_scan_status() {
+        let (db_path, _dir) = temp_db("status-degraded");
+        let data = TestDir::new("status-degraded-data");
+        data.write("a.png", PNG_A);
+        let (controller, _host) = make_controller(&db_path);
+        let (root, _) = controller.add_root(data.path()).unwrap();
+
+        assert!(
+            wait_until(10, || controller
+                .watchers
+                .lock()
+                .unwrap()
+                .contains_key(&root.id)),
+            "watcher確立待ち"
+        );
+        assert!(!controller.status_dto().watch_degraded);
+
+        // watcher喪失 (上限到達等) を模擬 → degraded
+        stop_watcher(&controller.watchers, root.id);
+        let status = controller.status_dto();
+        assert!(status.watch_degraded, "未確立はstatusへ露出");
+
+        // watch_enabled=false のルートは degraded扱いしない
+        controller
+            .shared
+            .db
+            .with_writer(|repos| {
+                repos.set_root_settings(
+                    root.id,
+                    RootSettings {
+                        watch_enabled: false,
+                        ..RootSettings::default()
+                    },
+                )
+            })
+            .unwrap();
+        assert!(!controller.status_dto().watch_degraded);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn maintenance_reestablishes_watcher_after_root_reappears() {
+        // Blocker 9: ルート不在化でwatcher解放 → 再出現で再確立・再スキャン。
+        let (db_path, _dir) = temp_db("reappear");
+        let data = TestDir::new("reappear-data");
+        data.write("a.png", PNG_A);
+        let db = Arc::new(gento_db::Db::open(&db_path).unwrap());
+        let host = TestHost::new();
+        let fs: Arc<dyn ScanFs> = Arc::new(PlatformFs);
+        let controller = LibraryController::with_fs_maintenance(
+            db,
+            host.clone(),
+            fs,
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let (root, _) = controller.add_root(data.path()).unwrap();
+        assert!(wait_scan_settled(&controller, &host, 1));
+
+        // ルートごと削除 (アンマウント相当)
+        std::fs::remove_file(data.path().join("a.png")).unwrap();
+        std::fs::remove_dir(data.path()).unwrap();
+        assert!(
+            wait_until(15, || !controller
+                .watchers
+                .lock()
+                .unwrap()
+                .contains_key(&root.id)),
+            "debouncer自己解放 or メンテナンス解放でwatcherが外れる"
+        );
+
+        // 再出現 → メンテナンスがwatcher再確立 + 再スキャン
+        std::fs::create_dir_all(data.path()).unwrap();
+        std::fs::write(data.path().join("a.png"), PNG_A).unwrap();
+        assert!(
+            wait_until(15, || {
+                controller.watchers.lock().unwrap().contains_key(&root.id)
+                    && count_state(&controller, root.id, ScanState::Present) == 1
+            }),
+            "再出現でwatcher再確立・present復帰: present={}",
+            count_state(&controller, root.id, ScanState::Present)
+        );
+        controller.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_denied_subtree_is_not_missing_marked() {
+        if std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("Uid:"))
+                    .and_then(|l| l.split_whitespace().nth(1).map(|u| u == "0"))
+            })
+            .unwrap_or(false)
+        {
+            return; // rootは chmod 000 でも読めてしまうため検証にならない
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let (db_path, _dir) = temp_db("perm-subtree");
+        let data = TestDir::new("perm-subtree-data");
+        data.write("keep.png", PNG_A);
+        data.write("locked/x.png", PNG_B);
+        let (controller, host) = make_controller(&db_path);
+        let (root, _) = controller.add_root(data.path()).unwrap();
+        assert!(wait_scan_settled(&controller, &host, 2));
+
+        // locked/ を読み取り不能にして再スキャン → 配下はmissing化しない
+        std::fs::set_permissions(
+            data.path().join("locked"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        controller.enqueue_scan_all();
+        assert!(
+            wait_until(15, || {
+                let status = controller.status_dto();
+                !status.scanning && status.errors >= 1
+            }),
+            "不完全走査はエラーとして状態に反映される"
+        );
+        let (present, missing) = (
+            count_state(&controller, root.id, ScanState::Present),
+            count_state(&controller, root.id, ScanState::Missing),
+        );
+        assert_eq!(
+            present, 2,
+            "locked配下もmissing化しない (present={present} missing={missing})"
+        );
+        assert_eq!(missing, 0);
+
+        // 権限復帰 → 通常運用に戻る
+        std::fs::set_permissions(
+            data.path().join("locked"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        controller.enqueue_scan_all();
+        assert!(wait_until(15, || {
+            let status = controller.status_dto();
+            !status.scanning && status.errors == 0
+        }));
+        assert_eq!(count_state(&controller, root.id, ScanState::Present), 2);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn remove_root_while_scanning_and_hashing_keeps_controller_healthy() {
+        // スキャン・ハッシュ稼働中のルート削除: パニックせず、会計も収束し、
+        // controllerは引き続き機能する。
+        let (db_path, _dir) = temp_db("remove-mid");
+        let data = TestDir::new("remove-mid-data");
+        for i in 0..200 {
+            data.write(&format!("f{i:03}.png"), PNG_A);
+        }
+        let (controller, _host) = make_controller(&db_path);
+        let (root, _) = controller.add_root(data.path()).unwrap();
+        // スキャン・ハッシュが動いているうちに削除
+        controller.remove_root(root.id).unwrap();
+
+        assert!(wait_until(20, || {
+            !controller.is_scanning() && controller.shared.hash_pending.load(Ordering::SeqCst) == 0
+        }));
+        let roots = controller
+            .db()
+            .with_reader(|repos| repos.list_roots())
+            .unwrap()
+            .len();
+        assert_eq!(roots, 0, "ルートは削除済み");
+
+        // controllerは新しいルートで引き続き機能する
+        let data2 = TestDir::new("remove-mid-data2");
+        data2.write("after.png", PNG_B);
+        let (root2, _) = controller.add_root(data2.path()).unwrap();
+        assert!(wait_until(20, || {
+            count_state(&controller, root2.id, ScanState::Present) == 1
+                && controller.shared.hash_pending.load(Ordering::SeqCst) == 0
+                && !controller.is_scanning()
+        }));
+        controller.shutdown();
+        assert_eq!(
+            controller.shared.hash_pending.load(Ordering::SeqCst),
+            0,
+            "終了时会計0"
+        );
     }
 }

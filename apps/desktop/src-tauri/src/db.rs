@@ -163,6 +163,10 @@ pub fn db_status(state: State<'_, AppState>) -> DbStatusDto {
 mod tests {
     use super::*;
 
+    /// GENTO_DB環境変数を扱うテストの直列化 (環境変数はプロセスグローバル
+    /// ため、set/remove中の並行resolve_db_path読み取りが競合する)。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn app_dirs() -> AppDirs {
         AppDirs {
             data_dir: PathBuf::from("/xdg/data/gento"),
@@ -173,6 +177,8 @@ mod tests {
 
     #[test]
     fn default_db_path_is_under_data_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("GENTO_DB");
         let dirs = app_dirs();
         assert_eq!(
             resolve_db_path(&[], &dirs),
@@ -203,8 +209,9 @@ mod tests {
 
     #[test]
     fn env_var_overrides_default_but_flag_wins() {
-        // 注意: 環境変数はプロセスグローバル。並行テストでGENTO_DBを
-        // 読むのはこのテストだけのため、set/removeの間に競合しない。
+        // 注意: 環境変数はプロセスグローバル。ENV_LOCKで直列化する
+        // (default_db_path_is_under_data_dir がresolve_db_pathを読むため)。
+        let _guard = ENV_LOCK.lock().unwrap();
         let dirs = app_dirs();
         std::env::set_var("GENTO_DB", "/tmp/env-db.sqlite3");
         assert_eq!(

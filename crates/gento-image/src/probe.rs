@@ -61,47 +61,50 @@ pub fn probe_png_dimensions(path: &Path) -> ProbeResult {
     }
 }
 
+/// テスト用最小PNG (シグネチャ + IHDR + IEND)。CRC32はチャンク検証される
+/// ため正しく計算する。fs.rs等の他テストモジュールからも使用。
+#[cfg(test)]
+pub(crate) fn minimal_png_bytes(width: u32, height: u32) -> Vec<u8> {
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc: u32 = 0xFFFF_FFFF;
+        for &b in data {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        !crc
+    }
+    fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(kind);
+        body.extend_from_slice(data);
+        let crc = crc32(&body);
+        let mut out = Vec::new();
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&crc.to_be_bytes());
+        out
+    }
+
+    let mut png = Vec::new();
+    png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8bit RGBA
+    png.extend_from_slice(&chunk(b"IHDR", &ihdr));
+    png.extend_from_slice(&chunk(b"IEND", &[]));
+    png
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
 
-    /// テスト用最小PNG (シグネチャ + IHDR + IEND)。
-    /// CRC32はチャンク検証されるため正しく計算する。
-    fn make_png_bytes(width: u32, height: u32) -> Vec<u8> {
-        fn crc32(data: &[u8]) -> u32 {
-            let mut crc: u32 = 0xFFFF_FFFF;
-            for &b in data {
-                crc ^= b as u32;
-                for _ in 0..8 {
-                    let mask = (crc & 1).wrapping_neg();
-                    crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-                }
-            }
-            !crc
-        }
-        fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
-            let mut body = Vec::new();
-            body.extend_from_slice(kind);
-            body.extend_from_slice(data);
-            let crc = crc32(&body);
-            let mut out = Vec::new();
-            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-            out.extend_from_slice(&body);
-            out.extend_from_slice(&crc.to_be_bytes());
-            out
-        }
-
-        let mut png = Vec::new();
-        png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
-        let mut ihdr = Vec::new();
-        ihdr.extend_from_slice(&width.to_be_bytes());
-        ihdr.extend_from_slice(&height.to_be_bytes());
-        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8bit RGBA
-        png.extend_from_slice(&chunk(b"IHDR", &ihdr));
-        png.extend_from_slice(&chunk(b"IEND", &[]));
-        png
-    }
+    use super::minimal_png_bytes as make_png_bytes;
 
     struct TestFile(std::path::PathBuf);
 

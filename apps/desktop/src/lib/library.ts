@@ -47,6 +47,8 @@ export type LibraryScanStatus = {
   hashed: number;
   pending_hash: number;
   errors: number;
+  /** true = watcher未確立の有効ルートがある (inotify上限等の劣化運用中)。 */
+  watch_degraded: boolean;
 };
 
 /** カタログ表示ソース (temp=一時走査 / library=登録ルートDB)。 */
@@ -62,6 +64,7 @@ export const EMPTY_SCAN_STATUS: LibraryScanStatus = {
   hashed: 0,
   pending_hash: 0,
   errors: 0,
+  watch_degraded: false,
 };
 
 function toMessage(value: unknown): string {

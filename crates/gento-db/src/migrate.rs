@@ -309,17 +309,17 @@ mod tests {
         }
     }
 
-    fn failing_migration_v3() -> Migration {
+    fn failing_migration_v4() -> Migration {
         Migration {
-            version: 3,
+            version: 4,
             name: "test_failing",
             sql: "CREATE TABLE wp1_test_extra (id INTEGER PRIMARY KEY); INSERT INTO wp1_test_extra VALUES (1); INSERT INTO nonexistent_table VALUES (1);",
         }
     }
 
-    fn ok_migration_v3() -> Migration {
+    fn ok_migration_v4() -> Migration {
         Migration {
-            version: 3,
+            version: 4,
             name: "test_ok_extra",
             sql: "CREATE TABLE wp1_test_extra (id INTEGER PRIMARY KEY);",
         }
@@ -330,7 +330,7 @@ mod tests {
         let tmp = TempDir::new("fresh");
         let mut conn = Connection::open(tmp.path().join("db.sqlite3")).unwrap();
         let outcome = run_migrations(&mut conn, MIGRATIONS, &MigrationOpts::default()).unwrap();
-        assert_eq!(outcome.applied, vec![1, 2]);
+        assert_eq!(outcome.applied, vec![1, 2, 3]);
         assert_eq!(outcome.backup, None); // 新規DB (v0) はbackup不要
         assert_eq!(read_user_version(&conn).unwrap(), LATEST_VERSION);
 
@@ -363,6 +363,8 @@ mod tests {
             // migration #2 (WP-2)
             "idx_files_root_scan_state",
             "idx_files_os_file_id",
+            // migration #3 (FG-WP2)
+            "idx_files_root_os_file_id",
         ] {
             assert!(
                 indexes.contains(&expect.to_string()),
@@ -388,6 +390,48 @@ mod tests {
         let outcome = run_migrations(&mut conn, MIGRATIONS, &MigrationOpts::default()).unwrap();
         assert!(outcome.applied.is_empty());
         assert_eq!(outcome.backup, None);
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM library_roots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn v2_database_upgrades_to_v3_with_backup() {
+        // WP-2世代 (v2) のデータ保有DBは、v3適用前にbackupを作ってから
+        // 移行される (FG-WP2のmigration #3)。
+        let tmp = TempDir::new("v2to3");
+        let backup_dir = tmp.path().join("db-backups");
+        let mut conn = Connection::open(tmp.path().join("db.sqlite3")).unwrap();
+        run_migrations(&mut conn, &MIGRATIONS[..2], &MigrationOpts::default()).unwrap();
+        conn.execute(
+            "INSERT INTO library_roots (uuid, path, path_encoding, display_path, created_at, updated_at)
+             VALUES ('00000000-0000-7000-8000-000000000004', x'2f64', 'utf8', '/d',
+                     '2026-08-30T00:00:00.000Z', '2026-08-30T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+
+        let opts = MigrationOpts {
+            backup_dir: Some(backup_dir.clone()),
+            keep_generations: 3,
+        };
+        let outcome = run_migrations(&mut conn, MIGRATIONS, &opts).unwrap();
+        assert_eq!(outcome.applied, vec![3]);
+        assert_eq!(read_user_version(&conn).unwrap(), LATEST_VERSION);
+        let backup = outcome.backup.expect("v2からの移行でbackup作成");
+        assert!(backup.starts_with(&backup_dir));
+
+        // v3の複合indexが存在
+        let idx: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_files_root_os_file_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1);
+        // データは無傷
         let n: i64 = conn
             .query_row("SELECT count(*) FROM library_roots", [], |r| r.get(0))
             .unwrap();
@@ -432,7 +476,7 @@ mod tests {
 
         // 実migration一覧の後に、途中で失敗するテストmigrationを注入して実行
         let mut list: Vec<Migration> = MIGRATIONS.to_vec();
-        list.push(failing_migration_v3());
+        list.push(failing_migration_v4());
         let opts = MigrationOpts {
             backup_dir: Some(backup_dir.clone()),
             keep_generations: 3,
@@ -470,7 +514,7 @@ mod tests {
 
         // 再実行 (今度は成功するテストmigration) で最新→+1へ進めることもできる
         let mut list_ok: Vec<Migration> = MIGRATIONS.to_vec();
-        list_ok.push(ok_migration_v3());
+        list_ok.push(ok_migration_v4());
         let outcome = run_migrations(&mut conn, &list_ok, &opts).unwrap();
         assert_eq!(outcome.applied, vec![LATEST_VERSION + 1]);
         assert_eq!(read_user_version(&conn).unwrap(), LATEST_VERSION + 1);
@@ -484,7 +528,7 @@ mod tests {
         run_migrations(&mut conn, MIGRATIONS, &MigrationOpts::default()).unwrap();
 
         let mut list: Vec<Migration> = MIGRATIONS.to_vec();
-        list.push(ok_migration_v3());
+        list.push(ok_migration_v4());
         let opts = MigrationOpts {
             backup_dir: Some(backup_dir.clone()),
             keep_generations: 3,
@@ -513,7 +557,7 @@ mod tests {
         let mut conn = Connection::open(tmp.path().join("db.sqlite3")).unwrap();
         run_migrations(&mut conn, MIGRATIONS, &MigrationOpts::default()).unwrap();
         let mut list: Vec<Migration> = MIGRATIONS.to_vec();
-        list.push(ok_migration_v3());
+        list.push(ok_migration_v4());
         let opts = MigrationOpts {
             backup_dir: Some(backup_dir.clone()),
             keep_generations: 3,

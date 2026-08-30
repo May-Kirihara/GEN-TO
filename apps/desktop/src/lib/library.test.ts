@@ -47,6 +47,7 @@ function makeIpc(state: IpcState): LibraryIpc {
             hashed: 3,
             pending_hash: 0,
             errors: 0,
+            watch_degraded: false,
           } as T;
         default:
           return undefined as T;
@@ -190,6 +191,31 @@ describe("LibraryStore", () => {
     expect(store.status.scanning).toBe(false);
     expect(store.status.phase).toBeNull();
     expect(store.lastError).toBeNull();
+  });
+
+  it("refreshStatus surfaces watch_degraded degradation flag", async () => {
+    // FG-WP2: watcher未確立 (inotify上限等) はstatusのwatch_degradedで露出。
+    const ipc = makeIpc(state);
+    ipc.invoke = async <T>(command: string): Promise<T> => {
+      if (command === "scan_status") {
+        return {
+          scanning: false,
+          phase: null,
+          found: 0,
+          updated: 0,
+          relocated: 0,
+          missing: 0,
+          hashed: 0,
+          pending_hash: 0,
+          errors: 0,
+          watch_degraded: true,
+        } as T;
+      }
+      return makeIpc(state).invoke<T>(command);
+    };
+    const degradedStore = new LibraryStore(ipc);
+    await degradedStore.refreshStatus();
+    expect(degradedStore.status.watch_degraded).toBe(true);
   });
 
   it("dispose stops polling and unlistens", async () => {

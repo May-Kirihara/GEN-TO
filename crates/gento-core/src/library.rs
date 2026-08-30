@@ -18,15 +18,20 @@
 //!      評価等のメタデータは失われない)
 //!    - 既存・missing再出現 → upsert (present復帰。size/mtime同一なら
 //!      リンク保持)
-//!    - 未知パス + os_file_idが既存レコードと一致 → 外部移動・改名と
-//!      判定し [`FileRepo::relocate_file`] で同一レコードのrel_pathを更新
-//!      (uuid・assetリンク保持)
+//!    - 未知パス + os_file_idが既存レコードと一致 **かつ size/mtimeも一致**
+//!      → 外部移動・改名と判定し [`FileRepo::relocate_file`] で同一レコードの
+//!      rel_pathを更新 (uuid・assetリンク保持)。size/mtimeが不一致なら移動と
+//!      みなさず新規扱い (inode再利用・移動+内容変化からuuid/assetを保護)
 //!    - 未知パス (照合なし) → 新規upsert
 //! 3. walk後に一度も見なかった既存File (scope内) は `missing` 化
-//!    (削除しない。メタデータ保持)
+//!    (削除しない。メタデータ保持)。ただし列挙に失敗したパス配下
+//!    (権限不足等。[`WalkError::blocks_missing`]) は保守的に現状維持とする
 //! 4. asset未リンクのFile (新規・変更・ハッシュ未完了) をハッシュ待ちとして
 //!    返す。呼び出し側が低優先度 (Background) でBLAKE3を計算し
-//!    [`hash_and_link_file`] でAssetへ統合する
+//!    [`hash_and_link_file`] でAssetへ統合する。リンクは
+//!    「ハッシュ時の (size, mtime) がDBレコードの直近観測と一致する場合に
+//!    のみ」行われる (世代検証。古いジョブの完了が新しいスキャンを
+//!    追い越しても誤リンクしない)
 //!
 //! # キャンセルと再開
 //!
@@ -69,13 +74,38 @@ pub struct ScanEntry {
     pub os_file_id: Option<OsFileId>,
 }
 
+/// 走査中の個別エラー (ルート相対パス解決済み)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalkError {
+    /// エラー対象のルート相対パス。ルート自体の失敗は空パス。
+    pub rel_path: PathBuf,
+    pub reason: String,
+    /// `true` = このパス (配下含む) の不在化を禁じる。
+    /// 「パスは存在するが読めない」(権限不足等) 場合にtrue。
+    /// パス自体が消えた (走査中削除・ルート不在) 場合はfalse —
+    /// そこは実際に不在のためmissing化が正しい。
+    pub blocks_missing: bool,
+}
+
+impl WalkError {
+    /// 進捗・ログ用の1行表現。
+    pub fn to_display(&self) -> String {
+        let path = if self.rel_path.as_os_str().is_empty() {
+            ".".to_string()
+        } else {
+            self.rel_path.display().to_string()
+        };
+        format!("{path}: {}", self.reason)
+    }
+}
+
 /// walk全体の結果。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WalkOutcome {
     /// 列挙したファイルエントリ総数 (拡張子を問わない)。
     pub entries_walked: u64,
     /// 個別エラー (権限不足等。走査は継続する)。
-    pub errors: Vec<String>,
+    pub errors: Vec<WalkError>,
 }
 
 /// ファイルハッシュ計算の失敗。
@@ -83,6 +113,9 @@ pub struct WalkOutcome {
 pub enum HashFileError {
     Io(String),
     Cancelled,
+    /// 計算対象の世代が古い (計算中の変化・新旧スキャン間での不一致)。
+    /// 結果は破棄され、ファイルは未リンクのまま次回スキャンで再ハッシュされる。
+    Stale(String),
 }
 
 impl std::fmt::Display for HashFileError {
@@ -90,18 +123,21 @@ impl std::fmt::Display for HashFileError {
         match self {
             HashFileError::Io(msg) => write!(f, "hash io error: {msg}"),
             HashFileError::Cancelled => f.write_str("hash cancelled"),
+            HashFileError::Stale(msg) => write!(f, "hash stale: {msg}"),
         }
     }
 }
 
 impl std::error::Error for HashFileError {}
 
-/// ハッシュ計算結果。
+/// ハッシュ計算結果。`mtime_ms` は計算時に変化なしを検証した観測値で、
+/// リンク時の世代検証 ([`hash_and_link_file`]) に使う。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileContentHash {
     /// `blake3:<64hex小文字>` 形式。
     pub content_hash: String,
     pub byte_size: u64,
+    pub mtime_ms: u64,
 }
 
 /// ファイルシステム操作の抽象 (実装: gento-image)。
@@ -117,7 +153,10 @@ pub trait ScanFs: Send + Sync {
     ) -> WalkOutcome;
 
     /// 寸法プローブ (WP-2ではPNGのみ。他形式・失敗時は `None`)。
-    fn probe_dims(&self, path: &Path) -> Option<(u32, u32)>;
+    /// `expect` はハッシュ計算時に検証済みの (size, mtime)。プローブ前後で
+    /// メタデータが `expect` から乖離した場合 (プローブが別世代を読んだ) は
+    /// `None` を返し、寸法を破棄する (ハッシュ結果との不一致を防ぐ)。
+    fn probe_dims(&self, path: &Path, expect: &FileContentHash) -> Option<(u32, u32)>;
 
     /// ファイル全体のBLAKE3ハッシュ。チャンクごとに `cancel` を検査する。
     fn content_hash(
@@ -174,12 +213,13 @@ fn read_one<T>(
     slot.unwrap_or_else(|| Err(RepoError::Db("read callback did not run".to_string())))
 }
 
-/// [`RepoStore::write`] で単一値を取り出すヘルパ。
-fn write_ret<T>(
+/// [`RepoStore::write`] で単一値を取り出すヘルパ。`E: From<RepoError>` により
+/// 接続自体の失敗も呼び出し側のエラー型へ変換される。
+fn write_ret<T, E: From<RepoError>>(
     store: &dyn RepoStore,
-    f: impl FnOnce(&dyn AllRepos) -> Result<T, RepoError>,
-) -> Result<T, RepoError> {
-    let mut slot: Option<Result<T, RepoError>> = None;
+    f: impl FnOnce(&dyn AllRepos) -> Result<T, E>,
+) -> Result<T, E> {
+    let mut slot: Option<Result<T, E>> = None;
     let mut f = Some(f);
     let mut closure = |repos: &dyn AllRepos| -> Result<(), RepoError> {
         if let Some(f) = f.take() {
@@ -188,7 +228,7 @@ fn write_ret<T>(
         Ok(())
     };
     store.write(&mut closure)?;
-    slot.unwrap_or_else(|| Err(RepoError::Db("write callback did not run".to_string())))
+    slot.unwrap_or_else(|| Err(RepoError::Db("write callback did not run".to_string()).into()))
 }
 
 /// スキャンの位相。
@@ -314,7 +354,7 @@ pub fn scan_root(
             .walk_errors
             .iter()
             .take(ERROR_SAMPLE_LIMIT)
-            .cloned()
+            .map(|e| e.to_display())
             .collect(),
     };
     progress(summary.progress);
@@ -329,6 +369,17 @@ enum PendingOp {
     Upsert(FileUpsert),
     /// 外部移動・改名: (既存file_id, 移動後の属性)。
     Relocate(i64, FileUpsert),
+}
+
+/// 1バッチのコミット結果。
+struct BatchOutcome {
+    /// upsert (新規 + relocationフォールバック) の結果行。
+    records: Vec<FileRecord>,
+    /// relocate成功行。
+    relocated: Vec<FileRecord>,
+    /// relocationがDuplicate/NotFoundでフォールバックした旧file_id
+    /// (seenから解除して不在化対象へ戻す)。
+    fallback_old_ids: Vec<i64>,
 }
 
 struct ScanCtx<'a> {
@@ -348,7 +399,7 @@ struct ScanCtx<'a> {
     relocated: u64,
     missing: u64,
     entries_walked: u64,
-    walk_errors: Vec<String>,
+    walk_errors: Vec<WalkError>,
     write_error: Option<RepoError>,
 }
 
@@ -428,23 +479,32 @@ impl<'a> ScanCtx<'a> {
             if let Some(old_rel) = self.by_os_file_id.get(&id).cloned() {
                 if let Some(old) = self.existing.get(&old_rel).cloned() {
                     if !self.seen_ids.contains(&old.id) {
-                        self.seen_ids.insert(old.id);
-                        self.relocated += 1;
-                        // 移動は内容不変のためassetリンク保持 (detachしない)。
-                        self.pending.push(PendingOp::Relocate(
-                            old.id,
-                            FileUpsert {
-                                root_id: self.root.id,
-                                rel_path: entry.rel_path,
-                                display_name,
-                                byte_size: entry.byte_size,
-                                mtime_ms: entry.mtime_ms,
-                                scan_state: ScanState::Present,
-                                os_file_id: entry.os_file_id,
-                                detach_asset: false,
-                            },
-                        ));
-                        return;
+                        // inode一致だけでなくsize+mtimeも一致する場合のみ移動と
+                        // 判定する (ハードリンク・inode再利用・移動+内容変化から
+                        // uuid/assetリンクを保護。missing行の無期限保持下での
+                        // inode再利用対策を兼ねる)。不一致は新規扱いへ落下し、
+                        // 旧パス行はmark_missingが不在化する。
+                        let content_intact =
+                            old.byte_size == entry.byte_size && old.mtime_ms == entry.mtime_ms;
+                        if content_intact {
+                            self.seen_ids.insert(old.id);
+                            self.relocated += 1;
+                            // 移動は内容不変のためassetリンク保持 (detachしない)。
+                            self.pending.push(PendingOp::Relocate(
+                                old.id,
+                                FileUpsert {
+                                    root_id: self.root.id,
+                                    rel_path: entry.rel_path,
+                                    display_name,
+                                    byte_size: entry.byte_size,
+                                    mtime_ms: entry.mtime_ms,
+                                    scan_state: ScanState::Present,
+                                    os_file_id: entry.os_file_id,
+                                    detach_asset: false,
+                                },
+                            ));
+                            return;
+                        }
                     }
                 }
             }
@@ -465,6 +525,11 @@ impl<'a> ScanCtx<'a> {
 
     /// 蓄積した操作を小バッチでコミットする (1バッチ=1トランザクション)。
     /// 失敗は `write_error` へ退避し、以降の処理を停止する。
+    ///
+    /// relocationの失敗は種別ごとに扱う: `Duplicate`/`NotFound` は通常
+    /// upsertへフォールバック (旧パス行のseenを解除しmark_missingが不在化)。
+    /// DB・制約エラーはバッチ全体を失敗させスキャンエラーとして伝播する
+    /// (黙って捨てない)。
     fn flush(&mut self, store: &dyn RepoStore) {
         if self.write_error.is_some() {
             return;
@@ -475,36 +540,51 @@ impl<'a> ScanCtx<'a> {
             let root_path = self.root.path.clone();
             let result = write_ret(store, move |repos| {
                 let mut plain: Vec<FileUpsert> = Vec::with_capacity(chunk.len());
+                let mut relocated: Vec<FileRecord> = Vec::new();
+                let mut fallback_old_ids: Vec<i64> = Vec::new();
                 for op in &chunk {
                     match op {
                         PendingOp::Upsert(upsert) => plain.push(upsert.clone()),
                         PendingOp::Relocate(file_id, upsert) => {
-                            // 移動先rel_pathに既存行があればDuplicate →
-                            // 通常upsertへフォールバック (旧パス行はmissing化が拾う)。
-                            if let Err(RepoError::Duplicate) =
-                                repos.relocate_file(*file_id, upsert.clone())
-                            {
-                                plain.push(upsert.clone());
+                            match repos.relocate_file(*file_id, upsert.clone()) {
+                                Ok(record) => relocated.push(record),
+                                // Duplicate: 移動先rel_pathに既存行 (load後の並行
+                                // 書き込み)。NotFound: 旧行が既に消えた。いずれも
+                                // 新パスを通常upsertで確定させる。
+                                Err(RepoError::Duplicate | RepoError::NotFound) => {
+                                    fallback_old_ids.push(*file_id);
+                                    plain.push(upsert.clone());
+                                }
+                                Err(err) => return Err(err),
                             }
                         }
                     }
                 }
-                if plain.is_empty() {
-                    Ok(Vec::new())
+                let records = if plain.is_empty() {
+                    Vec::new()
                 } else {
-                    repos.upsert_files_batch(&plain)
-                }
+                    repos.upsert_files_batch(&plain)?
+                };
+                Ok(BatchOutcome {
+                    records,
+                    relocated,
+                    fallback_old_ids,
+                })
             });
             match result {
-                Ok(records) => {
-                    // asset未リンクの結果行はハッシュ待ちへ。
-                    for record in records {
+                Ok(outcome) => {
+                    // asset未リンクの結果行 (upsert・relocate両方) はハッシュ待ちへ。
+                    for record in outcome.records.iter().chain(outcome.relocated.iter()) {
                         if record.asset_id.is_none() {
                             self.pending_hash.push(PendingHash {
                                 file_id: record.id,
                                 path: root_path.join(&record.rel_path),
                             });
                         }
+                    }
+                    // フォールバックした旧idはseenから外し、不在化対象へ戻す。
+                    for id in outcome.fallback_old_ids {
+                        self.seen_ids.remove(&id);
                     }
                 }
                 Err(err) => {
@@ -516,12 +596,19 @@ impl<'a> ScanCtx<'a> {
     }
 
     /// 本次走査で未参照の既存Fileをmissing化 (scope内のみ。削除しない)。
+    /// 列挙失敗 (`blocks_missing`) パス配下のレコードは現状維持とする —
+    /// permission-denied等で「見えなかった」ことを「不在」と混同しない。
     fn mark_missing(
         &mut self,
         store: &dyn RepoStore,
         cancel: &AtomicBool,
     ) -> Result<(), RepoError> {
         let scope = self.scope;
+        let blocked: Vec<&WalkError> = self
+            .walk_errors
+            .iter()
+            .filter(|e| e.blocks_missing)
+            .collect();
         let ids: Vec<i64> = self
             .existing
             .values()
@@ -531,6 +618,10 @@ impl<'a> ScanCtx<'a> {
                     && scope
                         .map(|s| record.rel_path.starts_with(s))
                         .unwrap_or(true)
+                    && !blocked.iter().any(|e| {
+                        e.rel_path.as_os_str().is_empty()
+                            || record.rel_path.starts_with(&e.rel_path)
+                    })
             })
             .map(|record| record.id)
             .collect();
@@ -590,8 +681,29 @@ fn display_name_of(rel_path: &Path) -> String {
         .unwrap_or_else(|| rel_path.to_string_lossy().into_owned())
 }
 
+/// リンク失敗の内訳 (DB失敗と世代不一致を呼び出し側で区別する)。
+#[derive(Debug)]
+enum LinkError {
+    Repo(RepoError),
+    /// ハッシュ結果がDBレコードの直近観測世代と一致しない (結果破棄・要再走査)。
+    Stale,
+}
+
+impl From<RepoError> for LinkError {
+    fn from(err: RepoError) -> Self {
+        LinkError::Repo(err)
+    }
+}
+
 /// 1ファイルのハッシュ計算 + Asset統合 (新規なら作成) + リンク。
 /// ハッシュワーカー (Background優先度) から呼ばれる。
+///
+/// 世代検証: [`ScanFs::content_hash`] は計算前後でメタデータ (size+mtime) が
+/// 不変であることを検証した観測値を返し、プローブ ([`ScanFs::probe_dims`]) も
+/// 同一メタデータに束ねられる。リンクは書き込みトランザクション内でDBレコード
+/// の (size, mtime) と突合し、一致する場合のみ実行する。これにより
+/// 「計算中の変更」「新しいスキャン後到着した古いジョブ」は誤リンクされず
+/// [`HashFileError::Stale`] として破棄され、次回スキャンで再ハッシュされる。
 pub fn hash_and_link_file(
     store: &dyn RepoStore,
     fs: &dyn ScanFs,
@@ -600,9 +712,15 @@ pub fn hash_and_link_file(
     cancel: &AtomicBool,
 ) -> Result<AssetRecord, HashFileError> {
     let content = fs.content_hash(path, cancel)?;
-    let dims = fs.probe_dims(path);
+    let dims = fs.probe_dims(path, &content);
     let mime = mime_of(path);
     let link = write_ret(store, |repos| {
+        let Some(record) = repos.get_file(file_id)? else {
+            return Err(LinkError::Repo(RepoError::NotFound));
+        };
+        if record.byte_size != content.byte_size || record.mtime_ms != content.mtime_ms {
+            return Err(LinkError::Stale);
+        }
         let (asset, _created) = repos.create_or_get_asset(NewAsset {
             content_hash: content.content_hash.clone(),
             hash_algorithm: "blake3".to_string(),
@@ -617,7 +735,11 @@ pub fn hash_and_link_file(
     });
     match link {
         Ok(asset) => Ok(asset),
-        Err(err) => Err(HashFileError::Io(format!("link failed: {err}"))),
+        Err(LinkError::Stale) => Err(HashFileError::Stale(format!(
+            "{}: file generation changed; result discarded",
+            path.display()
+        ))),
+        Err(LinkError::Repo(err)) => Err(HashFileError::Io(format!("link failed: {err}"))),
     }
 }
 
@@ -793,6 +915,8 @@ mod tests {
         files: StdMutex<Vec<FileRecord>>,
         assets: StdMutex<Vec<AssetRecord>>,
         write_calls: StdMutex<Vec<&'static str>>,
+        /// テスト注入: relocate_fileをこのエラーで失敗させる。
+        relocate_failure: StdMutex<Option<RepoError>>,
     }
 
     impl FakeRepos {
@@ -916,6 +1040,15 @@ mod tests {
                 .find(|f| f.root_id == root_id && f.rel_path == rel_path)
                 .cloned())
         }
+        fn get_file(&self, file_id: i64) -> Result<Option<FileRecord>, RepoError> {
+            Ok(self
+                .files
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|f| f.id == file_id)
+                .cloned())
+        }
         fn upsert_files_batch(&self, files: &[FileUpsert]) -> Result<Vec<FileRecord>, RepoError> {
             self.write_calls.lock().unwrap().push("upsert_files_batch");
             let mut out = Vec::with_capacity(files.len());
@@ -939,6 +1072,9 @@ mod tests {
         }
         fn relocate_file(&self, file_id: i64, file: FileUpsert) -> Result<FileRecord, RepoError> {
             self.write_calls.lock().unwrap().push("relocate_file");
+            if let Some(err) = self.relocate_failure.lock().unwrap().take() {
+                return Err(err);
+            }
             let mut files = self.files.lock().unwrap();
             if files.iter().any(|f| {
                 f.id != file_id && f.root_id == file.root_id && f.rel_path == file.rel_path
@@ -969,10 +1105,12 @@ mod tests {
             let mut changed = 0;
             for id in file_ids {
                 let mut files = self.files.lock().unwrap();
-                let record = files.iter_mut().find(|f| f.id == *id).unwrap();
-                if record.scan_state != state {
-                    record.scan_state = state;
-                    changed += 1;
+                // 並行削除済みの行はスキップ (SQLiteのUPDATEと同じく無視)。
+                if let Some(record) = files.iter_mut().find(|f| f.id == *id) {
+                    if record.scan_state != state {
+                        record.scan_state = state;
+                        changed += 1;
+                    }
                 }
             }
             Ok(changed)
@@ -1113,8 +1251,30 @@ mod tests {
         }
     }
 
-    /// フェイクfs: 事前に登録したエントリ群を返す。
-    struct FakeFs(StdMutex<Vec<ScanEntry>>);
+    /// フェイクfs: 事前に登録したエントリ群を返す。ハッシュ結果・プローブ
+    /// 検証・走査エラーも設定可能 (世代検証の敵対的テスト用)。
+    #[derive(Default)]
+    struct FakeFs {
+        entries: StdMutex<Vec<ScanEntry>>,
+        walk_errors: StdMutex<Vec<WalkError>>,
+        /// content_hashの戻り値 (byte_size/mtime_msはレコードとの世代検証に使う)。
+        hash: StdMutex<Option<FileContentHash>>,
+        /// プローブ時の「実メタデータ観測」。None = 常にexpectと一致。
+        probe_stat: StdMutex<Option<(u64, u64)>>,
+        dims: StdMutex<Option<(u32, u32)>>,
+    }
+
+    impl FakeFs {
+        /// レコードの (size, mtime) に合うハッシュ結果を設定する。
+        fn hash_matches(&self, size: u64, mtime: u64, hash: &str) {
+            *self.hash.lock().unwrap() = Some(FileContentHash {
+                content_hash: hash.to_string(),
+                byte_size: size,
+                mtime_ms: mtime,
+            });
+        }
+    }
+
     impl ScanFs for FakeFs {
         fn walk(
             &self,
@@ -1122,29 +1282,34 @@ mod tests {
             scope: Option<&Path>,
             sink: &mut dyn FnMut(ScanEntry),
         ) -> WalkOutcome {
-            for entry in self.0.lock().unwrap().iter() {
+            for entry in self.entries.lock().unwrap().iter() {
                 if scope.is_some_and(|s| !entry.rel_path.starts_with(s)) {
                     continue;
                 }
                 sink(entry.clone());
             }
             WalkOutcome {
-                entries_walked: self.0.lock().unwrap().len() as u64,
-                errors: Vec::new(),
+                entries_walked: self.entries.lock().unwrap().len() as u64,
+                errors: self.walk_errors.lock().unwrap().clone(),
             }
         }
-        fn probe_dims(&self, _path: &Path) -> Option<(u32, u32)> {
-            None
+        fn probe_dims(&self, _path: &Path, expect: &FileContentHash) -> Option<(u32, u32)> {
+            let stat = *self.probe_stat.lock().unwrap();
+            match stat {
+                Some((size, mtime)) if size != expect.byte_size || mtime != expect.mtime_ms => None,
+                _ => *self.dims.lock().unwrap(),
+            }
         }
         fn content_hash(
             &self,
             _path: &Path,
             _cancel: &AtomicBool,
         ) -> Result<FileContentHash, HashFileError> {
-            Ok(FileContentHash {
-                content_hash: "blake3:cafe".to_string(),
-                byte_size: 1,
-            })
+            self.hash
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or(HashFileError::Io("hash not configured".to_string()))
         }
     }
 
@@ -1169,7 +1334,7 @@ mod tests {
             repos: Arc::clone(&repos),
             fail_writes: AtomicBool::new(false),
         });
-        let fs = Arc::new(FakeFs(StdMutex::new(Vec::new())));
+        let fs = Arc::new(FakeFs::default());
         (repos, store, fs, root)
     }
 
@@ -1190,7 +1355,7 @@ mod tests {
     #[test]
     fn first_scan_registers_files_with_os_file_id() {
         let (repos, store, fs, root) = setup();
-        fs.0.lock().unwrap().extend([
+        fs.entries.lock().unwrap().extend([
             entry("a.png", 10, 1, Some((1, 100))),
             entry("sub/b.png", 20, 2, Some((1, 101))),
         ]);
@@ -1208,7 +1373,8 @@ mod tests {
     #[test]
     fn unchanged_second_scan_is_write_free_fast_path() {
         let (repos, store, fs, root) = setup();
-        fs.0.lock()
+        fs.entries
+            .lock()
             .unwrap()
             .push(entry("a.png", 10, 1, Some((1, 100))));
         run_scan(&store, &fs, &root);
@@ -1228,7 +1394,7 @@ mod tests {
     #[test]
     fn changed_file_upserts_and_detaches_asset() {
         let (repos, store, fs, root) = setup();
-        fs.0.lock().unwrap().push(entry("a.png", 10, 1, None));
+        fs.entries.lock().unwrap().push(entry("a.png", 10, 1, None));
         run_scan(&store, &fs, &root);
         // ハッシュ→リンクを模擬
         let asset = AssetRepo::create_asset(
@@ -1246,13 +1412,13 @@ mod tests {
         AssetRepo::link_file(repos.as_ref(), repos.files_cloned()[0].id, asset.id).unwrap();
 
         // 事前に「新しい内容」と同一ハッシュのAssetが存在する状況を作る
-        // (他ファイル由来と想定。FakeFsは常に blake3:cafe を返す)。
+        // (他ファイル由来と想定。FakeFsは blake3:cafe を返す)。
         let cafe = AssetRepo::create_asset(
             repos.as_ref(),
             NewAsset {
                 content_hash: "blake3:cafe".to_string(),
                 hash_algorithm: "blake3".to_string(),
-                byte_size: 1,
+                byte_size: 99,
                 mime_type: None,
                 width: None,
                 height: None,
@@ -1261,7 +1427,7 @@ mod tests {
         .unwrap();
 
         // 内容変化 (size+mtime)
-        fs.0.lock().unwrap()[0] = entry("a.png", 99, 2, None);
+        fs.entries.lock().unwrap()[0] = entry("a.png", 99, 2, None);
         let summary = run_scan(&store, &fs, &root);
         assert_eq!(summary.progress.updated, 1);
         let record = repos.files_cloned()[0].clone();
@@ -1270,6 +1436,7 @@ mod tests {
         assert_eq!(summary.pending_hash.len(), 1, "再ハッシュ待ちに登録");
 
         // 再ハッシュ → 新内容と同一ハッシュの既存Assetへ再リンク
+        fs.hash_matches(99, 2, "blake3:cafe");
         let cancel = AtomicBool::new(false);
         let pending = summary.pending_hash[0].clone();
         let relinked =
@@ -1287,11 +1454,15 @@ mod tests {
     #[test]
     fn removed_file_becomes_missing_not_deleted() {
         let (repos, store, fs, root) = setup();
-        fs.0.lock()
+        fs.entries
+            .lock()
             .unwrap()
             .extend([entry("keep.png", 1, 1, None), entry("gone.png", 2, 2, None)]);
         run_scan(&store, &fs, &root);
-        fs.0.lock().unwrap().retain(|e| e.rel_path != *"gone.png");
+        fs.entries
+            .lock()
+            .unwrap()
+            .retain(|e| e.rel_path != *"gone.png");
         let summary = run_scan(&store, &fs, &root);
         assert_eq!(summary.progress.missing, 1);
         let gone = repos
@@ -1302,7 +1473,10 @@ mod tests {
         assert_eq!(gone.scan_state, ScanState::Missing);
 
         // 再出現 → present復帰
-        fs.0.lock().unwrap().push(entry("gone.png", 2, 2, None));
+        fs.entries
+            .lock()
+            .unwrap()
+            .push(entry("gone.png", 2, 2, None));
         let summary = run_scan(&store, &fs, &root);
         assert_eq!(summary.progress.found, 0, "再出現は新規ではない");
         let back = repos
@@ -1317,14 +1491,15 @@ mod tests {
     #[test]
     fn moved_file_rediscovered_by_os_file_id_keeps_identity() {
         let (repos, store, fs, root) = setup();
-        fs.0.lock()
+        fs.entries
+            .lock()
             .unwrap()
             .push(entry("dir/a.png", 10, 5, Some((7, 42))));
         run_scan(&store, &fs, &root);
         let before = repos.files_cloned()[0].clone();
 
         // 外部で改名・移動 (同一inode)
-        fs.0.lock().unwrap()[0] = entry("moved/renamed.png", 10, 5, Some((7, 42)));
+        fs.entries.lock().unwrap()[0] = entry("moved/renamed.png", 10, 5, Some((7, 42)));
         let summary = run_scan(&store, &fs, &root);
         assert_eq!(summary.progress.relocated, 1);
         assert_eq!(summary.progress.missing, 0, "旧パスのmissing化なし");
@@ -1340,14 +1515,15 @@ mod tests {
     #[test]
     fn scope_limits_missing_marking() {
         let (repos, store, fs, root) = setup();
-        fs.0.lock().unwrap().extend([
+        fs.entries.lock().unwrap().extend([
             entry("sub/x.png", 1, 1, None),
             entry("other/y.png", 1, 1, None),
         ]);
         run_scan(&store, &fs, &root);
 
         // sub配下だけ「削除」された状態でscope走査
-        fs.0.lock()
+        fs.entries
+            .lock()
             .unwrap()
             .retain(|e| e.rel_path.starts_with("other"));
         let cancel = AtomicBool::new(false);
@@ -1374,7 +1550,8 @@ mod tests {
     fn writes_are_committed_in_small_batches() {
         let (repos, store, fs, root) = setup();
         for i in 0..5 {
-            fs.0.lock()
+            fs.entries
+                .lock()
                 .unwrap()
                 .push(entry(&format!("f{i}.png"), 1, 1, None));
         }
@@ -1401,9 +1578,9 @@ mod tests {
     #[test]
     fn cancel_stops_scan_before_missing_marking() {
         let (repos, store, fs, root) = setup();
-        fs.0.lock().unwrap().push(entry("a.png", 1, 1, None));
+        fs.entries.lock().unwrap().push(entry("a.png", 1, 1, None));
         run_scan(&store, &fs, &root);
-        fs.0.lock().unwrap().clear();
+        fs.entries.lock().unwrap().clear();
         let cancel = AtomicBool::new(true); // 最初からキャンセル
         let summary = scan_root(
             &*store,
@@ -1424,12 +1601,13 @@ mod tests {
     #[test]
     fn hash_and_link_shares_asset_between_identical_files() {
         let (repos, store, fs, root) = setup();
-        fs.0.lock().unwrap().extend([
+        fs.entries.lock().unwrap().extend([
             entry("a.png", 10, 1, None),
             entry("copy/b.png", 10, 1, None),
         ]);
         let summary = run_scan(&store, &fs, &root);
         assert_eq!(summary.pending_hash.len(), 2);
+        fs.hash_matches(10, 1, "blake3:cafe");
         let cancel = AtomicBool::new(false);
         for pending in &summary.pending_hash {
             hash_and_link_file(&*store, &*fs, pending.file_id, &pending.path, &cancel).unwrap();
@@ -1447,7 +1625,8 @@ mod tests {
         // ハッシュ中止残 (asset NULL のまま残ったFile) は次回スキャンで
         // 再びハッシュ待ちに乗る (resume)。
         let (repos, store, fs, root) = setup();
-        fs.0.lock()
+        fs.entries
+            .lock()
             .unwrap()
             .push(entry("a.png", 10, 1, Some((1, 5))));
         let first = run_scan(&store, &fs, &root);
@@ -1464,7 +1643,8 @@ mod tests {
         let (_repos, store, fs, root) = setup();
         store.fail_writes.store(true, Ordering::Relaxed);
         for i in 0..150 {
-            fs.0.lock()
+            fs.entries
+                .lock()
                 .unwrap()
                 .push(entry(&format!("f{i}.png"), 1, 1, None));
         }
@@ -1479,6 +1659,493 @@ mod tests {
             &mut |_| {},
         );
         assert!(result.is_err(), "DB書き込み失敗はErrで中断: {result:?}");
+    }
+
+    // ===== FG-WP2: 敵対的テスト (移動検出・relocation失敗・世代検証・保守的reconciliation) =====
+
+    #[test]
+    fn relocation_with_size_mismatch_is_not_a_move() {
+        // inode一致でもsize不一致 → 移動扱いしない (uuid/assetを引き継がない)。
+        let (repos, store, fs, root) = setup();
+        fs.entries
+            .lock()
+            .unwrap()
+            .push(entry("dir/a.png", 10, 5, Some((7, 42))));
+        run_scan(&store, &fs, &root);
+        let before = repos.files_cloned()[0].clone();
+        let asset = AssetRepo::create_asset(
+            repos.as_ref(),
+            NewAsset {
+                content_hash: "blake3:orig".to_string(),
+                hash_algorithm: "blake3".to_string(),
+                byte_size: 10,
+                mime_type: None,
+                width: None,
+                height: None,
+            },
+        )
+        .unwrap();
+        AssetRepo::link_file(repos.as_ref(), before.id, asset.id).unwrap();
+
+        // 同一inode・別パス・内容変化 (size相違)
+        fs.entries.lock().unwrap()[0] = entry("moved/x.png", 99, 5, Some((7, 42)));
+        let summary = run_scan(&store, &fs, &root);
+        assert_eq!(summary.progress.relocated, 0, "移動扱いしない");
+        assert_eq!(summary.progress.found, 1, "新規として登録");
+
+        let files = repos.files_cloned();
+        assert_eq!(files.len(), 2, "旧レコードは残る");
+        let old = files.iter().find(|f| f.id == before.id).unwrap();
+        assert_eq!(old.rel_path, PathBuf::from("dir/a.png"), "旧パスのまま");
+        assert_eq!(old.scan_state, ScanState::Missing, "旧パスは不在化");
+        assert_eq!(old.asset_id, Some(asset.id), "旧assetリンクは保持");
+        let new = files.iter().find(|f| f.rel_path == *"moved/x.png").unwrap();
+        assert_ne!(new.id, before.id, "別レコード (uuid不継承)");
+        assert_eq!(new.asset_id, None, "assetは引き継がれず再ハッシュ待ち");
+    }
+
+    #[test]
+    fn relocation_with_mtime_mismatch_is_not_a_move() {
+        let (repos, store, fs, root) = setup();
+        fs.entries
+            .lock()
+            .unwrap()
+            .push(entry("dir/a.png", 10, 5, Some((7, 42))));
+        run_scan(&store, &fs, &root);
+        let before = repos.files_cloned()[0].clone();
+
+        // 同一inode・同size・mtime変化 = 内容変化の可能性 → 移動扱いしない
+        fs.entries.lock().unwrap()[0] = entry("moved/x.png", 10, 9, Some((7, 42)));
+        let summary = run_scan(&store, &fs, &root);
+        assert_eq!(summary.progress.relocated, 0);
+        assert_eq!(summary.progress.missing, 1, "旧パスは不在化");
+        let files = repos.files_cloned();
+        let new = files.iter().find(|f| f.rel_path == *"moved/x.png").unwrap();
+        assert_ne!(new.id, before.id);
+        let _ = new;
+    }
+
+    #[test]
+    fn inode_reuse_against_missing_row_with_size_mismatch_is_not_relocation() {
+        // missing行を無期限保持する前提: 別ファイルがinodeを再利用しても
+        // size照合で移動と誤判定しない。
+        let (repos, store, fs, root) = setup();
+        fs.entries
+            .lock()
+            .unwrap()
+            .push(entry("old/gone.png", 10, 5, Some((7, 42))));
+        run_scan(&store, &fs, &root);
+        let gone = repos.files_cloned()[0].clone();
+        let asset = AssetRepo::create_asset(
+            repos.as_ref(),
+            NewAsset {
+                content_hash: "blake3:gone".to_string(),
+                hash_algorithm: "blake3".to_string(),
+                byte_size: 10,
+                mime_type: None,
+                width: None,
+                height: None,
+            },
+        )
+        .unwrap();
+        AssetRepo::link_file(repos.as_ref(), gone.id, asset.id).unwrap();
+
+        // 旧ファイル削除 → missing化 → 別コンテンツがinode (7,42) を再利用
+        fs.entries.lock().unwrap().clear();
+        run_scan(&store, &fs, &root);
+        assert_eq!(repos.files_cloned()[0].scan_state, ScanState::Missing);
+
+        fs.entries
+            .lock()
+            .unwrap()
+            .push(entry("brand/new.png", 777, 1, Some((7, 42))));
+        let summary = run_scan(&store, &fs, &root);
+        assert_eq!(summary.progress.relocated, 0, "inode再利用は移動でない");
+        let files = repos.files_cloned();
+        let missing = files.iter().find(|f| f.id == gone.id).unwrap();
+        assert_eq!(missing.scan_state, ScanState::Missing, "missing行のまま");
+        assert_eq!(missing.asset_id, Some(asset.id), "旧assetも維持");
+        let unrelated = files
+            .iter()
+            .find(|f| f.rel_path == *"brand/new.png")
+            .unwrap();
+        assert_eq!(unrelated.asset_id, None, "無関係レコードは未リンク");
+    }
+
+    /// walk開始時に任意の操作を差し込めるfs (relocation失敗の競合注入用)。
+    struct RiggedFs {
+        entries: Vec<ScanEntry>,
+        before_walk: Box<dyn Fn() + Send + Sync>,
+    }
+
+    impl ScanFs for RiggedFs {
+        fn walk(
+            &self,
+            _root: &Path,
+            _scope: Option<&Path>,
+            sink: &mut dyn FnMut(ScanEntry),
+        ) -> WalkOutcome {
+            (self.before_walk)();
+            for e in &self.entries {
+                sink(e.clone());
+            }
+            WalkOutcome {
+                entries_walked: self.entries.len() as u64,
+                errors: Vec::new(),
+            }
+        }
+        fn probe_dims(&self, _path: &Path, _expect: &FileContentHash) -> Option<(u32, u32)> {
+            None
+        }
+        fn content_hash(
+            &self,
+            _path: &Path,
+            _cancel: &AtomicBool,
+        ) -> Result<FileContentHash, HashFileError> {
+            Err(HashFileError::Io("not configured".to_string()))
+        }
+    }
+
+    #[test]
+    fn relocate_duplicate_falls_back_to_upsert_and_missing_marks_old() {
+        // load_existing後に移動先へ並行書き込みがある競合: relocateが
+        // Duplicateでも新パスをupsertで確定させ、旧パス行を確実にmissing化する
+        // (黙って捨てない)。
+        let (repos, store, _fs, root) = setup();
+        repos.files.lock().unwrap().push(FileRecord {
+            id: 1,
+            uuid: "00000000-0000-7000-8000-000000000001".to_string(),
+            root_id: root.id,
+            asset_id: None,
+            rel_path: PathBuf::from("old/a.png"),
+            display_name: "a.png".to_string(),
+            extension: Some("png".to_string()),
+            byte_size: 10,
+            mtime_ms: 5,
+            scan_state: ScanState::Present,
+            os_file_id: Some(OsFileId::new(7, 42)),
+            last_seen_at: "2026-08-30T00:00:00.000Z".to_string(),
+            created_at: "2026-08-30T00:00:00.000Z".to_string(),
+            updated_at: "2026-08-30T00:00:00.000Z".to_string(),
+        });
+        *repos.next_id.lock().unwrap() = 1;
+        // 競合: walk開始時 (load_existing後) に移動先パスへ別行が既にある
+        let racer = Arc::clone(&repos);
+        let fs = RiggedFs {
+            entries: vec![entry("new/b.png", 10, 5, Some((7, 42)))],
+            before_walk: Box::new(move || {
+                let _ = racer.upsert_file(FileUpsert {
+                    root_id: 1,
+                    rel_path: PathBuf::from("new/b.png"),
+                    display_name: "b.png".to_string(),
+                    byte_size: 1,
+                    mtime_ms: 1,
+                    scan_state: ScanState::Present,
+                    os_file_id: None,
+                    detach_asset: false,
+                });
+            }),
+        };
+        let cancel = AtomicBool::new(false);
+        let summary = scan_root(
+            &*store,
+            &fs,
+            &root,
+            None,
+            &cancel,
+            &ScanOptions::default(),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        let files = repos.files_cloned();
+        let old = files.iter().find(|f| f.rel_path == *"old/a.png").unwrap();
+        assert_eq!(old.scan_state, ScanState::Missing, "旧パスは不在化");
+        let new = files.iter().find(|f| f.rel_path == *"new/b.png").unwrap();
+        assert_eq!(new.byte_size, 10, "新パスはupsertで確定");
+        assert_eq!(new.scan_state, ScanState::Present);
+        assert_eq!(summary.progress.missing, 1);
+    }
+
+    #[test]
+    fn relocate_not_found_falls_back_to_upsert() {
+        // 旧行が走査中に消えた場合: NotFoundでも新パスを確定させる。
+        let (repos, store, _fs, root) = setup();
+        repos.files.lock().unwrap().push(FileRecord {
+            id: 1,
+            uuid: "00000000-0000-7000-8000-000000000001".to_string(),
+            root_id: root.id,
+            asset_id: None,
+            rel_path: PathBuf::from("old/a.png"),
+            display_name: "a.png".to_string(),
+            extension: Some("png".to_string()),
+            byte_size: 10,
+            mtime_ms: 5,
+            scan_state: ScanState::Present,
+            os_file_id: Some(OsFileId::new(7, 42)),
+            last_seen_at: "2026-08-30T00:00:00.000Z".to_string(),
+            created_at: "2026-08-30T00:00:00.000Z".to_string(),
+            updated_at: "2026-08-30T00:00:00.000Z".to_string(),
+        });
+        *repos.next_id.lock().unwrap() = 1;
+        let racer = Arc::clone(&repos);
+        let fs = RiggedFs {
+            entries: vec![entry("new/b.png", 10, 5, Some((7, 42)))],
+            before_walk: Box::new(move || {
+                racer.files.lock().unwrap().clear();
+            }),
+        };
+        let cancel = AtomicBool::new(false);
+        let summary = scan_root(
+            &*store,
+            &fs,
+            &root,
+            None,
+            &cancel,
+            &ScanOptions::default(),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        let files = repos.files_cloned();
+        assert_eq!(files.len(), 1, "新パスのみ残る");
+        assert_eq!(files[0].rel_path, PathBuf::from("new/b.png"));
+        assert_eq!(files[0].scan_state, ScanState::Present);
+        assert_eq!(summary.progress.missing, 0);
+    }
+
+    #[test]
+    fn relocate_db_error_fails_scan() {
+        // Duplicate/NotFound以外のrelocation失敗はスキャンエラーとして伝播。
+        let (repos, store, _fs, root) = setup();
+        repos.files.lock().unwrap().push(FileRecord {
+            id: 1,
+            uuid: "00000000-0000-7000-8000-000000000001".to_string(),
+            root_id: root.id,
+            asset_id: None,
+            rel_path: PathBuf::from("old/a.png"),
+            display_name: "a.png".to_string(),
+            extension: Some("png".to_string()),
+            byte_size: 10,
+            mtime_ms: 5,
+            scan_state: ScanState::Present,
+            os_file_id: Some(OsFileId::new(7, 42)),
+            last_seen_at: "2026-08-30T00:00:00.000Z".to_string(),
+            created_at: "2026-08-30T00:00:00.000Z".to_string(),
+            updated_at: "2026-08-30T00:00:00.000Z".to_string(),
+        });
+        *repos.relocate_failure.lock().unwrap() = Some(RepoError::Db("boom".to_string()));
+        let fs = RiggedFs {
+            entries: vec![entry("new/b.png", 10, 5, Some((7, 42)))],
+            before_walk: Box::new(|| {}),
+        };
+        let cancel = AtomicBool::new(false);
+        let result = scan_root(
+            &*store,
+            &fs,
+            &root,
+            None,
+            &cancel,
+            &ScanOptions::default(),
+            &mut |_| {},
+        );
+        let err = result.expect_err("DBエラーはスキャン失敗");
+        assert!(err.to_string().contains("boom"), "{err}");
+    }
+
+    #[test]
+    fn hash_discarded_when_generation_differs_from_record() {
+        // ハッシュ結果の (size, mtime) がDBレコードと不一致 → 破棄 (Stale)。
+        let (repos, store, fs, root) = setup();
+        fs.entries.lock().unwrap().push(entry("a.png", 10, 5, None));
+        let summary = run_scan(&store, &fs, &root);
+        assert_eq!(summary.pending_hash.len(), 1);
+
+        // 計算中にmtimeが変わった状況を模擬 (検証済み観測がレコードとズレる)
+        fs.hash_matches(10, 6, "blake3:cafe");
+        let cancel = AtomicBool::new(false);
+        let pending = summary.pending_hash[0].clone();
+        let result = hash_and_link_file(&*store, &*fs, pending.file_id, &pending.path, &cancel);
+        assert!(
+            matches!(result, Err(HashFileError::Stale(_))),
+            "世代不一致はStale: {result:?}"
+        );
+        assert_eq!(repos.files_cloned()[0].asset_id, None, "リンクされない");
+        assert!(repos.assets.lock().unwrap().is_empty(), "Assetも作らない");
+    }
+
+    #[test]
+    fn stale_hash_job_after_newer_scan_does_not_relink() {
+        // 古いジョブの完了が新しいスキャンの後に到着しても誤リンクしない。
+        let (repos, store, fs, root) = setup();
+        fs.entries.lock().unwrap().push(entry("a.png", 10, 5, None));
+        let first = run_scan(&store, &fs, &root);
+        assert_eq!(first.pending_hash.len(), 1);
+
+        // ハッシュ前に内容変化 + 再スキャン (detach + 新観測 (20,6))
+        fs.entries.lock().unwrap()[0] = entry("a.png", 20, 6, None);
+        let second = run_scan(&store, &fs, &root);
+        assert_eq!(second.progress.updated, 1);
+        assert_eq!(second.pending_hash.len(), 1);
+
+        // 古い世代 (10,5) のジョブ結果 → 破棄
+        fs.hash_matches(10, 5, "blake3:old");
+        let cancel = AtomicBool::new(false);
+        let old_pending = first.pending_hash[0].clone();
+        let result = hash_and_link_file(
+            &*store,
+            &*fs,
+            old_pending.file_id,
+            &old_pending.path,
+            &cancel,
+        );
+        assert!(matches!(result, Err(HashFileError::Stale(_))), "{result:?}");
+        assert_eq!(repos.files_cloned()[0].asset_id, None);
+
+        // 新しい世代 (20,6) はリンクされる
+        fs.hash_matches(20, 6, "blake3:new");
+        let new_pending = second.pending_hash[0].clone();
+        let linked = hash_and_link_file(
+            &*store,
+            &*fs,
+            new_pending.file_id,
+            &new_pending.path,
+            &cancel,
+        )
+        .unwrap();
+        let files = repos.files_cloned();
+        assert_eq!(files[0].asset_id, Some(linked.id));
+        assert_eq!(
+            repos.assets.lock().unwrap().len(),
+            1,
+            "古い結果のAssetは作らない"
+        );
+    }
+
+    #[test]
+    fn probe_bound_to_hash_metadata_drops_dims_on_mismatch() {
+        // プローブ時のメタデータ観測がハッシュ結果とズレたら寸法を破棄する
+        // (プローブとハッシュの別読み不一致対策)。
+        let (repos, store, fs, root) = setup();
+        fs.entries
+            .lock()
+            .unwrap()
+            .extend([entry("a.png", 10, 5, None), entry("b.png", 10, 5, None)]);
+        let summary = run_scan(&store, &fs, &root);
+        fs.hash_matches(10, 5, "blake3:cafe");
+        *fs.dims.lock().unwrap() = Some((640, 480));
+        let cancel = AtomicBool::new(false);
+
+        // a.png: プローブ観測がズレる → 寸法NULLでリンク
+        *fs.probe_stat.lock().unwrap() = Some((10, 6));
+        let a = summary
+            .pending_hash
+            .iter()
+            .find(|p| p.path.ends_with("a.png"))
+            .unwrap();
+        let asset_a = hash_and_link_file(&*store, &*fs, a.file_id, &a.path, &cancel).unwrap();
+        assert_eq!(asset_a.width, None, "ズレたプローブの寸法は破棄");
+
+        // b.png: 観測一致 → 寸法採用 (別内容として独立Asset)
+        *fs.probe_stat.lock().unwrap() = Some((10, 5));
+        fs.hash_matches(10, 5, "blake3:beef");
+        let b = summary
+            .pending_hash
+            .iter()
+            .find(|p| p.path.ends_with("b.png"))
+            .unwrap();
+        let asset_b = hash_and_link_file(&*store, &*fs, b.file_id, &b.path, &cancel).unwrap();
+        assert_eq!(asset_b.width, Some(640));
+        assert_eq!(asset_b.height, Some(480));
+        let _ = repos;
+    }
+
+    #[test]
+    fn partial_walk_blocked_subtree_is_not_missing_marked() {
+        // permission-denied等で列挙できなかったサブツリー配下はmissing化しない。
+        let (repos, store, fs, root) = setup();
+        fs.entries.lock().unwrap().extend([
+            entry("ok.png", 1, 1, None),
+            entry("locked/a.png", 2, 2, None),
+            entry("locked/deep/b.png", 3, 3, None),
+        ]);
+        run_scan(&store, &fs, &root);
+
+        fs.entries
+            .lock()
+            .unwrap()
+            .retain(|e| !e.rel_path.starts_with("locked"));
+        *fs.walk_errors.lock().unwrap() = vec![WalkError {
+            rel_path: PathBuf::from("locked"),
+            reason: "permission denied".to_string(),
+            blocks_missing: true,
+        }];
+        let summary = run_scan(&store, &fs, &root);
+        assert_eq!(summary.progress.missing, 0, "列挙失敗サブツリーは現状維持");
+        assert_eq!(summary.progress.errors, 1, "不完全走査は警告として残る");
+        assert!(summary.error_samples[0].contains("locked"));
+        for record in repos.files_cloned() {
+            assert_eq!(
+                record.scan_state,
+                ScanState::Present,
+                "{}",
+                record.rel_path.display()
+            );
+        }
+
+        // 列挙に成功した次回はmissing化が進む
+        fs.walk_errors.lock().unwrap().clear();
+        let summary = run_scan(&store, &fs, &root);
+        assert_eq!(summary.progress.missing, 2, "今度は不在化");
+    }
+
+    #[test]
+    fn vanished_paths_do_not_block_missing_marking() {
+        // パス自体が消えたエラー (走査中削除・ルート不在) は実際の不在のため
+        // missing化をブロックしない。
+        let (repos, store, fs, root) = setup();
+        fs.entries.lock().unwrap().extend([
+            entry("keep.png", 1, 1, None),
+            entry("gone/dir/x.png", 2, 2, None),
+        ]);
+        run_scan(&store, &fs, &root);
+
+        fs.entries
+            .lock()
+            .unwrap()
+            .retain(|e| e.rel_path == *"keep.png");
+        *fs.walk_errors.lock().unwrap() = vec![WalkError {
+            rel_path: PathBuf::from("gone"),
+            reason: "No such file or directory".to_string(),
+            blocks_missing: false,
+        }];
+        let summary = run_scan(&store, &fs, &root);
+        assert_eq!(summary.progress.missing, 1, "消えたパスはmissing化");
+        let _ = repos;
+    }
+
+    #[test]
+    fn root_level_walk_error_blocks_all_missing_marking() {
+        // ルート自体の列挙失敗 (空rel_path) はスコープ全体の不在化を禁じる。
+        let (repos, store, fs, root) = setup();
+        fs.entries
+            .lock()
+            .unwrap()
+            .extend([entry("a.png", 1, 1, None), entry("b.png", 2, 2, None)]);
+        run_scan(&store, &fs, &root);
+
+        fs.entries.lock().unwrap().clear();
+        *fs.walk_errors.lock().unwrap() = vec![WalkError {
+            rel_path: PathBuf::new(),
+            reason: "permission denied".to_string(),
+            blocks_missing: true,
+        }];
+        let summary = run_scan(&store, &fs, &root);
+        assert_eq!(summary.progress.missing, 0);
+        assert_eq!(repos.files_cloned().len(), 2, "レコードはそのまま");
+        for record in repos.files_cloned() {
+            assert_eq!(record.scan_state, ScanState::Present);
+        }
     }
 
     // ===== WatchBuffer =====

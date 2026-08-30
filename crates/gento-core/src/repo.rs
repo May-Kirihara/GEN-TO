@@ -364,6 +364,10 @@ pub trait FileRepo {
     /// `root_id` + `rel_path` でFileを引く。
     fn find_by_path(&self, root_id: i64, rel_path: &Path) -> Result<Option<FileRecord>, RepoError>;
 
+    /// 主キーでFileを引く (ハッシュリンク時の世代検証用。rel_pathは
+    /// 移動・改名で変わり得るため照合キーにできない)。
+    fn get_file(&self, file_id: i64) -> Result<Option<FileRecord>, RepoError>;
+
     /// [`FileRepo::upsert_file`] のバッチ版 (data-model §13「小さなバッチで
     /// コミット」)。1呼び出し=1トランザクション。呼び出し側がバッチサイズを
     /// 制御し、writer接続を長時間専有しない。

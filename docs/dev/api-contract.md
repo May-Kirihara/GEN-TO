@@ -726,6 +726,10 @@ invoke<null>("library_roots_set_enabled", { rootId: string, enabled: boolean })
 
 - `remove`: 監視停止 → ルート削除 (配下FileはCASCADE削除。**Assetは残る**
   — 評価等の共有メタデータ保持) → `roots:changed`。
+  **orphan Assetの保持は設計上の挙動** (FG-WP2時点の明記): ルート解除後、
+  どのFileからも参照されないAsset行 (と評価・タグ等) はDBに残り続ける。
+  同一内容を再登録・他ルートで発見した際に統合 (メタデータ保持) される
+  ため。明示的なGC (未参照Asset掃除) はWP-15で検討する。
 - `set_enabled(false)`: 監視停止・スキャン対象外 (File行は保持)。
   `set_enabled(true)`: 監視再開 + 当該ルートのスキャン投入。
 - 不正な `rootId` (非数字) は reject。
@@ -744,8 +748,14 @@ type LibraryScanStatus = {
   phase: "scanning" | "hashing" | null;
   found: number; updated: number; relocated: number; missing: number;
   hashed: number; pending_hash: number; errors: number;
+  watch_degraded: boolean;  // FG-WP2: watcher未確立の有効ルートあり (下記)
 };
 ```
+
+- `watch_degraded` は「有効・監視ON・パス存在なのにwatcherが確立できて
+  いないルートがある」場合にtrue (inotify上限到達等)。この状態でも
+  メンテナンス周期 (60秒) のポーリング再スキャンで変更は拾われ続ける
+  (即時性のみ劣化)。watcherの再確立も同じ周期で試行される。
 
 - `scan_start` はワーカー処理中 (`scanning: true`) の呼び出しを
   `"scan already in progress"` で拒否。既定ではUIから非同期で完了する。
@@ -834,12 +844,23 @@ WP-5のメタデータ編集は**安定ID (assets.id) を指定して**行うこ
 - 結合後の変化パスから影響ディレクトリを導出し、そのサブツリーのみ差分
   スキャン (`scope`)。スコープが24箇所を超えるかイベント欠落 (overflow・
   未知イベント種・watcherエラー) を検出した場合は**全体再スキャン**で収束。
+  overflow (watcherエラー・未知イベント種を含む) は**通常イベントが1件も
+  来なくても** debounceスレッドの50ms tickで検出され、全体再スキャンが
+  発火する (FG-WP2修正)。
 - スコープ差分スキャンはファイルシステムの最終状態のみに依存して冪等
   (size+mtime高速判定 + os_file_id移動検出 + 未参照missing化) のため、
   **大量イベント後も最終状態が一致する** (受入条件5。テスト
   `watcher_burst_of_many_events_converges` で実inotifyにより証明)。
-- ルート自体の削除 (アンマウント含む) はwatcher停止 + `roots:changed`。
-  DBのルート行・File行は保持。
+- **移動検出の内容検証 (FG-WP2)**: os_file_id (inode) 一致に加えて
+  size+mtime一致を必須とする。不一致は移動扱いせず新規登録+旧パスmissing化
+  (inode再利用・移動+内容変更からuuid/assetリンクを保護)。
+- **不完全走査の保守的reconciliation (FG-WP2)**: 権限不足等で列挙に
+  失敗したパス配下のレコードはmissing化しない (walkエラーは
+  `scan_status.errors` と`error_samples`で警告として露出)。パス自体が
+  消えたエラーは実際の不在のためmissing化をブロックしない。
+- ルート自体の削除 (アンマウント含む) はwatcher解放 + `roots:changed`。
+  DBのルート行・File行は保持。**ルート再出現時はメンテナンス周期 (60秒) で
+  watcherを再確立し再スキャンする** (FG-WP2修正)。
 - アプリ内からのスキャン中に到着したイベントはワーカーキューへ蓄積され、
   スキャン完了後に適用される (バッファリング)。
 
@@ -853,3 +874,7 @@ WP-5のメタデータ編集は**安定ID (assets.id) を指定して**行うこ
 | 4 | 変更検出時 (size/mtime変化) は assetリンクを一度解除 (NULL化) し、再ハッシュで再リンク | 列追加なし (migration #2はindexのみの要件) で「内容変化 → 別Asset」を実現。同一内容なら同一Assetへ再リンクされメタデータは失われない |
 | 5 | ハッシュ計算はサムネイルとは別の専用ワーカープール (2ワーカー) でBackground優先度 | gento-image WorkerPoolの優先度・キャンセル・一時停止機構を再利用しつつ、サムネイル生成 (Interactive/Viewport) をハッシュが飢餓させない分離。scan_stopで協調キャンセル |
 | 6 | `overlapping_roots` の照合はcanonicalize後のパスで実施 (呼び出し側で正規化) | WP-1の設計 (字面比較・シンボリックリンク解決は呼び出し側) を踏襲 |
+| 7 | **ハッシュの世代検証 (FG-WP2)**: 計算はopen済みfdから読み、計算前後の (size, mtime) を検証。リンクは書き込みトランザクション内でDBレコードの観測と突合し、一致時のみ実行 | 計算中の変更・rename/replace (inode差し替え)・「新しいスキャン後に到着した古いジョブ」を確実に破棄 (Stale) し、誤Assetリンクを防ぐ。寸法プローブも同一メタデータ検証に束ね、別読み不一致を排除 |
+| 8 | **ハッシュ会計 (FG-WP2)**: `pending_hash` は「submit成功 (新規Enqueued) 数 − プール完了通知数」で厳密に維持。減算は完了通知ドリブンの会計スレッドが行う | dedup統合 (同一file_idジョブのマージ)・queue満杯放棄・キャンセル・pool shutdown放棄のすべてで増減が1:1に対応し、終了時に厳密に0になる (`hash_accounting_is_exact_under_dedup_queue_saturation_and_shutdown`) |
+| 9 | **relocation失敗の伝播 (FG-WP2)**: `Duplicate`/`NotFound` は通常upsertへフォールバック (旧パス行はseen解除→不在化)。DB・制約エラーはスキャンエラーとして伝播・集計 | 失敗を黙って捨てると「移動でも不在化でもない」行が残る (Codex指摘) |
+| 10 | **メンテナンス周期 (60秒) の導入 (FG-WP2)**: watcher再確立・不在ルートのwatcher解放・degraded時のポーリング再スキャンをワーカーのアイドル時に実行 | inotify上限・ルート再出現への劣化運用。新規スレッドを増やさずワーカーループのrecv_timeoutで実現 |
