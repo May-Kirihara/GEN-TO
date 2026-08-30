@@ -91,7 +91,7 @@ GENTO_LOG=info GENTO_DEV_BRIDGE=1 NO_COLOR=1 \
   --cache-dir /tmp/gento-cache 2>&1 | tee app.log
 ```
 
-- `GENTO_DEV_BRIDGE=1` で計測ブリッジ (F2〜F12) が有効になる。dev buildでは常に有効
+- `GENTO_DEV_BRIDGE=1` (値は厳密に `1`) で計測ブリッジ (F2〜F12) とバックエンド計測コマンドが有効になる。dev buildでもこの環境変数が必要で、未指定・`0`・その他の値では無効
 - アプリ内開発パネルに 統計 (優先度別キューを含む) / long task・ロングフレーム / 起動タイムマーク / エラー注入 を表示
 - ブリッジは1秒周期の機械可読行を `devtest:` プレフィックスでログ出力する (`grep devtest:` で採取)
 - Rustプロセス+WebView子プロセスのRSS合計は `/proc` を読むスクリプトで測定 (例: `rss-sample.sh <pid>`)

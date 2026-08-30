@@ -677,7 +677,7 @@ WebPの圧縮コストが初回サムネイル生成を遅くする可能性が�
 
 ## 21. 完了チェックリスト
 
-> 2026-08-29 PMによる完了記録。各項目は WP-1〜7 の検証実績 (cargo test 145 / vitest 216 / 実機OCR・ログ検証) および [結果文書](./technical-spike-results.md) に基づく。最終項の採否は手動確認項目 (結果文書§6) を残す**暫定**である。
+> 2026-08-29 PMによる完了記録。各項目は WP-1〜7 の検証実績 (cargo test 159 / vitest 218 (最終ゲート修正後。実施時点の値は各WP履歴参照) / 実機OCR・ログ検証) および [結果文書](./technical-spike-results.md) に基づく。最終項の採否は手動確認項目 (結果文書§6) を残す**暫定**である。
 
 - [x] Tauri 2＋Svelte 5アプリをLinuxで起動できる (WP-1: dev+release起動実証)
 - [x] Rust coreがTauriから独立している (WP-1: gento-core/imageにtauri依存なし)

@@ -30,7 +30,7 @@
 |---|---|
 | 統計スナップショット (全シナリオ) | `docs/dev/measurements/results.json` |
 | シナリオ別アプリログ | `docs/dev/measurements/logs/` (`s1s2-r{1..3}.log`, `s7s8-r{1..3}.log`, `s3-cold.log`, `s3-s9.log`, `s4-s6.log`, `s9.log`) |
-| Part A 実証ログ | `docs/dev/measurements/logs/` (`sigterm-r{1..3}.log` 終了安全, `a3-inject.log` エラー注入, `a1-priority.log` 優先度, `a2-failed-ui.log` 失敗セルUI) |
+| Part A 実証ログ | `docs/dev/measurements/logs/` (`sigterm-{1..3}.log` 終了安全, `a3-inject.log` エラー注入, `a1-priority.log` 優先度, `a2-failed-ui.log` 失敗セルUI) |
 | FG-1 再計測ログ (2026-08-30) | `docs/dev/measurements/logs/` (`s256-r{1..3}.log` S2相当再計測, `preview-r{1..3}.log` §4再計測, `v50k-scroll-r{1..3}.log` 5万件仮想スクロール) |
 | 計測ドライバ | `docs/dev/measurements/drivers/` (`run_b.py` / `run-b2.py`, `fg1-remeasure.py`, `a4-sigterm.sh`, `a3-inject.sh`, `rss-sample.sh`, `lib.sh`) |
 | スクリーンショット | 測定時: `/tmp/opencode/wp7/shots/*.png` (s2_grid_generated, a2_failed_cells, a1_priority, s3_after_scroll, s4_viewer, s5_compare2, s6_compare4, s8_cached_grid, s9_virtual_end ほか。一時領域のため消滅する) |
