@@ -105,9 +105,16 @@ impl FileOpsHost for TauriFileOpsHost {
 /// - `file_ops_execute` は `kind: delete_forever` または上書き解決の実行に
 ///   **トークン一致を必須**化する (不一致/失効/再利用はErr)。
 ///   UIのチェックボックスだけに依存しない構造強制 (レビュー指摘対応)。
+/// - FG-WP7-2 (操作バインド): トークンは発行時の**破壊的意図の正準
+///   ダイジェスト**と対で保持される。executeは実際の要求から同じ方式で
+///   ダイジェストを再計算し、一致 + トークン一致 + 未使用 + 未失効の
+///   全てを要求する — 有効なトークンを**別の**破壊的要求へ流用することを
+///   構造的に排除する。
 #[derive(Debug)]
 struct ConfirmTokenEntry {
     expires_at: std::time::Instant,
+    /// plan時に確定した破壊的意図の正準ダイジェスト (`blake3:…`)。
+    intent_digest: String,
 }
 
 /// トークンの失効までの時間。
@@ -120,8 +127,9 @@ struct ConfirmTokenStore {
 }
 
 impl ConfirmTokenStore {
-    /// 期限切れを刈り取りつつ新しいトークンを発行する。
-    fn issue(&self) -> String {
+    /// 期限切れを刈り取りつつ新しいトークンを発行する (破壊的意図の
+    /// ダイジェストに束ねる)。
+    fn issue(&self, intent_digest: String) -> String {
         let token = Uuid::now_v7().to_string();
         // v7は時刻順序付きの乱数 (122bit randomness) — 予測困難性は
         // 秘密性ではなく「持っていること」の証明に十分。
@@ -132,19 +140,108 @@ impl ConfirmTokenStore {
             token.clone(),
             ConfirmTokenEntry {
                 expires_at: now + CONFIRM_TOKEN_TTL,
+                intent_digest,
             },
         );
         token
     }
 
-    /// トークンを検証して**消費する** (1回限り)。不一致・失効はfalse。
-    fn consume(&self, token: &str) -> bool {
+    /// トークンを検証して**消費する** (1回限り)。要求の正準ダイジェストが
+    /// 発行時と一致し、かつ未失効である場合のみtrue。いかなる使用試行も
+    /// トークンを破棄する (不一致・失効・再利用の全てで焼却 = 再試行不可)。
+    fn consume(&self, token: &str, intent_digest: &str) -> bool {
         let mut guard = self.tokens.lock().unwrap_or_else(|p| p.into_inner());
         match guard.remove(token) {
-            Some(entry) => entry.expires_at > std::time::Instant::now(),
+            Some(entry) => {
+                entry.expires_at > std::time::Instant::now() && entry.intent_digest == intent_digest
+            }
             None => false,
         }
     }
+}
+
+/// 破壊的意図の正準直列化 (FG-WP7-2)。フィールド順は固定:
+/// kind / 対象file id (昇順) / 宛先 / 新名 / 上書き対象候補id (昇順)。
+///
+/// 各フィールドは「UTF-8バイト長:内容」の長さ前置で連結する — 区切り文字
+/// を含むパス・名前での直列化衝突 (異なる要求→同一バイト列) を構造的に
+/// 排除する。id列は10進数のカンマ結合のため区切りは曖昧を生まない。
+fn canonical_intent_input(
+    kind: FileOpKind,
+    file_ids: &[i64],
+    dest_dir: Option<&Path>,
+    new_name: Option<&str>,
+    conflict_file_ids: &[i64],
+) -> String {
+    let mut normalized_ids = file_ids.to_vec();
+    normalized_ids.sort_unstable();
+    let mut conflict_ids = conflict_file_ids.to_vec();
+    conflict_ids.sort_unstable();
+    let ids_csv = normalized_ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let conflicts_csv = conflict_ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let dest = dest_dir.map(|p| p.display().to_string());
+    let name = new_name.map(str::to_string);
+    // Noneと空文字を区別するため、Optionは "0:null" / "1:<内容>" のタグ付き。
+    let parts: [String; 5] = [
+        kind.as_str().to_string(),
+        ids_csv,
+        match dest {
+            Some(d) => format!("1:{d}"),
+            None => "0:null".to_string(),
+        },
+        match name {
+            Some(n) => format!("1:{n}"),
+            None => "0:null".to_string(),
+        },
+        conflicts_csv,
+    ];
+    let mut out = String::new();
+    for part in parts {
+        out.push_str(&format!("{}:{}", part.len(), part));
+    }
+    out
+}
+
+/// 破壊的意図の正準ダイジェスト (`blake3:<hex>`)。plan時とexecute時で
+/// 同一入力から同一値が得られることが契約 (決定性は
+/// `destructive_intent_digest_is_deterministic_and_unambiguous` で固定)。
+fn destructive_intent_digest(
+    kind: FileOpKind,
+    file_ids: &[i64],
+    dest_dir: Option<&Path>,
+    new_name: Option<&str>,
+    conflict_file_ids: &[i64],
+) -> String {
+    let canonical = canonical_intent_input(kind, file_ids, dest_dir, new_name, conflict_file_ids);
+    format!("blake3:{}", blake3::hash(canonical.as_bytes()).to_hex())
+}
+
+/// plan/executeの各時点で観測された内容から破壊的意図ダイジェストを
+/// 組み立てる。`plan` の衝突ステップ (= 上書き対象候補) は再計算時点の
+/// FS状態から導かれるため、plan→execute間の衝突集合変化はダイジェスト
+/// 不一致として拒否される。
+fn intent_digest_of(
+    kind: FileOpKind,
+    file_ids: &[i64],
+    dest_dir: Option<&Path>,
+    new_name: Option<&str>,
+    plan: &FileOpPlan,
+) -> String {
+    let conflict_ids: Vec<i64> = plan
+        .steps
+        .iter()
+        .filter(|s| s.conflict.is_some())
+        .map(|s| s.file.file_id)
+        .collect();
+    destructive_intent_digest(kind, file_ids, dest_dir, new_name, &conflict_ids)
 }
 
 /// ファイル操作サービス (状態はAppStateではなくモジュールglobal的に
@@ -257,6 +354,8 @@ impl FileOpsService {
     ) -> Result<FileOpPlanDto, String> {
         let files = self.resolve_files(paths)?;
         let roots = self.roots()?;
+        // 破壊的意図ダイジェストの対象id (計画前の要求解決結果から)。
+        let file_ids: Vec<i64> = files.iter().map(|f| f.file_id).collect();
         let plan = plan_file_op(
             &*self.fs,
             &self.cancel,
@@ -269,7 +368,10 @@ impl FileOpsService {
         let confirm_token = if kind == FileOpKind::DeleteForever
             || plan.steps.iter().any(|s| s.conflict.is_some())
         {
-            Some(self.confirm_tokens.issue())
+            // トークンは計画時の破壊的意図 (対象・宛先・上書き候補) の
+            // 正準ダイジェストに束ねて発行する (FG-WP7-2)。
+            let digest = intent_digest_of(kind, &file_ids, dest_dir, new_name, &plan);
+            Some(self.confirm_tokens.issue(digest))
         } else {
             None
         };
@@ -296,6 +398,8 @@ impl FileOpsService {
         self.cancel.store(false, Ordering::SeqCst);
         let files = self.resolve_files(paths)?;
         let roots = self.roots()?;
+        // 破壊的意図ダイジェストの対象id (再計画の解決結果から)。
+        let file_ids: Vec<i64> = files.iter().map(|f| f.file_id).collect();
         let plan = plan_file_op(
             &*self.fs,
             &self.cancel,
@@ -314,15 +418,19 @@ impl FileOpsService {
                 .join(" / "));
         }
         // 確認ゲート: 破壊的操作 (delete_forever / overwrite解決) には
-        // planで発行した単発トークンの一致を必須とする。
+        // planで発行した単発トークンの一致を必須とする。トークンは plan時の
+        // 破壊的意図の正準ダイジェストに束ねられているため、対象・宛先・
+        // 衝突集合 (上書き対象候補) がplanと異なる要求では一致しない
+        // (FG-WP7-2: トークンの別要求への流用排除)。
         let needs_confirm = kind == FileOpKind::DeleteForever
             || plan.steps.iter().any(|s| {
                 s.conflict.is_some()
                     && resolutions.of(s.file.file_id) == Some(ConflictResolution::Overwrite)
             });
         if needs_confirm {
+            let digest = intent_digest_of(kind, &file_ids, dest_dir, new_name, &plan);
             match confirm_token {
-                Some(token) if self.confirm_tokens.consume(token) => {}
+                Some(token) if self.confirm_tokens.consume(token, &digest) => {}
                 _ => {
                     return Err(
                         "破壊的操作の実行には確認が必要です (操作をやり直して確認ダイアログから実行してください)"
@@ -2266,5 +2374,271 @@ mod tests {
             .plan(FileOpKind::Trash, &[dir.0.join("n.png")], None, None)
             .unwrap();
         assert!(plan2.confirm_token.is_none());
+    }
+
+    // ===== FG-WP7-2: 確認トークンの操作バインド (正準ダイジェスト) =====
+
+    /// トークンは発行元の要求に束ねられている: トークンAで要求B (対象違い)
+    /// は拒否され、不一致使用でトークンは失効する。再計画の新トークンでの
+    /// 正しい要求は成功 + 消費される。
+    #[test]
+    fn confirm_token_binds_to_planned_targets() {
+        let (dir, db, service, _host, _trash) = service_with_db("token-bind");
+        let root = db.with_writer(|repos| repos.add_root(&dir.0)).unwrap();
+        dir.write("f.png", b"target-f");
+        add_root_file(&db, root.id, "f.png", b"target-f");
+        dir.write("g.png", b"target-g");
+        add_root_file(&db, root.id, "g.png", b"target-g");
+
+        // f.pngの計画で発行したトークン
+        let plan = service
+            .plan(
+                FileOpKind::DeleteForever,
+                &[dir.0.join("f.png")],
+                None,
+                None,
+            )
+            .unwrap();
+        let token = plan.confirm_token.expect("delete_foreverはトークン発行");
+
+        // トークンAで要求B (対象違い) → 拒否。g.pngは無傷。
+        let err = service
+            .execute(
+                FileOpKind::DeleteForever,
+                &[dir.0.join("g.png")],
+                None,
+                None,
+                ResolutionSpec::default(),
+                Some(&token),
+            )
+            .unwrap_err();
+        assert!(err.contains("確認が必要"), "対象違い拒否: {err}");
+        assert_eq!(std::fs::read(dir.0.join("g.png")).unwrap(), b"target-g");
+
+        // 不一致使用でトークンは失効済み — 元の正しい要求でも拒否
+        let err = service
+            .execute(
+                FileOpKind::DeleteForever,
+                &[dir.0.join("f.png")],
+                None,
+                None,
+                ResolutionSpec::default(),
+                Some(&token),
+            )
+            .unwrap_err();
+        assert!(err.contains("確認が必要"), "失効トークン拒否: {err}");
+        assert!(dir.0.join("f.png").exists());
+
+        // 再計画 → 新トークン → 正しい要求は成功 + 消費
+        let plan2 = service
+            .plan(
+                FileOpKind::DeleteForever,
+                &[dir.0.join("f.png")],
+                None,
+                None,
+            )
+            .unwrap();
+        let token2 = plan2.confirm_token.expect("再発行");
+        assert_ne!(token, token2);
+        let outcome = service
+            .execute(
+                FileOpKind::DeleteForever,
+                &[dir.0.join("f.png")],
+                None,
+                None,
+                ResolutionSpec::default(),
+                Some(&token2),
+            )
+            .unwrap();
+        assert_eq!(outcome.status, FileOpStatus::Done);
+        assert!(!dir.0.join("f.png").exists());
+
+        // 消費済みトークンの再利用 → 拒否 (g.pngがまだあるため要求として有効)
+        let err = service
+            .execute(
+                FileOpKind::DeleteForever,
+                &[dir.0.join("g.png")],
+                None,
+                None,
+                ResolutionSpec::default(),
+                Some(&token2),
+            )
+            .unwrap_err();
+        assert!(err.contains("確認が必要"), "再利用拒否: {err}");
+        assert!(dir.0.join("g.png").exists(), "g.pngは無傷");
+    }
+
+    /// 上書き要求のトークンは宛先に束ねられている: 別宛先の上書きには
+    /// 使えない (不正流用で第三者のファイルを破壊させない)。
+    #[test]
+    fn confirm_token_binds_destination_of_overwrite() {
+        let (dir, db, service, _host, _trash) = service_with_db("token-dest");
+        let root = db.with_writer(|repos| repos.add_root(&dir.0)).unwrap();
+        dir.write("c.png", b"new-content");
+        add_root_file(&db, root.id, "c.png", b"new-content");
+        let dest1 = dir.mkdir("dest1");
+        let dest2 = dir.mkdir("dest2");
+        std::fs::write(dest1.join("c.png"), b"old-1").unwrap();
+        std::fs::write(dest2.join("c.png"), b"old-2").unwrap();
+        let overwrite = ResolutionSpec {
+            global: Some(ConflictResolution::Overwrite),
+            per_file: HashMap::new(),
+        };
+
+        let plan = service
+            .plan(FileOpKind::Copy, &[dir.0.join("c.png")], Some(&dest1), None)
+            .unwrap();
+        let token = plan.confirm_token.expect("衝突ありplanはトークン発行");
+
+        // dest1へ向けたトークンでdest2の上書き → 拒否。old-2は無傷。
+        let err = service
+            .execute(
+                FileOpKind::Copy,
+                &[dir.0.join("c.png")],
+                Some(&dest2),
+                None,
+                overwrite.clone(),
+                Some(&token),
+            )
+            .unwrap_err();
+        assert!(err.contains("確認が必要"), "宛先違い拒否: {err}");
+        assert_eq!(std::fs::read(dest2.join("c.png")).unwrap(), b"old-2");
+        assert_eq!(
+            std::fs::read(dest1.join("c.png")).unwrap(),
+            b"old-1",
+            "本来の宛先も未実行"
+        );
+
+        // 再計画のトークンで正しい要求 → 成功
+        let plan2 = service
+            .plan(FileOpKind::Copy, &[dir.0.join("c.png")], Some(&dest1), None)
+            .unwrap();
+        let token2 = plan2.confirm_token.expect("再発行");
+        let outcome = service
+            .execute(
+                FileOpKind::Copy,
+                &[dir.0.join("c.png")],
+                Some(&dest1),
+                None,
+                overwrite,
+                Some(&token2),
+            )
+            .unwrap();
+        assert_eq!(outcome.status, FileOpStatus::Done);
+        assert_eq!(std::fs::read(dest1.join("c.png")).unwrap(), b"new-content");
+    }
+
+    /// plan→execute間に外部が新たな衝突を作った場合 (衝突集合の変化)、
+    /// トークンのダイジェストは不一致となり拒否される — 確認ダイアログに
+    /// 一度も表示されなかったファイルの上書きを防ぐ。
+    #[test]
+    fn confirm_token_rejects_when_conflict_set_changed_after_plan() {
+        let (dir, db, service, _host, _trash) = service_with_db("token-race");
+        let root = db.with_writer(|repos| repos.add_root(&dir.0)).unwrap();
+        dir.write("a1.png", b"one");
+        add_root_file(&db, root.id, "a1.png", b"one");
+        dir.write("a2.png", b"two");
+        add_root_file(&db, root.id, "a2.png", b"two");
+        let dest = dir.mkdir("dest");
+        // 計画時点では a1 のみ衝突
+        std::fs::write(dest.join("a1.png"), b"old-1").unwrap();
+        let overwrite = ResolutionSpec {
+            global: Some(ConflictResolution::Overwrite),
+            per_file: HashMap::new(),
+        };
+        let plan = service
+            .plan(
+                FileOpKind::Copy,
+                &[dir.0.join("a1.png"), dir.0.join("a2.png")],
+                Some(&dest),
+                None,
+            )
+            .unwrap();
+        assert!(plan.steps[0].conflict.is_some());
+        assert!(plan.steps[1].conflict.is_none());
+        let token = plan.confirm_token.expect("衝突ありplanはトークン発行");
+
+        // plan後に外部が a2 の宛先へファイルを作成 (race)
+        std::fs::write(dest.join("a2.png"), b"sneaked").unwrap();
+
+        let err = service
+            .execute(
+                FileOpKind::Copy,
+                &[dir.0.join("a1.png"), dir.0.join("a2.png")],
+                Some(&dest),
+                None,
+                overwrite,
+                Some(&token),
+            )
+            .unwrap_err();
+        assert!(err.contains("確認が必要"), "衝突集合変化は拒否: {err}");
+        // 確認されていなかった a2 宛先は上書きされない。a1 も未実行。
+        assert_eq!(std::fs::read(dest.join("a2.png")).unwrap(), b"sneaked");
+        assert_eq!(std::fs::read(dest.join("a1.png")).unwrap(), b"old-1");
+        assert!(dir.0.join("a1.png").exists() && dir.0.join("a2.png").exists());
+    }
+
+    /// 正準ダイジェストの決定性 (フィールド順・区切り固定・順序正規化) と
+    /// 非曖昧性 (区切り文字を含む値の直列化衝突がないこと) の固定。
+    #[test]
+    fn destructive_intent_digest_is_deterministic_and_unambiguous() {
+        let digest = |ids: &[i64], dest: &str, name: &str, conflicts: &[i64]| {
+            destructive_intent_digest(
+                FileOpKind::Copy,
+                ids,
+                Some(Path::new(dest)),
+                Some(name),
+                conflicts,
+            )
+        };
+        // 形式: blake3:<64hex> (hash_fileと同じ表示規約)
+        let d = digest(&[1, 2], "/dst", "n.png", &[2]);
+        assert!(d.starts_with("blake3:"), "{d}");
+        assert_eq!(d.len(), "blake3:".len() + 64);
+
+        // 決定的: 同一入力は常に同一
+        assert_eq!(digest(&[1, 2], "/dst", "n.png", &[2]), d);
+        // 対象idは順序非依存 (正規化)
+        assert_eq!(digest(&[2, 1], "/dst", "n.png", &[2]), d);
+        // 衝突候補も順序非依存 (同一集合の並べ替えは一致)
+        assert_eq!(
+            digest(&[1, 2], "/dst", "n.png", &[1, 2]),
+            digest(&[1, 2], "/dst", "n.png", &[2, 1])
+        );
+
+        // どのフィールドが変わっても別ダイジェスト
+        assert_ne!(digest(&[1, 3], "/dst", "n.png", &[2]), d, "対象id違い");
+        assert_ne!(digest(&[1, 2], "/other", "n.png", &[2]), d, "宛先違い");
+        assert_ne!(digest(&[1, 2], "/dst", "m.png", &[2]), d, "新名違い");
+        assert_ne!(
+            digest(&[1, 2], "/dst", "n.png", &[1, 2]),
+            d,
+            "上書き対象違い"
+        );
+        assert_ne!(
+            destructive_intent_digest(
+                FileOpKind::Move,
+                &[1, 2],
+                Some(Path::new("/dst")),
+                Some("n.png"),
+                &[2],
+            ),
+            d,
+            "kind違い"
+        );
+        // None と空文字の混同なし (宛先なしdelete_forever等)
+        assert_ne!(
+            destructive_intent_digest(FileOpKind::Copy, &[1, 2], None, None, &[2],),
+            digest(&[1, 2], "", "", &[2]),
+            "Noneと空文字は区別"
+        );
+
+        // 非曖昧性: 区切り文字を含む値の組み替えで同一直列化にならない
+        // (長さ前置のため「a|b」+「c」と「a」+「b|c」は別物)
+        assert_ne!(
+            digest(&[1], "/a|b", "c", &[]),
+            digest(&[1], "/a", "b|c", &[]),
+            "フィールド境界の曖昧一致なし"
+        );
     }
 }

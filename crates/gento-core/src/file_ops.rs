@@ -2081,7 +2081,18 @@ fn execute_undo_action(
                 Err(err) => Err(Box::new((err, None))),
             }
         }
-        UndoAction::DeleteCopy { path, .. } => {
+        UndoAction::DeleteCopy { path, expect } => {
+            // 実行直前再検査 (FG-WP7-2): verify_undo通過後にパスが外部で
+            // 差し替えられていた場合、**異なるファイル**をゴミ箱へ送る
+            // 破壊的TOCTOUになるため、trashの直前にトークンを再照合する
+            // (MoveBackと同じ規律)。不一致はこのactionの失敗 = 補償
+            // ロールバック発動。
+            if let Err(refusal) = verify_token(path, expect, fs) {
+                return Err(Box::new((
+                    FsOpError::precondition(refusal.describe()),
+                    None,
+                )));
+            }
             // 生成物のみをゴミ箱へ (即削除しない — 誤操作でも復帰可能)。
             // 補償 (元位置へ戻す) のため生成エントリを捕捉する。
             let entry = match fs.trash(path) {
@@ -2389,6 +2400,9 @@ mod tests {
         trashed: StdMutex<std::collections::HashMap<PathBuf, PathBuf>>,
         /// copy_fileがテンポラリを作った直後に呼ぶ観測フック。
         on_tmp_created: StdMutex<TmpHook>,
+        /// stat()呼び出し直前に呼ぶ観測フック (verify通過後・実行直前
+        /// 再検査前の外部差し替えシミュレーション用)。
+        on_stat: StdMutex<TmpHook>,
         /// free_bytesの上書き (Noneなら実ディスク値)。
         free_override: StdMutex<Option<u64>>,
     }
@@ -2447,6 +2461,9 @@ mod tests {
 
     impl FileOpsFs for TestFs {
         fn stat(&self, path: &Path) -> Result<FileStat, FsOpError> {
+            if let Some(hook) = self.on_stat.lock().unwrap().as_ref() {
+                hook(path);
+            }
             Self::stat_of(path)
         }
 
@@ -4854,6 +4871,79 @@ mod tests {
         let op = fx.store.get_operation(outcome.op_id).unwrap().unwrap();
         assert_eq!(op.status, FileOpStatus::PartialUndone);
         assert!(!op.undoable, "再undoは不可");
+    }
+
+    /// FG-WP7-2: DeleteCopyの実行直前再検査。verify_undo通過後・trash直前に
+    /// パスが外部差し替えられた場合、そのactionは失敗し差し替えファイルは
+    /// ゴミ箱へ送られない (破壊的TOCTOU窓の排除)。
+    ///
+    /// 差し替えは on_stat フックで注入: verify_undo内のverify_token (対象
+    /// パスへの1回目のstat) はオリジナルトークンを観測して通過させ、
+    /// 実行直前再検査 (2回目のstat) の直前に差し替える — 「verify後の外部
+    /// 差し替え」を決定論的に再現する。
+    #[test]
+    fn undo_delete_copy_recheck_rejects_replacement_between_verify_and_trash() {
+        let fx = fixture("undo-dc-toctou");
+        let dst_dir = fx._dir.mkdir("dest");
+        let src = fx._dir.write("c.png", b"copy-undo");
+        let record = fx
+            .store
+            .add_file(fx.root.id, &src, &fx.root.path, b"copy-undo");
+        let plan = plan_file_op(
+            &*fx.fs,
+            &fx.cancel,
+            FileOpKind::Copy,
+            vec![fx.op_file(&record, None)],
+            Some(&dst_dir),
+            None,
+            &fx.roots,
+        );
+        let outcome = fx.run(&plan, &ResolutionSpec::default());
+        let target = dst_dir.join("c.png");
+        assert!(target.exists());
+        let candidate = {
+            let ops = fx.store.get_operation(outcome.op_id).unwrap().unwrap();
+            undo_candidate_of(&ops)
+        };
+        let swapped = target.clone();
+        let stat_calls = Arc::new(StdMutex::new(0u32));
+        *fx.fs.on_stat.lock().unwrap() = Some(Box::new(move |p: &Path| {
+            if *p == swapped {
+                let mut n = stat_calls.lock().unwrap();
+                *n += 1;
+                if *n == 2 {
+                    // verify_undo通過後・実行直前再検査の直前の外部差し替え
+                    std::fs::write(&swapped, b"SWAPPED-BY-OUTSIDE").unwrap();
+                }
+            }
+        }));
+        let undo = execute_undo(
+            &*fx.store,
+            &*fx.fs,
+            &candidate,
+            &fx.roots,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(!undo.fully_undone, "差し替え検知でundo失敗: {undo:?}");
+        assert_eq!(undo.steps.len(), 1);
+        assert_eq!(undo.steps[0].status, StepStatus::Failed);
+        let error = undo.steps[0].error.as_ref().expect("失敗理由あり");
+        assert!(
+            matches!(error.kind, FsOpErrorKind::Precondition),
+            "前提再検査の失敗であること: {error}"
+        );
+        // 差し替えファイルはゴミ箱へ行かず元の位置にそのまま
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"SWAPPED-BY-OUTSIDE",
+            "差し替えファイルは無傷"
+        );
+        assert!(
+            !fx.fs.trash_dir.lock().unwrap().join("c.png").exists(),
+            "差し替えファイルはゴミ箱へ送られない"
+        );
+        assert!(src.exists(), "コピー元は無傷");
     }
 
     /// 跨界移動でコピー後のsrc削除に失敗した場合、宛先完成済みのため

@@ -28,6 +28,9 @@ libc = "0.2"
 notify = { workspace = true }
 # ファイル操作のテンポラリ名採番 (WP-7)。workspace既存pin。
 uuid = { workspace = true }
+# 確認トークンの操作バインド用正準ダイジェスト (FG-WP7-2)。
+# workspace既存pin (gento-imageと同一物。新規依存ではない)。
+blake3 = { workspace = true }
 # OSファイルマネージャーで表示・外部アプリで開く (MVP WP-4)。
 # Rust API (reveal_item_in_dir / open_path) のみ使用し、JS側plugin commandは
 # 叩かないため capability への権限追加は不要。
