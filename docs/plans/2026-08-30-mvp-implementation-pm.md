@@ -86,7 +86,12 @@ QAレビュー（ユーザー可視面）: WP-4後、WP-8後、WP-18最終。
 - 後続硬化メモ（非ブロッキング記録）: write_retの明示的SQLiteトランザクション化（crash-atomicなasset作成+link）/ os_file_id不在プラットフォームのフォールバック強化 / 敵対的in-place変更（size+mtime復元）の検出は範囲外と明記 / WP-1レビューの非ブロッカー未対応分はWP-3以降の健全性確認時に拾う。
 - 2026-08-30: **WP-3完了** (`c67cda5`、done-with-notes)。6形式対応（probe/decode/thumb/orientation/animated/背景切替）。**AVIFはblocked**: `libdav1d-dev`不足（検出・mime・型は前方実装済み、feature追加のみで有効化）。cargo 347 / vitest 246。Codex個別レビューなし（normal、基盤レビューで担保）。
 - 2026-08-30: **WP-4完了** (`60f5529` + QA-WP4 `c1fd151`)。3ペインUIシェル・ツリー・InfoPanel・クイックプレビュー・コンテキストメニュー・選別セッション。性能退行なし（S3相当long frame +0、S4相当p50同等）。QA **pass-with-concerns** → Major-2件（走査キャンセル不能→scan_token世代切替+cancel_scan+深さ/件数ガードで解決、adhocセッションID不安定→ソート永続化+再開検証で解決）+Minor-3件修正。cargo 372 / vitest 331。
-- ユーザー依頼事項: `sudo apt install libdav1d-dev`（AVIF有効化。feature `avif-native`追加は別委任）。
+- ユーザー依頼事項: `sudo apt install libdav1d-dev`（AVIF有効化。feature `avif-native`追加は別委任）。→ **完了**: ユーザーがインストール (dav1d 1.4.1)、AVIF-1 `47d9034` で有効化。WebKitGTK自体はAVIF `<img>`非対応（original表示制限→WP-17記録）。
+- 2026-08-31: **WP-5完了** (`2246de0`)。評価・選別・タグ・キャプション（一括・Undo・高速選別・比較選別）。cargo 402 / vitest 357。
+- 2026-08-31: **WP-6完了** (`785d353`)。手動/スマートコレクション（query_json・明示refresh）。cargo 434 / vitest 372。
+- 2026-08-31: **WP-7完了** (`87f2294` + FG-WP7 `07dd963` + FG-WP7-2 `44a88d7`)。Codexレビュー: 1回目reject（7ブロッカー: 恒久削除確認・上書きTOCTOU・旧ファイル保護・ゴミ箱同一性・undo原子性・tmp所有権・watcher和解）→修正→2回目reject（DeleteCopy再検査・トークンバインド）→修正→3回目**approve-with-notes**。no-clobber配置(renameat2 NOREPLACE)・意図バインド確認トークン・補償ロールバック。cargo 530 / vitest 387。**M0〜M3マイルストーン完成**。
+- GaOTTT: 2026-08-31に接続復旧。スパイク〜WP-6の保存候補14件を書き戻し済み（規約・世代トークン・会計・notify・image/Svelte実務・進捗スナップショット）。以降はWP毎に書き戻し。
+- 残余制限の追跡 (WP-7レビュー): stat→trash同一action内窓 / overwrite宛先内容はトークン非バインド / undo補償はFSレベル（DBはスキャン収束）/ 掃除のstrict正規表現foreign一致（低確率）/ crash recoveryの段階的再構築未実装 / 旧result JSON undoはfails closed。
 
 ## 9. オープンクエスチョン（ユーザー判断不要・PM判断で進行）
 
