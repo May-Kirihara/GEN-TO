@@ -982,15 +982,20 @@ impl FsChange {
 ///
 /// WP-7: アプリ内ファイル操作由来のイベントを抑制するキー照合を持つ
 /// (二重反映防止)。操作実行前に [`WatchBuffer::suppress`] で対象パスを
-/// 登録すると、そのパスのイベントは [`WatchBuffer::push`] で無視される。
-/// 走査の冪等性により抑制漏れは無害 (最終状態へ収束する) ため、抑制は
-/// 性能・イベント嵐対策と位置づける。
+/// 登録すると、そのパスのイベントは [`WatchBuffer::push`] で破棄される。
+/// **抑制中に破棄したイベントのパスは記録され**、操作完了後の
+/// 和解スキャン ([`WatchBuffer::take_suppressed_dropped`]) で外部変更を
+/// 見逃さない (過剰抑制で外部変更が失われる問題への対応。走査の冪等性
+/// により抑制漏れは無害だが、抑制中の外部変更は明示的な差分スキャンで
+/// 収束させる)。
 pub struct WatchBuffer {
     changes: Mutex<HashMap<PathBuf, FsChange>>,
     overflow: AtomicBool,
     count: AtomicU64,
     /// アプリ内操作中のパス集合 (抑制キー)。
     suppressed: Mutex<std::collections::HashSet<PathBuf>>,
+    /// 抑制中に破棄したイベントのパス (和解スキャン用)。
+    suppressed_dropped: Mutex<Vec<PathBuf>>,
 }
 
 impl Default for WatchBuffer {
@@ -1006,13 +1011,21 @@ impl WatchBuffer {
             overflow: AtomicBool::new(false),
             count: AtomicU64::new(0),
             suppressed: Mutex::new(std::collections::HashSet::new()),
+            suppressed_dropped: Mutex::new(Vec::new()),
         }
     }
 
     /// 生イベントを1件投入。抑制キー ([`WatchBuffer::suppress`]) に一致する
-    /// パスのイベントは無視する (アプリ内操作由来 — 二重反映防止)。
+    /// パスのイベントは破棄する (アプリ内操作由来 — 二重反映防止) が、
+    /// パスを [`WatchBuffer::take_suppressed_dropped`] で取り出せるよう
+    /// 記録する (操作完了後のscoped差分スキャンで外部変更を見逃さない)。
     pub fn push(&self, change: FsChange, path: PathBuf) {
         if self.is_suppressed(&path) {
+            if let Ok(mut dropped) = self.suppressed_dropped.lock() {
+                if !dropped.contains(&path) {
+                    dropped.push(path);
+                }
+            }
             return;
         }
         let mut guard = self.changes.lock().unwrap_or_else(|p| p.into_inner());
@@ -1030,7 +1043,7 @@ impl WatchBuffer {
         guard.extend(paths.iter().cloned());
     }
 
-    /// 抑制キーを解除 (操作のDB反映完了後。漏れたイベントは走査の冪等性
+    /// 抑制キーを解除 (操作のDB反映完了後)。漏れたイベントは走査の冪等性
     /// で最終状態へ収束するため安全)。
     pub fn unsuppress(&self, paths: &[PathBuf]) {
         let mut guard = self.suppressed.lock().unwrap_or_else(|p| p.into_inner());
@@ -1045,6 +1058,17 @@ impl WatchBuffer {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .contains(path)
+    }
+
+    /// 抑制中に破棄したイベントパスを取り出す (クリアする)。
+    /// 操作完了後の和解スキャン (影響ディレクトリのscoped差分) で使用する。
+    pub fn take_suppressed_dropped(&self) -> Vec<PathBuf> {
+        std::mem::take(
+            &mut *self
+                .suppressed_dropped
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        )
     }
 
     /// イベント欠落を記録 (全体再スキャンが必要)。
@@ -2758,6 +2782,32 @@ mod tests {
         assert_eq!(buffer.observed_events(), 2);
         let coalesced = buffer.drain();
         assert_eq!(coalesced.changes.len(), 2);
+    }
+
+    /// 抑制中に破棄したイベントパスは記録され、和解スキャンで取り出せる
+    /// (FG-WP7: 過剰抑制で外部変更を見逃さない)。
+    #[test]
+    fn watch_buffer_records_suppressed_dropped_paths() {
+        let buffer = WatchBuffer::new();
+        // 実操作と同様に src/dst 両パスを抑制する
+        let op_paths = vec![PathBuf::from("/r/moving.png"), PathBuf::from("/r/dest.png")];
+        buffer.suppress(&op_paths);
+        // 抑制中: 自操作由来に加え、抑制パスへの外部変更も破棄されるが、
+        // パスは和解スキャン用に記録される
+        buffer.push(FsChange::Removed, PathBuf::from("/r/moving.png"));
+        buffer.push(FsChange::Created, PathBuf::from("/r/dest.png"));
+        buffer.push(FsChange::Modified, PathBuf::from("/r/dest.png"));
+        assert!(buffer.is_empty(), "バッファへは入らない");
+        let dropped = buffer.take_suppressed_dropped();
+        assert_eq!(dropped.len(), 2, "破棄パスを記録 (重複は圧縮): {dropped:?}");
+        assert!(dropped.contains(&PathBuf::from("/r/moving.png")));
+        assert!(dropped.contains(&PathBuf::from("/r/dest.png")));
+        // 取り出しはクリアを兼ねる (二重スキャンしない)
+        assert!(buffer.take_suppressed_dropped().is_empty());
+        // 無関係パス (抑制外) は通常どおりバッファへ入る
+        buffer.push(FsChange::Created, PathBuf::from("/r/external.png"));
+        assert!(!buffer.is_empty());
+        assert!(buffer.take_suppressed_dropped().is_empty());
     }
 
     // ===== AssetId符号化 =====

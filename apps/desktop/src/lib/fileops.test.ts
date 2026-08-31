@@ -11,7 +11,9 @@ import {
   createConflictSession,
   describeKind,
   diskWarningOf,
+  executeFileOp,
   outcomeNotice,
+  planFileOp,
   resolutionsOf,
   retryArgsOf,
   summarizeOutcome,
@@ -130,6 +132,7 @@ describe("summarizeOutcome / outcomeNotice", () => {
         status: "done",
         resolution: null,
         error: null,
+        warning: null,
       },
       {
         file_id: "2",
@@ -138,6 +141,7 @@ describe("summarizeOutcome / outcomeNotice", () => {
         status: "skipped",
         resolution: "skip",
         error: null,
+        warning: null,
       },
       {
         file_id: "3",
@@ -146,6 +150,7 @@ describe("summarizeOutcome / outcomeNotice", () => {
         status: "failed",
         resolution: null,
         error: "permission",
+        warning: null,
       },
       {
         file_id: "4",
@@ -154,6 +159,7 @@ describe("summarizeOutcome / outcomeNotice", () => {
         status: "cancelled",
         resolution: null,
         error: "cancel",
+        warning: null,
       },
     ],
   };
@@ -202,6 +208,7 @@ describe("retryArgsOf", () => {
           status: "done",
           resolution: null,
           error: null,
+          warning: null,
         },
         {
           file_id: "2",
@@ -210,6 +217,7 @@ describe("retryArgsOf", () => {
           status: "failed",
           resolution: null,
           error: "x",
+          warning: null,
         },
       ],
     };
@@ -247,12 +255,80 @@ describe("misc", () => {
   });
 
   it("容量不足警告の書式 (MiB / バイト)", () => {
-    expect(diskWarningOf({ kind: "copy", steps: [], plan_errors: [], dest_root_id: null, disk_shortfall_bytes: null })).toBeNull();
+    expect(diskWarningOf({ kind: "copy", steps: [], plan_errors: [], dest_root_id: null, disk_shortfall_bytes: null, confirm_token: null })).toBeNull();
     expect(
-      diskWarningOf({ kind: "copy", steps: [], plan_errors: [], dest_root_id: null, disk_shortfall_bytes: 2 * 1024 * 1024 }),
+      diskWarningOf({ kind: "copy", steps: [], plan_errors: [], dest_root_id: null, disk_shortfall_bytes: 2 * 1024 * 1024, confirm_token: null }),
     ).toContain("2.0 MiB");
     expect(
-      diskWarningOf({ kind: "copy", steps: [], plan_errors: [], dest_root_id: null, disk_shortfall_bytes: 100 }),
+      diskWarningOf({ kind: "copy", steps: [], plan_errors: [], dest_root_id: null, disk_shortfall_bytes: 100, confirm_token: null }),
     ).toContain("100 バイト");
+  });
+});
+
+// ===== FG-WP7: 確認トークンの受け渡し・警告表示 =====
+
+describe("確認トークン (FG-WP7)", () => {
+  it("planFileOpは引数をsnake_caseへ変換して渡す (destDir/newName)", async () => {
+    const calls: Array<[string, Record<string, unknown> | undefined]> = [];
+    const ipc = {
+      invoke: async <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
+        calls.push([command, args]);
+        return { kind: "trash", steps: [], plan_errors: [], dest_root_id: null, disk_shortfall_bytes: null, confirm_token: null } as never;
+      },
+    };
+    await planFileOp(ipc, { kind: "copy", paths: ["/r/a.png"], dest_dir: "/r/d", new_name: "b.png" });
+    expect(calls[0]?.[0]).toBe("file_ops_plan");
+    expect(calls[0]?.[1]).toEqual({
+      kind: "copy",
+      paths: ["/r/a.png"],
+      destDir: "/r/d",
+      newName: "b.png",
+    });
+  });
+
+  it("executeFileOpはconfirm_tokenをargsへ含める", async () => {
+    const calls: Array<[string, Record<string, unknown> | undefined]> = [];
+    const ipc = {
+      invoke: async <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
+        calls.push([command, args]);
+        return {
+          op_id: "1",
+          kind: "delete_forever",
+          status: "done",
+          undoable: false,
+          steps: [],
+        } as never;
+      },
+    };
+    await executeFileOp(ipc, {
+      kind: "delete_forever",
+      paths: ["/r/a.png"],
+      confirm_token: "tok-1",
+    });
+    expect(calls[0]?.[0]).toBe("file_ops_execute");
+    expect(calls[0]?.[1]).toEqual({
+      args: { kind: "delete_forever", paths: ["/r/a.png"], confirm_token: "tok-1" },
+    });
+  });
+
+  it("ステップ警告はトースト文へ付記される", () => {
+    const outcome: FileOpOutcomeDto = {
+      op_id: "1",
+      kind: "move",
+      status: "done",
+      undoable: false,
+      steps: [
+        {
+          file_id: "1",
+          from: "/r/a.png",
+          to: "/r/d/a.png",
+          status: "done",
+          resolution: null,
+          error: null,
+          warning: "跨界移動のコピー後の元ファイル削除に失敗しました",
+        },
+      ],
+    };
+    expect(outcomeNotice(outcome)).toContain("跨界移動のコピー後の元ファイル削除に失敗しました");
   });
 });

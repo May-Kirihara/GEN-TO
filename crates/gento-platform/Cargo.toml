@@ -9,6 +9,10 @@ gento-core = { workspace = true }
 # OSゴミ箱への移動 (freedesktop.org Trash仕様)。失敗時の通常削除
 # フォールバックは安全原則上禁止 (呼び出し側でエラー表示のみ)。
 trash = { workspace = true }
+# renameat2(RENAME_NOREPLACE) 直接syscall (原子的no-clobberリネーム。
+# FG-WP7。docs/dev/dependency-notes.md参照)。gento-tauriと同一の直付け。
+libc = "0.2"
+
 
 [dev-dependencies]
 serde_json = { workspace = true }

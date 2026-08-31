@@ -1,29 +1,53 @@
 //! 安全なファイル操作エンジン (MVP WP-7)。
 //!
 //! ユーザーデータを初めて変更・削除する領域のため、以下の安全原則を
-//! 構造で強制する (計画書§15):
+//! 構造で強制する (計画書§15 + WP-7レビュー対応):
 //!
 //! 1. **通常削除はゴミ箱**: [`FileOpKind::Trash`] が既定の削除。
-//!    [`FileOpKind::DeleteForever`] は別操作 (UIで明示確認)。
+//!    [`FileOpKind::DeleteForever`] は別操作 (呼び出し層の確認ゲート
+//!    — 単発トークン — を通過した場合のみ実行される)。
 //!    ゴミ箱移動の失敗は通常削除へフォールバックしない (エラー表示のみ)。
-//! 2. **上書きは明示確認**: 計画 (dry-run) で衝突を検出し、
-//!    [`ConflictResolution::Overwrite`] が明示された場合のみ置換する。
+//! 2. **上書きは明示確認 + 原子的no-clobber配置**: 計画 (dry-run) で衝突を
+//!    検出し、[`ConflictResolution::Overwrite`] が明示された場合のみ
+//!    (1) 旧宛先を先にゴミ箱へ退避し (2) 新ファイルを配置する。
+//!    最終配置はすべて `renameat2(RENAME_NOREPLACE)` 相当の原子操作で
+//!    行うため、計画→実行間に宛先が現れても**上書きされない**
+//!    (TOCTOU競合は kind=AlreadyExists の失敗になる)。
 //!    解決方針未指定の衝突はスキップ (安全側)。
 //!    「操作先 == 操作元」の上書きは実行拒否 (自己破壊)。
 //! 3. **外部変更で前提が崩れたUndoは拒否**: Undo実行前に全ステップの
-//!    前提 (対象の存在・世代トークン一致・復帰先の不在) を検証し、
-//!    1つでも崩れていれば全体を拒否し理由を返す ([`verify_undo`])。
+//!    前提 (対象の存在・世代トークン一致・復帰先の不在・ゴミ箱エントリの
+//!    存在+サイズ一致) を検証し、1つでも崩れていれば全体を拒否し理由を
+//!    返す ([`verify_undo`])。
 //! 4. **コピー完了前のファイルを正規ファイルとして登録しない**:
-//!    コピーは宛先ディレクトリ内のテンポラリ名
-//!    (`.gento-tmp-` 接頭辞。[`TMP_FILE_PREFIX`]) で書き込み、完了後に
-//!    最終名へrenameしてからDB反映する。走査側 (gento-image
-//!    `is_image_entry`) も同接頭辞を画像扱いしないため、異常終了で
-//!    残ったテンポラリも登録されない (起動時掃除対象)。
+//!    コピーは宛先ディレクトリ内のテンポラリ名 (厳密形式
+//!    `.{最終名}.gento-tmp-{op_uuid}-{seq}`。[`tmp_path_for`]) で書き込み、
+//!    完了後にNOREPLACEで最終名へ確定してからDB反映する。走査側
+//!    (gento-image `is_image_entry`) も `.gento-tmp-` を含む名を画像扱い
+//!    しないため、異常終了で残ったテンポラリも登録されない
+//!    (起動時掃除は所有権検証付き — 呼び出し側 `recover_at_startup`)。
 //! 5. **操作ログを確定してからUI上の成功を通知する**: 実行は
 //!    (a) file_operations行を `executing` で確保 → (b) ファイル単位で
 //!    FS操作+DB反映 (1ファイル=1トランザクション) → (c) 全ファイル成否を
 //!    result JSONへ書き込みstatus確定、の順。呼び出し側は
 //!    [`execute_file_op`] の戻り (確定後) をもって成功通知してよい。
+//!
+//! # Undo原子性ポリシー (逐次実行 + 補償ロールバック)
+//!
+//! Undoはトランザクション的原子性を持たない複数FS操作の列であるため、
+//! 以下の構造で一貫性を保証する:
+//!
+//! - **事前検証**: [`verify_undo`] で全アクションの前提を検証してから
+//!   開始する (1つでも崩れていれば何も実行しない)。検証は記録順を考慮
+//!   (先頭側アクションが空けるパスを後続の「復帰先不在」判定に反映)。
+//! - **逐次実行 + 実行直前再検証**: 各アクションは実行直前に自分の前提を
+//!   再検証する (verifyと実行の間の外部変更にも安全側で倒れる)。
+//! - **補償ロールバック**: アクションが失敗 (またはキャンセル) した場合、
+//!   実行済みアクションを**逆順で補償**する (各補償も前提検証付き。
+//!   補償に必要な実行時情報 — 例: DeleteCopyが生成したゴミ箱エントリ —
+//!   は実行時に捕捉する)。補償結果をstatusへ正確に反映する:
+//!   全成功でのみ `undone`、巻き戻し中の失敗があれば `partial_undone`
+//!   +理由 ([`UndoOutcome`])。
 //!
 //! # 異常終了回復
 //!
@@ -48,10 +72,107 @@ use serde::{Deserialize, Serialize};
 use crate::library::{GenerationToken, RepoStore};
 use crate::repo::{FileUpsert, OsFileId, RepoError, ScanState};
 
-/// コピー進行中テンポラリのファイル名接頭辞。最終名へのrename後に正規
-/// ファイル化する。走査 (gento-image `is_image_entry`) はこの接頭辞を
-/// 画像扱いしない — 「コピー完了前のファイルを登録しない」の走査側強制。
+/// コピー進行中テンポラリのファイル名接頭辞 (旧形式。互換のため残存)。
+/// 最終名へのrename後に正規ファイル化する。走査 (gento-image
+/// `is_image_entry`) はこの接頭辞を画像扱いしない — 「コピー完了前の
+/// ファイルを登録しない」の走査側強制。
 pub const TMP_FILE_PREFIX: &str = ".gento-tmp-";
+
+/// テンポラリ名の中間マーカー。厳密形式 `.{最終名}.gento-tmp-{op_uuid}
+/// -{seq}` に含まれる (WP-7レビュー対応: 掃除の所有権検証用)。
+pub const TMP_FILE_MARKER: &str = ".gento-tmp-";
+
+/// 一時ファイルの厳密形式 `.{最終名}.gento-tmp-{op_uuid}-{seq}` を組み
+/// 立てる。`op_uuid` はfile_operations行のuuid (ハイフンは除去して
+/// 32桁hexへ正規化)。`seq` はステップ索引 (0開始・6桁固定)。
+///
+/// 一時名から操作とステップを一意に再構成できるため、起動掃除は
+/// 「記録された所有パス」「厳密形式+uuid形式検証+登録ルート配下」の
+/// みを削除対象にできる (外部作成の類似名ファイルは残置)。
+pub fn tmp_path_for(dst: &Path, op_uuid: &str, seq: usize) -> PathBuf {
+    let file_name = dst
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let uuid_simple: String = op_uuid.chars().filter(|c| *c != '-').collect();
+    let name = format!(".{file_name}{TMP_FILE_MARKER}{uuid_simple}-{seq:06}");
+    match dst.parent() {
+        Some(p) => p.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
+/// uuidの簡易形式検証 (ハイフン除去後32桁の小写hex)。
+fn is_uuid_simple_hex(s: &str) -> bool {
+    s.len() == 32
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// ファイル名がGEN-TO所有の一時ファイルの厳密形式に一致するか
+/// (`.{名前}.gento-tmp-{32桁hex}-{6桁seq}`)。uuid形式検証を含むため、
+/// 類似名の外部ファイルは一致しない。
+pub fn is_owned_tmp_name(file_name: &str) -> bool {
+    let Some(rest) = file_name.strip_prefix('.') else {
+        return false;
+    };
+    let Some(pos) = rest.rfind(TMP_FILE_MARKER) else {
+        return false;
+    };
+    let suffix = &rest[pos + TMP_FILE_MARKER.len()..];
+    let Some((uuid_part, seq_part)) = suffix.rsplit_once('-') else {
+        return false;
+    };
+    is_uuid_simple_hex(uuid_part)
+        && seq_part.len() == 6
+        && seq_part.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// 一時ファイル名から所有操作のuuid (簡易形式) を取り出す。
+/// 厳密形式に一致しない場合はNone。
+pub fn tmp_owner_uuid_simple(file_name: &str) -> Option<String> {
+    if !is_owned_tmp_name(file_name) {
+        return None;
+    }
+    let rest = file_name.strip_prefix('.')?;
+    let pos = rest.rfind(TMP_FILE_MARKER)? + TMP_FILE_MARKER.len();
+    let suffix = &rest[pos..];
+    let (uuid_part, _) = suffix.rsplit_once('-')?;
+    Some(uuid_part.to_string())
+}
+
+/// file_operations行からGEN-TOが所有する一時ファイルパスを抽出する
+/// (起動掃除の削除候補。FG-WP7)。
+///
+/// - 完了済み (result JSONあり): `steps[].tmp` に記録されたパス。
+/// - executing残留 (result JSONなし): request JSONの `files[].to` (計画時
+///   宛先) + 行uuid + step indexから決定論的に再構築。
+///   (keep_both代替名・undo経路のtmpは宛先が異なるため再構築から漏れるが、
+///   厳密形式 (uuid検証) の正規表現掃除が補完する。)
+pub fn owned_tmp_paths_of(record: &FileOpRecord) -> Vec<PathBuf> {
+    if let Some(outcome) = record
+        .result_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<FileOpOutcome>(json).ok())
+    {
+        return outcome.steps.iter().filter_map(|s| s.tmp.clone()).collect();
+    }
+    let Ok(request) = serde_json::from_str::<serde_json::Value>(&record.request_json) else {
+        return Vec::new();
+    };
+    let Some(files) = request["files"].as_array() else {
+        return Vec::new();
+    };
+    files
+        .iter()
+        .enumerate()
+        .filter_map(|(index, file)| {
+            file["to"]
+                .as_str()
+                .map(|to| tmp_path_for(Path::new(to), &record.uuid, index))
+        })
+        .collect()
+}
 
 /// 操作種別 (data-model §12)。`DeleteForever` は通常削除と意図的に分離
 /// (spec §5.1「完全削除は通常の削除操作と分離し、明示的な確認を必要とする」)。
@@ -116,6 +237,21 @@ impl std::str::FromStr for FileOpKind {
     }
 }
 
+/// ゴミ箱内エントリの厳密特定情報 (undo復帰の対象特定。WP-7レビュー対応)。
+///
+/// `trash` 実行直後に生成エントリを特定してresult JSONへ記録し、
+/// undo/restoreはこの正確なエントリを対象にする (パス再利用・複数
+/// エントリ競合での誤復帰防止)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrashEntry {
+    /// ゴミ箱ディレクトリ (`info/`・`files/` の親。
+    /// 例: `~/.local/share/Trash`、`<mount>/.Trash-1000`)。
+    pub trash_dir: PathBuf,
+    /// `files/` 内のエントリ名 (対応trashinfoのステムと一致。
+    /// 名前衝突でtrash crateが付けるsuffixも含む)。
+    pub file_name: String,
+}
+
 /// 衝突の解決方針 (spec §5.3)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -138,7 +274,7 @@ impl ConflictResolution {
     }
 }
 
-/// 操作の状態 (file_operations.status。migration #5のCHECK値)。
+/// 操作の状態 (file_operations.status。migration #6のCHECK値)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileOpStatus {
@@ -154,6 +290,9 @@ pub enum FileOpStatus {
     Failed,
     /// Undo済み。
     Undone,
+    /// Undo実行中に一部アクションが失敗し、補償ロールバックで
+    /// 巻き戻した (または補償にも失敗した)。全成功でのみ `undone`。
+    PartialUndone,
 }
 
 impl FileOpStatus {
@@ -165,6 +304,7 @@ impl FileOpStatus {
             FileOpStatus::Partial => "partial",
             FileOpStatus::Failed => "failed",
             FileOpStatus::Undone => "undone",
+            FileOpStatus::PartialUndone => "partial_undone",
         }
     }
 }
@@ -181,6 +321,7 @@ impl std::str::FromStr for FileOpStatus {
             "partial" => Ok(FileOpStatus::Partial),
             "failed" => Ok(FileOpStatus::Failed),
             "undone" => Ok(FileOpStatus::Undone),
+            "partial_undone" => Ok(FileOpStatus::PartialUndone),
             _ => Err(ParseFileOpStatusError),
         }
     }
@@ -194,7 +335,7 @@ impl std::fmt::Display for ParseFileOpStatusError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(
             "unknown operation status: expected one of \
-                     planned|executing|done|partial|failed|undone",
+                     planned|executing|done|partial|failed|undone|partial_undone",
         )
     }
 }
@@ -270,15 +411,26 @@ impl FileStat {
 
 /// ファイル操作のFS境界 (実装: gento-tauri。std fs + platform trash + BLAKE3)。
 ///
+/// # no-clobber契約 (WP-7レビュー対応: 上書きTOCTOUの排除)
+///
+/// - `rename_noreplace` は `to` が既に存在する場合 kind=AlreadyExists で
+///   失敗する**原子操作** (Linux: `renameat2(RENAME_NOREPLACE)`)。
+///   最終配置 (copy/move/keep_both・上書き時の再配置を含む) はすべてこの
+///   操作で行う — 上書き解決は先に旧宛先をゴミ箱へ退避するため、
+///   置換renameは不要 (replace経路を構造的に排除)。
+///   跨界 (EXDEV) の場合は [`FsOpError`] (kind=Io、メッセージに
+///   `CrossesDevices` を含む) を返し、呼び出し側 (execute) がcopy+removeへ
+///   フォールバックする。
+/// - `copy_file` は `tmp` (最終名と同ディレクトリ・厳密形式
+///   `.{名前}.gento-tmp-{uuid}-{seq}`) へ書き込み・fsyncした後、
+///   `tmp → to` を **NOREPLACEで** 確定する。`to` が存在すれば
+///   kind=AlreadyExists の失敗 (上書きしない)。
 /// - `stat` はシンボリックリンクを辿らない (lstat相当)。
-/// - `copy_file` は `to` と同じディレクトリのテンポラリ名
-///   (`.gento-tmp-` 接頭辞) へ書き込み・fsync後に最終名へrenameする
-///   (「コピー完了前のファイルを正規ファイルとして登録しない」)。
-///   `to` が既に存在する場合は**置換する** (上書きは呼び出し側で解決済み
-///   であることが前提 — 衝突時の未指定はskipが選ばれるため)。
-/// - `rename` は `fs::rename` (同一FS)。跨界の場合は [`FsOpError`]
-///   (kind=Io、メッセージに `CrossesDevices` を含む) を返し、呼び出し側
-///   (execute) がcopy+removeへフォールバックする。
+/// - `trash` は移動後のゴミ箱エントリを特定して返す (undo復帰の厳密
+///   同一性検証用)。失敗時は対象を変更しない。
+/// - `restore_trash` は `entry` が指す正確なエントリを `original` へ復帰
+///   する。復帰前にエントリ存在検証+サイズ検証 (`expect_byte_size` =
+///   トークンのsize成分) を行い、不一致は拒否 (Err)。
 /// - `trash` の失敗は通常削除へフォールバックしない (エラー返すのみ)。
 pub trait FileOpsFs: Send + Sync {
     /// lstat相当のメタデータ。対象不在は kind=NotFound。
@@ -286,18 +438,37 @@ pub trait FileOpsFs: Send + Sync {
     fn exists(&self, path: &Path) -> bool;
     fn is_dir(&self, path: &Path) -> bool;
     fn is_symlink(&self, path: &Path) -> bool;
-    /// ディレクトリを1つ作成する (親は存在必須。fs::create_dir相当)。
+    /// ディレクトリを1つ作成する (親は存在必須。fs::create_dir相当。
+    /// 既存ならAlreadyExists)。
     fn mkdir(&self, path: &Path) -> Result<(), FsOpError>;
-    /// 同一FSリネーム (既存の`to`は置換)。
-    fn rename(&self, from: &Path, to: &Path) -> Result<(), FsOpError>;
-    /// コピー (テンポラリ書き込み→rename。既存の`to`は置換)。
-    fn copy_file(&self, from: &Path, to: &Path, cancel: &AtomicBool) -> Result<(), FsOpError>;
+    /// 原子的no-clobberリネーム (同一FS。`to` 既存はAlreadyExists。
+    /// 跨界は `CrossesDevices` を含むメッセージのIoエラー)。
+    fn rename_noreplace(&self, from: &Path, to: &Path) -> Result<(), FsOpError>;
+    /// コピー (テンポラリ`tmp`へ書き込み→NOREPLACEで`to`へ確定。
+    /// 既存の`to`は置換**しない** — AlreadyExists失敗)。
+    fn copy_file(
+        &self,
+        from: &Path,
+        to: &Path,
+        tmp: &Path,
+        cancel: &AtomicBool,
+    ) -> Result<(), FsOpError>;
     /// 完全削除 (ゴミ箱を経由しない。DeleteForever専用)。
     fn remove_file(&self, path: &Path) -> Result<(), FsOpError>;
-    /// OSゴミ箱へ移動。失敗時は対象を変更しない。
-    fn trash(&self, path: &Path) -> Result<(), FsOpError>;
-    /// OSゴミ箱から `original` へ復帰 (Undo用)。
-    fn restore_trash(&self, original: &Path) -> Result<PathBuf, FsOpError>;
+    /// OSゴミ箱へ移動し、生成されたゴミ箱エントリを特定して返す。
+    /// 失敗時は対象を変更しない。
+    fn trash(&self, path: &Path) -> Result<TrashEntry, FsOpError>;
+    /// ゴミ箱エントリ `entry` を `original` へ復帰 (Undo用)。
+    /// 復帰前にエントリの存在とサイズ (`expect_byte_size`) を検証し、
+    /// 不一致は拒否する。
+    fn restore_trash(
+        &self,
+        entry: &TrashEntry,
+        original: &Path,
+        expect_byte_size: u64,
+    ) -> Result<PathBuf, FsOpError>;
+    /// ゴミ箱エントリの現在サイズ (存在検証用。不在・読取不可はNone)。
+    fn trash_entry_size(&self, entry: &TrashEntry) -> Option<u64>;
     /// ディレクトリの空きバイト数 (容量事前確認)。
     fn free_bytes(&self, dir: &Path) -> Result<u64, FsOpError>;
     /// ファイルの内容ハッシュ (`blake3:<hex>`)。衝突UIのハッシュ一致表示用。
@@ -379,7 +550,8 @@ pub struct ResolutionSpec {
 }
 
 impl ResolutionSpec {
-    fn of(&self, file_id: i64) -> Option<ConflictResolution> {
+    /// ファイル個別 (優先) → 全体方針の順で解決した方針。
+    pub fn of(&self, file_id: i64) -> Option<ConflictResolution> {
         self.per_file.get(&file_id).copied().or(self.global)
     }
 }
@@ -395,6 +567,10 @@ pub enum StepStatus {
 }
 
 /// Undoの逆操作 (result JSONへ直列化して保存)。
+///
+/// 1ステップのundoは複数アクションの列 (上書きステップは「新ファイル
+/// 除去+旧ファイル復帰」の複合)。実行順は記録順 — 先頭側のアクションが
+/// 末尾側の前提を整える (例: 新ファイル除去が旧ファイルの復帰先を空ける)。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum UndoAction {
@@ -406,8 +582,11 @@ pub enum UndoAction {
         expect: TokenDto,
     },
     /// ゴミ箱から元位置へ戻す。`expect`はゴミ箱へ移す直前のトークン。
+    /// `trash_entry` はtrash実行時に特定した厳密エントリ (復帰はこの
+    /// エントリを対象に、存在+サイズ検証を行う)。
     RestoreFromTrash {
         original: PathBuf,
+        trash_entry: TrashEntry,
         #[serde(flatten)]
         expect: TokenDto,
     },
@@ -460,7 +639,17 @@ pub struct StepResult {
     /// 衝突があったステップの実際の解決。
     pub resolution: Option<ConflictResolution>,
     pub error: Option<FsOpError>,
-    pub undo: Option<UndoAction>,
+    /// 完了したが注意喚起がいる事象 (例: 跨界移動でコピー後の元ファイル
+    /// 削除に失敗 — 宛先は完成済み)。statusには影響しない。
+    #[serde(default)]
+    pub warning: Option<String>,
+    /// このステップが使用した一時ファイルのパス (所有権記録。
+    /// 起動掃除はこの記録と厳密形式検証のみを削除対象にする)。
+    #[serde(default)]
+    pub tmp: Option<PathBuf>,
+    /// 逆操作の列 (上書きステップは複合)。実行順 = 記録順。
+    #[serde(default)]
+    pub undo: Vec<UndoAction>,
 }
 
 /// 操作全体の実行結果 (file_operations.result_jsonの正本)。
@@ -803,6 +992,7 @@ pub fn execute_file_op(
         })?
     };
     let op_id = record.id;
+    let op_uuid = record.uuid.clone();
 
     let mut results: Vec<StepResult> = Vec::with_capacity(plan.steps.len());
     for (index, step) in plan.steps.iter().enumerate() {
@@ -817,7 +1007,9 @@ pub fn execute_file_op(
                     FsOpErrorKind::Cancelled,
                     "キャンセルされました",
                 )),
-                undo: None,
+                warning: None,
+                tmp: None,
+                undo: Vec::new(),
             });
             continue;
         }
@@ -829,7 +1021,17 @@ pub fn execute_file_op(
             to: Some(step.dst.display().to_string()),
             done: false,
         });
-        let result = execute_step(store, fs, step, plan.kind, resolutions, roots, cancel);
+        let result = execute_step(
+            store,
+            fs,
+            step,
+            plan.kind,
+            resolutions,
+            roots,
+            cancel,
+            &op_uuid,
+            index,
+        );
         results.push(result);
         progress(FileOpProgress {
             op_id,
@@ -857,14 +1059,22 @@ pub fn execute_file_op(
     Ok(outcome)
 }
 
-/// request JSONの実体。
+/// request JSONの実体。`dest_dir`/`new_name`/各ステップの計画時`to`は
+/// 異常終了回復の一時ファイル再構築 (所有tmpパスの復元) に使用する。
 fn request_json_of(plan: &FileOpPlan, resolutions: &ResolutionSpec) -> serde_json::Value {
     serde_json::json!({
         "kind": plan.kind.as_str(),
         "files": plan.steps.iter().map(|s| serde_json::json!({
             "file_id": s.file.file_id,
             "from": s.src.display().to_string(),
+            "to": s.dst.display().to_string(),
         })).collect::<Vec<_>>(),
+        "dest_dir": plan.steps.first()
+            .and_then(|s| s.dst.parent())
+            .map(|p| p.display().to_string()),
+        "new_name": plan.steps.first()
+            .and_then(|s| s.dst.file_name())
+            .map(|n| n.to_string_lossy().into_owned()),
         "dest_root_id": plan.dest_root_id,
         "global_resolution": resolutions.global.map(|r| r.as_str()),
     })
@@ -880,7 +1090,7 @@ fn summarize(results: &[StepResult], kind: FileOpKind) -> (FileOpStatus, bool) {
         .iter()
         .filter(|r| matches!(r.status, StepStatus::Failed | StepStatus::Cancelled))
         .count();
-    let undo_actions = results.iter().filter(|r| r.undo.is_some()).count();
+    let undo_actions = results.iter().filter(|r| !r.undo.is_empty()).count();
     let status = if failed == 0 {
         FileOpStatus::Done
     } else if done > 0 {
@@ -896,6 +1106,12 @@ fn summarize(results: &[StepResult], kind: FileOpKind) -> (FileOpStatus, bool) {
 }
 
 /// 1ステップの実行: FS操作 → DB反映 (1tx)。
+///
+/// 上書き解決の実行モデル (旧ファイル保護): (1) 旧宛先を先にゴミ箱へ
+/// 退避し (トークン+エントリを記録) → (2) 新ファイルをNOREPLACEで配置。
+/// 配置失敗時は退避した旧ファイルを復帰させてステップを不成立にする。
+/// undo記録は「新ファイルの除去 + 旧ファイルの復帰」の複合。
+#[allow(clippy::too_many_arguments)]
 fn execute_step(
     store: &dyn RepoStore,
     fs: &dyn FileOpsFs,
@@ -904,6 +1120,8 @@ fn execute_step(
     resolutions: &ResolutionSpec,
     roots: &[FileRootRef],
     cancel: &AtomicBool,
+    op_uuid: &str,
+    seq: usize,
 ) -> StepResult {
     let mut result = StepResult {
         file_id: step.file.file_id,
@@ -912,7 +1130,9 @@ fn execute_step(
         status: StepStatus::Failed,
         resolution: None,
         error: None,
-        undo: None,
+        warning: None,
+        tmp: None,
+        undo: Vec::new(),
     };
     if let Some(err) = &step.plan_error {
         result.error = Some(err.clone());
@@ -967,28 +1187,103 @@ fn execute_step(
         return result;
     }
 
-    let observed: Result<Option<FileStat>, FsOpError> = match kind {
+    let overwrite = resolution == Some(ConflictResolution::Overwrite);
+    let places_file = matches!(
+        kind,
+        FileOpKind::Copy | FileOpKind::Move | FileOpKind::Rename
+    );
+
+    // no-clobber前置検査: 上書き解決以外で宛先が現存する場合、配置を
+    // 拒否して再計画へ戻す (NOREPLACE確定でも同じ結果になるが、早期の
+    // 明確なエラーとして提供。TOCTOU競合の最終防御はNOREPLACE自身)。
+    if places_file && !overwrite && fs.exists(&effective_dst) {
+        result.error = Some(FsOpError::new(
+            FsOpErrorKind::AlreadyExists,
+            format!(
+                "{} が計画後に作成されたため実行しませんでした (最新の状態で再計画してください)",
+                effective_dst.display()
+            ),
+        ));
+        return result;
+    }
+
+    // 上書き: 旧宛先を先にゴミ箱へ退避する (旧ファイル保護)。
+    // 退避に失敗した場合、旧ファイルは無傷のまま残るため上書き中止。
+    let mut evacuated: Option<(TrashEntry, FileStat)> = None;
+    if overwrite {
+        let old_stat = match fs.stat(&effective_dst) {
+            Ok(stat) => stat,
+            Err(_) => {
+                result.error = Some(FsOpError::not_found(format!(
+                    "{} (上書き対象) が実行直前に消失しました (再計画してください)",
+                    effective_dst.display()
+                )));
+                return result;
+            }
+        };
+        match fs.trash(&effective_dst) {
+            Ok(entry) => evacuated = Some((entry, old_stat)),
+            Err(err) => {
+                result.error = Some(FsOpError::new(
+                    err.kind.clone(),
+                    format!(
+                        "上書き前の旧ファイル退避に失敗したため中止しました (旧ファイルは無傷): {err}"
+                    ),
+                ));
+                return result;
+            }
+        }
+    }
+
+    // 一時ファイル (コピーと跨界移動フォールバックで使用。所有権記録)。
+    let tmp = if matches!(kind, FileOpKind::Copy | FileOpKind::Move) {
+        let t = tmp_path_for(&effective_dst, op_uuid, seq);
+        result.tmp = Some(t.clone());
+        t
+    } else {
+        PathBuf::new()
+    };
+
+    /// 配置結果 (moveの跨界フォールバックでsrc削除失敗があった場合の
+    /// 警告を運ぶ — 宛先完成済みのため成功扱い)。
+    enum Placement {
+        Placed,
+        /// ゴミ箱へ移した (エントリと移動直前のトークン)。
+        Trashed(TrashEntry, Option<FileStat>),
+        Removed,
+        DirCreated,
+    }
+    let placement: Result<Placement, FsOpError> = match kind {
         FileOpKind::Copy => fs
-            .copy_file(&step.src, &effective_dst, cancel)
-            .map(|_| fs.stat(&effective_dst).ok()),
+            .copy_file(&step.src, &effective_dst, &tmp, cancel)
+            .map(|_| Placement::Placed),
         FileOpKind::Move | FileOpKind::Rename => {
-            move_file(fs, &step.src, &effective_dst, cancel).map(|_| fs.stat(&effective_dst).ok())
+            match move_file(fs, &step.src, &effective_dst, &tmp, cancel) {
+                Ok(MoveOutcome::Completed) => Ok(Placement::Placed),
+                Ok(MoveOutcome::CompletedWithWarning(warning)) => {
+                    result.warning = Some(warning);
+                    Ok(Placement::Placed)
+                }
+                Err(err) => Err(err),
+            }
         }
         FileOpKind::Trash => {
             // トークンはゴミ箱へ移す直前の観測 (復帰検証用)
             let before = fs.stat(&step.src).ok();
-            fs.trash(&step.src).map(|_| before)
+            fs.trash(&step.src)
+                .map(|entry| Placement::Trashed(entry, before))
         }
-        FileOpKind::DeleteForever => fs.remove_file(&step.src).map(|_| None),
-        FileOpKind::Mkdir => fs.mkdir(&effective_dst).map(|_| None),
+        FileOpKind::DeleteForever => fs.remove_file(&step.src).map(|_| Placement::Removed),
+        FileOpKind::Mkdir => fs.mkdir(&effective_dst).map(|_| Placement::DirCreated),
     };
 
-    match observed {
-        Ok(stat) => {
+    match placement {
+        Ok(Placement::Placed) => {
+            let observed = fs.stat(&effective_dst).ok();
             result.status = StepStatus::Done;
             result.to = Some(effective_dst.clone());
-            result.undo = undo_action_of(kind, step, &effective_dst, stat.as_ref());
-            if let Err(err) = reflect_db(store, step, kind, &effective_dst, stat, roots) {
+            result.undo = undo_actions_of(kind, step, &effective_dst, observed.as_ref(), evacuated);
+            if let Err(err) = reflect_db(store, step, kind, &effective_dst, observed, roots) {
                 // FS成功・DB失敗: 再スキャンで収束する状態だが、操作としては
                 // 失敗を報告する (黙って成功としない)。
                 result.status = StepStatus::Failed;
@@ -998,68 +1293,139 @@ fn execute_step(
                 ));
             }
         }
+        Ok(Placement::Trashed(entry, before)) => {
+            result.status = StepStatus::Done;
+            result.to = None;
+            if let Some(stat) = before {
+                result.undo = vec![UndoAction::RestoreFromTrash {
+                    original: step.src.clone(),
+                    trash_entry: entry,
+                    expect: stat.token().into(),
+                }];
+            }
+            if let Err(err) = reflect_db(store, step, kind, &step.src, None, roots) {
+                result.status = StepStatus::Failed;
+                result.error = Some(FsOpError::new(
+                    FsOpErrorKind::Io,
+                    format!("DB反映に失敗しました (再スキャンで回復します): {err}"),
+                ));
+            }
+        }
+        Ok(Placement::Removed) | Ok(Placement::DirCreated) => {
+            result.status = StepStatus::Done;
+            if let Err(err) = reflect_db(store, step, kind, &effective_dst, None, roots) {
+                result.status = StepStatus::Failed;
+                result.error = Some(FsOpError::new(
+                    FsOpErrorKind::Io,
+                    format!("DB反映に失敗しました (再スキャンで回復します): {err}"),
+                ));
+            }
+        }
         Err(err) => {
+            // 配置失敗: 上書き退避済みの旧ファイルを復帰させる
+            // (ステップ不成立のため旧ファイルを元位置へ戻す)。
+            if let Some((entry, old_stat)) = evacuated {
+                if let Err(restore_err) =
+                    fs.restore_trash(&entry, &effective_dst, old_stat.byte_size)
+                {
+                    result.error = Some(FsOpError::new(
+                        FsOpErrorKind::Io,
+                        format!(
+                            "{err}。さらに退避した旧ファイルの復帰にも失敗しました \
+                             (ゴミ箱から手動で復元してください): {restore_err}"
+                        ),
+                    ));
+                    return result;
+                }
+            }
             result.error = Some(err);
         }
     }
     result
 }
 
-/// 移動: 同一FSはrename、跨界 (EXDEV) はcopy+removeへフォールバック。
+/// undo実行が一時ファイルを使う際のseq基点 (ステップseqと衝突しない
+/// 専用帯。最大ステップ数に対して十分大きい値)。
+const UNDO_TMP_SEQ_BASE: usize = 900_000;
+
+/// 移動の結果 (跨界フォールバックでsrc削除に失敗した場合の警告を運ぶ —
+/// 宛先は完成済みのため成功扱い)。
+enum MoveOutcome {
+    Completed,
+    CompletedWithWarning(String),
+}
+
+/// 移動: 同一FSはNOREPLACEリネーム、跨界 (EXDEV) はcopy+noreplace配置+
+/// src削除へフォールバック。src削除失敗は警告付き成功
+/// (「宛先完成済みならstepをwarning付き成功扱い」)。
 fn move_file(
     fs: &dyn FileOpsFs,
     src: &Path,
     dst: &Path,
+    tmp: &Path,
     cancel: &AtomicBool,
-) -> Result<(), FsOpError> {
-    match fs.rename(src, dst) {
-        Ok(()) => Ok(()),
+) -> Result<MoveOutcome, FsOpError> {
+    match fs.rename_noreplace(src, dst) {
+        Ok(()) => Ok(MoveOutcome::Completed),
         // 同一FSでの失敗のうち跨界のみフォールバック (権限等は伝播)。
         Err(err) if is_cross_device(&err) => {
-            fs.copy_file(src, dst, cancel)?;
-            fs.remove_file(src).map_err(|e| {
-                FsOpError::new(
-                    FsOpErrorKind::Io,
-                    format!(
-                        "跨界移動でコピー後の元ファイル削除に失敗 \
-                         (コピーは完了済み。手動で削除してください): {e}"
-                    ),
-                )
-            })
+            fs.copy_file(src, dst, tmp, cancel)?;
+            match fs.remove_file(src) {
+                Ok(()) => Ok(MoveOutcome::Completed),
+                Err(e) => Ok(MoveOutcome::CompletedWithWarning(format!(
+                    "跨界移動のコピー後の元ファイル削除に失敗しました \
+                     (コピーは完了済み。手動で削除してください): {e}"
+                ))),
+            }
         }
         Err(err) => Err(err),
     }
+}
+
+/// ステップ成功時の逆操作列を組み立てる (上書きステップは
+/// 「新ファイル除去 + 旧ファイル復帰」の複合。実行順 = 記録順)。
+fn undo_actions_of(
+    kind: FileOpKind,
+    step: &PlannedStep,
+    effective_dst: &Path,
+    observed: Option<&FileStat>,
+    evacuated: Option<(TrashEntry, FileStat)>,
+) -> Vec<UndoAction> {
+    let mut undo = Vec::new();
+    match kind {
+        FileOpKind::Copy => {
+            if let Some(stat) = observed {
+                undo.push(UndoAction::DeleteCopy {
+                    path: effective_dst.to_path_buf(),
+                    expect: stat.token().into(),
+                });
+            }
+        }
+        FileOpKind::Move | FileOpKind::Rename => {
+            if let Some(stat) = observed {
+                undo.push(UndoAction::MoveBack {
+                    from: effective_dst.to_path_buf(),
+                    to: step.src.clone(),
+                    expect: stat.token().into(),
+                });
+            }
+        }
+        FileOpKind::Trash | FileOpKind::DeleteForever | FileOpKind::Mkdir => {}
+    }
+    if let Some((entry, old_stat)) = evacuated {
+        undo.push(UndoAction::RestoreFromTrash {
+            original: effective_dst.to_path_buf(),
+            trash_entry: entry,
+            expect: old_stat.token().into(),
+        });
+    }
+    undo
 }
 
 /// エラーが跨界 (EXDEV) か。実装側はメッセージに `CrossesDevices` を含める
 /// 契約にする (io::ErrorKindそのものをtrait境界へ出さないため)。
 fn is_cross_device(err: &FsOpError) -> bool {
     err.message.contains("CrossesDevices")
-}
-
-/// ステップ成功時の逆操作を組み立てる。
-fn undo_action_of(
-    kind: FileOpKind,
-    step: &PlannedStep,
-    effective_dst: &Path,
-    observed: Option<&FileStat>,
-) -> Option<UndoAction> {
-    match kind {
-        FileOpKind::Copy => observed.map(|stat| UndoAction::DeleteCopy {
-            path: effective_dst.to_path_buf(),
-            expect: stat.token().into(),
-        }),
-        FileOpKind::Move | FileOpKind::Rename => observed.map(|stat| UndoAction::MoveBack {
-            from: effective_dst.to_path_buf(),
-            to: step.src.clone(),
-            expect: stat.token().into(),
-        }),
-        FileOpKind::Trash => observed.map(|stat| UndoAction::RestoreFromTrash {
-            original: step.src.clone(),
-            expect: stat.token().into(),
-        }),
-        FileOpKind::DeleteForever | FileOpKind::Mkdir => None,
-    }
 }
 
 /// FS成功後のDB反映 (1ファイル=1トランザクション)。
@@ -1194,7 +1560,9 @@ pub fn execute_mkdir(
             status: StepStatus::Failed,
             resolution: None,
             error: Some(error),
-            undo: None,
+            warning: None,
+            tmp: None,
+            undo: Vec::new(),
         }],
     };
     if let Err(err) = validate_new_name(name) {
@@ -1229,7 +1597,9 @@ pub fn execute_mkdir(
         status: StepStatus::Done,
         resolution: None,
         error: None,
-        undo: None,
+        warning: None,
+        tmp: None,
+        undo: Vec::new(),
     };
     let status = match fs.mkdir(&dst) {
         Ok(()) => FileOpStatus::Done,
@@ -1281,6 +1651,13 @@ pub enum UndoRefusal {
     TrashEntryNotFound {
         path: PathBuf,
     },
+    /// ゴミ箱エントリのサイズが記録 (トークンのsize成分) と一致しない
+    /// (パス再利用・外部trashed混在での誤復帰防止)。
+    TrashEntrySizeMismatch {
+        path: PathBuf,
+        expected: u64,
+        actual: u64,
+    },
     Io {
         path: PathBuf,
         message: String,
@@ -1308,6 +1685,15 @@ impl UndoRefusal {
             UndoRefusal::TrashEntryNotFound { path } => {
                 format!("ゴミ箱内に {} の復帰情報が見つかりません", path.display())
             }
+            UndoRefusal::TrashEntrySizeMismatch {
+                path,
+                expected,
+                actual,
+            } => format!(
+                "ゴミ箱内の {} は操作時のサイズ ({expected}バイト) と異なるため \
+                 復帰を拒否しました (現状: {actual}バイト)",
+                path.display()
+            ),
             UndoRefusal::Io { path, message } => format!("{}: {}", path.display(), message),
         }
     }
@@ -1317,6 +1703,9 @@ impl UndoRefusal {
 #[derive(Debug, Clone, PartialEq)]
 pub struct UndoCandidate {
     pub op_id: i64,
+    /// file_operations行のuuid (undo実行が一時ファイルを作る場合の
+    /// 所有権記録に使用 — 厳密形式の掃除対象)。
+    pub op_uuid: String,
     pub kind: FileOpKind,
     pub status: FileOpStatus,
     pub undoable: bool,
@@ -1334,12 +1723,13 @@ pub fn undo_candidate_of(record: &FileOpRecord) -> UndoCandidate {
                 .steps
                 .iter()
                 .filter(|s| s.status != StepStatus::Skipped)
-                .filter_map(|s| s.undo.clone())
+                .flat_map(|s| s.undo.iter().cloned())
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
     UndoCandidate {
         op_id: record.id,
+        op_uuid: record.uuid.clone(),
         kind: record.operation_type,
         status: record.status,
         undoable: record.undoable,
@@ -1347,8 +1737,14 @@ pub fn undo_candidate_of(record: &FileOpRecord) -> UndoCandidate {
     }
 }
 
-/// Undo実行前の前提検証 (全ステップ検証してから実行する — 部分Undoの
+/// Undo実行前の前提検証 (全アクション検証してから実行する — 部分Undoの
 /// 不整合を防ぐ)。1つでも崩れていれば全理由を返す。
+///
+/// 検証は**記録順を考慮した逐次シミュレーション**: 先頭側アクションが
+/// 空けるパス (`MoveBack.from`・`DeleteCopy.path`) は、後続アクションの
+/// 「戻し先不在」判定から除外する (上書きステップの複合undo —
+/// 「新ファイル除去 → 旧ファイル復帰」— で、復帰先が新ファイルに
+/// 占められていることを正しく扱う)。
 pub fn verify_undo(candidate: &UndoCandidate, fs: &dyn FileOpsFs) -> Result<(), Vec<UndoRefusal>> {
     let mut refusals = Vec::new();
     if candidate.status == FileOpStatus::Undone {
@@ -1367,9 +1763,16 @@ pub fn verify_undo(candidate: &UndoCandidate, fs: &dyn FileOpsFs) -> Result<(), 
         refusals.push(UndoRefusal::NoUndoSteps);
         return Err(refusals);
     }
+    // 先行アクションが空けるパス (逐次シミュレーション)。
+    let mut vacated: Vec<PathBuf> = Vec::new();
     for action in &candidate.actions {
-        if let Err(refusal) = verify_undo_action(action, fs) {
+        if let Err(refusal) = verify_undo_action(action, fs, &vacated) {
             refusals.push(refusal);
+        }
+        match action {
+            UndoAction::MoveBack { from, .. } => vacated.push(from.clone()),
+            UndoAction::DeleteCopy { path, .. } => vacated.push(path.clone()),
+            UndoAction::RestoreFromTrash { .. } => {}
         }
     }
     if refusals.is_empty() {
@@ -1379,22 +1782,49 @@ pub fn verify_undo(candidate: &UndoCandidate, fs: &dyn FileOpsFs) -> Result<(), 
     }
 }
 
-fn verify_undo_action(action: &UndoAction, fs: &dyn FileOpsFs) -> Result<(), UndoRefusal> {
+fn verify_undo_action(
+    action: &UndoAction,
+    fs: &dyn FileOpsFs,
+    vacated: &[PathBuf],
+) -> Result<(), UndoRefusal> {
+    let occupied = |path: &Path| fs.exists(path) && !vacated.iter().any(|v| v == path);
     match action {
         UndoAction::MoveBack { from, to, expect } => {
             verify_token(from, expect, fs)?;
-            if fs.exists(to) {
+            if occupied(to) {
                 return Err(UndoRefusal::DestinationExists { path: to.clone() });
             }
             Ok(())
         }
-        UndoAction::RestoreFromTrash { original, .. } => {
-            if fs.exists(original) {
+        UndoAction::RestoreFromTrash {
+            original,
+            trash_entry,
+            expect,
+        } => {
+            if occupied(original) {
                 return Err(UndoRefusal::DestinationExists {
                     path: original.clone(),
                 });
             }
-            Ok(())
+            // 厳密同一性: 記録されたエントリの存在とサイズ (トークンの
+            // size成分) を検証する (パス再利用・複数エントリ競合の誤復帰
+            // 防止。verify_undoがエントリ不在すら見ていなかったレビュー
+            // 指摘への対応)。
+            let trashed = trash_entry
+                .trash_dir
+                .join("files")
+                .join(&trash_entry.file_name);
+            match fs.trash_entry_size(trash_entry) {
+                None => Err(UndoRefusal::TrashEntryNotFound { path: trashed }),
+                Some(actual) if actual != expect.byte_size => {
+                    Err(UndoRefusal::TrashEntrySizeMismatch {
+                        path: trashed,
+                        expected: expect.byte_size,
+                        actual,
+                    })
+                }
+                Some(_) => Ok(()),
+            }
         }
         UndoAction::DeleteCopy { path, expect } => verify_token(path, expect, fs),
     }
@@ -1418,27 +1848,40 @@ fn verify_token(path: &Path, expect: &TokenDto, fs: &dyn FileOpsFs) -> Result<()
     }
 }
 
-/// 1ステップのUndo結果。
+/// 1アクションのUndo結果。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UndoStepResult {
     #[serde(flatten)]
     pub action: UndoAction,
     pub status: StepStatus,
     pub error: Option<FsOpError>,
+    /// 完了したが注意喚起がいる事象 (跨界undo移動のsrc削除失敗等)。
+    #[serde(default)]
+    pub warning: Option<String>,
 }
 
 /// Undo実行の全体結果。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UndoOutcome {
     pub op_id: i64,
+    /// 全成功でのみtrue (このときのみ操作行は `undone` へ遷移する)。
     pub fully_undone: bool,
     pub steps: Vec<UndoStepResult>,
     /// 拒否された場合の理由 (verify失敗。何も実行していない)。
     pub refusals: Vec<UndoRefusal>,
+    /// 補償ロールバックの結果報告 (失敗した補償がある場合のみ追加)。
+    #[serde(default)]
+    pub rollback_errors: Vec<String>,
 }
 
-/// Undoを実行する。前提検証 ([`verify_undo`]) に失敗した場合は何も実行せず
-/// 理由を返す (安全原則3)。
+/// Undoを実行する (逐次実行 + 補償ロールバック。file_ops.rsモジュールdoc
+/// 「Undo原子性ポリシー」参照):
+///
+/// 1. 前提検証 ([`verify_undo`]) に失敗した場合は何も実行せず理由を返す。
+/// 2. 各アクションは実行直前に前提を再検証してから実行する。
+/// 3. アクションの失敗・キャンセル時、実行済みアクションを**逆順で補償**
+///    する (各補償も前提検証付き)。全成功でのみ `undone`、それ以外は
+///    `partial_undone` +理由を返す。
 pub fn execute_undo(
     store: &dyn RepoStore,
     fs: &dyn FileOpsFs,
@@ -1452,125 +1895,270 @@ pub fn execute_undo(
             fully_undone: false,
             steps: Vec::new(),
             refusals,
+            rollback_errors: Vec::new(),
         });
     }
     let mut steps = Vec::with_capacity(candidate.actions.len());
-    for action in &candidate.actions {
+    // 実行済みアクション (補償に必要な実行時情報付き)。
+    let mut executed: Vec<ExecutedAction> = Vec::new();
+    let mut failure: Option<(UndoAction, FsOpError)> = None;
+    for (index, action) in candidate.actions.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
-            steps.push(UndoStepResult {
-                action: action.clone(),
-                status: StepStatus::Cancelled,
-                error: Some(FsOpError::new(
-                    FsOpErrorKind::Cancelled,
-                    "キャンセルされました",
-                )),
-            });
-            continue;
+            failure = Some((
+                action.clone(),
+                FsOpError::new(FsOpErrorKind::Cancelled, "キャンセルされました"),
+            ));
+            break;
         }
-        let (status, error) = execute_undo_action(store, fs, action, roots);
-        steps.push(UndoStepResult {
-            action: action.clone(),
-            status,
-            error,
-        });
+        match execute_undo_action(store, fs, action, roots, &candidate.op_uuid, index) {
+            Ok(exec) => {
+                steps.push(UndoStepResult {
+                    action: action.clone(),
+                    status: StepStatus::Done,
+                    error: None,
+                    warning: exec.warning.clone(),
+                });
+                executed.push(exec);
+            }
+            Err(boxed) => {
+                let (err, partial_reflect) = *boxed;
+                // DB反映のみ失敗した場合 (FS側は実行済み) は部分実行として
+                // 補償対象に含めた上で失敗報告する。
+                if let Some(partial) = partial_reflect {
+                    executed.push(partial);
+                }
+                failure = Some((action.clone(), err));
+                break;
+            }
+        }
     }
-    let fully_undone = steps.iter().all(|s| s.status == StepStatus::Done);
+    let mut rollback_errors = Vec::new();
+    let mut fully_undone = false;
+    match failure {
+        None => fully_undone = true,
+        Some((action, err)) => {
+            steps.push(UndoStepResult {
+                action,
+                status: StepStatus::Failed,
+                error: Some(err.clone()),
+                warning: None,
+            });
+            // 補償ロールバック: 実行済みアクションを逆順で巻き戻す。
+            for exec in executed.iter().rev() {
+                if let Err(comp_err) = compensate_executed(fs, exec) {
+                    rollback_errors.push(format!(
+                        "巻き戻し中に失敗しました (手動確認が必要です): {comp_err}"
+                    ));
+                }
+            }
+        }
+    }
     let outcome = UndoOutcome {
         op_id: candidate.op_id,
         fully_undone,
         steps,
         refusals: Vec::new(),
+        rollback_errors,
     };
     let op_id = candidate.op_id;
     if fully_undone {
         write_ret(store, move |repos: &dyn crate::library::AllRepos| {
             repos.mark_undone(op_id)
         })?;
+    } else {
+        // partial_undone: 操作行を明示的な状態へ確定し、再undo不能にする
+        // (一部アクション実行済みのため、再実行は前提検証で破綻する)。
+        let report = serde_json::to_string(&outcome)
+            .map_err(|e| RepoError::Db(format!("serialize undo report: {e}")))?;
+        write_ret(store, move |repos: &dyn crate::library::AllRepos| {
+            repos.update_operation(op_id, FileOpStatus::PartialUndone, Some(&report), false)
+        })?;
     }
     Ok(outcome)
 }
 
-/// 1逆操作の実行 (FS + DB反映)。
+/// 実行済みundoアクション (補償に必要な実行時情報を含む)。
+struct ExecutedAction {
+    action: UndoAction,
+    /// 警告 (跨界undo移動のsrc削除失敗等)。
+    warning: Option<String>,
+    /// DeleteCopy実行時に生成されたゴミ箱エントリ (補償=元位置へ戻す
+    /// 対象の厳密特定に使用)。
+    captured_entry: Option<TrashEntry>,
+}
+
+/// 1逆操作の実行 (FS + DB反映)。失敗時は (エラー, FS実行済みでDB反映のみ
+/// 失敗した場合の部分実行情報) を返す (size制約のためBox)。
 fn execute_undo_action(
     store: &dyn RepoStore,
     fs: &dyn FileOpsFs,
     action: &UndoAction,
     roots: &[FileRootRef],
-) -> (StepStatus, Option<FsOpError>) {
+    op_uuid: &str,
+    index: usize,
+) -> Result<ExecutedAction, Box<(FsOpError, Option<ExecutedAction>)>> {
     match action {
         UndoAction::MoveBack { from, to, expect } => {
             // 再検証 (verifyとexecuteの間の変化にも安全側で倒れる)
             if let Err(refusal) = verify_token(from, expect, fs) {
-                return (
-                    StepStatus::Failed,
-                    Some(FsOpError::precondition(refusal.describe())),
-                );
+                return Err(Box::new((
+                    FsOpError::precondition(refusal.describe()),
+                    None,
+                )));
             }
             if fs.exists(to) {
-                return (
-                    StepStatus::Failed,
-                    Some(FsOpError::precondition(
+                return Err(Box::new((
+                    FsOpError::precondition(
                         UndoRefusal::DestinationExists { path: to.clone() }.describe(),
-                    )),
-                );
+                    ),
+                    None,
+                )));
             }
-            if let Err(err) = move_file(fs, from, to, &AtomicBool::new(false)) {
-                return (StepStatus::Failed, Some(err));
-            }
+            // 跨界undo (元の移動が跨界だった場合) に備えフォールバック付き。
+            // 一時名は元操作と同じuuid空間 + 専用seq帯 (所有権掃除対象)。
+            let tmp = tmp_path_for(to, op_uuid, UNDO_TMP_SEQ_BASE + index);
+            let outcome = match move_file(fs, from, to, &tmp, &AtomicBool::new(false)) {
+                Ok(outcome) => outcome,
+                Err(err) => return Err(Box::new((err, None))),
+            };
             if let Err(err) = undo_reflect_move(store, fs, from, to, roots) {
-                return (
-                    StepStatus::Failed,
-                    Some(FsOpError::new(
-                        FsOpErrorKind::Io,
-                        format!("DB反映に失敗しました: {err}"),
-                    )),
-                );
+                return Err(Box::new((
+                    FsOpError::new(FsOpErrorKind::Io, format!("DB反映に失敗しました: {err}")),
+                    Some(ExecutedAction {
+                        action: action.clone(),
+                        warning: None,
+                        captured_entry: None,
+                    }),
+                )));
             }
-            (StepStatus::Done, None)
+            Ok(ExecutedAction {
+                action: action.clone(),
+                warning: match outcome {
+                    MoveOutcome::Completed => None,
+                    MoveOutcome::CompletedWithWarning(w) => Some(w),
+                },
+                captured_entry: None,
+            })
         }
-        UndoAction::RestoreFromTrash { original, .. } => {
+        UndoAction::RestoreFromTrash {
+            original,
+            trash_entry,
+            expect,
+        } => {
             if fs.exists(original) {
-                return (
-                    StepStatus::Failed,
-                    Some(FsOpError::precondition(
+                return Err(Box::new((
+                    FsOpError::precondition(
                         UndoRefusal::DestinationExists {
                             path: original.clone(),
                         }
                         .describe(),
-                    )),
-                );
+                    ),
+                    None,
+                )));
             }
-            match fs.restore_trash(original) {
+            match fs.restore_trash(trash_entry, original, expect.byte_size) {
                 Ok(_) => {
                     if let Err(err) = undo_reflect_restore(store, fs, original, roots) {
-                        return (
-                            StepStatus::Failed,
-                            Some(FsOpError::new(
+                        return Err(Box::new((
+                            FsOpError::new(
                                 FsOpErrorKind::Io,
                                 format!("DB反映に失敗しました: {err}"),
-                            )),
-                        );
+                            ),
+                            Some(ExecutedAction {
+                                action: action.clone(),
+                                warning: None,
+                                captured_entry: None,
+                            }),
+                        )));
                     }
-                    (StepStatus::Done, None)
+                    Ok(ExecutedAction {
+                        action: action.clone(),
+                        warning: None,
+                        captured_entry: None,
+                    })
                 }
-                Err(err) => (StepStatus::Failed, Some(err)),
+                // サイズ不一致・不在は誤復帰防止の拒否 (識別情報を明示)。
+                Err(err) => Err(Box::new((err, None))),
             }
         }
         UndoAction::DeleteCopy { path, .. } => {
-            // 生成物のみをゴミ箱へ (即削除しない — 誤操作でも復帰可能)
-            if let Err(err) = fs.trash(path) {
-                return (StepStatus::Failed, Some(err));
-            }
+            // 生成物のみをゴミ箱へ (即削除しない — 誤操作でも復帰可能)。
+            // 補償 (元位置へ戻す) のため生成エントリを捕捉する。
+            let entry = match fs.trash(path) {
+                Ok(entry) => entry,
+                Err(err) => return Err(Box::new((err, None))),
+            };
             if let Err(err) = undo_reflect_delete(store, path, roots) {
-                return (
-                    StepStatus::Failed,
-                    Some(FsOpError::new(
-                        FsOpErrorKind::Io,
-                        format!("DB反映に失敗しました: {err}"),
-                    )),
-                );
+                return Err(Box::new((
+                    FsOpError::new(FsOpErrorKind::Io, format!("DB反映に失敗しました: {err}")),
+                    Some(ExecutedAction {
+                        action: action.clone(),
+                        warning: None,
+                        captured_entry: Some(entry),
+                    }),
+                )));
             }
-            (StepStatus::Done, None)
+            Ok(ExecutedAction {
+                action: action.clone(),
+                warning: None,
+                captured_entry: Some(entry),
+            })
+        }
+    }
+}
+
+/// 実行済みundoアクションの補償 (逆順ロールバックの1ステップ)。
+/// 各補償も前提検証付き — 前提が崩れている場合 (外部変更等) は補償を
+/// 行わずエラーを返す (結果は partial_undone + rollback_errors へ反映)。
+fn compensate_executed(fs: &dyn FileOpsFs, exec: &ExecutedAction) -> Result<(), String> {
+    match &exec.action {
+        UndoAction::MoveBack { from, to, expect } => {
+            // 実行時の移動 (from→to) を巻き戻す: to→from。
+            let current = fs.stat(to).map_err(|e| format!("{}: {e}", to.display()))?;
+            if current.token() != expect.to_token() {
+                return Err(format!(
+                    "{} はUndo実行後に外部で変更されているため巻き戻しを中止しました",
+                    to.display()
+                ));
+            }
+            if fs.exists(from) {
+                return Err(format!(
+                    "巻き戻し先 {} に別のファイルが存在するため中止しました",
+                    from.display()
+                ));
+            }
+            fs.rename_noreplace(to, from)
+                .map_err(|e| format!("{} → {}: {e}", to.display(), from.display()))
+        }
+        UndoAction::RestoreFromTrash {
+            original, expect, ..
+        } => {
+            // 復帰したファイルを再度ゴミ箱へ戻す (トークン検証付き)。
+            let current = fs
+                .stat(original)
+                .map_err(|e| format!("{}: {e}", original.display()))?;
+            if current.token() != expect.to_token() {
+                return Err(format!(
+                    "{} は復帰後に外部で変更されているため再退避を中止しました",
+                    original.display()
+                ));
+            }
+            fs.trash(original)
+                .map(|_| ())
+                .map_err(|e| format!("{}: {e}", original.display()))
+        }
+        UndoAction::DeleteCopy { path, expect } => {
+            // ゴミ箱へ移した生成物を、実行時に捕捉したエントリで特定して
+            // 元位置へ戻す (サイズ検証付き — 誤復帰防止)。
+            let Some(entry) = &exec.captured_entry else {
+                return Err(format!(
+                    "{} の巻き戻し情報が無いため手動復帰が必要です (ゴミ箱に退避済み)",
+                    path.display()
+                ));
+            };
+            fs.restore_trash(entry, path, expect.byte_size)
+                .map(|_| ())
+                .map_err(|e| format!("{}: {e}", path.display()))
         }
     }
 }
@@ -1793,6 +2381,8 @@ mod tests {
         copy_fail: StdMutex<std::collections::HashMap<PathBuf, String>>,
         /// このパスのtrashを失敗させる。
         trash_fail: StdMutex<std::collections::HashSet<PathBuf>>,
+        /// このパスのremove_fileを失敗させる (EXDEV警告経路の検証用)。
+        remove_fail: StdMutex<std::collections::HashSet<PathBuf>>,
         /// trash実体の退避場所 (TestFs::newで指定)。
         trash_dir: StdMutex<PathBuf>,
         /// trash退避の写像 (original → trashed)。
@@ -1879,7 +2469,7 @@ mod tests {
                 .map_err(|e| FsOpError::new(FsOpErrorKind::Io, format!("{}: {e}", path.display())))
         }
 
-        fn rename(&self, from: &Path, to: &Path) -> Result<(), FsOpError> {
+        fn rename_noreplace(&self, from: &Path, to: &Path) -> Result<(), FsOpError> {
             if self.rename_exdev.lock().unwrap().contains(from) {
                 return Err(FsOpError::new(
                     FsOpErrorKind::Io,
@@ -1890,6 +2480,14 @@ mod tests {
                     ),
                 ));
             }
+            // 実原子性 (renameat2) はRealFileOps側で担保するため、ここでは
+            // チェック+renameで契約 (既存toはAlreadyExists) を模倣する。
+            if std::fs::symlink_metadata(to).is_ok() {
+                return Err(FsOpError::new(
+                    FsOpErrorKind::AlreadyExists,
+                    format!("{} already exists", to.display()),
+                ));
+            }
             std::fs::rename(from, to).map_err(|e| {
                 FsOpError::new(
                     FsOpErrorKind::Io,
@@ -1898,38 +2496,49 @@ mod tests {
             })
         }
 
-        fn copy_file(&self, from: &Path, to: &Path, _cancel: &AtomicBool) -> Result<(), FsOpError> {
+        fn copy_file(
+            &self,
+            from: &Path,
+            to: &Path,
+            tmp: &Path,
+            _cancel: &AtomicBool,
+        ) -> Result<(), FsOpError> {
             if let Some(msg) = self.copy_fail.lock().unwrap().get(from) {
                 return Err(FsOpError::new(FsOpErrorKind::PermissionDenied, msg.clone()));
             }
-            // 本物と同じ規則: テンポラリ名で書き込み→rename (安全原則4)
-            let file_name = to
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let tmp = to
-                .parent()
-                .unwrap_or(Path::new("."))
-                .join(format!("{TMP_FILE_PREFIX}{file_name}"));
-            std::fs::copy(from, &tmp).map_err(|e| {
+            // 本物と同じ規則: テンポラリ名で書き込み→NOREPLACE確定 (安全原則4)
+            std::fs::copy(from, tmp).map_err(|e| {
                 FsOpError::new(
                     FsOpErrorKind::Io,
                     format!("copy {} -> {}: {e}", from.display(), to.display()),
                 )
             })?;
             if let Some(hook) = self.on_tmp_created.lock().unwrap().as_ref() {
-                hook(&tmp);
+                hook(tmp);
             }
-            std::fs::rename(&tmp, to)
+            if std::fs::symlink_metadata(to).is_ok() {
+                let _ = std::fs::remove_file(tmp);
+                return Err(FsOpError::new(
+                    FsOpErrorKind::AlreadyExists,
+                    format!("{} already exists", to.display()),
+                ));
+            }
+            std::fs::rename(tmp, to)
                 .map_err(|e| FsOpError::new(FsOpErrorKind::Io, format!("tmp rename: {e}")))
         }
 
         fn remove_file(&self, path: &Path) -> Result<(), FsOpError> {
+            if self.remove_fail.lock().unwrap().contains(path) {
+                return Err(FsOpError::new(
+                    FsOpErrorKind::PermissionDenied,
+                    format!("remove failed (injected): {}", path.display()),
+                ));
+            }
             std::fs::remove_file(path)
                 .map_err(|e| FsOpError::not_found(format!("{}: {e}", path.display())))
         }
 
-        fn trash(&self, path: &Path) -> Result<(), FsOpError> {
+        fn trash(&self, path: &Path) -> Result<TrashEntry, FsOpError> {
             if self.trash_fail.lock().unwrap().contains(path) {
                 return Err(FsOpError::new(
                     FsOpErrorKind::PermissionDenied,
@@ -1941,33 +2550,60 @@ mod tests {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "file".to_string());
-            let dest = dir.join(name);
+            // 同名再trashは一意な退避名へ (実ゴミ箱のsuffix規則の模倣)。
+            let mut file_name = name.clone();
+            {
+                let mut seq = 2;
+                while dir.join(&file_name).exists() {
+                    file_name = format!("{name}.{seq}");
+                    seq += 1;
+                }
+            }
+            let dest = dir.join(&file_name);
             std::fs::rename(path, &dest)
                 .map_err(|e| FsOpError::new(FsOpErrorKind::Io, format!("trash: {e}")))?;
             self.trashed
                 .lock()
                 .unwrap()
                 .insert(path.to_path_buf(), dest);
-            Ok(())
+            Ok(TrashEntry {
+                trash_dir: dir,
+                file_name,
+            })
         }
 
-        fn restore_trash(&self, original: &Path) -> Result<PathBuf, FsOpError> {
-            let trashed = self
-                .trashed
-                .lock()
-                .unwrap()
-                .get(original)
-                .cloned()
-                .ok_or_else(|| {
-                    FsOpError::not_found(format!(
-                        "no trash entry for {} (injected)",
-                        original.display()
-                    ))
-                })?;
+        fn restore_trash(
+            &self,
+            entry: &TrashEntry,
+            original: &Path,
+            expect_byte_size: u64,
+        ) -> Result<PathBuf, FsOpError> {
+            let trashed = entry.trash_dir.join(&entry.file_name);
+            let size = std::fs::metadata(&trashed)
+                .map_err(|e| FsOpError::not_found(format!("{}: {e}", trashed.display())))?
+                .len();
+            if size != expect_byte_size {
+                return Err(FsOpError::precondition(format!(
+                    "ゴミ箱エントリ {} はサイズ不一致 (期待 {expect_byte_size}, 実際 {size})",
+                    trashed.display()
+                )));
+            }
+            if std::fs::symlink_metadata(original).is_ok() {
+                return Err(FsOpError::precondition(format!(
+                    "復帰先が存在: {}",
+                    original.display()
+                )));
+            }
             std::fs::rename(&trashed, original)
                 .map_err(|e| FsOpError::new(FsOpErrorKind::Io, format!("restore: {e}")))?;
             self.trashed.lock().unwrap().remove(original);
             Ok(original.to_path_buf())
+        }
+
+        fn trash_entry_size(&self, entry: &TrashEntry) -> Option<u64> {
+            std::fs::metadata(entry.trash_dir.join(&entry.file_name))
+                .ok()
+                .map(|m| m.len())
         }
 
         fn free_bytes(&self, _dir: &Path) -> Result<u64, FsOpError> {
@@ -3106,11 +3742,15 @@ mod tests {
             *fx.fs.on_tmp_created.lock().unwrap() = Some(Box::new(move |tmp| {
                 let final_path = tmp.with_file_name("t.png");
                 assert!(tmp.exists(), "テンポラリ実体が存在");
-                assert!(tmp
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .starts_with(TMP_FILE_PREFIX));
+                let tmp_name = tmp.file_name().unwrap().to_string_lossy().into_owned();
+                assert!(
+                    tmp_name.starts_with(".t.png") && is_owned_tmp_name(&tmp_name),
+                    "厳密形式の一時名であること: {tmp_name}"
+                );
+                assert!(
+                    tmp_owner_uuid_simple(&tmp_name).is_some(),
+                    "所有操作uuidを復元できる"
+                );
                 assert!(!final_path.exists(), "最終名はまだ無い");
                 assert!(
                     store
@@ -3141,14 +3781,8 @@ mod tests {
         assert!(dst_dir.join("t.png").exists(), "最終名で存在");
         // テンポラリは残っていない
         for entry in std::fs::read_dir(&dst_dir).unwrap().flatten() {
-            assert!(
-                !entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(TMP_FILE_PREFIX),
-                "tmp残留: {:?}",
-                entry.file_name()
-            );
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(!name.contains(".gento-tmp-"), "tmp残留: {name}");
         }
     }
 
@@ -3190,7 +3824,8 @@ mod tests {
         );
         let row = fx.store.get_file(record.id).unwrap().unwrap();
         assert_eq!(row.scan_state, ScanState::Missing);
-        match outcome.steps[0].undo.as_ref().unwrap() {
+        assert_eq!(outcome.steps[0].undo.len(), 1);
+        match &outcome.steps[0].undo[0] {
             UndoAction::RestoreFromTrash { original, .. } => {
                 assert_eq!(*original, src);
             }
@@ -3686,6 +4321,608 @@ mod tests {
         .unwrap();
         assert!(!undo.fully_undone);
         assert!(matches!(undo.refusals[0], UndoRefusal::FileMissing { .. }));
+    }
+
+    // ===== WP-7レビュー対応: 上書きTOCTOU・旧ファイル保護・厳密ゴミ箱同一性 =====
+
+    /// 計画と実行の間に宛先が作成された場合、copy/moveは上書きせず失敗する
+    /// (no-clobber。レビュー指摘: 上書きTOCTOU)。
+    #[test]
+    fn execute_refuses_destination_created_after_plan_copy_and_move() {
+        for kind in [FileOpKind::Copy, FileOpKind::Move] {
+            let fx = fixture("toctou");
+            let src = fx._dir.write("a.png", b"src");
+            let dst_dir = fx._dir.mkdir("dest");
+            let record = fx.store.add_file(fx.root.id, &src, &fx.root.path, b"src");
+            // 計画時点では衝突なし
+            let plan = plan_file_op(
+                &*fx.fs,
+                &fx.cancel,
+                kind,
+                vec![fx.op_file(&record, None)],
+                Some(&dst_dir),
+                None,
+                &fx.roots,
+            );
+            assert!(plan.steps[0].conflict.is_none());
+            // 計画→実行間に外部から宛先を作成 (TOCTOU窓)
+            std::fs::write(dst_dir.join("a.png"), b"EXTERNAL").unwrap();
+            let outcome = fx.run(&plan, &ResolutionSpec::default());
+            assert_eq!(
+                outcome.steps[0].status,
+                StepStatus::Failed,
+                "{kind}: 宛先出現後の実行は失敗"
+            );
+            assert!(matches!(
+                outcome.steps[0].error.as_ref().unwrap().kind,
+                FsOpErrorKind::AlreadyExists
+            ));
+            assert_eq!(
+                std::fs::read(dst_dir.join("a.png")).unwrap(),
+                b"EXTERNAL",
+                "{kind}: 外部ファイルは上書きされない"
+            );
+            assert!(src.exists(), "{kind}: 元ファイルも無傷");
+        }
+    }
+
+    /// keep_bothの事前計算名が計画後に占められた場合も配置を拒否する。
+    #[test]
+    fn execute_keep_both_refuses_name_taken_after_plan() {
+        let fx = fixture("toctou-kb");
+        let src = fx._dir.write("a.png", b"NEW");
+        let dst_dir = fx._dir.mkdir("dest");
+        std::fs::write(dst_dir.join("a.png"), b"OLD").unwrap();
+        fx.store
+            .add_file(fx.root.id, &dst_dir.join("a.png"), &fx.root.path, b"OLD");
+        let record = fx.store.add_file(fx.root.id, &src, &fx.root.path, b"NEW");
+        let plan = plan_file_op(
+            &*fx.fs,
+            &fx.cancel,
+            FileOpKind::Copy,
+            vec![fx.op_file(&record, None)],
+            Some(&dst_dir),
+            None,
+            &fx.roots,
+        );
+        assert_eq!(
+            plan.steps[0].conflict.as_ref().unwrap().keep_both_name,
+            "a (2).png"
+        );
+        // 計画後に代替名を外部が作成
+        std::fs::write(dst_dir.join("a (2).png"), b"TAKEN").unwrap();
+        let outcome = fx.run(
+            &plan,
+            &ResolutionSpec {
+                global: Some(ConflictResolution::KeepBoth),
+                per_file: HashMap::new(),
+            },
+        );
+        assert_eq!(outcome.steps[0].status, StepStatus::Failed);
+        assert!(matches!(
+            outcome.steps[0].error.as_ref().unwrap().kind,
+            FsOpErrorKind::AlreadyExists
+        ));
+        assert_eq!(std::fs::read(dst_dir.join("a (2).png")).unwrap(), b"TAKEN");
+        assert_eq!(std::fs::read(dst_dir.join("a.png")).unwrap(), b"OLD");
+    }
+
+    /// 上書きcopyは旧宛先を先にゴミ箱へ退避し、undoで旧内容まで復元する
+    /// (レビュー指摘: 上書き操作のundo可能性)。
+    #[test]
+    fn execute_overwrite_protects_old_file_and_undo_restores_it() {
+        let fx = fixture("ow-copy");
+        let src = fx._dir.write("a.png", b"NEW");
+        let dst_dir = fx._dir.mkdir("dest");
+        std::fs::write(dst_dir.join("a.png"), b"OLD").unwrap();
+        let old = fx
+            .store
+            .add_file(fx.root.id, &dst_dir.join("a.png"), &fx.root.path, b"OLD");
+        let record = fx.store.add_file(fx.root.id, &src, &fx.root.path, b"NEW");
+        let plan = plan_file_op(
+            &*fx.fs,
+            &fx.cancel,
+            FileOpKind::Copy,
+            vec![fx.op_file(&record, None)],
+            Some(&dst_dir),
+            None,
+            &fx.roots,
+        );
+        let outcome = fx.run(
+            &plan,
+            &ResolutionSpec {
+                global: Some(ConflictResolution::Overwrite),
+                per_file: HashMap::new(),
+            },
+        );
+        assert_eq!(outcome.steps[0].status, StepStatus::Done);
+        assert_eq!(std::fs::read(dst_dir.join("a.png")).unwrap(), b"NEW");
+        // undoは複合: [新ファイル除去, 旧ファイル復帰]
+        let undos = &outcome.steps[0].undo;
+        assert_eq!(undos.len(), 2, "複合undoであること: {undos:?}");
+        assert!(matches!(undos[0], UndoAction::DeleteCopy { .. }));
+        assert!(matches!(undos[1], UndoAction::RestoreFromTrash { .. }));
+        // undo実行 → 旧ファイルが内容まで復元される
+        let candidate = {
+            let ops = fx.store.get_operation(outcome.op_id).unwrap().unwrap();
+            undo_candidate_of(&ops)
+        };
+        let undo = execute_undo(
+            &*fx.store,
+            &*fx.fs,
+            &candidate,
+            &fx.roots,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(undo.fully_undone, "{undo:?}");
+        assert_eq!(
+            std::fs::read(dst_dir.join("a.png")).unwrap(),
+            b"OLD",
+            "旧ファイルが内容まで復元"
+        );
+        assert!(src.exists(), "コピー元は無傷");
+        let op = fx.store.get_operation(outcome.op_id).unwrap().unwrap();
+        assert_eq!(op.status, FileOpStatus::Undone);
+        let _ = old;
+    }
+
+    /// 上書きmoveのundo: 新ファイルは元位置へ戻り、旧ファイルは復帰する。
+    #[test]
+    fn execute_overwrite_move_undo_restores_both() {
+        let fx = fixture("ow-move");
+        let src = fx._dir.write("a.png", b"NEW");
+        let dst_dir = fx._dir.mkdir("dest");
+        std::fs::write(dst_dir.join("a.png"), b"OLD").unwrap();
+        fx.store
+            .add_file(fx.root.id, &dst_dir.join("a.png"), &fx.root.path, b"OLD");
+        let record = fx.store.add_file(fx.root.id, &src, &fx.root.path, b"NEW");
+        let plan = plan_file_op(
+            &*fx.fs,
+            &fx.cancel,
+            FileOpKind::Move,
+            vec![fx.op_file(&record, None)],
+            Some(&dst_dir),
+            None,
+            &fx.roots,
+        );
+        let outcome = fx.run(
+            &plan,
+            &ResolutionSpec {
+                global: Some(ConflictResolution::Overwrite),
+                per_file: HashMap::new(),
+            },
+        );
+        assert_eq!(outcome.steps[0].status, StepStatus::Done);
+        assert_eq!(std::fs::read(dst_dir.join("a.png")).unwrap(), b"NEW");
+        let undos = &outcome.steps[0].undo;
+        assert!(matches!(undos[0], UndoAction::MoveBack { .. }));
+        assert!(matches!(undos[1], UndoAction::RestoreFromTrash { .. }));
+        let candidate = {
+            let ops = fx.store.get_operation(outcome.op_id).unwrap().unwrap();
+            undo_candidate_of(&ops)
+        };
+        let undo = execute_undo(
+            &*fx.store,
+            &*fx.fs,
+            &candidate,
+            &fx.roots,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(undo.fully_undone, "{undo:?}");
+        assert_eq!(
+            std::fs::read(dst_dir.join("a.png")).unwrap(),
+            b"OLD",
+            "旧ファイル復帰"
+        );
+        assert_eq!(std::fs::read(&src).unwrap(), b"NEW", "新ファイルは元位置へ");
+    }
+
+    /// 上書き指定時に宛先が実行直前に消失していた場合、上書きせず失敗。
+    #[test]
+    fn execute_overwrite_refuses_when_dst_vanished() {
+        let fx = fixture("ow-vanish");
+        let src = fx._dir.write("a.png", b"NEW");
+        let dst_dir = fx._dir.mkdir("dest");
+        std::fs::write(dst_dir.join("a.png"), b"OLD").unwrap();
+        let record = fx.store.add_file(fx.root.id, &src, &fx.root.path, b"NEW");
+        let plan = plan_file_op(
+            &*fx.fs,
+            &fx.cancel,
+            FileOpKind::Copy,
+            vec![fx.op_file(&record, None)],
+            Some(&dst_dir),
+            None,
+            &fx.roots,
+        );
+        assert!(plan.steps[0].conflict.is_some());
+        std::fs::remove_file(dst_dir.join("a.png")).unwrap();
+        let outcome = fx.run(
+            &plan,
+            &ResolutionSpec {
+                global: Some(ConflictResolution::Overwrite),
+                per_file: HashMap::new(),
+            },
+        );
+        assert_eq!(outcome.steps[0].status, StepStatus::Failed);
+        assert!(matches!(
+            outcome.steps[0].error.as_ref().unwrap().kind,
+            FsOpErrorKind::NotFound
+        ));
+    }
+
+    /// 上書き配置に失敗した場合、退避した旧ファイルを復帰させる
+    /// (ステップ不成立でも旧ファイルを失わない)。
+    #[test]
+    fn execute_overwrite_restores_old_when_placement_fails() {
+        let fx = fixture("ow-fail");
+        let src = fx._dir.write("a.png", b"NEW");
+        let dst_dir = fx._dir.mkdir("dest");
+        std::fs::write(dst_dir.join("a.png"), b"OLD").unwrap();
+        let record = fx.store.add_file(fx.root.id, &src, &fx.root.path, b"NEW");
+        // 退避後に新配置が失敗するようコピーを注入失敗させる
+        fx.fs
+            .copy_fail
+            .lock()
+            .unwrap()
+            .insert(src.clone(), "permission denied (injected)".to_string());
+        let plan = plan_file_op(
+            &*fx.fs,
+            &fx.cancel,
+            FileOpKind::Copy,
+            vec![fx.op_file(&record, None)],
+            Some(&dst_dir),
+            None,
+            &fx.roots,
+        );
+        let outcome = fx.run(
+            &plan,
+            &ResolutionSpec {
+                global: Some(ConflictResolution::Overwrite),
+                per_file: HashMap::new(),
+            },
+        );
+        assert_eq!(outcome.steps[0].status, StepStatus::Failed);
+        assert_eq!(
+            std::fs::read(dst_dir.join("a.png")).unwrap(),
+            b"OLD",
+            "旧ファイルは元位置へ復帰 (失われない)"
+        );
+    }
+
+    /// ゴミ箱undoの厳密同一性: 同パスの複数エントリ・外部trashed混在下で
+    /// 記録エントリのみを復帰する (レビュー指摘)。
+    #[test]
+    fn undo_trash_restores_exact_recorded_entry_among_same_path_entries() {
+        let fx = fixture("trash-exact");
+        // (1) 1回目: a.pngをtrash (内容 v1) → 手動復元 (外部trashed相当に残す)
+        let src = fx._dir.write("a.png", b"v1");
+        let record = fx.store.add_file(fx.root.id, &src, &fx.root.path, b"v1");
+        let plan1 = plan_file_op(
+            &*fx.fs,
+            &fx.cancel,
+            FileOpKind::Trash,
+            vec![fx.op_file(&record, None)],
+            None,
+            None,
+            &fx.roots,
+        );
+        let outcome1 = fx.run(&plan1, &ResolutionSpec::default());
+        let entry1 = match &outcome1.steps[0].undo[0] {
+            UndoAction::RestoreFromTrash { trash_entry, .. } => trash_entry.clone(),
+            other => panic!("unexpected: {other:?}"),
+        };
+        // 外部で同パスを別内容としてもう1つtrashed (エントリ追加)
+        let src2 = fx._dir.write("a.png", b"v2-longer-content");
+        let trashed2 = fx.fs.trash_dir.lock().unwrap().clone();
+        std::fs::rename(&src2, trashed2.join("a.png.2")).unwrap();
+        // (2) 2回目: a.png (v3) をtrash → この操作のundo対象はv3エントリ
+        let src3 = fx._dir.write("a.png", b"v3");
+        let record3 = fx.store.add_file(fx.root.id, &src3, &fx.root.path, b"v3");
+        let plan3 = plan_file_op(
+            &*fx.fs,
+            &fx.cancel,
+            FileOpKind::Trash,
+            vec![fx.op_file(&record3, None)],
+            None,
+            None,
+            &fx.roots,
+        );
+        let outcome3 = fx.run(&plan3, &ResolutionSpec::default());
+        let entry3 = match &outcome3.steps[0].undo[0] {
+            UndoAction::RestoreFromTrash { trash_entry, .. } => trash_entry.clone(),
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert_ne!(entry1.file_name, entry3.file_name, "別エントリとして特定");
+        // undo → v3が復帰する (最新一致ではなく記録エントリ)
+        let candidate = {
+            let ops = fx.store.get_operation(outcome3.op_id).unwrap().unwrap();
+            undo_candidate_of(&ops)
+        };
+        let undo = execute_undo(
+            &*fx.store,
+            &*fx.fs,
+            &candidate,
+            &fx.roots,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(undo.fully_undone, "{undo:?}");
+        assert_eq!(
+            std::fs::read(&src3).unwrap(),
+            b"v3",
+            "記録したエントリ (=v3) が復帰"
+        );
+    }
+
+    /// 記録されたゴミ箱エントリが不在 (外部で空にされた) 場合はundo拒否。
+    #[test]
+    fn undo_trash_refuses_when_recorded_entry_missing() {
+        let fx = fixture("trash-missing-entry");
+        let src = fx._dir.write("a.png", b"gone");
+        let record = fx.store.add_file(fx.root.id, &src, &fx.root.path, b"gone");
+        let plan = plan_file_op(
+            &*fx.fs,
+            &fx.cancel,
+            FileOpKind::Trash,
+            vec![fx.op_file(&record, None)],
+            None,
+            None,
+            &fx.roots,
+        );
+        let outcome = fx.run(&plan, &ResolutionSpec::default());
+        // ゴミ箱エントリを外部で削除
+        let entry = match &outcome.steps[0].undo[0] {
+            UndoAction::RestoreFromTrash { trash_entry, .. } => trash_entry.clone(),
+            other => panic!("unexpected: {other:?}"),
+        };
+        std::fs::remove_file(entry.trash_dir.join(&entry.file_name)).unwrap();
+        let candidate = {
+            let ops = fx.store.get_operation(outcome.op_id).unwrap().unwrap();
+            undo_candidate_of(&ops)
+        };
+        let undo = execute_undo(
+            &*fx.store,
+            &*fx.fs,
+            &candidate,
+            &fx.roots,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(!undo.fully_undone);
+        assert!(
+            undo.refusals
+                .iter()
+                .any(|r| matches!(r, UndoRefusal::TrashEntryNotFound { .. })),
+            "{:?}",
+            undo.refusals
+        );
+    }
+
+    /// エントリのサイズが記録 (トークンのsize成分) と一致しない場合は拒否。
+    #[test]
+    fn undo_trash_refuses_when_entry_size_mismatch() {
+        let fx = fixture("trash-size");
+        let src = fx._dir.write("a.png", b"original-size");
+        let record = fx
+            .store
+            .add_file(fx.root.id, &src, &fx.root.path, b"original-size");
+        let plan = plan_file_op(
+            &*fx.fs,
+            &fx.cancel,
+            FileOpKind::Trash,
+            vec![fx.op_file(&record, None)],
+            None,
+            None,
+            &fx.roots,
+        );
+        let outcome = fx.run(&plan, &ResolutionSpec::default());
+        // ゴミ箱内の実体を書き換え (サイズ変化)
+        let entry = match &outcome.steps[0].undo[0] {
+            UndoAction::RestoreFromTrash { trash_entry, .. } => trash_entry.clone(),
+            other => panic!("unexpected: {other:?}"),
+        };
+        std::fs::write(entry.trash_dir.join(&entry.file_name), b"DIFFERENT").unwrap();
+        let candidate = {
+            let ops = fx.store.get_operation(outcome.op_id).unwrap().unwrap();
+            undo_candidate_of(&ops)
+        };
+        let undo = execute_undo(
+            &*fx.store,
+            &*fx.fs,
+            &candidate,
+            &fx.roots,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(!undo.fully_undone);
+        assert!(
+            undo.refusals
+                .iter()
+                .any(|r| matches!(r, UndoRefusal::TrashEntrySizeMismatch { .. })),
+            "{:?}",
+            undo.refusals
+        );
+    }
+
+    /// Undo原子性: 2番目アクションの失敗 → 実行済み1番目が補償され、
+    /// statusはpartial_undone (レビュー指摘: all-or-nothingの構造化)。
+    #[test]
+    fn undo_rolls_back_executed_actions_when_later_action_fails() {
+        let fx = fixture("undo-rollback");
+        let dst_dir = fx._dir.mkdir("dest");
+        // 2ファイルmove → undo候補は [MoveBack(m1), MoveBack(m2)]
+        let s1 = fx._dir.write("m1.png", b"one");
+        let s2 = fx._dir.write("m2.png", b"two");
+        let r1 = fx.store.add_file(fx.root.id, &s1, &fx.root.path, b"one");
+        let r2 = fx.store.add_file(fx.root.id, &s2, &fx.root.path, b"two");
+        let plan = plan_file_op(
+            &*fx.fs,
+            &fx.cancel,
+            FileOpKind::Move,
+            vec![fx.op_file(&r1, None), fx.op_file(&r2, None)],
+            Some(&dst_dir),
+            None,
+            &fx.roots,
+        );
+        let outcome = fx.run(&plan, &ResolutionSpec::default());
+        assert_eq!(outcome.status, FileOpStatus::Done);
+        // undo実行中に2番目のMoveBack (m2) を失敗させる: 移動元が改変
+        // されていれば再検証で失敗する — 実行直前に改変を注入するフック
+        // として、trash失敗ではなく「移動先ファイル改変」を使う。
+        std::fs::write(dst_dir.join("m2.png"), b"tampered").unwrap();
+        let candidate = {
+            let ops = fx.store.get_operation(outcome.op_id).unwrap().unwrap();
+            undo_candidate_of(&ops)
+        };
+        // verifyは全体拒否されるため、逐次実行のロールバックを起こすには
+        // verify通過後に変化させる必要がある。ここではexecute_undo呼び出し
+        // 前に改変するとverify拒否になるため、ロールバック経路の直接検証は
+        // 「verify通過 → 実行時再検証失敗」を作る独立テストに譲り、
+        // このテストではverify全体拒否 (all-or-nothing) を確認する。
+        let undo = execute_undo(
+            &*fx.store,
+            &*fx.fs,
+            &candidate,
+            &fx.roots,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(!undo.fully_undone);
+        assert!(undo.steps.is_empty(), "何も実行しない");
+        assert!(dst_dir.join("m1.png").exists(), "m1も戻らない");
+        assert!(!s1.exists());
+    }
+
+    /// 逐次実行中の失敗 (verify後・実行時再検証で崩れたケース) の
+    /// 補償ロールバック: 1番目実行後に2番目の前提が外部で崩れると、
+    /// 1番目が巻き戻され partial_undone になる。
+    #[test]
+    fn undo_compensates_executed_action_when_second_fails_midway() {
+        let fx = fixture("undo-comp");
+        let dst_dir = fx._dir.mkdir("dest");
+        let s1 = fx._dir.write("c1.png", b"one");
+        let s2 = fx._dir.write("c2.png", b"two");
+        let r1 = fx.store.add_file(fx.root.id, &s1, &fx.root.path, b"one");
+        let r2 = fx.store.add_file(fx.root.id, &s2, &fx.root.path, b"two");
+        let plan = plan_file_op(
+            &*fx.fs,
+            &fx.cancel,
+            FileOpKind::Copy,
+            vec![fx.op_file(&r1, None), fx.op_file(&r2, None)],
+            Some(&dst_dir),
+            None,
+            &fx.roots,
+        );
+        let outcome = fx.run(&plan, &ResolutionSpec::default());
+        assert_eq!(outcome.status, FileOpStatus::Done);
+        // undo = [DeleteCopy(dest/c1), DeleteCopy(dest/c2)]。
+        // 2番目 (c2) のtrashを失敗注入すると、1番目 (c1) の実行済み
+        // DeleteCopyが補償 (ゴミ箱から復帰) される。
+        fx.fs
+            .trash_fail
+            .lock()
+            .unwrap()
+            .insert(dst_dir.join("c2.png"));
+        let candidate = {
+            let ops = fx.store.get_operation(outcome.op_id).unwrap().unwrap();
+            undo_candidate_of(&ops)
+        };
+        let undo = execute_undo(
+            &*fx.store,
+            &*fx.fs,
+            &candidate,
+            &fx.roots,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(!undo.fully_undone, "{undo:?}");
+        assert_eq!(undo.steps.len(), 2);
+        assert_eq!(undo.steps[0].status, StepStatus::Done);
+        assert_eq!(undo.steps[1].status, StepStatus::Failed);
+        assert!(undo.rollback_errors.is_empty(), "補償は成功: {undo:?}");
+        // 補償: c1は元位置 (dest) へ復帰している
+        assert_eq!(
+            std::fs::read(dst_dir.join("c1.png")).unwrap(),
+            b"one",
+            "実行済みDeleteCopyが補償され復帰"
+        );
+        assert!(dst_dir.join("c2.png").exists(), "失敗したc2はそのまま");
+        assert!(s1.exists() && s2.exists(), "コピー元は無傷");
+        // 操作行は partial_undone
+        let op = fx.store.get_operation(outcome.op_id).unwrap().unwrap();
+        assert_eq!(op.status, FileOpStatus::PartialUndone);
+        assert!(!op.undoable, "再undoは不可");
+    }
+
+    /// 跨界移動でコピー後のsrc削除に失敗した場合、宛先完成済みのため
+    /// warning付き成功となる (non-blocker対応)。
+    #[test]
+    fn execute_move_exdev_remove_failure_is_warning_success() {
+        let fx = fixture("exdev-warn");
+        let dst_dir = fx._dir.mkdir("dest");
+        let src = fx._dir.write("a.png", b"cross-fs");
+        let record = fx
+            .store
+            .add_file(fx.root.id, &src, &fx.root.path, b"cross-fs");
+        fx.fs.rename_exdev.lock().unwrap().insert(src.clone());
+        fx.fs.remove_fail.lock().unwrap().insert(src.clone());
+        let plan = plan_file_op(
+            &*fx.fs,
+            &fx.cancel,
+            FileOpKind::Move,
+            vec![fx.op_file(&record, None)],
+            Some(&dst_dir),
+            None,
+            &fx.roots,
+        );
+        let outcome = fx.run(&plan, &ResolutionSpec::default());
+        assert_eq!(
+            outcome.steps[0].status,
+            StepStatus::Done,
+            "宛先完成済みのため成功扱い"
+        );
+        assert!(
+            outcome.steps[0]
+                .warning
+                .as_ref()
+                .is_some_and(|w| w.contains("元ファイル削除に失敗")),
+            "警告がある: {:?}",
+            outcome.steps[0].warning
+        );
+        assert!(dst_dir.join("a.png").exists());
+        assert!(src.exists(), "srcは残る (手動削除指示)");
+    }
+
+    /// 一時ファイル命名の厳密形式 (所有権検証の基盤)。
+    #[test]
+    fn tmp_name_strict_format_and_ownership() {
+        let dst = Path::new("/r/sub/a.png");
+        let tmp = tmp_path_for(dst, "01234567-89ab-cdef-0123-456789abcdef", 3);
+        let name = tmp.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(
+            name,
+            ".a.png.gento-tmp-0123456789abcdef0123456789abcdef-000003"
+        );
+        assert_eq!(tmp.parent().unwrap(), Path::new("/r/sub"));
+        assert!(is_owned_tmp_name(&name));
+        assert_eq!(
+            tmp_owner_uuid_simple(&name).as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        // 類似名の外部ファイルは所有扱いしない
+        for ng in [
+            ".gento-tmp-x.png",
+            ".a.png.gento-tmp-nothex32-000001",
+            ".a.png.gento-tmp-0123456789abcdef0123456789abcdef-1",
+            ".a.png.gento-tmp-0123456789abcdef0123456789abcdef-00000x",
+            "a.png.gento-tmp-0123456789abcdef0123456789abcdef-000001",
+            ".a.png.gento-tmp",
+        ] {
+            assert!(!is_owned_tmp_name(ng), "{ng}");
+            assert!(tmp_owner_uuid_simple(ng).is_none(), "{ng}");
+        }
     }
 
     // ===== 進捗イベント =====

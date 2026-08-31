@@ -204,10 +204,14 @@
   let fileOpsError = $state<string | null>(null);
   /** 宛先選択ダイアログ (コピー/移動)。 */
   let destPickerFor = $state<{ kind: "copy" | "move"; paths: string[] } | null>(null);
-  /** 衝突ダイアログ (計画実行の保留中)。 */
-  let conflictOf = $state<{ session: ConflictSession; args: ExecuteArgs } | null>(null);
-  /** 完全削除の確認。 */
-  let deleteForeverFor = $state<string[] | null>(null);
+  /** 衝突ダイアログ (計画実行の保留中。トークンは計画時に発行されたもの)。 */
+  let conflictOf = $state<{
+    session: ConflictSession;
+    args: ExecuteArgs;
+    confirmToken: string | null;
+  } | null>(null);
+  /** 完全削除の確認 (paths + 計画発行の確認トークン)。 */
+  let deleteForeverFor = $state<{ paths: string[]; confirmToken: string | null } | null>(null);
   /** 部分成功レポート (再試行)。 */
   let retryReport = $state<{ outcome: FileOpOutcomeDto; args: ExecuteArgs } | null>(null);
   /** F2インラインリネーム中の項目id。 */
@@ -274,7 +278,11 @@
     destPickerFor = { kind, paths };
   }
 
-  /** 宛先確定 → 計画 (dry-run) → 衝突があれば解決ダイアログ → 実行。 */
+  /**
+   * 宛先確定 → 計画 (dry-run) → 衝突があれば解決ダイアログ → 実行。
+   * 破壊的操作を含む計画はトークンが発行されるため、確認ダイアログを
+   * 経てトークン付きで実行する (backend確認ゲート)。
+   */
   async function runPlannedOp(args: ExecuteArgs): Promise<void> {
     fileOpsError = null;
     fileOpsNotice = "";
@@ -289,10 +297,10 @@
     }
     const session = createConflictSession(plan.steps);
     if (session.current !== null) {
-      conflictOf = { session, args };
+      conflictOf = { session, args, confirmToken: plan.confirm_token };
       return;
     }
-    await doExecute(args);
+    await doExecute({ ...args, confirm_token: plan.confirm_token });
   }
 
   /** 実行 + 結果通知 + Undo登録 (操作ログ確定後の応答で通知する)。 */
@@ -329,9 +337,13 @@
       conflictOf = { ...conflictOf, session };
       return;
     }
-    // 全衝突が解決 → 実行
+    // 全衝突が解決 → 実行 (上書きを含む場合は計画時トークンが必要)
     const perFile = resolutionsOf(session);
-    void doExecute({ ...conflictOf.args, resolutions: { per_file: perFile } });
+    void doExecute({
+      ...conflictOf.args,
+      resolutions: { per_file: perFile },
+      confirm_token: conflictOf.confirmToken,
+    });
   }
 
   /** ゴミ箱への移動 (Delete。確認なし — ゴミ箱から復帰可能なため)。 */
@@ -347,7 +359,10 @@
     void runPlannedOp({ kind: "trash", paths });
   }
 
-  /** 完全削除 (Shift+Delete。確認ダイアログ+チェックボックス)。 */
+  /**
+   * 完全削除 (Shift+Delete)。計画 (dry-run + 確認トークン発行) →
+   * 確認ダイアログ+チェックボックス → トークン付き実行。
+   */
   function startDeleteForever(): void {
     if (!requireLibraryMode()) {
       return;
@@ -357,16 +372,33 @@
       fileOpsNotice = "対象ファイルを選択してください";
       return;
     }
-    deleteForeverFor = paths;
+    fileOpsError = null;
+    fileOpsNotice = "";
+    void (async () => {
+      try {
+        const plan = await planFileOp(fileOpsIpc, { kind: "delete_forever", paths });
+        if (plan.plan_errors.length > 0) {
+          fileOpsError = plan.plan_errors.join(" / ");
+          return;
+        }
+        deleteForeverFor = { paths, confirmToken: plan.confirm_token };
+      } catch (error) {
+        fileOpsError = toErrorMessage(error);
+      }
+    })();
   }
 
   async function confirmDeleteForever(): Promise<void> {
-    const paths = deleteForeverFor;
+    const pending = deleteForeverFor;
     deleteForeverFor = null;
-    if (paths === null) {
+    if (pending === null) {
       return;
     }
-    await doExecute({ kind: "delete_forever", paths });
+    await doExecute({
+      kind: "delete_forever",
+      paths: pending.paths,
+      confirm_token: pending.confirmToken,
+    });
   }
 
   /** F2リネーム開始 (グリッド内インライン編集)。 */
@@ -456,7 +488,11 @@
         }
         const result = await undoFileOp(fileOpsIpc, opId);
         if (!result.fully_undone) {
-          const reasons = [...result.refusals, ...result.errors];
+          const reasons = [
+            ...result.refusals,
+            ...result.errors,
+            ...result.rollback_errors,
+          ];
           throw new Error(reasons.length > 0 ? reasons.join(" / ") : "元に戻せませんでした");
         }
       },
@@ -2448,7 +2484,7 @@
 
 {#if deleteForeverFor !== null}
   <DeleteForeverDialog
-    count={deleteForeverFor.length}
+    count={deleteForeverFor.paths.length}
     onConfirm={() => void confirmDeleteForever()}
     onCancel={() => (deleteForeverFor = null)}
   />
@@ -2477,7 +2513,9 @@
             if (report !== null) {
               const retry = retryArgsOf(report.outcome, report.args);
               if (retry !== null) {
-                void doExecute(retry);
+                // 再計画からやり直す (確認トークンは単発のため再発行が必要。
+                // 衝突状態も変わっている可能性がある)。
+                void runPlannedOp(retry);
               }
             }
           }}

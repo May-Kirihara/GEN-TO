@@ -53,6 +53,12 @@ export type FileOpPlanDto = {
   plan_errors: string[];
   dest_root_id: string | null;
   disk_shortfall_bytes: number | null;
+  /**
+   * 破壊的操作 (delete_forever / 上書き解決の可能性) を含む場合に発行
+   * される単発確認トークン (5分失効・1回限り)。execute時に必須。
+   * UIは 計画→確認ダイアログ→トークン付き実行 のフローを組む。
+   */
+  confirm_token: string | null;
 };
 
 /** 実行結果の1ステップ。 */
@@ -63,6 +69,8 @@ export type StepResultDto = {
   status: "done" | "skipped" | "failed" | "cancelled";
   resolution: ConflictResolution | null;
   error: string | null;
+  /** 完了したが注意喚起がいる事象 (跨界移動のsrc削除失敗等)。 */
+  warning: string | null;
 };
 
 /** 実行結果 (部分成功レポートを含む)。 */
@@ -104,7 +112,7 @@ export type FileOpsProgressEvent = {
   done: boolean;
 };
 
-/** 実行要求の引数 (計画と同じ入力 + 解決方針)。 */
+/** 実行要求の引数 (計画と同じ入力 + 解決方針 + 確認トークン)。 */
 export type ExecuteArgs = {
   kind: FileOpKind;
   paths: string[];
@@ -114,6 +122,8 @@ export type ExecuteArgs = {
     global?: ConflictResolution | null;
     per_file?: Record<string, ConflictResolution>;
   } | null;
+  /** 破壊的操作 (delete_forever / overwrite) に必須の単発確認トークン。 */
+  confirm_token?: string | null;
 };
 
 /** 操作種別のUI表示名。 */
@@ -257,8 +267,13 @@ export function outcomeNotice(outcome: FileOpOutcomeDto): string {
   if (cancelled > 0) {
     parts.push(`${cancelled.toLocaleString()}件中止`);
   }
+  let notice = `${label}: ${parts.join("・")}`;
+  const warning = outcome.steps.find((step) => step.warning !== null)?.warning ?? null;
+  if (warning !== null) {
+    notice += ` ⚠ ${warning}`;
+  }
   const suffix = outcome.undoable ? " (Ctrl+Zで元に戻せます)" : "";
-  return `${label}: ${parts.join("・")}${suffix}`;
+  return notice + suffix;
 }
 
 /** 失敗ステップの再試行引数 (同じkind・宛先で失敗分のみ再実行)。 */
@@ -325,11 +340,20 @@ export async function undoCheck(
   return ipc.invoke<UndoCheckDto>("file_ops_undo_check", { opId });
 }
 
+/** Undo実行結果 (補償ロールバックの状態を含む)。 */
+export type UndoResultDto = {
+  op_id: string;
+  fully_undone: boolean;
+  /** "undone" | "partial_undone" | "refused"。 */
+  status: string;
+  errors: string[];
+  refusals: string[];
+  /** 補償ロールバックにも失敗した項目 (手動確認が必要)。 */
+  rollback_errors: string[];
+};
+
 /** Undo実行。 */
-export async function undoFileOp(
-  ipc: FileOpsIpc,
-  opId: string,
-): Promise<{ fully_undone: boolean; errors: string[]; refusals: string[] }> {
+export async function undoFileOp(ipc: FileOpsIpc, opId: string): Promise<UndoResultDto> {
   return ipc.invoke("file_ops_undo", { opId });
 }
 

@@ -341,3 +341,19 @@
     gento-imageは再エポートで追随 (既存外部API互換維持)。
   - ゴミ箱復帰 (Undo用): XDG trashinfo を走査して元パスへ戻す実装は
     自前 (trash crateに単一項目復帰APIが無いため。WP-17でWindows対応検討)。
+
+## WP-7 レビュー対応 (FG-WP7) で追加した依存 (2026-08-31)
+
+- **`libc`** (gento-platform、通常依存。`libc = "0.2"`)
+  - 用途: `renameat2(2)` への `RENAME_NOREPLACE` 直接syscall (上書き
+    TOCTOU排除の原子的no-clobberリネーム)。`SYS_renameat2`/`AT_FDCWD`/
+    errno定数のみ使用。crate新規追加ではなく、gento-tauriが既に直付け
+    利用中の同一crate・同一バージョン帯 (0.2) をplatformへも直付け。
+  - 入手元: crates.io (rust-lang/libc)。
+  - ライセンス: MIT OR Apache-2.0。native libraryなし (pure Rust束縛)。
+  - 対応プラットフォーム: 全対応 (renameat2呼び出しはLinuxのみ。
+    非Linuxはlink+unlinkフォールバック)。
+  - `nix`クレートの採用を見送った理由: 必要なのは単一syscallのみで、
+    nix (MIT/OR) を追加すると推移依存が増える一方、直接syscallで
+    同じ原子性が得られるため (WP指示の「nixまたは直接syscall」より
+    依存最小側を選択)。

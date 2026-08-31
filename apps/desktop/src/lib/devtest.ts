@@ -743,6 +743,25 @@ export function installDevBridge(stores: DevBridgeStores): void {
         );
       }, 120);
     },
+    /** FG-WP7 E2E: 既存名 (lib-05.png) へのリネーム確定 — 上書き衝突の
+     * 確認トークンフロー (計画→衝突ダイアログ→上書き) を駆動する。 */
+    foRenameToExisting: () => {
+      const input = document.querySelector<HTMLInputElement>('[data-testid="rename-input"]');
+      if (input === null) {
+        return;
+      }
+      input.value = "lib-05.png";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      setTimeout(() => {
+        input.dispatchEvent(
+          new KeyboardEvent("keydown", {
+            key: "Enter",
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+      }, 120);
+    },
     /** Deleteキー相当 (ゴミ箱) の合成keydown。 */
     pressKeyDelete: () => {
       window.dispatchEvent(
@@ -1062,6 +1081,7 @@ export function installDevBridge(stores: DevBridgeStores): void {
           t: "foMenuTrash",
           e: "foMenuRename",
           w: "foRenameWillRevert",
+          q: "foRenameToExisting",
           x: "pressKeyDelete",
           y: "pressKeyShiftDelete",
           z: "pressCtrlZ",

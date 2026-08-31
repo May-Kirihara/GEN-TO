@@ -14,7 +14,9 @@
 //!
 //! # ゴミ箱 (trash crate包み)
 //!
-//! - [`trash_to_bin`]: OSゴミ箱へ移動。Linux実装 (trash crate) は
+//! - 関数 [`trash_to_bin`]: OSゴミ箱へ移動し、**生成されたゴミ箱エントリを
+//!   特定して** [`TrashEntry`] で返す (undo復帰の厳密同一性検証用。
+//!   WP-7レビュー対応)。Linux実装 (trash crate) は
 //!   freedesktop.org Trash Specification に従い、対象ファイルと同じ
 //!   「topdir」(マウント) ごとにゴミ箱を評価する:
 //!   - ホーム領域 (= home trashと同一マウント): `$XDG_DATA_HOME/Trash`
@@ -24,12 +26,23 @@
 //! - **失敗時の通常削除フォールバックは呼び出し側で禁止** (安全原則:
 //!   「通常削除はゴミ箱」。エラー表示のみ)。
 //! - [`restore_from_trash`]: Undo用の復帰。trash crateに単一項目復帰APIが
-//!   無いため、XDG仕様の `.trashinfo` を走査して元パス特定+移動を自前実装
-//!   する。ホームゴミ箱とadmin trash (`.Trash-$uid`) の両方を探索する。
+//!   無いため、XDG仕様の `.trashinfo` とエントリ名で構成される
+//!   [`TrashEntry`] を直接扱う。復帰前にエントリの存在検証+サイズ検証
+//!   (`expect_byte_size` = 操作時トークンのsize成分) を行い、不一致は
+//!   拒否する (パス再利用・複数エントリ競合での誤復帰防止)。
+//!
+//! # 原子的no-clobberリネーム
+//!
+//! - [`rename_noreplace`]: Linux `renameat2(RENAME_NOREPLACE)` 直接syscall
+//!   (libc経由。新規依存追加なし)。カーネル/FSが対応しない場合は
+//!   `link+unlink` フォールバック (同じく原子的no-clobber)。
+//!   上書きTOCTOU排除の最終防御 (WP-7レビュー対応)。
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use gento_core::file_ops::TrashEntry;
 use gento_core::repo::OsFileId;
 
 /// metadataからOSファイルIDを取り出す (Linux: dev+inode)。
@@ -47,16 +60,281 @@ pub fn os_file_id_of(_md: &fs::Metadata) -> Option<OsFileId> {
     None
 }
 
-/// OSゴミ箱へ移動する。失敗した場合はエラーを返すのみで、対象ファイルは
-/// **移動されず元の位置に残る** (ロールバック検証: 本関数がErrを返した時点
-/// で対象パスは不変。trash crateは移動にrenameを使うため部分移動も起きない)。
+/// [`rename_noreplace`] の失敗分類。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenameNoReplaceError {
+    /// 宛先が既に存在する (上書きしない — TOCTOU競合の検出)。
+    DestinationExists,
+    /// その他のIO失敗。
+    Io(String),
+}
+
+impl std::fmt::Display for RenameNoReplaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RenameNoReplaceError::DestinationExists => {
+                write!(f, "destination already exists (no-clobber)")
+            }
+            RenameNoReplaceError::Io(msg) => write!(f, "rename_noreplace io error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for RenameNoReplaceError {}
+
+/// 原子的no-clobberリネーム: `to` が既に存在する場合は
+/// [`RenameNoReplaceError::DestinationExists`] を返し、両ファイルを
+/// 変更しない (置換禁止。上書きTOCTOUの排除)。
+///
+/// - Linux: `renameat2(2)` に `RENAME_NOREPLACE` を指定して直接syscall
+///   (libcのsyscall番号経由。依存追加なし)。
+/// - カーネルやファイルシステムが `renameat2` のflagsに対応しない場合
+///   (ENOSYS/EINVAL/ENOTSUP)、`link(2)` + `unlink(2)` へフォールバック
+///   する (`link` は宛先存在時に `EEXIST` で失敗する原子操作のため、
+///   同じno-clobber契約を満たす)。
+/// - ファイル専用 (ディレクトリのlinkは不可。GEN-TOの最終配置はすべて
+///   ファイル。ディレクトリ作成は `create_dir` が既に排他)。
+pub fn rename_noreplace(from: &Path, to: &Path) -> Result<(), RenameNoReplaceError> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(result) = renameat2_noreplace(from, to) {
+            return result;
+        }
+        // renameat2が使えない (ENOSYS/EINVAL/ENOTSUP) → link+unlinkへ。
+    }
+    link_unlink_noreplace(from, to)
+}
+
+/// `renameat2(RENAME_NOREPLACE)` の呼び出し。`Some(result)` = syscallが
+/// 実行された (成否を含む)。`None` = サポート外のためフォールバック。
+#[cfg(target_os = "linux")]
+fn renameat2_noreplace(from: &Path, to: &Path) -> Option<Result<(), RenameNoReplaceError>> {
+    use std::os::unix::ffi::OsStrExt;
+    // libc版による差異を避けるためflag値を直に定義
+    // (linux/renameat2.h: RENAME_NOREPLACE = 1 << 0)。
+    const RENAME_NOREPLACE: libc::c_uint = 1;
+    let c_from = match std::ffi::CString::new(from.as_os_str().as_bytes()) {
+        Ok(c) => c,
+        Err(e) => {
+            return Some(Err(RenameNoReplaceError::Io(format!(
+                "{}: {e}",
+                from.display()
+            ))))
+        }
+    };
+    let c_to = match std::ffi::CString::new(to.as_os_str().as_bytes()) {
+        Ok(c) => c,
+        Err(e) => {
+            return Some(Err(RenameNoReplaceError::Io(format!(
+                "{}: {e}",
+                to.display()
+            ))))
+        }
+    };
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            c_from.as_ptr(),
+            libc::AT_FDCWD,
+            c_to.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
+    if rc == 0 {
+        return Some(Ok(()));
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EEXIST) => Some(Err(RenameNoReplaceError::DestinationExists)),
+        Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) => None,
+        code => Some(Err(RenameNoReplaceError::Io(format!(
+            "{} -> {}: {} (os error {})",
+            from.display(),
+            to.display(),
+            err,
+            code.unwrap_or(0)
+        )))),
+    }
+}
+
+/// `link(2)` + `unlink(2)` によるno-clobber移動 (フォールバック)。
+/// linkは宛先存在時にEEXISTで失敗する原子操作のため契約を満たす。
+/// unlink失敗時、ファイルは両名で存在する (同一inode。データは失われない)。
+fn link_unlink_noreplace(from: &Path, to: &Path) -> Result<(), RenameNoReplaceError> {
+    if let Err(e) = fs::hard_link(from, to) {
+        return Err(match e.kind() {
+            std::io::ErrorKind::AlreadyExists => RenameNoReplaceError::DestinationExists,
+            _ => RenameNoReplaceError::Io(format!("{} -> {}: {e}", from.display(), to.display())),
+        });
+    }
+    fs::remove_file(from).map_err(|e| {
+        RenameNoReplaceError::Io(format!(
+            "{} (link済みのため両名に存在。手動で片側を削除してください): {e}",
+            from.display()
+        ))
+    })
+}
+
+/// OSゴミ箱へ移動し、生成されたゴミ箱エントリを特定して返す。
+/// 失敗した場合はエラーを返すのみで、対象ファイルは**移動されず元の位置に
+/// 残る** (ロールバック検証: 本関数がErrを返した時点で対象パスは不変。
+/// trash crateは移動にrenameを使うため部分移動も起きない)。
+///
+/// エントリ特定: 移動前に候補ゴミ箱の `info/` を.snapshotし、移動後に
+/// **新規に出現した `Path=` 一致のtrashinfo** から `files/` 側の名前を
+/// 得る (名前衝突でtrash crateが付けるsuffixにも対応)。特定できない
+/// 場合はエラー (undo情報の欠落を黙認しない)。
 ///
 /// `path` が存在しない場合はエラー。
-pub fn trash_to_bin(path: &Path) -> Result<(), String> {
+pub fn trash_to_bin(path: &Path) -> Result<TrashEntry, String> {
     if !path.exists() {
         return Err(format!("{}: not found", path.display()));
     }
-    trash::delete(path).map_err(|e| format!("trash failed for {}: {e}", path.display()))
+    let before = snapshot_trashinfos(path);
+    trash::delete(path).map_err(|e| format!("trash failed for {}: {e}", path.display()))?;
+    let after = snapshot_trashinfos(path);
+    // 新規trashinfoのうち Path= が対象と一致するものを最新順に選ぶ。
+    let mut matches: Vec<(PathBuf, String, String)> = Vec::new(); // (trash_dir, stem, date)
+    for (dir, infos) in &after {
+        for (stem, (recorded, date)) in infos {
+            let known = before.get(dir).is_some_and(|prev| prev.contains_key(stem));
+            if !known && recorded_matches(dir, recorded, path) {
+                matches.push((dir.clone(), stem.clone(), date.clone()));
+            }
+        }
+    }
+    matches.sort_by(|a, b| b.2.cmp(&a.2));
+    if let Some((trash_dir, file_name, _)) = matches.into_iter().next() {
+        return Ok(TrashEntry {
+            trash_dir,
+            file_name,
+        });
+    }
+    Err(format!(
+        "trashed {} がエントリ特定に失敗しました (undo情報を記録できません。\
+         ゴミ箱から手動で確認してください)",
+        path.display()
+    ))
+}
+
+/// `recorded` (trashinfoの `Path=`。マウントローカルゴミ箱では
+/// マウントルート相対の場合がある) が `original` と一致するか。
+fn recorded_matches(trash_dir: &Path, recorded: &Path, original: &Path) -> bool {
+    if recorded.is_absolute() {
+        return recorded == original;
+    }
+    // XDG仕様: admin trash (.Trash/$uid, .Trash-$uid) の Path= は
+    // topdir (マウントルート) 相对。
+    #[cfg(unix)]
+    if let Some(mount) = mount_root_of(trash_dir) {
+        return mount.join(recorded) == original;
+    }
+    false
+}
+
+/// 候補ゴミ箱群の `info/` snapshot: trash_dir → {stem: (Path=, DeletionDate=)}。
+fn snapshot_trashinfos(original: &Path) -> HashMap<PathBuf, HashMap<String, (PathBuf, String)>> {
+    let mut out: HashMap<PathBuf, HashMap<String, (PathBuf, String)>> = HashMap::new();
+    for trash_root in candidate_trash_dirs(original) {
+        let info_dir = trash_root.join("info");
+        let Ok(entries) = fs::read_dir(&info_dir) else {
+            continue;
+        };
+        let mut infos = HashMap::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(stem) = name
+                .to_str()
+                .and_then(|n| n.strip_suffix(".trashinfo"))
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if let Some((path, date)) = read_trashinfo_fields(&entry.path()) {
+                infos.insert(stem, (path, date));
+            }
+        }
+        if !infos.is_empty() {
+            out.insert(trash_root, infos);
+        }
+    }
+    out
+}
+
+/// trashinfoから (Path=, DeletionDate=) を読む。
+fn read_trashinfo_fields(info_path: &Path) -> Option<(PathBuf, String)> {
+    let body = fs::read_to_string(info_path).ok()?;
+    let path = original_path_from_trashinfo(info_path)?;
+    let date = body
+        .lines()
+        .find(|l| l.starts_with("DeletionDate="))
+        .map(|l| l.trim_start_matches("DeletionDate=").to_string())
+        .unwrap_or_default();
+    Some((path, date))
+}
+
+/// ゴミ箱エントリの現在バイト数 (存在検証用。不在・読取不可はNone)。
+pub fn trash_entry_byte_size(entry: &TrashEntry) -> Option<u64> {
+    fs::metadata(entry.trash_dir.join("files").join(&entry.file_name))
+        .ok()
+        .map(|m| m.len())
+}
+
+/// ゴミ箱から `original_path` へ復帰する (Undo用)。
+///
+/// [`TrashEntry`] が指す**正確なエントリ**を `original` へ移動する。
+/// 復帰前に:
+/// - エントリ実体の存在検証 (無ければ [`RestoreError::NotFound`])。
+/// - サイズ検証: 実体サイズが `expect_byte_size` (操作時トークンの
+///   size成分) と一致しなければ [`RestoreError::SizeMismatch`]
+///   (パス再利用・複数エントリ競合での誤復帰防止)。
+/// - 復帰先に同名ファイルが存在すれば [`RestoreError::DestinationExists`]
+///   (上書きしない — 外部変更でUndoの前提が崩れたケース)。
+///
+/// 移動後、対応するtrashinfoを削除する (ゴミ箱側の整合)。
+pub fn restore_from_trash(
+    entry: &TrashEntry,
+    original: &Path,
+    expect_byte_size: u64,
+) -> Result<PathBuf, RestoreError> {
+    let trashed = entry.trash_dir.join("files").join(&entry.file_name);
+    let size = fs::metadata(&trashed)
+        .map_err(|e| {
+            RestoreError::NotFound(format!(
+                "trash entry {} not readable: {e}",
+                trashed.display()
+            ))
+        })?
+        .len();
+    if size != expect_byte_size {
+        return Err(RestoreError::SizeMismatch {
+            path: trashed,
+            expected: expect_byte_size,
+            actual: size,
+        });
+    }
+    if original.exists() {
+        return Err(RestoreError::DestinationExists(original.to_path_buf()));
+    }
+    if let Some(parent) = original.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| RestoreError::Io(format!("create {}: {e}", parent.display())))?;
+    }
+    fs::rename(&trashed, original).map_err(|e| {
+        RestoreError::Io(format!(
+            "restore {} -> {}: {e}",
+            trashed.display(),
+            original.display()
+        ))
+    })?;
+    let _ = fs::remove_file(
+        entry
+            .trash_dir
+            .join("info")
+            .join(format!("{}.trashinfo", entry.file_name)),
+    );
+    Ok(original.to_path_buf())
 }
 
 /// ゴミ箱復帰の失敗。
@@ -66,6 +344,13 @@ pub enum RestoreError {
     NotFound(String),
     /// 復帰先に同名ファイルが存在する (上書きはしない — 安全原則)。
     DestinationExists(PathBuf),
+    /// エントリ実体のサイズが操作時の記録 (トークンのsize成分) と
+    /// 一致しない (パス再利用・複数エントリ競合での誤復帰防止)。
+    SizeMismatch {
+        path: PathBuf,
+        expected: u64,
+        actual: u64,
+    },
     /// 読み取り・移動の失敗。
     Io(String),
 }
@@ -77,6 +362,15 @@ impl std::fmt::Display for RestoreError {
             RestoreError::DestinationExists(path) => write!(
                 f,
                 "cannot restore: destination already exists: {}",
+                path.display()
+            ),
+            RestoreError::SizeMismatch {
+                path,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "trash entry size mismatch: {} (expected {expected} bytes, got {actual})",
                 path.display()
             ),
             RestoreError::Io(msg) => write!(f, "restore io error: {msg}"),
@@ -189,83 +483,6 @@ fn percent_decode_utf8(encoded: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// ゴミ箱から `original_path` へ復帰する (Undo用)。
-///
-/// ゴミ箱の `info/*.trashinfo` を走査し、`Path=` が `original_path` と
-/// 一致する最新エントリ (DeletionDate降順) を `files/` から元位置へ移動する。
-/// ホームゴミ箱と元パスのマウントのadmin trash (`.Trash-$uid`) の両方を探索。
-///
-/// 安全原則:
-/// - 復帰先にファイルが既に存在する場合は [`RestoreError::DestinationExists`]
-///   (上書きしない — 外部変更でUndoの前提が崩れたケース)。
-/// - 一致するエントリが無い場合は [`RestoreError::NotFound`]。
-/// - 移動後、対応するtrashinfoを削除する (ゴミ箱側の整合)。
-pub fn restore_from_trash(original_path: &Path) -> Result<PathBuf, RestoreError> {
-    let mut candidates: Vec<(PathBuf, PathBuf, String)> = Vec::new(); // (info_path, trashed_file, deletion_date)
-    for trash_root in candidate_trash_dirs(original_path) {
-        let info_dir = trash_root.join("info");
-        let files_dir = trash_root.join("files");
-        let Ok(info_entries) = fs::read_dir(&info_dir) else {
-            continue; // そのゴミ箱は存在しない — 次の候補
-        };
-        for entry in info_entries.flatten() {
-            let info_path = entry.path();
-            if info_path.extension().and_then(|e| e.to_str()) != Some("trashinfo") {
-                continue;
-            }
-            let Some(recorded) = original_path_from_trashinfo(&info_path) else {
-                continue;
-            };
-            if recorded != original_path {
-                continue;
-            }
-            let body = fs::read_to_string(&info_path).unwrap_or_default();
-            let date = body
-                .lines()
-                .find(|l| l.starts_with("DeletionDate="))
-                .map(|l| l.trim_start_matches("DeletionDate=").to_string())
-                .unwrap_or_default();
-            // trashinfoのファイル名から拡張子を除いたものがfiles/側の名前
-            // (XDG仕様)。名前衝突でtrash crateが付けるsuffix (例: a.2) も
-            // trashinfo側と同名になるためこの規則で一致する。
-            let base_name = entry.file_name();
-            let trashed_name = base_name.to_string_lossy();
-            let trashed_name = trashed_name
-                .strip_suffix(".trashinfo")
-                .unwrap_or(&trashed_name);
-            let trashed = files_dir.join(trashed_name);
-            candidates.push((info_path, trashed, date));
-        }
-    }
-    candidates.sort_by(|a, b| b.2.cmp(&a.2)); // 降順 (最新優先)
-
-    for (info_path, trashed, _) in candidates {
-        if !trashed.exists() {
-            continue; // 壊れたエントリ — 次の候補へ
-        }
-        if original_path.exists() {
-            return Err(RestoreError::DestinationExists(original_path.to_path_buf()));
-        }
-        if let Some(parent) = original_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| RestoreError::Io(format!("create {}: {e}", parent.display())))?;
-        }
-        fs::rename(&trashed, original_path).map_err(|e| {
-            RestoreError::Io(format!(
-                "restore {} -> {}: {e}",
-                trashed.display(),
-                original_path.display()
-            ))
-        })?;
-        let _ = fs::remove_file(&info_path);
-        return Ok(original_path.to_path_buf());
-    }
-    Err(RestoreError::NotFound(format!(
-        "no trash entry for {}",
-        original_path.display()
-    )))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,28 +547,83 @@ mod tests {
         fs::create_dir_all(original.parent().unwrap()).unwrap();
         fs::write(&original, b"pngdata").unwrap();
 
-        trash_to_bin(&original).expect("trash succeeds");
+        let entry = trash_to_bin(&original).expect("trash succeeds");
         assert!(!original.exists(), "元位置からは消える");
         let trash_root = xdg_trash_root().unwrap();
+        assert_eq!(entry.trash_dir, trash_root);
         assert!(
-            trash_root.join("files").join("img.png").exists(),
-            "ゴミ箱files/配下に実在する (XDG配置)"
+            trash_root.join("files").join(&entry.file_name).exists(),
+            "特定したエントリがfiles/配下に実在する"
         );
         assert!(
-            trash_root.join("info").join("img.png.trashinfo").exists(),
-            "trashinfoが書かれている (復帰探索の前提)"
+            trash_root
+                .join("info")
+                .join(format!("{}.trashinfo", entry.file_name))
+                .exists(),
+            "対応するtrashinfoが存在 (特定の正しさ)"
         );
 
-        let restored = restore_from_trash(&original).expect("restore succeeds");
+        let restored =
+            restore_from_trash(&entry, &original, b"pngdata".len() as u64).expect("restore");
         assert_eq!(restored, original);
         assert_eq!(fs::read(&original).unwrap(), b"pngdata");
+    }
+
+    /// 同名を2回trashした場合、各エントリは別名で特定され、それぞれ
+    /// 正確に復帰できる (パス再利用・複数エントリ競合への耐性)。
+    #[test]
+    fn trash_identifies_distinct_entries_for_same_path() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let (work, _trash) = set_xdg_trash("dupnames");
+        let original = work.0.join("dup.png");
+        fs::write(&original, b"first").unwrap();
+        let entry1 = trash_to_bin(&original).unwrap();
+        // 同パスを別内容で再出現→再trash
+        fs::write(&original, b"second!").unwrap();
+        let entry2 = trash_to_bin(&original).unwrap();
+        assert_ne!(entry1.file_name, entry2.file_name, "衝突suffixで別名");
+        // それぞれ正確に復帰 (entry1を先に戻すとentry2の復帰先が塞がる
+        // ため、entry2 → 削除 → entry1の順で検証)
+        let restored2 = restore_from_trash(&entry2, &original, 7).unwrap();
+        assert_eq!(fs::read(&restored2).unwrap(), b"second!");
+        fs::remove_file(&original).unwrap();
+        let restored1 = restore_from_trash(&entry1, &original, 5).unwrap();
+        assert_eq!(fs::read(&restored1).unwrap(), b"first");
+    }
+
+    /// 外部で同パスのtrashinfoが既に存在していても、新規エントリのみを
+    /// 特定する (既存エントリと混同しない)。
+    #[test]
+    fn trash_identifies_only_new_entry_when_same_path_exists() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let (tmp, trash) = set_xdg_trash("existing");
+        let original = tmp.0.join("mix.png");
+        // 外部trashed相当の既存エントリ (内容 OLD)
+        write_trashinfo(
+            &trash,
+            "mix",
+            &original.to_string_lossy(),
+            "2026-08-30T00:00:00",
+        );
+        fs::write(trash.join("files").join("mix"), b"OLD").unwrap();
+        // GEN-TOが同パスをtrash (内容 NEW) → 新規エントリが特定される
+        fs::write(&original, b"NEW").unwrap();
+        let entry = trash_to_bin(&original).unwrap();
+        assert_ne!(entry.file_name, "mix", "既存ではなく新規エントリ");
+        let restored = restore_from_trash(&entry, &original, 3).unwrap();
+        assert_eq!(fs::read(&restored).unwrap(), b"NEW", "新規分を復帰");
     }
 
     #[test]
     fn restore_missing_entry_is_not_found() {
         let _env = ENV_LOCK.lock().unwrap();
         let (_tmp, _trash) = set_xdg_trash("missing");
-        let err = restore_from_trash(Path::new("/definitely/not/trashed.png")).unwrap_err();
+        let entry = TrashEntry {
+            trash_dir: xdg_trash_root().unwrap(),
+            file_name: "ghost".to_string(),
+        };
+        let err =
+            restore_from_trash(&entry, Path::new("/definitely/not/trashed.png"), 1).unwrap_err();
         assert!(matches!(err, RestoreError::NotFound(_)), "{err}");
     }
 
@@ -368,8 +640,11 @@ mod tests {
         );
         fs::write(trash.join("files").join("a"), b"trashed").unwrap();
         fs::write(&original, b"external new file").unwrap();
-
-        let err = restore_from_trash(&original).unwrap_err();
+        let entry = TrashEntry {
+            trash_dir: trash.clone(),
+            file_name: "a".to_string(),
+        };
+        let err = restore_from_trash(&entry, &original, 7).unwrap_err();
         assert!(
             matches!(&err, RestoreError::DestinationExists(p) if *p == original),
             "{err}"
@@ -378,30 +653,68 @@ mod tests {
         assert_eq!(fs::read(&original).unwrap(), b"external new file");
     }
 
+    /// エントリ実体のサイズが期待 (トークンのsize成分) と一致しない
+    /// 場合は復帰拒否 (誤復帰防止)。
     #[test]
-    fn restore_picks_latest_deletion_date() {
+    fn restore_refuses_when_entry_size_mismatch() {
         let _env = ENV_LOCK.lock().unwrap();
-        let (tmp, trash) = set_xdg_trash("latest");
-        let original = tmp.0.join("latest.png");
-        // 同一元パスで2エントリ (古い方には別内容)
+        let (tmp, trash) = set_xdg_trash("sizemismatch");
+        let original = tmp.0.join("size.png");
         write_trashinfo(
             &trash,
-            "old",
+            "s",
             &original.to_string_lossy(),
-            "2026-08-30T00:00:00",
+            "2026-08-31T10:00:00",
         );
-        fs::write(trash.join("files").join("old"), b"old").unwrap();
-        write_trashinfo(
-            &trash,
-            "new",
-            &original.to_string_lossy(),
-            "2026-08-31T00:00:00",
+        fs::write(trash.join("files").join("s"), b"actual-9").unwrap();
+        let entry = TrashEntry {
+            trash_dir: trash.clone(),
+            file_name: "s".to_string(),
+        };
+        let err = restore_from_trash(&entry, &original, 42).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                RestoreError::SizeMismatch {
+                    expected: 42,
+                    actual: 8,
+                    ..
+                }
+            ),
+            "{err}"
         );
-        fs::write(trash.join("files").join("new"), b"new").unwrap();
+        assert!(!original.exists(), "復帰しない");
+    }
 
-        let restored = restore_from_trash(&original).unwrap();
-        assert_eq!(restored, original);
-        assert_eq!(fs::read(&original).unwrap(), b"new", "最新のエントリが復帰");
+    /// マウントローカルtrashinfoの相対 `Path=` 対応 (non-blocker):
+    /// admin trash (.Trash-$uid) の Path= はマウントルート相対。
+    #[test]
+    fn restore_resolves_relative_path_against_mount_root() {
+        // recorded_matches の単体検証: 相対Path=はtrash dirの実際の
+        // マウントルート基準で解決される (環境非依存に実ディレクトリで検証)。
+        let work = TestDir::new("relpath");
+        let trash_dir = work.0.join(".Trash-1000");
+        fs::create_dir_all(trash_dir.join("info")).unwrap();
+        fs::create_dir_all(trash_dir.join("files")).unwrap();
+        let mount = mount_root_of(&trash_dir).expect("trash dirが存在すればマウントルートは求まる");
+        assert!(
+            mount.is_absolute() && trash_dir.starts_with(&mount),
+            "trash dirは自身のマウントルート配下: mount={}",
+            mount.display()
+        );
+        let original = mount.join("photos/a.png");
+        assert!(recorded_matches(
+            &trash_dir,
+            Path::new("photos/a.png"),
+            &original
+        ));
+        assert!(!recorded_matches(
+            &trash_dir,
+            Path::new("photos/a.png"),
+            &mount.join("other/a.png")
+        ));
+        // 絶対Path=は従来どおり直接比較
+        assert!(recorded_matches(&trash_dir, &original, &original));
     }
 
     #[test]
@@ -414,7 +727,11 @@ mod tests {
         let encoded = format!("/{}", percent_encode_for_test(&original.to_string_lossy()));
         write_trashinfo(&trash, "p", &encoded, "2026-08-31T00:00:00");
         fs::write(trash.join("files").join("p"), b"data").unwrap();
-        let restored = restore_from_trash(&original).unwrap();
+        let entry = TrashEntry {
+            trash_dir: trash.clone(),
+            file_name: "p".to_string(),
+        };
+        let restored = restore_from_trash(&entry, &original, 4).unwrap();
         assert_eq!(restored, original);
         assert_eq!(fs::read(&original).unwrap(), b"data");
     }
@@ -453,11 +770,75 @@ mod tests {
         let (work, _trash) = set_xdg_trash("keep");
         let original = work.0.join("keep.png");
         fs::write(&original, b"keepme").unwrap();
-        trash_to_bin(&original).unwrap();
+        let entry = trash_to_bin(&original).unwrap();
         let trash_root = xdg_trash_root().unwrap();
         // ゴミ箱内の実体が同一内容
-        let trashed = fs::read(trash_root.join("files").join("keep.png")).unwrap();
+        let trashed = fs::read(trash_root.join("files").join(&entry.file_name)).unwrap();
         assert_eq!(trashed, b"keepme", "移動 (削除+再作成) で内容が失われない");
+    }
+
+    // ===== 原子的no-clobberリネーム =====
+
+    #[test]
+    fn rename_noreplace_moves_file_atomically() {
+        let work = TestDir::new("rnp");
+        let from = work.0.join("a.png");
+        let to = work.0.join("b.png");
+        fs::write(&from, b"data").unwrap();
+        rename_noreplace(&from, &to).expect("move succeeds");
+        assert!(!from.exists());
+        assert_eq!(fs::read(&to).unwrap(), b"data");
+    }
+
+    #[test]
+    fn rename_noreplace_refuses_existing_destination() {
+        let work = TestDir::new("rnp-exists");
+        let from = work.0.join("a.png");
+        let to = work.0.join("b.png");
+        fs::write(&from, b"new").unwrap();
+        fs::write(&to, b"existing").unwrap();
+        let err = rename_noreplace(&from, &to).unwrap_err();
+        assert!(
+            matches!(err, RenameNoReplaceError::DestinationExists),
+            "{err}"
+        );
+        // 両ファイル無傷 (上書きされない)
+        assert_eq!(fs::read(&to).unwrap(), b"existing");
+        assert_eq!(fs::read(&from).unwrap(), b"new");
+    }
+
+    #[test]
+    fn rename_noreplace_fallback_link_unlink_is_atomic_noclobber() {
+        let work = TestDir::new("rnp-fallback");
+        let from = work.0.join("a.png");
+        let to = work.0.join("b.png");
+        fs::write(&from, b"x").unwrap();
+        fs::write(&to, b"y").unwrap();
+        let err = link_unlink_noreplace(&from, &to).unwrap_err();
+        assert!(matches!(err, RenameNoReplaceError::DestinationExists));
+        assert_eq!(fs::read(&from).unwrap(), b"x");
+        assert_eq!(fs::read(&to).unwrap(), b"y");
+        // 成功経路: 移動して内容が同一inode (link) であることを確認
+        let to2 = work.0.join("c.png");
+        link_unlink_noreplace(&from, &to2).unwrap();
+        assert!(!from.exists());
+        assert_eq!(fs::read(&to2).unwrap(), b"x");
+    }
+
+    #[test]
+    fn trash_entry_byte_size_reports_current_size() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let (work, _trash) = set_xdg_trash("entrysize");
+        let original = work.0.join("s.png");
+        fs::write(&original, b"12345").unwrap();
+        let entry = trash_to_bin(&original).unwrap();
+        assert_eq!(trash_entry_byte_size(&entry), Some(5));
+        fs::write(
+            entry.trash_dir.join("files").join(&entry.file_name),
+            b"1234567",
+        )
+        .unwrap();
+        assert_eq!(trash_entry_byte_size(&entry), Some(7));
     }
 
     #[test]

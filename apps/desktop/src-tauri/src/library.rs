@@ -445,6 +445,50 @@ impl LibraryController {
         }
     }
 
+    /// FG-WP7: 抑制中に破棄されたイベントパスの和解スキャンを発火する
+    /// (操作完了後に呼ぶ)。各ルートのバッファが記録した破棄パスを取り出し、
+    /// 影響ディレクトリ (親ディレクトリ) 単位のscoped差分スキャン
+    /// ([`LibCmd::ScanScope`] — 監視イベント適用と同じ差分エンジン) を
+    /// 投入する。抑制中の外部変更を見逃さないための兜底。
+    pub fn reconcile_suppressed(&self) {
+        let watchers = self.watchers.lock().unwrap_or_else(|p| p.into_inner());
+        for (root_id, state) in watchers.iter() {
+            let dropped = state.buffer.take_suppressed_dropped();
+            if dropped.is_empty() {
+                continue;
+            }
+            let Some((root, _)) = self
+                .list_roots()
+                .ok()
+                .and_then(|roots| roots.into_iter().find(|(r, _)| r.id == *root_id))
+            else {
+                continue;
+            };
+            // 破棄パス → 影響ディレクトリ (ルート相対)。
+            let mut scopes = std::collections::BTreeSet::new();
+            for path in &dropped {
+                match path.strip_prefix(&root.path) {
+                    Ok(rel) if rel.as_os_str().is_empty() => {
+                        // ルート自体への変化 — 全体スキャンへ
+                        let _ = self.tx.send(LibCmd::ScanRoot(root.id));
+                        scopes.clear();
+                        break;
+                    }
+                    Ok(rel) => {
+                        scopes.insert(rel.parent().unwrap_or(Path::new("")).to_path_buf());
+                    }
+                    Err(_) => continue, // このルート配下でない
+                }
+            }
+            for scope in scopes {
+                let _ = self.tx.send(LibCmd::ScanScope {
+                    root_id: root.id,
+                    scope,
+                });
+            }
+        }
+    }
+
     /// 監視を停止しワーカー・ハッシュプールを終了する (アプリ終了時)。
     pub fn shutdown(&self) {
         let ids: Vec<i64> = self
@@ -1883,6 +1927,49 @@ mod tests {
                 })
                 .unwrap_or(false)
         }));
+        controller.shutdown();
+    }
+
+    /// FG-WP7: 抑制中に破棄された外部変更イベントが、操作完了後の
+    /// 和解スキャン (reconcile_suppressed → scoped差分) でDBへ反映される。
+    /// 抑制中に対象パスへ外部ファイルが再出現するシナリオ。
+    #[test]
+    fn reconcile_suppressed_recovers_external_change_during_operation() {
+        let (db_path, _dir) = temp_db("reconcile");
+        let data = TestDir::new("reconcile-data");
+        data.write("a.png", PNG_A);
+        let (controller, host) = make_controller(&db_path);
+        let (root, _) = controller.add_root(data.path()).unwrap();
+        assert!(wait_scan_settled(&controller, &host, 1));
+
+        // 操作中をシミュレート: 対象パスを抑制 (trash想定)
+        let target = data.path().join("a.png");
+        controller.suppress_paths(std::slice::from_ref(&target));
+        // 抑制中: 自操作 (a.png削除) + 外部変更 (同パスへ別内容が再出現)
+        std::fs::remove_file(&target).unwrap();
+        std::fs::write(&target, PNG_B).unwrap();
+        // watcherイベントの交付を待つ (抑制され破棄パスとして記録される)
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        // 操作完了: 抑制解除 + 和解スキャン
+        controller.unsuppress_paths(std::slice::from_ref(&target));
+        controller.reconcile_suppressed();
+
+        // 和解スキャンで外部変更 (PNG_Bのサイズ) がDBへ反映される
+        let expected_len = PNG_B.len() as u64;
+        assert!(
+            wait_until(20, || {
+                controller
+                    .db()
+                    .with_reader(|repos| {
+                        Ok(repos
+                            .find_by_path(root.id, &PathBuf::from("a.png"))
+                            .unwrap()
+                            .is_some_and(|r| r.byte_size == expected_len))
+                    })
+                    .unwrap_or(false)
+            }),
+            "抑制中の外部変更が和解スキャンでDBへ反映される"
+        );
         controller.shutdown();
     }
 

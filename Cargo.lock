@@ -1456,6 +1456,7 @@ name = "gento-platform"
 version = "0.1.0"
 dependencies = [
  "gento-core",
+ "libc",
  "serde_json",
  "trash",
 ]

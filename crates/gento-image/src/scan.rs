@@ -213,14 +213,20 @@ pub const IMAGE_EXTENSIONS: [&str; 9] = [
 ];
 
 /// 拡張子がMVP対象画像形式か (大小文字無視)。
-/// WP-7のコピー進行中テンポラリ (`.gento-tmp-`接頭辞) は画像扱いしない
-/// — 「コピー完了前のファイルを正規ファイルとして登録しない」安全原則の
-/// 走査側強制 (異常終了で残った掃除漏れも登録しない)。
+/// WP-7のコピー進行中テンポラリは画像扱いしない — 「コピー完了前の
+/// ファイルを正規ファイルとして登録しない」安全原則の走査側強制
+/// (異常終了で残った掃除漏れも登録しない)。
+///
+/// テンポラリ名は2形式ある (どちらも名前中に `.gento-tmp-` を含む):
+/// - 旧形式: `.gento-tmp-<uuid>-<name>` (接頭辞)
+/// - 厳密形式 (FG-WP7): `.<最終名>.gento-tmp-<op_uuid>-<seq>`
+///
+/// 走査側はfail-closed (広めに拒否) するため包含一致で判定する。
 pub fn is_image_entry(path: &Path) -> bool {
     if path
         .file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|n| n.starts_with(gento_core::file_ops::TMP_FILE_PREFIX))
+        .is_some_and(|n| n.contains(gento_core::file_ops::TMP_FILE_PREFIX))
     {
         return false;
     }

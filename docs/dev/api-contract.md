@@ -1458,8 +1458,16 @@ invoke<FileOpPlanDto>("file_ops_plan", {
   plan_errors: string[],             // 実行不可 (renameに複数ファイル等)
   dest_root_id: string | null,
   disk_shortfall_bytes: number | null,  // 容量不足 (バイト差)
+  confirm_token: string | null,  // FG-WP7: 破壊的操作を含む場合の単発確認トークン
 }
 ```
+
+`confirm_token` (FG-WP7): `kind: "delete_forever"` または上書き解決の
+可能性がある衝突を含む計画に対して発行される**単発用トークン**
+(乱数nonce・メモリ保持・5分失効・1回限り)。`file_ops_execute` は
+`delete_forever` / overwrite解決の実行にトークン一致を**必須**化する
+(不一致・失効・再利用はErr)。UIは 計画→確認ダイアログ→トークン付き実行
+のフローを組む (チェックボックスのみに依存しないbackend確認ゲート)。
 
 ### `file_ops_execute` — 実行 (async command)
 
@@ -1474,12 +1482,15 @@ invoke<FileOpOutcomeDto>("file_ops_execute", {
       global: "overwrite" | "skip" | "keep_both" | null,
       per_file: Record<string, string> | null,  // file_id → 方針
     } | null,
+    confirm_token: string | null,  // FG-WP7: 破壊的操作に必須 (plan応答のもの)
   },
 });
 ```
 
 応答 (`FileOpOutcomeDto`): `{ op_id, kind, status: "done"|"partial"|"failed",
-undoable, steps: Array<{ file_id, from, to, status, resolution, error }> }`。
+undoable, steps: Array<{ file_id, from, to, status, resolution, error,
+warning }> }` (`warning` = 完了したが注意喚起がいる事象。例: 跨界移動で
+コピー後の元ファイル削除失敗 — 宛先完成済みのため成功扱い)。
 **実行は (a) file_operations行をexecutingで確保 → (b) ファイル単位FS+DB
 (1tx) → (c) result JSON確定、の順。この応答を受けた時点で操作ログは
 確定済み** (安全原則「操作ログ確定後にUI成功通知」)。内部で計画を再計算
@@ -1492,13 +1503,26 @@ invoke<UndoCheckDto>("file_ops_undo_check", { opId: string });
 // → { op_id, ok, kind, refusals: string[] }  前提検証のみ (何も実行しない)
 
 invoke<UndoOutcomeDto>("file_ops_undo", { opId: string });
-// → { op_id, fully_undone: boolean, errors: string[], refusals: string[] }
+// → { op_id, fully_undone: boolean, status: "undone"|"partial_undone"|"refused",
+//     errors: string[], refusals: string[], rollback_errors: string[] }
 ```
 
-前提検証 (全ステップ all-or-nothing): 対象の存在・世代トークン一致
-(os_file_id+size+mtime_ns)・戻し先の不在。外部変更で前提が崩れていれば
-**何も実行せず**理由を返す (安全原則3)。Undo対象: copy(生成物削除=ゴミ箱) /
-move・rename(巻き戻し) / trash(ゴミ箱復帰)。mkdir・delete_foreverは対象外。
+前提検証 (全アクション): 対象の存在・世代トークン一致
+(os_file_id+size+mtime_ns)・戻し先の不在・**ゴミ箱エントリの存在+サイズ一致**
+(記録した `TrashEntry` = trash dir + entry名に対する厳密同一性検証。
+パス再利用・複数エントリ競合では不一致→拒否)。検証は記録順を考慮した
+逐次シミュレーション (上書きステップの複合undo —「新ファイル除去→旧
+ファイル復帰」— では除去が復帰先を空けた前提で検証する)。外部変更で
+前提が崩れていれば**何も実行せず**理由を返す (安全原則3)。
+
+**Undo原子性ポリシー (FG-WP7): 逐次実行+補償ロールバック**。各アクション
+は実行直前に前提を再検証し、失敗・キャンセル時は実行済みアクションを
+**逆順で補償**する (各補償も前提検証付き)。全成功でのみ `undone`
+(操作行のstatusも `undone`)。それ以外は `partial_undone` +理由
+(操作行のstatusは `partial_undone`・undoable=0)。補償にも失敗した項目は
+`rollback_errors` へ (手動確認が必要)。Undo対象: copy(生成物削除=ゴミ箱) /
+move・rename(巻き戻し) / trash(ゴミ箱復帰) / **上書きステップ(新ファイル
+除去+旧ファイル復帰の複合)**。mkdir・delete_foreverは対象外。
 
 ### `file_ops_history` / `file_ops_cancel` / `folder_create`
 
@@ -1526,22 +1550,41 @@ type FileOpsProgressEvent = {
 ## 41. ファイル操作の安全規約 (WP-7。Codexレビュー対象)
 
 - **通常削除はゴミ箱** (`trash`)。`delete_forever` は別コマンドとして分離し、
-  UIでは確認ダイアログ+「完全に削除する」チェックボックスの2段明示。
+  **backend確認ゲート** (FG-WP7: plan発行の単発トークン一致がexecuteに必須。
+  UIは確認ダイアログ+「完全に削除する」チェックボックスの2段明示)。
   ゴミ箱移動の失敗は通常削除へフォールバックしない (エラー表示のみ)。
-- **上書きは明示確認**: dry-runで衝突を検出し、overwriteが明示された場合
-  のみ置換。未指定の衝突はskip。「操作先==操作元」の上書きは拒否。
-- **コピーの中間生成物は非登録**: コピーは `.gento-tmp-` 接頭辞のテンポラリ
-  名で書き込み・fsync後に最終名へrenameしてからDB反映。走査
-  (is_image_entry) も同接頭辞を画像扱いしないため、異常終了残骸も一覧・
-  DBに現れない (起動時に掃除)。
-- **移動の原子性**: 同一FSはfs::rename。跨界 (EXDEV) はcopy+fsync+rename→
-  元削除へフォールバック。
+- **上書きは明示確認 + 旧ファイル保護**: dry-runで衝突を検出し、overwrite
+  が明示された場合のみ (1) 旧宛先を先に**ゴミ箱へ退避**し (2) 新ファイルを
+  配置する (undoは「新ファイル除去+旧ファイル復帰」の複合)。未指定の衝突は
+  skip。「操作先==操作元」の上書きは拒否。上書き実行にも確認トークン必須。
+- **最終配置は原子的no-clobber** (FG-WP7): copy/move/keep_bothの最終配置は
+  すべて `renameat2(RENAME_NOREPLACE)` (Linux直接syscall。非対応環境は
+  link+unlinkフォールバック) で行う。計画→実行間に宛先が出現しても
+  **上書きされない** (AlreadyExists失敗 = TOCTOU競合の検出)。
+- **ゴミ箱undoの厳密同一性** (FG-WP7): trash実行直後に生成エントリを特定
+  (新規trashinfoのPath=一致) し `TrashEntry` (trash dir + entry名) を
+  result JSONへ記録。undo/restoreはその正確なエントリを対象に、復帰前に
+  存在検証+サイズ検証 (トークンのsize成分) を行う。
+- **コピーの中間生成物は非登録**: コピーは厳密形式
+  `.{最終名}.gento-tmp-{op_uuid}-{seq}` のテンポラリ名で書き込み・fsync後
+  にNOREPLACEで最終名へ確定してからDB反映。走査 (is_image_entry) も名前中
+  の `.gento-tmp-` を画像扱いしないため、異常終了残骸も一覧・DBに現れない。
+- **一時ファイル掃除の所有権** (FG-WP7): 起動掃除は (a) file_operationsの
+  request/result JSONに記録された所有tmpパス、(b) 厳密正規表現一致
+  (uuid形式検証含む) かつ登録ルート配下、のみ削除。それ以外の
+  `.gento-tmp-` 類似ファイルは残置しログで通知。
+- **移動の原子性**: 同一FSはNOREPLACEリネーム。跨界 (EXDEV) は
+  copy+fsync+NOREPLACE配置→元削除へフォールバック (元削除失敗は
+  warning付き成功 — 宛先完成済みのため)。
 - **DB反映**: ファイル単位で1トランザクション。移動=rel_path更新
   (uuid・Asset・os_file_id保持)、ゴミ箱/完全削除/ルート外移動=missing化
   (`.gento-trash` 仮想化はしない — 再出現で復帰)。コピーは元Assetへ即時
   共有リンク (hash共有)。
-- **watcher抑制**: 操作実行中、対象パス (元・先) の監視イベントを無視
-  (WatchBuffer抑制キー)。DB反映完了後に解除。
+- **watcher抑制 + 和解スキャン** (FG-WP7): 操作実行中、対象パス (元・先)
+  の監視イベントを破棄 (WatchBuffer抑制キー) するが、**破棄したパスを記録**。
+  操作完了後 (`operation_finished`) に影響ディレクトリのscoped差分スキャン
+  (監視イベント適用と同じ差分エンジン) を発火し、抑制中の外部変更を見逃さ
+  ない。
 - **異常終了回復**: 起動時に `executing` 残留のfile_operationsを検出→
   `failed`確定+再スキャンで収束 (「安全な再開」= 失敗項目のUI再試行)。
 - IDs: file_id/op_idは10進文字列 (JS安全整数規約に合わせる)。

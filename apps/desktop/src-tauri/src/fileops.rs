@@ -19,9 +19,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use gento_core::file_ops::{
-    execute_file_op, execute_mkdir, plan_file_op, undo_candidate_of, verify_undo, ConflictInfo,
-    FileOpFile, FileOpKind, FileOpOutcome, FileOpPlan, FileOpProgress, FileOpsFs, FileRootRef,
-    FileStat, FsOpError, FsOpErrorKind, ResolutionSpec, StepStatus, UndoOutcome, TMP_FILE_PREFIX,
+    execute_file_op, execute_mkdir, owned_tmp_paths_of, plan_file_op, undo_candidate_of,
+    verify_undo, ConflictInfo, ConflictResolution, FileOpFile, FileOpKind, FileOpOutcome,
+    FileOpPlan, FileOpProgress, FileOpsFs, FileOpsRepo, FileRootRef, FileStat, FsOpError,
+    FsOpErrorKind, ResolutionSpec, StepStatus, UndoOutcome,
 };
 use gento_core::repo::{AssetRepo, FileRepo, LibraryRootRepo, RepoError};
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,9 @@ pub trait FileOpsHost: Send + Sync {
     fn progress(&self, payload: &FileOpProgressDto);
     /// 操作完了 (操作ログ確定後のみ呼ばれる): カタログ再反映。
     fn operation_finished(&self);
+    /// FG-WP7: 操作完了後のwatcher和解 (抑制中に破棄した外部変更イベント
+    /// パスのscoped差分スキャン発火)。既定は何もしない (テストHost向け)。
+    fn reconcile_after_operation(&self) {}
     /// watcher抑制の登録/解除。
     fn suppress(&self, paths: &[PathBuf]);
     fn unsuppress(&self, paths: &[PathBuf]);
@@ -66,6 +70,15 @@ impl FileOpsHost for TauriFileOpsHost {
         }
     }
 
+    fn reconcile_after_operation(&self) {
+        let Some(state) = self.app.try_state::<AppState>() else {
+            return;
+        };
+        if let Some(controller) = &state.library {
+            controller.reconcile_suppressed();
+        }
+    }
+
     fn suppress(&self, paths: &[PathBuf]) {
         let Some(state) = self.app.try_state::<AppState>() else {
             return;
@@ -85,6 +98,55 @@ impl FileOpsHost for TauriFileOpsHost {
     }
 }
 
+/// 恒久削除・上書きのbackend確認ゲート用トークン (FG-WP7)。
+///
+/// - `file_ops_plan` が破壊的操作を含む計画に対して**単発用**の乱数nonceを
+///   発行する (メモリ保持・5分失効・1回限り)。
+/// - `file_ops_execute` は `kind: delete_forever` または上書き解決の実行に
+///   **トークン一致を必須**化する (不一致/失効/再利用はErr)。
+///   UIのチェックボックスだけに依存しない構造強制 (レビュー指摘対応)。
+#[derive(Debug)]
+struct ConfirmTokenEntry {
+    expires_at: std::time::Instant,
+}
+
+/// トークンの失効までの時間。
+const CONFIRM_TOKEN_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// 確認トークンストア (メモリ。プロセス再起動で失効 = 再確認要求)。
+#[derive(Default)]
+struct ConfirmTokenStore {
+    tokens: Mutex<HashMap<String, ConfirmTokenEntry>>,
+}
+
+impl ConfirmTokenStore {
+    /// 期限切れを刈り取りつつ新しいトークンを発行する。
+    fn issue(&self) -> String {
+        let token = Uuid::now_v7().to_string();
+        // v7は時刻順序付きの乱数 (122bit randomness) — 予測困難性は
+        // 秘密性ではなく「持っていること」の証明に十分。
+        let mut guard = self.tokens.lock().unwrap_or_else(|p| p.into_inner());
+        let now = std::time::Instant::now();
+        guard.retain(|_, entry| entry.expires_at > now);
+        guard.insert(
+            token.clone(),
+            ConfirmTokenEntry {
+                expires_at: now + CONFIRM_TOKEN_TTL,
+            },
+        );
+        token
+    }
+
+    /// トークンを検証して**消費する** (1回限り)。不一致・失効はfalse。
+    fn consume(&self, token: &str) -> bool {
+        let mut guard = self.tokens.lock().unwrap_or_else(|p| p.into_inner());
+        match guard.remove(token) {
+            Some(entry) => entry.expires_at > std::time::Instant::now(),
+            None => false,
+        }
+    }
+}
+
 /// ファイル操作サービス (状態はAppStateではなくモジュールglobal的に
 /// 保持せず、AppStateへmanageする)。
 pub struct FileOpsService {
@@ -93,6 +155,7 @@ pub struct FileOpsService {
     host: Arc<dyn FileOpsHost>,
     cancel: Arc<AtomicBool>,
     running: RunningGuard,
+    confirm_tokens: ConfirmTokenStore,
 }
 
 impl FileOpsService {
@@ -112,6 +175,7 @@ impl FileOpsService {
             host,
             cancel: Arc::new(AtomicBool::new(false)),
             running: Mutex::new(None),
+            confirm_tokens: ConfirmTokenStore::default(),
         })
     }
 
@@ -181,7 +245,9 @@ impl FileOpsService {
         Ok(out)
     }
 
-    /// dry-run (計画)。
+    /// dry-run (計画)。`delete_forever` または上書き可能性のある衝突を
+    /// 含む場合は、確認ゲート用の単発トークンを発行して応答へ含める
+    /// (executeで一致が必須。UIは 計画→確認ダイアログ→トークン付き実行)。
     pub fn plan(
         &self,
         kind: FileOpKind,
@@ -200,11 +266,23 @@ impl FileOpsService {
             new_name,
             &roots,
         );
-        Ok(FileOpPlanDto::from_plan(&plan))
+        let confirm_token = if kind == FileOpKind::DeleteForever
+            || plan.steps.iter().any(|s| s.conflict.is_some())
+        {
+            Some(self.confirm_tokens.issue())
+        } else {
+            None
+        };
+        Ok(FileOpPlanDto::from_plan(&plan, confirm_token))
     }
 
     /// 実行。内部で計画を再計算する (クライアント由来の計画を信頼しない —
     /// 現在のFS状態に対して解決する)。衝突解決は `resolutions`。
+    ///
+    /// 確認ゲート (FG-WP7): `kind: delete_forever` または実行時計画で
+    /// 上書き解決となるステップを含む場合、`confirm_token` が plan発行の
+    /// 有効な単発トークンと一致しなければErr (不一致・失効・再利用もErr)。
+    /// トークンは消費される (1回限り)。
     pub fn execute(
         &self,
         kind: FileOpKind,
@@ -212,6 +290,7 @@ impl FileOpsService {
         dest_dir: Option<&Path>,
         new_name: Option<&str>,
         resolutions: ResolutionSpec,
+        confirm_token: Option<&str>,
     ) -> Result<FileOpOutcome, String> {
         let _guard = self.lock_running()?;
         self.cancel.store(false, Ordering::SeqCst);
@@ -233,6 +312,24 @@ impl FileOpsService {
                 .map(|e| e.message.clone())
                 .collect::<Vec<_>>()
                 .join(" / "));
+        }
+        // 確認ゲート: 破壊的操作 (delete_forever / overwrite解決) には
+        // planで発行した単発トークンの一致を必須とする。
+        let needs_confirm = kind == FileOpKind::DeleteForever
+            || plan.steps.iter().any(|s| {
+                s.conflict.is_some()
+                    && resolutions.of(s.file.file_id) == Some(ConflictResolution::Overwrite)
+            });
+        if needs_confirm {
+            match confirm_token {
+                Some(token) if self.confirm_tokens.consume(token) => {}
+                _ => {
+                    return Err(
+                        "破壊的操作の実行には確認が必要です (操作をやり直して確認ダイアログから実行してください)"
+                            .to_string(),
+                    );
+                }
+            }
         }
         // watcher抑制: 操作対象パス (元・先) のイベントを二重反映させない。
         let suppress_paths: Vec<PathBuf> = plan
@@ -256,8 +353,10 @@ impl FileOpsService {
         .map_err(|e| format!("操作の記録に失敗しました: {e}"));
         self.host.unsuppress(&suppress_paths);
         let outcome = outcome?;
-        // 操作ログ確定後にのみカタログ反映 (安全原則5)
+        // 操作ログ確定後にのみカタログ反映 (安全原則5) + 抑制中に破棄した
+        // 外部変更イベントの和解スキャン (FG-WP7)。
         self.host.operation_finished();
+        self.host.reconcile_after_operation();
         Ok(outcome)
     }
 
@@ -341,9 +440,11 @@ impl FileOpsService {
         .map_err(|e| format!("Undoの記録に失敗しました: {e}"));
         self.host.unsuppress(&paths);
         let outcome = outcome?;
+        // undoも操作: 完了時のカタログ反映 + 抑制中破棄イベントの和解。
         if outcome.fully_undone {
             self.host.operation_finished();
         }
+        self.host.reconcile_after_operation();
         Ok(outcome)
     }
 
@@ -375,7 +476,12 @@ impl FileOpsService {
     /// 起動時の異常終了回復:
     /// (1) `executing` 残留操作を `failed` で確定 (FSが正本のため、再スキャンで
     ///     DBは最終状態へ収束する。「安全な再開」= 失敗項目のUI再試行)。
-    /// (2) `.gento-tmp-` 残留ファイルを掃除 (コピー途中の不完全実体)。
+    /// (2) GEN-TO所有の一時ファイル (厳形式 `.{名前}.gento-tmp-{op_uuid}-{seq}`)
+    ///     を掃除 (コピー途中の不完全実体)。削除は以下に限定する (FG-WP7:
+    ///     外部作成の類似名ファイルを誤削除しない):
+    ///     (a) file_operationsのrequest/result JSONに記録された所有tmpパス
+    ///     (b) 厳密正規表現一致 (uuid形式検証含む) **かつ登録ルート配下**
+    ///     それ以外の `.gento-tmp-` 類似ファイルは**残置**しログで通知する。
     /// 戻り値は検出した未完了操作の説明 (UIの案内表示用)。
     pub fn recover_at_startup(&self) -> Vec<String> {
         let mut notices = Vec::new();
@@ -392,16 +498,17 @@ impl FileOpsService {
                 Ok(executing)
             })
             .unwrap_or_default();
-        for record in interrupted {
+        for record in &interrupted {
             notices.push(format!(
                 "未完了の{}操作 (id={}) を中断しました。必要なら履歴から再試行できます",
                 record.operation_type, record.id
             ));
         }
-        // .gento-tmp- 掃除
+        // 所有tmp掃除 (所有権検証付き)
         if let Ok(roots) = self.roots() {
+            let owned = self.collect_owned_tmp_paths(&interrupted);
             for root in roots {
-                let removed = sweep_tmp_files(&root.root_path);
+                let (removed, skipped) = sweep_tmp_files(&root.root_path, &owned);
                 if removed > 0 {
                     notices.push(format!(
                         "コピー中断のテンポラリを {} 件掃除しました ({})",
@@ -409,35 +516,81 @@ impl FileOpsService {
                         root.root_path.display()
                     ));
                 }
+                for name in skipped {
+                    tracing::warn!(
+                        "所有権を確認できない .gento-tmp- 類似ファイルを残置しました: {}",
+                        root.root_path.join(&name).display()
+                    );
+                }
             }
         }
         notices
     }
+
+    /// GEN-TOが所有する一時ファイルパスの集合。
+    /// (a) 完了操作のresult JSONに記録された `steps[].tmp`
+    /// (b) executing残留行から再構築 (request JSONの `files[].to` + 行uuid
+    ///     + step index — tmp命名は決定論的)。
+    fn collect_owned_tmp_paths(
+        &self,
+        executing: &[gento_core::file_ops::FileOpRecord],
+    ) -> std::collections::HashSet<PathBuf> {
+        let mut owned = std::collections::HashSet::new();
+        let records = self
+            .db
+            .with_reader(|repos| repos.list_recent_operations(u32::MAX))
+            .unwrap_or_default();
+        for record in records.iter().chain(executing) {
+            owned.extend(owned_tmp_paths_of(record));
+        }
+        owned
+    }
 }
 
-/// ディレクトリ再帰で `.gento-tmp-` 接頭辞のファイルを掃除する。
-/// 走査対象は接頭辞を持つものだけ (シンボリックリンクは辿らない)。
-fn sweep_tmp_files(root: &Path) -> u64 {
+/// ディレクトリ再帰でGEN-TO所有の一時ファイルのみを掃除する
+/// (シンボリックリンクは辿らない)。戻り値: (削除件数, 残置した類似名)。
+///
+/// 削除基準 (いずれか):
+/// - `owned` (request/result JSONに記録された所有パス) に一致
+/// - 厳密形式 `.{名前}.gento-tmp-{32桁hex}-{6桁seq}` (uuid形式検証含む)
+///   ※呼び出し側が登録ルート配下に対して呼ぶため「登録ルート配下」は保証済み
+///
+/// 旧形式 (`.gento-tmp-`接頭辞・uuid無し) や不正な形式のファイルは
+/// **削除せず**名前を返す (呼び出し側がログ通知する)。
+fn sweep_tmp_files(root: &Path, owned: &std::collections::HashSet<PathBuf>) -> (u64, Vec<String>) {
     let mut removed = 0u64;
+    let mut skipped = Vec::new();
     let Ok(entries) = std::fs::read_dir(root) else {
-        return 0;
+        return (0, skipped);
     };
     for entry in entries.flatten() {
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
         if file_type.is_dir() {
-            removed += sweep_tmp_files(&entry.path());
-        } else if entry
-            .file_name()
-            .to_str()
-            .is_some_and(|n| n.starts_with(TMP_FILE_PREFIX))
-            && std::fs::remove_file(entry.path()).is_ok()
-        {
+            let (sub_removed, sub_skipped) = sweep_tmp_files(&entry.path(), owned);
+            removed += sub_removed;
+            skipped.extend(sub_skipped);
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let is_gento_tmp_like = name.contains(".gento-tmp-");
+        if !is_gento_tmp_like {
+            continue;
+        }
+        let deletable =
+            owned.contains(&entry.path()) || gento_core::file_ops::is_owned_tmp_name(&name);
+        if deletable && std::fs::remove_file(entry.path()).is_ok() {
             removed += 1;
+            continue;
+        }
+        if !deletable {
+            skipped.push(name);
         }
     }
-    removed
+    (removed, skipped)
 }
 
 // ===== 実FS実装 =====
@@ -523,41 +676,33 @@ impl FileOpsFs for RealFileOps {
         std::fs::create_dir(path).map_err(|e| io_error(path, &e))
     }
 
-    fn rename(&self, from: &Path, to: &Path) -> Result<(), FsOpError> {
-        std::fs::rename(from, to).map_err(|e| {
-            let mut err = io_error(from, &e);
-            // フォールバック契約: 跨界はメッセージで識別可能にする
-            if format!("{e:?}").contains("CrossesDevices") {
-                err.message = format!(
-                    "{} -> {}: CrossesDevices: {e}",
-                    from.display(),
-                    to.display()
-                );
-            } else {
-                err.message = format!("{} -> {}: {e}", from.display(), to.display());
-            }
-            err
+    fn rename_noreplace(&self, from: &Path, to: &Path) -> Result<(), FsOpError> {
+        gento_platform::rename_noreplace(from, to).map_err(|e| match e {
+            gento_platform::RenameNoReplaceError::DestinationExists => FsOpError::new(
+                FsOpErrorKind::AlreadyExists,
+                format!("{} が既に存在するため上書きしませんでした", to.display()),
+            ),
+            gento_platform::RenameNoReplaceError::Io(msg) => FsOpError::new(FsOpErrorKind::Io, msg),
         })
     }
 
-    fn copy_file(&self, from: &Path, to: &Path, cancel: &AtomicBool) -> Result<(), FsOpError> {
-        // 安全原則4: テンポラリ名で書き込み→fsync→最終名へrename。
+    fn copy_file(
+        &self,
+        from: &Path,
+        to: &Path,
+        tmp: &Path,
+        cancel: &AtomicBool,
+    ) -> Result<(), FsOpError> {
+        // 安全原則4: テンポラリ (厳密形式。呼び出し側が命名・所有権記録)
+        // へ書き込み→fsync→NOREPLACEで最終名へ確定。
         // テンポラリは最終名と同じディレクトリ (renameの原子性)。
-        let file_name = to
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let tmp = to.parent().unwrap_or_else(|| Path::new(".")).join(format!(
-            "{TMP_FILE_PREFIX}{}-{file_name}",
-            Uuid::now_v7().simple()
-        ));
         let result = (|| -> Result<(), FsOpError> {
             let mut src = std::fs::File::open(from).map_err(|e| io_error(from, &e))?;
-            let mut dst = std::fs::File::create(&tmp).map_err(|e| io_error(&tmp, &e))?;
+            let mut dst = std::fs::File::create(tmp).map_err(|e| io_error(tmp, &e))?;
             let mut buf = vec![0u8; 512 * 1024];
             loop {
                 if cancel.load(Ordering::Relaxed) {
-                    let _ = std::fs::remove_file(&tmp);
+                    let _ = std::fs::remove_file(tmp);
                     return Err(FsOpError {
                         kind: FsOpErrorKind::Cancelled,
                         message: "コピーをキャンセルしました".to_string(),
@@ -567,24 +712,26 @@ impl FileOpsFs for RealFileOps {
                 if read == 0 {
                     break;
                 }
-                dst.write_all(&buf[..read])
-                    .map_err(|e| io_error(&tmp, &e))?;
+                dst.write_all(&buf[..read]).map_err(|e| io_error(tmp, &e))?;
             }
             // 元のmtimeを保存 (コピーは内容・属性の継承。トークン比較の
             // 安定化にも寄与 — size+mtime一致で衝突UIの判断が正確になる)
             if let Ok(mtime) = src.metadata().and_then(|m| m.modified()) {
                 let _ = dst.set_modified(mtime);
             }
-            dst.sync_all().map_err(|e| io_error(&tmp, &e))?;
+            dst.sync_all().map_err(|e| io_error(tmp, &e))?;
             Ok(())
         })();
         match result {
-            Ok(()) => std::fs::rename(&tmp, to).map_err(|e| {
-                let _ = std::fs::remove_file(&tmp);
-                io_error(to, &e)
-            }),
+            Ok(()) => {
+                // 最終配置はNOREPLACE (上書きTOCTOU排除)。宛先が出現して
+                // いた場合は失敗し、テンポラリを掃除する。
+                self.rename_noreplace(tmp, to).inspect_err(|_| {
+                    let _ = std::fs::remove_file(tmp);
+                })
+            }
             Err(err) => {
-                let _ = std::fs::remove_file(&tmp);
+                let _ = std::fs::remove_file(tmp);
                 Err(err)
             }
         }
@@ -594,12 +741,17 @@ impl FileOpsFs for RealFileOps {
         std::fs::remove_file(path).map_err(|e| io_error(path, &e))
     }
 
-    fn trash(&self, path: &Path) -> Result<(), FsOpError> {
+    fn trash(&self, path: &Path) -> Result<gento_core::file_ops::TrashEntry, FsOpError> {
         gento_platform::trash_to_bin(path).map_err(|msg| FsOpError::new(FsOpErrorKind::Io, msg))
     }
 
-    fn restore_trash(&self, original: &Path) -> Result<PathBuf, FsOpError> {
-        gento_platform::restore_from_trash(original).map_err(|err| {
+    fn restore_trash(
+        &self,
+        entry: &gento_core::file_ops::TrashEntry,
+        original: &Path,
+        expect_byte_size: u64,
+    ) -> Result<PathBuf, FsOpError> {
+        gento_platform::restore_from_trash(entry, original, expect_byte_size).map_err(|err| {
             let (kind, message) = match &err {
                 gento_platform::RestoreError::NotFound(msg) => {
                     (FsOpErrorKind::NotFound, msg.clone())
@@ -607,10 +759,17 @@ impl FileOpsFs for RealFileOps {
                 gento_platform::RestoreError::DestinationExists(_) => {
                     (FsOpErrorKind::Precondition, err.to_string())
                 }
+                gento_platform::RestoreError::SizeMismatch { .. } => {
+                    (FsOpErrorKind::Precondition, err.to_string())
+                }
                 gento_platform::RestoreError::Io(msg) => (FsOpErrorKind::Io, msg.clone()),
             };
             FsOpError::new(kind, message)
         })
+    }
+
+    fn trash_entry_size(&self, entry: &gento_core::file_ops::TrashEntry) -> Option<u64> {
+        gento_platform::trash_entry_byte_size(entry)
     }
 
     fn free_bytes(&self, dir: &Path) -> Result<u64, FsOpError> {
@@ -678,6 +837,9 @@ pub struct FileOpPlanDto {
     pub plan_errors: Vec<String>,
     pub dest_root_id: Option<String>,
     pub disk_shortfall_bytes: Option<u64>,
+    /// 破壊的操作 (delete_forever / 上書き解決の可能性) を含む場合に
+    /// 発行される単発確認トークン (5分失効・1回限り)。execute時に必須。
+    pub confirm_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -700,9 +862,10 @@ pub struct ConflictDto {
 }
 
 impl FileOpPlanDto {
-    fn from_plan(plan: &FileOpPlan) -> Self {
+    fn from_plan(plan: &FileOpPlan, confirm_token: Option<String>) -> Self {
         Self {
             kind: plan.kind.as_str().to_string(),
+            confirm_token,
             steps: plan
                 .steps
                 .iter()
@@ -752,6 +915,7 @@ pub struct StepResultDto {
     pub status: String,
     pub resolution: Option<String>,
     pub error: Option<String>,
+    pub warning: Option<String>,
 }
 
 impl FileOpOutcomeDto {
@@ -771,6 +935,7 @@ impl FileOpOutcomeDto {
                     status: step_status_str(s.status).to_string(),
                     resolution: s.resolution.map(|r| r.as_str().to_string()),
                     error: s.error.as_ref().map(|e| e.message.clone()),
+                    warning: s.warning.clone(),
                 })
                 .collect(),
         }
@@ -824,26 +989,39 @@ impl FileOpHistoryDto {
     }
 }
 
-/// Undo実行の応答 (拒否時の理由を含む)。
+/// Undo実行の応答 (拒否時の理由・補償ロールバック結果を含む)。
 #[derive(Debug, Clone, Serialize)]
 pub struct UndoOutcomeDto {
     pub op_id: String,
     pub fully_undone: bool,
+    /// "undone" | "partial_undone" | "refused"。
+    pub status: String,
     pub errors: Vec<String>,
     pub refusals: Vec<String>,
+    /// 補償ロールバックにも失敗した項目 (手動確認が必要)。
+    pub rollback_errors: Vec<String>,
 }
 
 impl UndoOutcomeDto {
     fn from_outcome(o: &UndoOutcome) -> Self {
+        let status = if o.fully_undone {
+            "undone"
+        } else if o.refusals.is_empty() {
+            "partial_undone"
+        } else {
+            "refused"
+        };
         Self {
             op_id: o.op_id.to_string(),
             fully_undone: o.fully_undone,
+            status: status.to_string(),
             errors: o
                 .steps
                 .iter()
                 .filter_map(|s| s.error.as_ref().map(|e| e.message.clone()))
                 .collect(),
             refusals: o.refusals.iter().map(|r| r.describe()).collect(),
+            rollback_errors: o.rollback_errors.clone(),
         }
     }
 }
@@ -883,7 +1061,7 @@ impl ResolutionSpecDto {
     }
 }
 
-/// 実行要求 (計画と同じ入力 + 解決方針)。
+/// 実行要求 (計画と同じ入力 + 解決方針 + 確認トークン)。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct FileOpExecuteArgs {
@@ -892,6 +1070,9 @@ pub struct FileOpExecuteArgs {
     pub dest_dir: Option<String>,
     pub new_name: Option<String>,
     pub resolutions: Option<ResolutionSpecDto>,
+    /// 破壊的操作 (delete_forever / overwrite) に必須の単発確認トークン
+    /// (plan応答に含まれる)。
+    pub confirm_token: Option<String>,
 }
 
 fn parse_kind(s: &str) -> Result<FileOpKind, String> {
@@ -951,6 +1132,7 @@ pub async fn file_ops_execute(
         args.dest_dir.as_deref().map(Path::new),
         args.new_name.as_deref(),
         resolutions,
+        args.confirm_token.as_deref(),
     )?;
     Ok(FileOpOutcomeDto::from_outcome(&outcome))
 }
@@ -1024,7 +1206,7 @@ mod tests {
     use super::*;
     use gento_core::file_ops::{
         ConflictResolution, FileOpStatus, FileOpsRepo, FsOpErrorKind, StepResult, TokenDto,
-        UndoAction,
+        TrashEntry, UndoAction,
     };
     use gento_core::repo::{FileUpsert, ScanState};
     use std::sync::Mutex as StdMutex;
@@ -1172,43 +1354,85 @@ mod tests {
         fn mkdir(&self, path: &Path) -> Result<(), FsOpError> {
             std::fs::create_dir(path).map_err(|e| FsOpError::new(FsOpErrorKind::Io, format!("{e}")))
         }
-        fn rename(&self, from: &Path, to: &Path) -> Result<(), FsOpError> {
+        fn rename_noreplace(&self, from: &Path, to: &Path) -> Result<(), FsOpError> {
+            if std::fs::symlink_metadata(to).is_ok() {
+                return Err(FsOpError::new(
+                    FsOpErrorKind::AlreadyExists,
+                    format!("{} already exists", to.display()),
+                ));
+            }
             std::fs::rename(from, to).map_err(|e| FsOpError::new(FsOpErrorKind::Io, format!("{e}")))
         }
-        fn copy_file(&self, from: &Path, to: &Path, _c: &AtomicBool) -> Result<(), FsOpError> {
-            std::fs::copy(from, to)
-                .map(|_| ())
-                .map_err(|e| FsOpError::new(FsOpErrorKind::Io, format!("{e}")))
+        fn copy_file(
+            &self,
+            from: &Path,
+            to: &Path,
+            tmp: &Path,
+            _c: &AtomicBool,
+        ) -> Result<(), FsOpError> {
+            std::fs::copy(from, tmp)
+                .map_err(|e| FsOpError::new(FsOpErrorKind::Io, format!("{e}")))?;
+            self.rename_noreplace(tmp, to)
         }
         fn remove_file(&self, path: &Path) -> Result<(), FsOpError> {
             std::fs::remove_file(path).map_err(|e| FsOpError::not_found(format!("{e}")))
         }
-        fn trash(&self, path: &Path) -> Result<(), FsOpError> {
-            let dest = self
-                .trash_dir
-                .lock()
-                .unwrap()
-                .join(path.file_name().unwrap_or_default());
+        fn trash(&self, path: &Path) -> Result<TrashEntry, FsOpError> {
+            let trash_dir = self.trash_dir.lock().unwrap().clone();
+            let base = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let mut file_name = base.clone();
+            {
+                let mut seq = 2;
+                while trash_dir.join(&file_name).exists() {
+                    file_name = format!("{base}.{seq}");
+                    seq += 1;
+                }
+            }
+            let dest = trash_dir.join(&file_name);
             std::fs::rename(path, &dest)
                 .map_err(|e| FsOpError::new(FsOpErrorKind::Io, format!("{e}")))?;
             self.trashed
                 .lock()
                 .unwrap()
                 .insert(path.to_path_buf(), dest);
-            Ok(())
+            Ok(TrashEntry {
+                trash_dir,
+                file_name,
+            })
         }
-        fn restore_trash(&self, original: &Path) -> Result<PathBuf, FsOpError> {
-            let trashed = self
-                .trashed
-                .lock()
-                .unwrap()
-                .get(original)
-                .cloned()
-                .ok_or_else(|| FsOpError::not_found("no trash entry (stub)"))?;
+        fn restore_trash(
+            &self,
+            entry: &TrashEntry,
+            original: &Path,
+            expect_byte_size: u64,
+        ) -> Result<PathBuf, FsOpError> {
+            let trashed = entry.trash_dir.join(&entry.file_name);
+            let size = std::fs::metadata(&trashed)
+                .map_err(|e| FsOpError::not_found(format!("{e}")))?
+                .len();
+            if size != expect_byte_size {
+                return Err(FsOpError::precondition(format!(
+                    "サイズ不一致 (期待 {expect_byte_size}, 実際 {size})"
+                )));
+            }
+            if std::fs::symlink_metadata(original).is_ok() {
+                return Err(FsOpError::precondition(format!(
+                    "復帰先が存在: {}",
+                    original.display()
+                )));
+            }
             std::fs::rename(&trashed, original)
                 .map_err(|e| FsOpError::new(FsOpErrorKind::Io, format!("{e}")))?;
             self.trashed.lock().unwrap().remove(original);
             Ok(original.to_path_buf())
+        }
+        fn trash_entry_size(&self, entry: &TrashEntry) -> Option<u64> {
+            std::fs::metadata(entry.trash_dir.join(&entry.file_name))
+                .ok()
+                .map(|m| m.len())
         }
         fn free_bytes(&self, _dir: &Path) -> Result<u64, FsOpError> {
             Ok(u64::MAX)
@@ -1300,6 +1524,7 @@ mod tests {
                 Some(&dest),
                 None,
                 ResolutionSpec::default(),
+                None,
             )
             .unwrap();
         assert_eq!(outcome.status, FileOpStatus::Done);
@@ -1366,6 +1591,7 @@ mod tests {
                 Some(&dest),
                 None,
                 ResolutionSpec::default(),
+                None,
             )
             .unwrap();
         assert_eq!(outcome.status, FileOpStatus::Done);
@@ -1408,6 +1634,7 @@ mod tests {
                 Some(&dest),
                 None,
                 ResolutionSpec::default(),
+                None,
             )
             .unwrap();
         // 外部変更
@@ -1429,7 +1656,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_finalizes_executing_ops_and_sweeps_tmp() {
+    fn recovery_finalizes_executing_ops_and_sweeps_only_owned_tmp() {
         let (dir, db, service, _host, _trash) = service_with_db("svc-recovery");
         let root = db.with_writer(|repos| repos.add_root(&dir.0)).unwrap();
         // executing残留行 (プロセス死亡のシミュレーション)
@@ -1442,12 +1669,16 @@ mod tests {
             })
         })
         .unwrap();
-        // .gento-tmp- 残留 (コピー中断)
-        dir.write(".gento-tmp-xxx-a.png", b"partial");
+        // 外部作成の .gento-tmp- 風ファイル (uuid形式なし) — 残置される
+        dir.write(".gento-tmp-xxx-a.png", b"external lookalike");
+        // GEN-TO所有の厳密形式tmp (uuid検証OK) — 掃除される
+        dir.write(
+            ".a.png.gento-tmp-0123456789abcdef0123456789abcdef-000001",
+            b"ours",
+        );
         dir.write("keep.png", b"keep");
 
-        let notices = service.recover_at_startup();
-        assert_eq!(notices.len(), 2, "{notices:?}");
+        let _notices = service.recover_at_startup();
         // executing → failed
         let ops = db
             .with_reader(|repos| Ok(repos.list_executing_operations().unwrap()))
@@ -1455,10 +1686,52 @@ mod tests {
         assert!(ops.is_empty());
         let history = service.history(10).unwrap();
         assert_eq!(history[0].status, "failed");
-        // tmp掃除・正規ファイルは無傷
-        assert!(!dir.0.join(".gento-tmp-xxx-a.png").exists());
+        // 所有tmpは掃除・外部類似名は残置・正規ファイルは無傷
+        assert!(
+            !dir.0
+                .join(".a.png.gento-tmp-0123456789abcdef0123456789abcdef-000001")
+                .exists(),
+            "所有tmpは掃除される"
+        );
+        assert!(
+            dir.0.join(".gento-tmp-xxx-a.png").exists(),
+            "外部作成の類似名は削除しない (ログ通知のみ)"
+        );
         assert!(dir.0.join("keep.png").exists());
         let _ = root;
+    }
+
+    /// 完了操作のresult JSONに記録された所有tmpパスも掃除される
+    /// (記録経由の所有権確認)。
+    #[test]
+    fn recovery_sweeps_tmp_recorded_in_result_json() {
+        let (dir, db, service, _host, _trash) = service_with_db("svc-recovery-owned");
+        let root = db.with_writer(|repos| repos.add_root(&dir.0)).unwrap();
+        let _ = root;
+        // コピーを実行して記録されたtmp…は完了時に残らないため、意図的に
+        // result JSONにtmpパスを記録した行を仕込み、そのパスのファイルを置く
+        let recorded_tmp = dir
+            .0
+            .join(".x.png.gento-tmp-0123456789abcdef0123456789abcdef-000002");
+        std::fs::write(&recorded_tmp, b"crashed leftover").unwrap();
+        let outcome_json = format!(
+            r#"{{"op_id":1,"kind":"copy","status":"done","undoable":false,"steps":[{{"file_id":1,"from":"/r/x.png","to":"/r/x.png","status":"done","resolution":null,"error":null,"warning":null,"tmp":"{}","undo":[]}}]}}"#,
+            recorded_tmp.display().to_string().replace('\\', "\\\\")
+        );
+        db.with_writer(|repos| {
+            let record = repos
+                .insert_operation(gento_core::file_ops::NewFileOp {
+                    operation_type: FileOpKind::Copy,
+                    status: FileOpStatus::Done,
+                    undoable: false,
+                    request_json: "{}".to_string(),
+                })
+                .unwrap();
+            repos.update_operation(record.id, FileOpStatus::Done, Some(&outcome_json), false)
+        })
+        .unwrap();
+        service.recover_at_startup();
+        assert!(!recorded_tmp.exists(), "記録された所有tmpは掃除される");
     }
 
     #[test]
@@ -1480,6 +1753,7 @@ mod tests {
                 Some(&dest),
                 None,
                 ResolutionSpec::default(),
+                None,
             )
             .unwrap_err();
         assert!(err.contains("実行中"), "{err}");
@@ -1535,6 +1809,7 @@ mod tests {
                     global: Some(ConflictResolution::KeepBoth),
                     per_file: HashMap::new(),
                 },
+                None,
             )
             .unwrap();
         assert_eq!(outcome.status, FileOpStatus::Done);
@@ -1573,6 +1848,7 @@ mod tests {
                 None,
                 None,
                 ResolutionSpec::default(),
+                None,
             )
             .unwrap();
         let history = service.history(10).unwrap();
@@ -1585,13 +1861,15 @@ mod tests {
     // ===== RealFileFsの実FS挙動 =====
 
     #[test]
-    fn real_file_ops_copy_preserves_mtime_and_uses_tmp_prefix() {
+    fn real_file_ops_copy_preserves_mtime_and_uses_strict_tmp_name() {
         let dir = TestDir::new("real-copy");
         let src = dir.write("r.png", b"real-copy-content");
         let dst = dir.0.join("out.png");
         let original_mtime = std::fs::metadata(&src).unwrap().modified().unwrap();
+        let tmp =
+            gento_core::file_ops::tmp_path_for(&dst, "01234567-89ab-cdef-0123-456789abcdef", 0);
         RealFileOps
-            .copy_file(&src, &dst, &AtomicBool::new(false))
+            .copy_file(&src, &dst, &tmp, &AtomicBool::new(false))
             .unwrap();
         assert_eq!(std::fs::read(&dst).unwrap(), b"real-copy-content");
         assert_eq!(
@@ -1602,8 +1880,25 @@ mod tests {
         // テンポラリは残らない
         for entry in std::fs::read_dir(&dir.0).unwrap().flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            assert!(!name.starts_with(TMP_FILE_PREFIX), "tmp残留: {name}");
+            assert!(!name.contains(".gento-tmp-"), "tmp残留: {name}");
         }
+    }
+
+    /// 最終配置はNOREPLACE: 宛先が既に存在する場合は上書きせず失敗。
+    #[test]
+    fn real_file_ops_copy_refuses_existing_destination() {
+        let dir = TestDir::new("real-copy-exists");
+        let src = dir.write("r.png", b"new");
+        let dst = dir.0.join("out.png");
+        std::fs::write(&dst, b"existing").unwrap();
+        let tmp =
+            gento_core::file_ops::tmp_path_for(&dst, "01234567-89ab-cdef-0123-456789abcdef", 0);
+        let err = RealFileOps
+            .copy_file(&src, &dst, &tmp, &AtomicBool::new(false))
+            .unwrap_err();
+        assert!(matches!(err.kind, FsOpErrorKind::AlreadyExists), "{err}");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"existing", "上書きされない");
+        assert!(!tmp.exists(), "テンポラリは掃除される");
     }
 
     #[test]
@@ -1612,15 +1907,16 @@ mod tests {
         let src = dir.write("big.png", &[7u8; 4 * 1024 * 1024]);
         let dst = dir.0.join("cancelled.png");
         let cancel = AtomicBool::new(true); // 最初のチャンク読み出し前に中断
-        let err = RealFileOps.copy_file(&src, &dst, &cancel).unwrap_err();
+        let tmp =
+            gento_core::file_ops::tmp_path_for(&dst, "01234567-89ab-cdef-0123-456789abcdef", 0);
+        let err = RealFileOps
+            .copy_file(&src, &dst, &tmp, &cancel)
+            .unwrap_err();
         assert!(matches!(err.kind, FsOpErrorKind::Cancelled), "{err}");
         assert!(!dst.exists());
         for entry in std::fs::read_dir(&dir.0).unwrap().flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            assert!(
-                !name.starts_with(TMP_FILE_PREFIX),
-                "キャンセルでtmp掃除: {name}"
-            );
+            assert!(!name.contains(".gento-tmp-"), "キャンセルでtmp掃除: {name}");
         }
     }
 
@@ -1665,15 +1961,16 @@ mod tests {
     }
 
     #[test]
-    fn real_file_ops_trash_round_trip() {
+    fn real_file_ops_trash_round_trip_with_exact_entry() {
         // XDG_DATA_HOMEを一意に向けて実ゴミ箱と復帰を検証 (環境ロック直列化)
         let _env = TRASH_ENV_LOCK.lock().unwrap();
         let dir = TestDir::new("real-trash");
         let file = dir.write("t.png", b"trash-roundtrip");
         std::env::set_var("XDG_DATA_HOME", dir.0.join("xdg/data"));
-        RealFileOps.trash(&file).unwrap();
+        let entry = RealFileOps.trash(&file).unwrap();
         assert!(!file.exists());
-        let restored = RealFileOps.restore_trash(&file).unwrap();
+        assert_eq!(RealFileOps.trash_entry_size(&entry), Some(15));
+        let restored = RealFileOps.restore_trash(&entry, &file, 15).unwrap();
         assert_eq!(restored, file);
         assert_eq!(std::fs::read(&file).unwrap(), b"trash-roundtrip");
     }
@@ -1735,7 +2032,9 @@ mod tests {
                 status: StepStatus::Done,
                 resolution: None,
                 error: None,
-                undo: Some(UndoAction::MoveBack {
+                warning: None,
+                tmp: None,
+                undo: vec![UndoAction::MoveBack {
                     from: PathBuf::from("/r/new.png"),
                     to: PathBuf::from("/r/old.png"),
                     expect: TokenDto {
@@ -1743,7 +2042,7 @@ mod tests {
                         byte_size: 0,
                         mtime_ns: 0,
                     },
-                }),
+                }],
             }],
         };
         let json = serde_json::to_string(&outcome).unwrap();
@@ -1761,5 +2060,211 @@ mod tests {
         let candidate = undo_candidate_of(&record);
         assert_eq!(candidate.actions.len(), 1);
         assert!(matches!(candidate.actions[0], UndoAction::MoveBack { .. }));
+    }
+
+    // ===== FG-WP7: 確認トークンゲート (恒久削除・上書きのbackend強制) =====
+
+    /// delete_foreverはトークン無しでは実行拒否。plan→トークン→実行のみ通る。
+    #[test]
+    fn confirm_token_gate_delete_forever() {
+        let (dir, db, service, _host, _trash) = service_with_db("token-df");
+        let root = db.with_writer(|repos| repos.add_root(&dir.0)).unwrap();
+        dir.write("f.png", b"forever");
+        add_root_file(&db, root.id, "f.png", b"forever");
+
+        // トークン無し → 拒否
+        let err = service
+            .execute(
+                FileOpKind::DeleteForever,
+                &[dir.0.join("f.png")],
+                None,
+                None,
+                ResolutionSpec::default(),
+                None,
+            )
+            .unwrap_err();
+        assert!(err.contains("確認が必要"), "{err}");
+        assert!(dir.0.join("f.png").exists(), "ファイルは無傷");
+
+        // 不正トークン → 拒否
+        let err = service
+            .execute(
+                FileOpKind::DeleteForever,
+                &[dir.0.join("f.png")],
+                None,
+                None,
+                ResolutionSpec::default(),
+                Some("00000000-0000-0000-0000-000000000000"),
+            )
+            .unwrap_err();
+        assert!(err.contains("確認が必要"), "{err}");
+
+        // plan → トークン発行 → 実行成功 → ファイル消滅
+        let plan = service
+            .plan(
+                FileOpKind::DeleteForever,
+                &[dir.0.join("f.png")],
+                None,
+                None,
+            )
+            .unwrap();
+        let token = plan.confirm_token.expect("delete_foreverはトークン発行");
+        let outcome = service
+            .execute(
+                FileOpKind::DeleteForever,
+                &[dir.0.join("f.png")],
+                None,
+                None,
+                ResolutionSpec::default(),
+                Some(&token),
+            )
+            .unwrap();
+        assert_eq!(outcome.status, FileOpStatus::Done);
+        assert!(!dir.0.join("f.png").exists());
+
+        // 再利用 → 拒否 (1回限り)
+        dir.write("g.png", b"forever2");
+        add_root_file(&db, root.id, "g.png", b"forever2");
+        let err = service
+            .execute(
+                FileOpKind::DeleteForever,
+                &[dir.0.join("g.png")],
+                None,
+                None,
+                ResolutionSpec::default(),
+                Some(&token),
+            )
+            .unwrap_err();
+        assert!(err.contains("確認が必要"), "再利用拒否: {err}");
+        assert!(dir.0.join("g.png").exists(), "g.pngは無傷");
+    }
+
+    /// 失効したトークンは拒否される (5分TTL)。
+    #[test]
+    fn confirm_token_expires_after_ttl() {
+        let (dir, db, service, _host, _trash) = service_with_db("token-exp");
+        let root = db.with_writer(|repos| repos.add_root(&dir.0)).unwrap();
+        let _ = root;
+        dir.write("f.png", b"x");
+        add_root_file(&db, root.id, "f.png", b"x");
+        let plan = service
+            .plan(
+                FileOpKind::DeleteForever,
+                &[dir.0.join("f.png")],
+                None,
+                None,
+            )
+            .unwrap();
+        let token = plan.confirm_token.unwrap();
+        // 失効を強制的に再現 (期限を過去へ)
+        {
+            let mut guard = service.confirm_tokens.tokens.lock().unwrap();
+            if let Some(entry) = guard.get_mut(&token) {
+                entry.expires_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+            }
+        }
+        let err = service
+            .execute(
+                FileOpKind::DeleteForever,
+                &[dir.0.join("f.png")],
+                None,
+                None,
+                ResolutionSpec::default(),
+                Some(&token),
+            )
+            .unwrap_err();
+        assert!(err.contains("確認が必要"), "{err}");
+        assert!(dir.0.join("f.png").exists());
+    }
+
+    /// 上書き解決にもトークンが必須。keep_both/skipはトークン不要。
+    #[test]
+    fn confirm_token_gate_overwrite_resolution() {
+        let (dir, db, service, _host, _trash) = service_with_db("token-ow");
+        let root = db.with_writer(|repos| repos.add_root(&dir.0)).unwrap();
+        dir.write("c.png", b"new-content");
+        add_root_file(&db, root.id, "c.png", b"new-content");
+        let dest = dir.mkdir("dest");
+        std::fs::write(dest.join("c.png"), b"old-content").unwrap();
+        let overwrite = ResolutionSpec {
+            global: Some(ConflictResolution::Overwrite),
+            per_file: HashMap::new(),
+        };
+
+        // トークン無しの上書き → 拒否 (旧ファイル無傷)
+        let err = service
+            .execute(
+                FileOpKind::Copy,
+                &[dir.0.join("c.png")],
+                Some(&dest),
+                None,
+                overwrite.clone(),
+                None,
+            )
+            .unwrap_err();
+        assert!(err.contains("確認が必要"), "{err}");
+        assert_eq!(
+            std::fs::read(dest.join("c.png")).unwrap(),
+            b"old-content",
+            "旧ファイルは無傷"
+        );
+
+        // plan (衝突あり) → トークン → 上書き実行
+        let plan = service
+            .plan(FileOpKind::Copy, &[dir.0.join("c.png")], Some(&dest), None)
+            .unwrap();
+        assert!(plan.steps[0].conflict.is_some());
+        let token = plan.confirm_token.expect("衝突ありplanはトークン発行");
+        let outcome = service
+            .execute(
+                FileOpKind::Copy,
+                &[dir.0.join("c.png")],
+                Some(&dest),
+                None,
+                overwrite,
+                Some(&token),
+            )
+            .unwrap();
+        assert_eq!(outcome.status, FileOpStatus::Done);
+        assert_eq!(std::fs::read(dest.join("c.png")).unwrap(), b"new-content");
+
+        // keep_bothはトークン無しで実行可能 (破壊的でない)
+        dir.write("k.png", b"kb");
+        add_root_file(&db, root.id, "k.png", b"kb");
+        std::fs::write(dest.join("k.png"), b"existing").unwrap();
+        let outcome = service
+            .execute(
+                FileOpKind::Copy,
+                &[dir.0.join("k.png")],
+                Some(&dest),
+                None,
+                ResolutionSpec {
+                    global: Some(ConflictResolution::KeepBoth),
+                    per_file: HashMap::new(),
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(outcome.status, FileOpStatus::Done);
+        assert!(dest.join("k (2).png").exists());
+    }
+
+    /// 衝突の無いplanはトークンを発行しない (通常操作のUXを損なわない)。
+    #[test]
+    fn confirm_token_not_issued_for_non_destructive_plan() {
+        let (dir, db, service, _host, _trash) = service_with_db("token-none");
+        let root = db.with_writer(|repos| repos.add_root(&dir.0)).unwrap();
+        dir.write("n.png", b"n");
+        add_root_file(&db, root.id, "n.png", b"n");
+        let dest = dir.mkdir("dest");
+        let plan = service
+            .plan(FileOpKind::Copy, &[dir.0.join("n.png")], Some(&dest), None)
+            .unwrap();
+        assert!(plan.confirm_token.is_none(), "衝突なしcopyはトークン不要");
+        // trashもトークン不要
+        let plan2 = service
+            .plan(FileOpKind::Trash, &[dir.0.join("n.png")], None, None)
+            .unwrap();
+        assert!(plan2.confirm_token.is_none());
     }
 }

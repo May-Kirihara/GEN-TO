@@ -12,6 +12,8 @@
 #   4) ゴミ箱 (Delete) → missing化 + OSゴミ箱 (~/.local/share/Trash/files) 実在
 #   5) Undo混在履歴: ゴミ箱→リネーム→評価 (Ctrl+Zで逆順に巻き戻し)
 #      + 外部変更後のリネームUndo拒否 (ファイルが改変されても無傷)
+#   5b) 上書き (rename→既存名。FG-WP7確認トークン新フロー): 旧ファイルは
+#       ゴミ箱へ退避保護 → Undoで旧内容まで復元
 #   6) 完全削除 (Shift+Delete + チェックボックス確認) → ゴミ箱を経由しない
 #   7) 再起動でmissing維持 (再スキャンでも復活しない)
 #
@@ -268,6 +270,38 @@ xdotool key ctrl+z; sleep 2.5                  # リネームのUndo = lib-02.pn
 wait_db "SELECT id FROM files WHERE CAST(rel_path AS TEXT)='lib-02.png'" 1 15 \
   || fail "rename-undo did not update DB"
 pass "Undo (コピー生成物削除→リネーム巻き戻し): FS・DB整合"
+
+echo "=== 5b) 上書き (rename→既存名。FG-WP7確認トークン新フロー) → 旧ファイル退避保護 → Undo旧内容復元 ==="
+cp "$WORK/home/LIB/lib-04.png" "$WORK/lib-04-new.png"
+cp "$WORK/home/LIB/lib-05.png" "$WORK/lib-05-old.png"
+fo_key 3 0.8                                  # セル3 (lib-04.png) を選択
+[[ "$(db_present_name 3)" == "lib-04.png" ]] || fail "cell3 should be lib-04.png ($(db_present_name 3))"
+fo_key 5 0.8                                  # フォーカスセルのコンテキストメニュー
+fo_key e 1.2                                  # 「リネーム (F2)」→ インライン入力
+wait_fo rn 10 || fail "rename input not shown for overwrite (rn=$(devtest_value rn || echo -))"
+fo_key q 2.5                                  # "lib-05.png" (既存名) へ確定 → 衝突
+wait_fo cf 15 || fail "conflict dialog not shown for overwrite rename (cf=$(devtest_value cf || echo -))"
+shot 05-overwrite-conflict
+fo_key o 4.0                                  # 上書き (計画トークン付き実行)
+# FS: lib-05.pngは新内容 (lib-04の実体)・lib-04.pngは消える
+[[ ! -f "$WORK/home/LIB/lib-04.png" ]] || fail "rename-overwrite should remove lib-04.png"
+cmp -s "$WORK/home/LIB/lib-05.png" "$WORK/lib-04-new.png" \
+  || fail "overwritten lib-05.png must carry the NEW content"
+# 旧ファイル (lib-05の旧実体) はOSゴミ箱へ退避されている (旧ファイル保護)
+trash_old=$(ls "$WORK/home/.local/share/Trash/files/" 2>/dev/null | grep -E '^lib-05\.png(\.[0-9]+)?$' | head -1)
+[[ -n "$trash_old" ]] || fail "old lib-05.png must be evacuated to OS trash"
+cmp -s "$WORK/home/.local/share/Trash/files/$trash_old" "$WORK/lib-05-old.png" \
+  || fail "evacuated old file must carry the OLD content"
+# Undo → 新実体はlib-04へ戻り・旧内容がlib-05へ復元される (複合undo)
+xdotool key ctrl+z; sleep 3
+[[ -f "$WORK/home/LIB/lib-04.png" ]] || fail "undo must restore lib-04.png"
+cmp -s "$WORK/home/LIB/lib-04.png" "$WORK/lib-04-new.png" \
+  || fail "lib-04.png must carry the moved-back new content"
+cmp -s "$WORK/home/LIB/lib-05.png" "$WORK/lib-05-old.png" \
+  || fail "undo must restore the OLD content byte-for-byte"
+wait_db "SELECT id FROM files WHERE CAST(rel_path AS TEXT)='lib-05.png' AND scan_state='present'" 1 15 \
+  || fail "restored old file row not present"
+pass "上書き: 旧ファイルゴミ箱退避保護 + Undo旧内容復元 (確認トークン新フロー)"
 
 echo "=== 6) ゴミ箱 (Delete) → missing化 + OSゴミ箱実在 → Undo復帰 ==="
 target=$(db_present_name 0)                    # 表示順先頭

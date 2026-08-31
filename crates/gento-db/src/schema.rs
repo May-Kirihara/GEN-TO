@@ -66,11 +66,16 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "wp7_file_operations_status",
         sql: MIGRATION_V5_SQL,
     },
+    Migration {
+        version: 6,
+        name: "fgwp7_file_operations_partial_undone",
+        sql: MIGRATION_V6_SQL,
+    },
 ];
 
 /// 現在の最新schema version (`PRAGMA user_version` の目標値)。
 /// このbuildの [`crate::Db::open`] は既存DBを必ずこの値へ移行する。
-pub const LATEST_VERSION: i32 = 5;
+pub const LATEST_VERSION: i32 = 6;
 
 /// WP-2 (登録ルート・差分スキャン) のindex追加。
 /// 列追加は不要 — 設定列は#1に含まれ、os_file_idも#1でNULL可として定義済み。
@@ -138,6 +143,34 @@ INSERT INTO file_operations_v5 (id, uuid, operation_type, status, undoable,
       FROM file_operations;
 DROP TABLE file_operations;
 ALTER TABLE file_operations_v5 RENAME TO file_operations;
+";
+
+/// FG-WP7 (WP-7レビュー対応): `file_operations.status` に `partial_undone`
+/// を追加 (undo逐次実行+補償ロールバック政策の状態表現。全成功でのみ
+/// `undone` になる)。CHECK変更にはテーブル再構築が必要なため#5と同じ
+/// 手法で複製する (データは恒等コピー)。
+const MIGRATION_V6_SQL: &str = r"
+CREATE TABLE file_operations_v6 (
+    id INTEGER PRIMARY KEY,
+    uuid TEXT NOT NULL UNIQUE
+        CHECK (length(uuid) = 36 AND uuid = lower(uuid)),
+    operation_type TEXT NOT NULL,
+    status TEXT NOT NULL
+        CHECK (status IN ('planned', 'executing', 'done', 'partial', 'failed',
+                          'undone', 'partial_undone')),
+    undoable INTEGER NOT NULL DEFAULT 0 CHECK (undoable IN (0, 1)),
+    request_json TEXT NOT NULL,
+    result_json TEXT,
+    created_at TEXT NOT NULL,
+    undone_at TEXT
+);
+INSERT INTO file_operations_v6 (id, uuid, operation_type, status, undoable,
+                                request_json, result_json, created_at, undone_at)
+    SELECT id, uuid, operation_type, status, undoable,
+           request_json, result_json, created_at, undone_at
+      FROM file_operations;
+DROP TABLE file_operations;
+ALTER TABLE file_operations_v6 RENAME TO file_operations;
 ";
 
 const MIGRATION_V1_SQL: &str = r#"
