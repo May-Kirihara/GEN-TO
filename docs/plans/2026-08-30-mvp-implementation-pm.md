@@ -92,6 +92,8 @@ QAレビュー（ユーザー可視面）: WP-4後、WP-8後、WP-18最終。
 - 2026-08-31: **WP-7完了** (`87f2294` + FG-WP7 `07dd963` + FG-WP7-2 `44a88d7`)。Codexレビュー: 1回目reject（7ブロッカー: 恒久削除確認・上書きTOCTOU・旧ファイル保護・ゴミ箱同一性・undo原子性・tmp所有権・watcher和解）→修正→2回目reject（DeleteCopy再検査・トークンバインド）→修正→3回目**approve-with-notes**。no-clobber配置(renameat2 NOREPLACE)・意図バインド確認トークン・補償ロールバック。cargo 530 / vitest 387。**M0〜M3マイルストーン完成**。
 - GaOTTT: 2026-08-31に接続復旧。スパイク〜WP-6の保存候補14件を書き戻し済み（規約・世代トークン・会計・notify・image/Svelte実務・進捗スナップショット）。以降はWP毎に書き戻し。
 - 残余制限の追跡 (WP-7レビュー): stat→trash同一action内窓 / overwrite宛先内容はトークン非バインド / undo補償はFSレベル（DBはスキャン収束）/ 掃除のstrict正規表現foreign一致（低確率）/ crash recoveryの段階的再構築未実装 / 旧result JSON undoはfails closed。
+- 2026-08-31: **WP-8完了** (`6832349` + FG-WP8込み + QA-WP8 `9576bb5`)。FTS5 trigram・検索AST (gento-search新設)・GUIフィルタ合成・保存済み検索=v2 ASTスマートコレクション・一致根拠・fts_integrity/repair/rebuild。5万件合成でp95 42-78ms。**QA pass-with-concerns**: Major（同期コマンドのUIブロック〜1秒）→ async化+spawn_blockingで解消。FG-WP8: PMがE2E失敗を決定的再現（2回）し「ハーネスタイミング」主張を反証——ドライバキー誤り+**検索遷移でcatalogSource未維持の実プロダクト欠陥**を両方修正。グリッド空白化 (WP-7既知1) も根本修正。cargo 575 / vitest 408。**M4完了**。
+- QA手動確認リスト（ユーザー）: 50k級実データでの広域検索体感 / 未登録→検索→Meta編集 / 検索ビューからファイル操作 / スコープ=ルート全体の受け入れ / v2保存検索の左ペイン表示。50k実データE2E・検索ビューFileOps E2EはWP-16へ申し送り。
 
 ## 9. オープンクエスチョン（ユーザー判断不要・PM判断で進行）
 
