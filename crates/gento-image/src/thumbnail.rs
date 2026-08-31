@@ -380,6 +380,9 @@ mod tests {
 
     static DIR_SEQ: AtomicU32 = AtomicU32::new(0);
 
+    /// 実AVIF fixture (生成手段は crates/gento-image/fixtures/README.md)。
+    const AVIF_STILL: &[u8] = include_bytes!("../fixtures/still-yuv420.avif");
+
     struct TestDir(PathBuf);
 
     impl TestDir {
@@ -506,7 +509,7 @@ mod tests {
         assert_eq!((out.width, out.height), (171, 256));
     }
 
-    /// MVP各形式 (AVIF除く6形式) の実ファイルからサムネイルが生成できる。
+    /// MVP各形式 (AVIF含む7形式) の実ファイルからサムネイルが生成できる。
     #[test]
     fn generate_supports_all_mvp_formats() {
         let dir = TestDir::new("formats");
@@ -558,6 +561,14 @@ mod tests {
         }
         let out = generate(&webp_path, SizeClass::S256, &CancelToken::new()).unwrap();
         assert_eq!((out.width, out.height), (256, 167), "webp");
+
+        // AVIF (実fixture。dav1d decode → リサイズ → WebPエンコードの全経路)
+        let avif_path = dir.path().join("a.avif");
+        fs::write(&avif_path, AVIF_STILL).unwrap();
+        let out = generate(&avif_path, SizeClass::S256, &CancelToken::new()).unwrap();
+        assert_eq!((out.width, out.height), (256, 167), "avif");
+        let decoded = decode_webp(&out.bytes);
+        assert_eq!((decoded.width(), decoded.height()), (256, 167), "avif webp");
     }
 
     /// アニメーションGIFは先頭フレームで静止化される (一覧=静止画の仕様)。
@@ -847,6 +858,11 @@ mod tests {
         }
         seeds.push(webp);
 
+        // AVIF (実fixture。dav1dは変異bitstreamをErrとして返すこと — panicしない)
+        let avif = dir.path().join("seed.avif");
+        fs::write(&avif, AVIF_STILL).unwrap();
+        seeds.push(avif);
+
         let mut rng = Lcg(0x5EED_0000_FFFF_0001);
         for (si, seed) in seeds.iter().enumerate() {
             let bytes = fs::read(seed).unwrap();
@@ -1131,9 +1147,10 @@ mod tests {
         assert_eq!(InjectionMode::from_ipc(""), None);
     }
 
-    /// E2Eスモーク用データセット生成 (WP-3 §7)。
+    /// E2Eスモーク用データセット生成 (WP-3 §7 + AVIF-1)。
     /// `GENTO_E2E_DATASET_DIR` (既定 /tmp/gento-wp3-e2e/dataset) へ
-    /// 6ファイル (5形式の静止画 + アニメGIF) を書く。AVIFはblockedのため対象外。
+    /// 7ファイル (6形式の静止画 + アニメGIF + AVIF) を書く。
+    /// AVIFはコード内生成できないため実fixtureを複写する。
     /// 起動方法は docs/handoff/2026-08-30-mvp-wp3.md のE2E手順参照。
     #[test]
     #[ignore = "E2E用 (cargo test -p gento-image --lib write_e2e_dataset -- --ignored)"]
@@ -1188,9 +1205,10 @@ mod tests {
                 .encode_lossless();
             fs::write(dir.join("05-a.webp"), &*encoded).unwrap();
         }
+        fs::write(dir.join("06-a.avif"), AVIF_STILL).unwrap();
         let count = fs::read_dir(&dir).unwrap().count();
         println!("e2e dataset: {count} files in {}", dir.display());
-        assert_eq!(count, 6);
+        assert_eq!(count, 7);
     }
 
     // ===== WebP q80 preview品質の比較資料生成 (WP-3 §6。文書化タスク) =====

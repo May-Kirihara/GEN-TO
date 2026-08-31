@@ -1,6 +1,6 @@
 # 依存ライブラリメモ (Phase 2 / WP-2時点)
 
-- 記録日: 2026-08-28 (Phase 1 → WP-2更新 → WP-3更新 2026-08-29 → WP-4更新 2026-08-29 → WP-5更新 2026-08-29 → WP-0確認 2026-08-30)
+- 記録日: 2026-08-28 (Phase 1 → WP-2更新 → WP-3更新 2026-08-29 → WP-4更新 2026-08-29 → WP-5更新 2026-08-29 → WP-0確認 2026-08-30 → AVIF-1更新 2026-08-31)
 - 方針: バージョンはpin (npmは正確なバージョン指定、Cargoは `=` 付き + Cargo.lock)。追加・変更時に本メモへ記録する。
 
 ## Rust (workspace直依存)
@@ -15,7 +15,7 @@
 | tracing-subscriber | =0.3.23 (features: env-filter) | ローグ出力実装 (`GENTO_LOG`環境変数対応) | MIT | gento-tauri |
 | walkdir | =2.5.0 | ディレクトリ再帰走査 (WP-2。エントリ列挙・エラー隔離) | Unlicense OR MIT | gento-image |
 | png | =0.18.1 | PNGシグネチャ+IHDRのみの寸法プローブ (WP-2。全文デコードなし) | MIT OR Apache-2.0 | gento-image |
-| image | =0.25.10 (default-features=false, features: png) | サムネイル用デコード・リサイズ (WP-3)。PNGのみ有効化し攻撃面を最小化。`Limits` (max_alloc 256MiB・寸法20000) でdecompression bomb対策。`DynamicImage::thumbnail_exact` で拡大なしリサイズ | MIT OR Apache-2.0 | gento-image, gento-tauri (dev: テストPNG生成) |
+| image | =0.25.10 (default-features=false, features: png, jpeg, gif, bmp, tiff, webp, avif-native) | サムネイル用デコード・リサイズ (WP-3 + AVIF-1)。PNGのみ→6形式→AVIF追加と攻撃面を段階的に拡大。`Limits` (max_alloc 256MiB・寸法20000) でdecompression bomb対策。`DynamicImage::thumbnail_exact` で拡大なしリサイズ | MIT OR Apache-2.0 | gento-image, gento-tauri (dev: テストPNG生成) |
 | webp | =0.3.1 (default-features=false) | lossy WebPエンコード (quality 80、`Encoder::from_rgba` への明示的RGBA渡し) およびテストでの往復デコード (`Decoder`。feature不問で利用可)。`img` featureは無効化し image crate との型結合に依存しない (PM計画 §3)。libwebp-sys はccでビルド (BSD-3-Clause) | MIT OR Apache-2.0 | gento-image |
 | twox-hash | =2.1.4 | キャッシュキーのXxh3 128bit (`xxhash3_128::Hasher::oneshot`)。非暗号だが128bitで衝突耐性を確保し、キー入力 (パス+size+mtime+クラス+バージョン) を決定的に圧縮 | MIT | gento-image |
 | dirs | =6.0.0 | 既定キャッシュディレクトリ解決 (`cache_dir()`) | MIT OR Apache-2.0 | gento-tauri |
@@ -243,6 +243,39 @@
   - バージョンpin理由: 0.5系最新。コンテナ対応 (JPEG/TIFF) は0.5系で
     安定。PNG/WebPのEXIFチャンクは本repo側で抽出してTIFF生体を渡す
     (crateのコンテナ対応に依存しない)。
+
+## AVIF-1 (WP-3残項目) で追加した依存 (2026-08-31。AVIF有効化)
+
+- **`image` =0.25.10 のfeatureに `avif-native` を追加** (workspace。既定ON)
+  - 用途: AVIFのprobe・decode (WP-3で前方実装済みの `ProbedFormat::Avif` 経路の
+    有効化。dav1d 1.4.1導入に伴うもの。handoff 2026-08-30-mvp-wp3.md の
+    blocked-avif解消)。
+  - 追加される推移依存:
+    - **`dav1d`** =0.11.1 (rust-av/dav1d-rs。**MIT**) — AV1デコードのsafe wrapper。
+    - **`dav1d-sys`** =0.8.3 (同repo。**MIT**) — **システムライブラリ `libdav1d`
+      への動的リンク** (`system-deps`経由のpkg-config `dav1d` ≥1.3で発見。
+      bindingsは手書き宣言でbindgen不要。システムにdav1dが無い場合は
+      git clone + meson/ninjaでdav1d 1.5.0をソースビルドするfallbackがある
+      — CI/配布環境では明示的にシステムdav1dを入れる方が決定的。
+      検証環境: libdav1d7 / libdav1d-dev 1.4.1-1build1 Ubuntu 24.04)。
+    - **`mp4parse`** =0.17.0 (mozilla/mp4parse-rust。**MPL-2.0**) — AVIF (BMFF)
+      コンテナのパース (HeifContext経由)。未改変のライブラリ利用のため
+      MPL-2.0の義務は発生しない (改変時にファイル単位の公開義務に注意)。
+  - 依存するnative library: **libdav1d (システム共用ライブラリ)**。
+    - Linux: `libdav1d-dev` (ビルド時) + `libdav1d7` (実行時)。Ubuntu 24.04では
+      標準universeリポジトリから入手可。実行バイナリはdav1dに動的リンクする
+      ため、配布物 (AppImage等) ではsoの同梱/依存解決が必要 → **WP-17で再検討**。
+    - Windows/macOS: dav1dの入手経路 (vcpkg / homebrew) が未検証のため
+      **WP-17で実機確認するまで「Linux検証済み」扱い**。featureはプラットフォーム
+      非依存にON (条件付きfeatureにしない — cargoのtarget固有依存は複雑化する
+      ため、配布検討のタイミングで判断)。
+  - 既知の設計上の注意 (image 0.25.10 `AvifDecoder` の実装に由来):
+    - デコーダ構築時にdav1dで**本体をフルデコード**する (ヘッダのみの軽量APIが
+      無い)。probe (寸法取得) も同経路のため、AVIFのprobeは他形式より高コスト。
+      Limits (寸法20000) は構築**後**の `set_limits` で適用され、dav1d内部の
+      フレームバッファ割り当て (寸法詐称bitstream) は上限前チェックの対象外。
+      詳細は handoff 2026-08-30-mvp-wp3.md のAVIF-1追記。
+  - licenses.md: `scripts/gen-licenses.sh` で再生成 (dav1d/dav1d-sys/mp4parse追加)。
 
 ## WP-7で追加した依存
 

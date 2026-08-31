@@ -207,7 +207,7 @@ pub(crate) fn is_png_entry(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// MVP対象の画像拡張子 (計画書§11の7形式+別名。AVIFの実デコードはblocked-avif)。
+/// MVP対象の画像拡張子 (計画書§11の7形式+別名。AVIFはavif-nativeで有効化済み)。
 pub const IMAGE_EXTENSIONS: [&str; 9] = [
     "png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "avif",
 ];

@@ -436,6 +436,14 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// 実AVIF fixture (生成コマンド・出所は crates/gento-image/fixtures/README.md)。
+    /// still-yuv420: 400x260 不透過 (ffmpeg libaom-av1)。
+    const AVIF_STILL: &[u8] = include_bytes!("../fixtures/still-yuv420.avif");
+    /// still-alpha: 80x60 左上4分の1透過 (ImageMagick/libheif。alpha aux item入り)。
+    const AVIF_STILL_ALPHA: &[u8] = include_bytes!("../fixtures/still-alpha.avif");
+    /// animated-avis: 96x64 3フレーム (ffmpeg。ブランドavis)。
+    const AVIF_ANIMATED: &[u8] = include_bytes!("../fixtures/animated-avis.avif");
+
     struct TestFile(std::path::PathBuf);
 
     impl TestFile {
@@ -752,7 +760,25 @@ mod tests {
             other => panic!("tiff: {other:?}"),
         }
 
-        assert_eq!(checked, 6, "6形式すべてプローブ成功であること");
+        // AVIF (実fixture。avif-native有効時にdav1dでプローブ成功)
+        let avif_path = dir.join("a.avif");
+        fs::write(&avif_path, AVIF_STILL).unwrap();
+        match probe_image(&avif_path) {
+            ImageProbe::Ok(p) => {
+                assert_eq!((p.width, p.height), (400, 260));
+                assert_eq!(p.format, ProbedFormat::Avif);
+                // image crateのAvifDecoderはalpha planeの有無にかかわらず
+                // color_type=Rgba8を返すため、AVIFのhas_alphaは常にtrueに
+                // なる (保守的な過大検出。decode時のalphaは実payloadどおり)
+                assert!(p.has_alpha);
+                assert!(!p.is_animated);
+                assert_eq!(p.frame_count, None);
+                checked += 1;
+            }
+            other => panic!("avif: {other:?}"),
+        }
+
+        assert_eq!(checked, 7, "7形式すべてプローブ成功であること");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -800,6 +826,48 @@ mod tests {
         assert_eq!(frames, Some(2));
     }
 
+    /// alpha aux itemを持つ実AVIF: プローブはhas_alpha=true、デコード結果の
+    /// RGBAは透過領域を維持する (dav1d + mp4parseのalpha併合経路)。
+    #[test]
+    fn avif_alpha_item_probes_and_keeps_transparency() {
+        let f = TestFile::new("avif-alpha", AVIF_STILL_ALPHA);
+        match probe_image(&f.0) {
+            ImageProbe::Ok(p) => {
+                assert_eq!(p.format, ProbedFormat::Avif);
+                assert_eq!((p.width, p.height), (80, 60));
+                assert!(p.has_alpha);
+                assert!(!p.is_animated);
+            }
+            other => panic!("probe: {other:?}"),
+        }
+        let decoded = crate::thumbnail::decode_with_limits(&f.0).expect("decode");
+        let rgba = decoded.to_rgba8();
+        // 左上4分の1は透過、右下は不透明 (alphaは損失圧縮のため閾値判定)
+        let tl = rgba.get_pixel(2, 2).0[3];
+        let br = rgba.get_pixel(70, 50).0[3];
+        assert!(tl <= 32, "transparent corner alpha={tl}");
+        assert!(br >= 224, "opaque corner alpha={br}");
+    }
+
+    /// ブランドavis (アニメーションAVIF): プローブは is_animated=true を返し、
+    /// デコードは先頭フレームを静止画として得る (他アニメ形式と同一の規約)。
+    #[test]
+    fn animated_avis_avif_probes_animation_and_decodes_first_frame() {
+        let f = TestFile::new("avif-anim", AVIF_ANIMATED);
+        match probe_image(&f.0) {
+            ImageProbe::Ok(p) => {
+                assert_eq!(p.format, ProbedFormat::Avif);
+                assert_eq!((p.width, p.height), (96, 64));
+                assert!(p.is_animated, "avisブランド = animated");
+                // AVIFはフレーム数走査を行わない (既知の簡易判定)
+                assert_eq!(p.frame_count, None);
+            }
+            other => panic!("probe: {other:?}"),
+        }
+        let decoded = crate::thumbnail::decode_with_limits(&f.0).expect("先頭フレームのデコード");
+        assert_eq!((decoded.width(), decoded.height()), (96, 64));
+    }
+
     #[test]
     fn truncated_and_garbage_inputs_are_safe() {
         // テキストファイル (拡張子はpngだがmagicなし) → Unsupported
@@ -812,6 +880,13 @@ mod tests {
 
         // PNGシグネチャのみ → Corrupt
         let f = TestFile::new("trunc-png", &crate::probe::minimal_png_bytes(4, 4)[..10]);
+        assert_eq!(probe_image(&f.0), ImageProbe::Corrupt);
+
+        // AVIFの切り詰め: ftyp途中 (10バイト) はmagic切り詰めとしてCorrupt、
+        // コンテナ途中 (先頭100バイト) はmp4parse/dav1dの失敗としてCorrupt
+        let f = TestFile::new("trunc-avif-magic", &AVIF_STILL[..10]);
+        assert_eq!(probe_image(&f.0), ImageProbe::Corrupt);
+        let f = TestFile::new("trunc-avif-body", &AVIF_STILL[..100]);
         assert_eq!(probe_image(&f.0), ImageProbe::Corrupt);
 
         // 存在しない → Unreadable
@@ -872,6 +947,8 @@ mod tests {
             gif_bytes(8, 8, 1),
             animated_webp_skeleton(),
             jpeg_seed,
+            AVIF_STILL.to_vec(),
+            AVIF_STILL_ALPHA.to_vec(),
         ];
         let mut rng = Lcg(0x5EED_1234_ABCD_0001);
         for (si, seed) in seeds.iter().enumerate() {

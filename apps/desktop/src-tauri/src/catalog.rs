@@ -830,8 +830,8 @@ fn run_scan(app: AppHandle, dataset: PathBuf, generation: u64, token: u64) {
             let probe_started = Instant::now();
             let probe = probe_image(&file.path);
             probe_elapsed += probe_started.elapsed();
-            // magicが正本。AVIFはavif-native不在時Unsupportedになる
-            // (blocked-avif。handoff参照)
+            // magicが正本。AVIFもavif-native (dav1d) でプローブされる
+            // (AVIF-1で有効化。handoff参照)
             let (state, width, height, mime, is_animated) = match probe {
                 ImageProbe::Ok(info) => (
                     ImageState::Ready,

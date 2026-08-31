@@ -917,15 +917,22 @@ WP-5のメタデータ編集は**安定ID (assets.id) を指定して**行うこ
 
 ## 22. 対応形式と形式判定
 
-- 対象: PNG / JPEG / GIF / BMP / TIFF / WebP (**AVIFはblocked-avif** —
-  `image` crate `avif-native` featureがシステムdav1dを要求し、本環境に
-  absentのため。PMがパッケージ入手を調整するまで`Unsupported`表示。
-  詳細は handoff 2026-08-30-mvp-wp3)
+- 対象: PNG / JPEG / GIF / BMP / TIFF / WebP / AVIF (AVIFはAVIF-1で有効化。
+  `image` crate `avif-native` feature = dav1d (システムライブラリ) +
+  mp4parse。Linux検証済み、Windows/macOSはWP-17で実機確認。
+  詳細は handoff 2026-08-30-mvp-wp3 のAVIF-1追記)
 - **形式判定はmagic (先頭バイト) が正本**。拡張子は走査列挙と
   プローブ失敗時のMIMEフォールバックにのみ使用する
 - プローブ (`gento_image::format`) はmagic+寸法+alpha+アニメーション情報
   (GIFフレーム数・WebP ANIM/ANMF走査) を返す。寸法上限
   (`MAX_DECODE_DIMENSION=20000`) を超えるヘッダは`Corrupt`
+- AVIF固有の特性 (上流 `AvifDecoder` 実装に由来):
+  - probe (寸法取得) はヘッダパースでなく**dav1dでのフルデコード**で
+    行われる (軽量APIが無い)。寸法上限はデコード後検査。
+  - `has_alpha` は**常にtrue** (color_typeが常にRgba8/Rgba16を返すための
+    保守的な過大検出。decode結果のalphaは実payloadどおり)。
+  - アニメーション判定はftypブランド (`avis`) のみ。フレーム数は持たない
+    (`frame_count: null`)。ビューアはoriginal直接表示対象。
 - 走査 (一時`temp`・登録ルート`library`両方) で全形式が列挙・プローブされ、
   `assets`行の `width/height/mime_type/has_alpha/is_animated/frame_count`
   へ保存 (schema #1の既存列のためmigration追加なし)
@@ -954,6 +961,13 @@ WP-5のメタデータ編集は**安定ID (assets.id) を指定して**行うこ
   (`setOriginal`) とactual自動昇格はanimatedでは**スキップ**。originalの
   Content-Typeはプローブ由来の正確値 (例: `image/gif`)。
   original読み込み失敗時は静的previewへ復帰せずエラー表示 (再生喪失のため)
+- **AVIFのoriginal表示はWebView能力依存 (既知制限)**: サムネイル・previewは
+  Rust側dav1dデコードで常時動作するが、original (raw AVIFバイト) の描画は
+  WebView自身のAVIF対応に依存する。検証環境のWebKitGTK 2.52.3
+  (Ubuntu 24.04) はAVIF非対応のため、静止AVIFのactual/昇格はonerror→
+  preview復帰、アニメAVIFのoriginal直接表示はエラー表示になる。
+  WP-17で他環境の実態確認と対応判断を行う
+  (handoff 2026-08-30-mvp-wp3 AVIF-1追記参照)
 - **比較表示**: 静止画扱い (既存preview経路。アニメーション資産は先頭
   フレーム) — **既知制限**として明記。段階アニメーション比較は将来課題
 - **透過背景**: ビューアで市松/白/黒を切替 (localStorage `gento.viewer.background`
