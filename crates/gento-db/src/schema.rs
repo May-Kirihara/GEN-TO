@@ -71,11 +71,16 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "fgwp7_file_operations_partial_undone",
         sql: MIGRATION_V6_SQL,
     },
+    Migration {
+        version: 7,
+        name: "wp8_asset_docs_fts5",
+        sql: MIGRATION_V7_SQL,
+    },
 ];
 
 /// 現在の最新schema version (`PRAGMA user_version` の目標値)。
 /// このbuildの [`crate::Db::open`] は既存DBを必ずこの値へ移行する。
-pub const LATEST_VERSION: i32 = 6;
+pub const LATEST_VERSION: i32 = 7;
 
 /// WP-2 (登録ルート・差分スキャン) のindex追加。
 /// 列追加は不要 — 設定列は#1に含まれ、os_file_idも#1でNULL可として定義済み。
@@ -172,6 +177,30 @@ INSERT INTO file_operations_v6 (id, uuid, operation_type, status, undoable,
 DROP TABLE file_operations;
 ALTER TABLE file_operations_v6 RENAME TO file_operations;
 ";
+
+/// WP-8: Asset単位の全文検索文書FTS5仮想テーブル。
+///
+/// - `tokenize='trigram'`: 日本語substring一致と英数字両方に機能
+///   (bundled SQLite 3.45以降)。1〜2文字クエリはLIKEフォールバック
+///   (search.rs。trigramは3文字未満を索引化しないため — 仕様文書化)。
+/// - contentless (`content=''`) にしない: 通常のFTS5テーブルとして
+///   文書本文を保持するため `snippet()` が使え、LIKEフォールバックも
+///   同一テーブルへ投げられる。対象assetのみのDELETE+INSERT再構築は
+///   同一トランザクションで行う (Rust駆動。トリガー不使用 — data-model §9)。
+/// - フィールド分離 (filename/path/tags/captions/note) は一致根拠表示に
+///   使用する。`asset_id` はUNINDEXED (FTS対象外の参照列)。
+/// - schema確定の経緯・検索構文は docs/dev/api-contract.md §42。
+const MIGRATION_V7_SQL: &str = r#"
+CREATE VIRTUAL TABLE asset_docs USING fts5(
+    asset_id UNINDEXED,
+    filename,
+    path,
+    tags,
+    captions,
+    note,
+    tokenize='trigram'
+);
+"#;
 
 const MIGRATION_V1_SQL: &str = r#"
 CREATE TABLE library_roots (

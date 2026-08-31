@@ -1606,3 +1606,135 @@ type FileOpsProgressEvent = {
   `failed`確定+再スキャンで収束 (「安全な再開」= 失敗項目のUI再試行)。
 - IDs: file_id/op_idは10進文字列 (JS安全整数規約に合わせる)。
 - `GENTO_API_VERSION` 据え置き (1): 追加のみで破壊的変更なし。
+
+## 42. WP-8: キーワード検索・FTS5・フィルター
+
+### FTS5スキーマ (migration #7)
+
+```sql
+CREATE VIRTUAL TABLE asset_docs USING fts5(
+    asset_id UNINDEXED,
+    filename,
+    path,
+    tags,
+    captions,
+    note,
+    tokenize='trigram'
+);
+```
+
+- **通常のFTS5テーブル** (contentlessではない): 文書本文を保持するため
+  `snippet()` が使え、LIKEフォールバックも同一テーブルへ投げられる
+- **rowid = asset_id の1:1対応**で管理する (`asset_id` はFTS列でないため
+  `WHERE asset_id` は全文走査になる。rowid経由のDELETE/INSERTで索引更新が
+  O(log n) — 5万件全再構築が2〜3秒に収まる根拠)
+- **検索文書の構成** (data-model §9): ファイル名 (全present File・重複
+  除外) / パス (同・lossy表示) / タグ (正規化名) / キャプション
+  (description + sd_tags の現行行) / user_note。
+  **embedded_prompt はWP-9で接続予定 (現未対応)**。negative prompt・
+  workflow全体は意味文書に含めない (明示検索もWP-8時点では不可)
+- **更新方針**: トリガー不使用。タグ/キャプション/ファイル操作のrepo書き込み
+  と**同一トランザクション**で対象assetの文書をDELETE+INSERT再構築
+  (Rust駆動の正本)。リネーム・移動・リンク・不在化も同一経路
+- **初期索引**: 走査後 `library_snapshot_changed` のタイミングで件数照合
+  (軽量) → 不整合時のみ背景修復 (`fts_repair`)。走査中の文書構築は
+  link_file等のフックで進行中に完了する。本格進捗UIはWP-10ジョブ基盤で本化
+
+### 検索構文 (gento-search parser)
+
+```text
+青い髪の少女 tag:night rating:>=3 type:png
+model:"model-name" steps:>=30 has:workflow
+added:2026-01-01..2026-06-30 path:"vacation/2026" fav:true cull:picked
+```
+
+- 空白区切りのterm群 (全AND)。**空クエリ = 全件**
+- フリーテキスト (裸語 / `"引用句"`) は全文一致。**trigram仕様のため
+  3文字未満トークンを含む語句は検索文書テーブルへのLIKEフォールバック**
+  で一致させる (大文字小文字はASCII範囲で無視)
+- `key:値` = 等価。`key:>=値` `<=` `>` `<` = 比較 (ratingのみ意味を持つ)。
+  `key:"句"` = 引用値 (空白・記号入り)
+- keys: `tag` (正規化一致) / `rating` (0..=5) / `cull`
+  (unselected|picked|rejected。採用/除外/未選別も可) / `fav`
+  (true|false) / `type` (拡張子 png等 または完全MIME) / `path` / `name` /
+  `note` (部分一致) / `added` (`YYYY-MM-DD..YYYY-MM-DD` 片端可・単日可)
+- **未対応キー** `model` / `steps` / `has` は**エラーではなく警告**を返し
+  無視される (WP-9で画像メタデータ接続時に有効化)
+- パース失敗は日本語エラー + 文字位置 (`位置: N文字目`)
+- **GUIフィルタはAST term JSONを組み立てて投入**し、クエリ文字列とAND合成
+  される (`search_run` の `filters` 引数。形状は下記)
+
+### AST term JSON (filters / 保存形式共通)
+
+gento-search `SearchQuery` の直列化と同一形状:
+
+```json
+{"type":"text","value":"夜景"}
+{"type":"field","key":"rating","op":"ge","value":{"number":3}}
+{"type":"field","key":"cull","op":"eq","value":{"text":"picked"}}
+{"type":"field","key":"fav","op":"eq","value":{"bool":true}}
+{"type":"field","key":"tag","op":"eq","value":{"text":"night"}}
+{"type":"field","key":"added","op":"eq","value":{"date_range":{"from":{"year":2026,"month":1,"day":1},"to":null}}}
+```
+
+### Commands
+
+- `search_run(query, filters?, scopeRootId?, scopeCollectionId?)` →
+  `{summary, total, shown, elapsedMs, warnings, queryJson}`。
+  検索を実行し結果を**カタログの検索ソース**として表示する
+  (mode=Library系・安定AssetId。`catalog:changed` reason=`search_switch`)。
+  `set_catalog_source("search")` で最後の検索結果へ再切替できる
+- `search_refresh()` → 表示中検索を新しいDB状態で再実行 (メタデータ編集後の
+  反映用。同じ応答形状)
+- `search_evidence(assetIds: string[])` → `[{assetId, matches:
+  [{field, snippet}]}]`。一致フィールド (filename|path|tags|captions|note)
+  と `[一致語]` 形式の前後文。InfoPanel・セルツールチップが使用
+- `fts_integrity()` → `{expectedDocs, actualDocs, missingDocs, orphanDocs,
+  duplicateDocs, staleContents, consistent}`
+- `fts_rebuild()` (async) → `{rebuilt, removed, elapsedMs}`。
+  進捗は `fts:rebuild_progress` イベント `{done, total}`
+- `fts_repair()` → 不整合のみ修復 (欠落・内容不一致の再構築 + 孤立・重複削除)
+
+### スマートコレクション = 保存済み検索 (設計判断)
+
+- **「保存済み検索」と「スマートコレクション」は同一実体の別ビュー**
+  (二重実体を作らない)。左ペインのsmartコレクション表示ラベルを
+  「保存済み検索」としている (実体はcollections.kind='smart')
+- query_jsonは **version 2 (AST正本)** で書き込む:
+  `{"version":2,"query":{"terms":[...]}}`。
+  `smart_collection_create` は `searchJson` 引数 (version 2形式) を取り、
+  指定時はそちらを正本とする (旧`queryJson`引数は互換用)
+- 旧形式 (WP-6最小条件 `{"conditions":[...]}`) は**読み取り互換のみ**:
+  評価時にASTへ変換 (`legacy_to_query`)。新規書き込みは拒否
+- **スマートコレクション評価はWP-6のSQL直クエリからAST検索経路へ移行**
+  (`smart_collection_refresh` / `collection_show` / 件数表示はすべて
+  `search_asset_ids` で評価。WP-6互換のためpresentファイル制約は掛けない)
+- 検索UIの「保存」ボタン → `smart_collection_create(searchJson=<AST>)`
+
+### AST→SQL の安全規約
+
+条件→SQLは固定断片 + パラメータバインドのみ (WP-6 smart_whereと同じ規約。
+FTS MATCH式はgento-searchが構築・引用符エスケープする)。LIKEは
+`ESCAPE '\'` + `%`/`_`/`\` エスケープ。
+
+### 5万件性能 (合成行計測 — cargo test search_performance_50k_synthetic)
+
+release測定 (作業マシン): 50,000 asset + 文書 (タグ5,000件付き) で
+p50=27ms / **p95=78.5ms** / max=78.9ms (シナリオ×10: 日本語LIKE高頻度・
+狭束縛・構造化・複合・日付範囲)。全再構築 2.3秒。詳細は
+docs/dev/measurements/ とhandoff参照。
+
+### 制約・保証
+
+- 検索結果はpresentなFileを持つassetに限定 (グリッド表示可能集合と同一)
+- 検索実行はreader接続 (UIをブロックしない。結果到着後に表示)
+- 検索結果表示中はlibraryスナップショットの自動反映をしない (コレクション
+  表示と同じ方針。「再実行」で明示更新。`asset:updated` のin-placeパッチは
+  適用される)
+- **フロントエンドのカタログソース状態も検索表示中はlibrary系扱い**
+  (`runSearch`/`refreshSearch`/`exitSearch` がlibraryへ遷移 — backendの
+  `CatalogMode::Library` と一致。showCollectionと同じ規則。一時走査
+  (temp) ビューから検索しても、検索結果は安定AssetIdのためInfoPanel編集・
+  asset_detail取得が有効。メタデータ編集可否の規則正本は
+  `lib/metadata.ts canEditMetadata`)
+- `GENTO_API_VERSION` 据え置き (1): 追加のみ

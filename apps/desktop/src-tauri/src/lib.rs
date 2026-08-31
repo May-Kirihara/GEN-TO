@@ -17,6 +17,7 @@ pub mod fsview;
 pub mod library;
 pub mod metadata;
 pub mod protocol;
+pub mod search;
 pub mod thumbnails;
 
 use std::path::{Path, PathBuf};
@@ -187,6 +188,12 @@ pub fn run() {
         collections::smart_collection_items,
         collections::smart_collection_refresh,
         collections::collection_show,
+        search::search_run,
+        search::search_refresh,
+        search::search_evidence,
+        search::fts_integrity,
+        search::fts_rebuild,
+        search::fts_repair,
         fsview::fs_list_dirs,
         fsview::reveal_in_file_manager,
         fsview::open_with_default_app,
@@ -250,6 +257,12 @@ pub fn run() {
         collections::smart_collection_items,
         collections::smart_collection_refresh,
         collections::collection_show,
+        search::search_run,
+        search::search_refresh,
+        search::search_evidence,
+        search::fts_integrity,
+        search::fts_rebuild,
+        search::fts_repair,
         fsview::fs_list_dirs,
         fsview::reveal_in_file_manager,
         fsview::open_with_default_app,

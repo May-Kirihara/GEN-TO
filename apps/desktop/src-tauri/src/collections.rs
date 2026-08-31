@@ -276,12 +276,21 @@ pub(crate) fn smart_collection_create_impl(
     emit: &dyn Fn(&CollectionEvent),
     name: String,
     query_json: String,
+    search_json: Option<String>,
 ) -> Result<CollectionDto, String> {
-    let query = parse_smart_query(&query_json)?;
     let db = db_of(state)?;
-    let record = db
-        .with_writer(|repos| repos.create_smart_collection(&name, &query))
-        .map_err(repo_error_message)?;
+    // WP-8: search_json (検索AST・version 2) があればそちらを正本とする。
+    // 旧query_json (最小条件) は既存呼び出し側 (E2E・旧UI) の互換用。
+    let record = match search_json {
+        Some(ast_json) => db
+            .with_writer(|repos| repos.create_smart_collection_search(&name, &ast_json))
+            .map_err(repo_error_message)?,
+        None => {
+            let query = parse_smart_query(&query_json)?;
+            db.with_writer(|repos| repos.create_smart_collection(&name, &query))
+                .map_err(repo_error_message)?
+        }
+    };
     let dto = collection_dto(&record);
     emit(&CollectionEvent::Changed(CollectionsChangedPayload {
         reason: "created".to_string(),
@@ -649,8 +658,9 @@ pub fn smart_collection_create(
     state: State<'_, AppState>,
     name: String,
     query_json: String,
+    search_json: Option<String>,
 ) -> Result<CollectionDto, String> {
-    smart_collection_create_impl(&state, &tauri_emitter(&app), name, query_json)
+    smart_collection_create_impl(&state, &tauri_emitter(&app), name, query_json, search_json)
 }
 
 #[tauri::command]
@@ -1028,6 +1038,7 @@ mod tests {
             &|e| app.emit(e),
             "高評価".into(),
             RATING_QUERY.to_string(),
+            None,
         )
         .unwrap();
         assert_eq!(created.kind, "smart");
@@ -1125,6 +1136,7 @@ mod tests {
                 &|e| app.emit(e),
                 "s".into(),
                 bad.to_string(),
+                None,
             )
             .unwrap_err();
             assert!(!err.is_empty(), "拒否: {bad}");
@@ -1135,6 +1147,7 @@ mod tests {
             &|e| app.emit(e),
             "   ".into(),
             RATING_QUERY.to_string(),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("受け付けられません"), "{err}");

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   CAPTION_KINDS,
   MetadataStore,
+  canEditMetadata,
   patchOfEvent,
   type AssetUpdatedEvent,
   type MetadataIpc,
@@ -85,6 +86,32 @@ describe("patchOfEvent", () => {
     expect(
       patchOfEvent({ ids: ["1"], changes: ["rating", "favorite"], rating: 5, favorite: true }),
     ).toEqual({ rating: 5, favorite: true });
+  });
+});
+
+describe("canEditMetadata", () => {
+  it("library系表示 (ライブラリ・コレクション・検索結果) のAsset確定項目は編集可", () => {
+    expect(canEditMetadata(true, { dbState: "asset" })).toBe(true);
+  });
+
+  it("WP-8回帰: 検索結果表示はlibrary系 — 直前がtemp走査でも編集可", () => {
+    // 検索実行でカタログソースはlibrary系へ遷移する (api-contract §42:
+    // 検索結果はmode=Library系・安定AssetId)。temp由来だからといって
+    // 編集不可に戻してはならない。
+    expect(canEditMetadata(true, { dbState: "asset" })).toBe(true);
+  });
+
+  it("一時走査表示 (未登録フォルダ) はdbStateに関係なく編集不可 — 仕様§4.1", () => {
+    expect(canEditMetadata(false, { dbState: "asset" })).toBe(false);
+    expect(canEditMetadata(false, { dbState: "adhoc" })).toBe(false);
+  });
+
+  it("ハッシュ計算待ち (provisional) は編集不可", () => {
+    expect(canEditMetadata(true, { dbState: "provisional" })).toBe(false);
+  });
+
+  it("項目未選択は編集不可", () => {
+    expect(canEditMetadata(true, null)).toBe(false);
   });
 });
 

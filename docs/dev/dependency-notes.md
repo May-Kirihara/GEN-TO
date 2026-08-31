@@ -357,3 +357,27 @@
     nix (MIT/OR) を追加すると推移依存が増える一方、直接syscallで
     同じ原子性が得られるため (WP指示の「nixまたは直接syscall」より
     依存最小側を選択)。
+
+## WP-8 キーワード検索 (2026-09-01)
+
+- **`gento-search` 新crate** (workspace member追加): 検索AST・parser・
+  FTS MATCH/LIKE割り振り (TextPlan)・スマートコレクション保存形式
+  (version 2) の読み書き。依存: gento-core / serde / serde_json のみ
+  (新外部依存なし。依存方向: search → core、db/tauri → search)。
+  - gento-core依存は旧query_json (WP-6最小条件) → AST変換
+    (`legacy_to_query`) とタグ正規化の再利用のため。
+- **FTS5 trigram**: bundled SQLite (=0.31.0, SQLite 3.45) の組み込み
+  機能。追加依存・featureなし (WP-1の `fts5_is_available_at_runtime`
+  テストが前提検証済み)。
+- 既知の落とし穴 (採用メモ):
+  - **FTS5テーブルに対する `PRAGMA integrity_check` は内部で書き込みを
+    試みる**ため、READ_ONLY接続・query_only接続では
+    「attempt to write a readonly database」で検証が失敗する。
+    backup検証 (migrate.rs) は読み書き可能接続で、`db_status`
+    (diagnose.rs) のintegrity_checkはwriter接続で実行するよう分離した。
+  - trigramは3文字未満トークンを索引化しないため、1〜2文字クエリは
+    検索文書テーブルへのLIKEフォールバック (仕様として文書化)。
+  - FTS5仮想テーブルのUNINDEXED列 (asset_id) には索引が張れない。
+    rowid=asset_idの1:1管理 + rowid経由のDELETE/INSERTで索引更新を
+    O(log n) にする (WHERE asset_idでの相関EXISTSは50k行×全走査に
+    なる — 計測で顕在化し修正済み)。

@@ -271,12 +271,7 @@ export class GridStore {
         this.notify();
       });
     }
-    if (this.debounceTimer === null) {
-      this.debounceTimer = setTimeout(() => {
-        this.debounceTimer = null;
-        void this.fireDemand();
-      }, this.debounceMs);
-    }
+    this.scheduleDemand();
   }
 
   /** 行範囲 → アイテムindex範囲 (endは含む。total未満へクランプ)。 */
@@ -303,6 +298,23 @@ export class GridStore {
     void this.pager.ensureRange(indexRange.start, indexRange.end).then(() => {
       this.notify();
     });
+    // ready地図もクリア済みのため、サムネイル需要を再計画する。
+    // これを忘れると「スクロールも件数変化も無いgeneration変化」
+    // (リネーム・同数移動後のスナップショット反映等) でvirtualizerが
+    // viewportChangedを再発火せず、セルが恒久的に空白になる
+    // (WP-7既知1「ファイル操作後のグリッド空白化」の根本原因)。
+    this.scheduleDemand();
+  }
+
+  /** サムネイル需要計画をデバウンス付きで起動する (二重起動しない)。 */
+  private scheduleDemand(): void {
+    if (this.debounceTimer !== null) {
+      return;
+    }
+    this.debounceTimer = setTimeout(() => {
+      this.debounceTimer = null;
+      void this.fireDemand();
+    }, this.debounceMs);
   }
 
   private async fireDemand(): Promise<void> {

@@ -45,6 +45,7 @@
   import { KeyDispatcher } from "./lib/keys";
   import {
     MetadataStore,
+    canEditMetadata,
     patchOfEvent,
     type AssetDetailDto,
     type CullValue,
@@ -56,6 +57,13 @@
     type CollectionsChangedEvent,
   } from "./lib/collections";
   import { UndoStack } from "./lib/undo";
+  import {
+    EMPTY_FILTERS,
+    SearchStore,
+    filtersActive,
+    type GuiFilters,
+    type SearchFieldMatch,
+  } from "./lib/search";
   import {
     applyConflictChoice,
     cancelFileOps,
@@ -577,6 +585,7 @@
       await collectionsStore.show(collection.id);
       activeCollection = collection;
       catalogSource = "library";
+      searchActive = false;
       gridSelection = { ids: [], focusIndex: null };
       collectionPositionInput = "";
       if (collection.kind === "manual") {
@@ -614,6 +623,7 @@
     const ok = await library.useSource("library");
     if (ok) {
       activeCollection = null;
+      searchActive = false;
       collectionNotes = {};
       await catalog.refreshSummary();
       await catalog.loadPage(0);
@@ -720,6 +730,172 @@
     }
   }
 
+  // ===== 検索 (WP-8) =====
+
+  const searchStore = new SearchStore(ipc);
+  let searchInput = $state("");
+  let searchFilters = $state<GuiFilters>({ ...EMPTY_FILTERS });
+  let searchFiltersOpen = $state(false);
+  let searchScopeMode = $state<"library" | "folder" | "collection">("library");
+  /** 検索結果表示中 (カタログはsearchソース)。 */
+  let searchActive = $state(false);
+  let searchNotice = $state("");
+  /** evidence写像の変化通知 (InfoPanel・ツールチップ再評価用)。 */
+  let searchEvidenceTick = $state(0);
+
+  searchStore.onChange(() => {
+    searchEvidenceTick++;
+  });
+
+  /** 検索スコープの解決 (folder=現在の登録ルート / collection=表示中コレクション)。 */
+  function resolveSearchScope(): { rootId?: string; collectionId?: string } | string {
+    if (searchScopeMode === "folder") {
+      if (currentFolder === null) {
+        return "フォルダを先に選択してください";
+      }
+      if (registeredStateFor(currentFolder, libraryRoots) === null) {
+        return "現在のフォルダが登録ルート内にありません (ライブラリ全体で検索してください)";
+      }
+      const folder = currentFolder;
+      const root = libraryRoots.find(
+        (candidate) => folder === candidate.path || folder.startsWith(candidate.path + "/"),
+      );
+      if (root === undefined) {
+        return "現在のフォルダに対応する登録ルートが見つかりません";
+      }
+      return { rootId: root.id };
+    }
+    if (searchScopeMode === "collection") {
+      if (activeCollection === null) {
+        return "コレクションを先に表示してください";
+      }
+      return { collectionId: activeCollection.id };
+    }
+    return {};
+  }
+
+  /** 検索実行 → 結果をカタログのsearchソースへ表示。 */
+  async function runSearch(): Promise<void> {
+    const scope = resolveSearchScope();
+    if (typeof scope === "string") {
+      searchNotice = scope;
+      return;
+    }
+    searchNotice = "";
+    const ok = await searchStore.run(searchInput, searchFilters, scope);
+    if (!ok) {
+      searchNotice = searchStore.lastError ?? "検索に失敗しました";
+      return;
+    }
+    searchActive = true;
+    // 検索結果は安定AssetIdのLibrary系表示 (api-contract §42。backendも
+    // CatalogMode::Library)。コレクション表示 (showCollection) と同じ扱いに
+    // して、一時走査ビューから検索しても編集・詳細取得を無効化しない。
+    catalogSource = "library";
+    activeCollection = null;
+    collectionNotes = {};
+    gridSelection = { ids: [], focusIndex: null };
+    await catalog.refreshSummary();
+    await catalog.loadPage(0);
+  }
+
+  /** 検索結果表示をやめて通常ライブラリ表示へ戻る。 */
+  async function exitSearch(): Promise<void> {
+    if (!searchActive) {
+      return;
+    }
+    const ok = await library.useSource("library");
+    if (ok) {
+      searchActive = false;
+      // libraryスナップショット表示へ戻す (一時走査由来の検索でも図る)。
+      catalogSource = "library";
+      gridSelection = { ids: [], focusIndex: null };
+      await catalog.refreshSummary();
+      await catalog.loadPage(0);
+    } else {
+      searchNotice = library.lastError ?? "ライブラリ表示へ戻せませんでした";
+    }
+  }
+
+  /** 表示中検索を新しいDB状態で再実行 (メタデータ編集後の反映)。 */
+  async function refreshSearch(): Promise<void> {
+    const ok = await searchStore.refresh();
+    if (!ok) {
+      searchNotice = searchStore.lastError ?? "再実行に失敗しました";
+      return;
+    }
+    searchActive = true;
+    // 再実行も検索結果表示 (Library系)。runSearchと同一の遷移規則。
+    catalogSource = "library";
+    gridSelection = { ids: [], focusIndex: null };
+    await catalog.refreshSummary();
+    await catalog.loadPage(0);
+  }
+
+  /** 現在の検索を保存済み検索 (スマートコレクション) として保存。 */
+  async function saveCurrentSearch(): Promise<void> {
+    const queryJson = searchStore.lastResult?.queryJson;
+    if (queryJson === undefined) {
+      searchNotice = "先に検索を実行してください";
+      return;
+    }
+    const name = window.prompt("保存済み検索の名前", searchInput.trim() || "新しい検索");
+    if (name === null || name.trim() === "") {
+      return;
+    }
+    const ok = await searchStore.save(name.trim(), queryJson);
+    searchNotice = ok ? "保存しました (左ペインの「保存済み検索」に表示されます)" : searchStore.lastError ?? "保存できませんでした";
+  }
+
+  /** 検索表示中の一致根拠 (フォーカス + 先頭ページ分。未取得のみ取得)。 */
+  function prefetchSearchEvidence(): void {
+    if (!searchActive) {
+      return;
+    }
+    void gridTick;
+    void searchEvidenceTick;
+    const total = grid.summary?.total ?? 0;
+    const count = Math.min(total, 500);
+    const ids: string[] = [];
+    for (let index = 0; index < count; index++) {
+      const item = grid.getItem(index);
+      if (item !== null) {
+        ids.push(item.id);
+      }
+    }
+    if (ids.length > 0) {
+      void searchStore.evidenceFor(ids);
+    }
+  }
+
+  /** 一致根拠の概略行 (セルツールチップ用)。 */
+  function searchEvidenceOf(id: string): SearchFieldMatch[] | null {
+    if (!searchActive) {
+      return null;
+    }
+    void searchEvidenceTick;
+    return searchStore.evidence[id] ?? null;
+  }
+
+  /** セルツールチップ文言 (表示名 + 検索一致根拠)。 */
+  function cellTooltip(displayName: string, id: string): string {
+    const matches = searchEvidenceOf(id);
+    if (matches === null || matches.length === 0) {
+      return displayName;
+    }
+    const fieldLabels: Record<string, string> = {
+      filename: "ファイル名",
+      path: "パス",
+      tags: "タグ",
+      captions: "キャプション",
+      note: "メモ",
+    };
+    const lines = matches
+      .map((match) => `${fieldLabels[match.field] ?? match.field}: ${match.snippet}`)
+      .join("\n");
+    return `${displayName}\n— 検索一致 —\n${lines}`;
+  }
+
   // ===== コンテキストメニュー (WP-4) =====
 
   let contextMenu: { x: number; y: number; actions: MenuAction[] } | null = $state(null);
@@ -755,6 +931,8 @@
       markedFirstPage = true;
       perf.markFirstPage();
     }
+    // 検索表示中は到着ページ分の一致根拠を先読み (WP-8)
+    prefetchSearchEvidence();
   });
 
   const stopLibraryNotification = library.onChange(() => {
@@ -772,8 +950,7 @@
   // フォーカス項目 or 表示モードが変わったら詳細を引き直す (WP-5)
   $effect(() => {
     const item = focusInfo;
-    const library = catalogSource === "library";
-    if (item !== null && library && item.dbState === "asset") {
+    if (item !== null && canEditMetadata(catalogSource === "library", item)) {
       void refreshMetaDetail(item.id);
     } else {
       detailGeneration++;
@@ -854,6 +1031,7 @@
         catalogSource = "library";
         currentFolder = path;
         activeCollection = null;
+        searchActive = false;
         collectionNotes = {};
         gridSelection = { ids: [], focusIndex: null };
         await applySavedSort(LIBRARY_SORT_KEY, sortOverride);
@@ -873,6 +1051,7 @@
       catalogSource = "temp";
       currentFolder = path;
       activeCollection = null;
+      searchActive = false;
       collectionNotes = {};
       gridSelection = { ids: [], focusIndex: null };
       saveFolderPrefs();
@@ -941,6 +1120,9 @@
   const scanBusy = $derived(
     (summaryNow()?.scanning ?? false) || libraryScanBusy,
   );
+
+  /** GUIフィルタに未適用の設定があるか (フィルターボタンの強調用)。 */
+  const searchFiltersActive = $derived(filtersActive(searchFilters));
 
   // ===== ビューア (スパイク資産・Enter/ダブルクリック/ボタン) =====
 
@@ -1912,10 +2094,7 @@
             detail: metaDetail,
             triageMode: triageModeOn,
             undoDepth: undo.depth,
-            canEdit:
-              focusInfo !== null &&
-              catalogSource === "library" &&
-              focusInfo.dbState === "asset",
+            canEdit: canEditMetadata(catalogSource === "library", focusInfo),
             focusItem: focusInfo === null
               ? null
               : {
@@ -1946,7 +2125,23 @@
                 ? (collectionNotes[focusInfo.id] ?? null)
                 : null,
           }),
-          getFileOps: () => ({
+          getSearch: () => ({
+          lastResult: searchStore.lastResult === null
+            ? null
+            : {
+                total: searchStore.lastResult.total,
+                shown: searchStore.lastResult.shown,
+                elapsedMs: searchStore.lastResult.elapsedMs,
+                warnings: searchStore.lastResult.warnings,
+                queryJson: searchStore.lastResult.queryJson,
+              },
+          lastQuery: searchStore.lastQuery,
+          running: searchStore.running,
+          evidenceCount: Object.keys(searchStore.evidence).length,
+          save: (name: string) => searchStore.save(name, searchStore.lastResult?.queryJson ?? ""),
+          refresh: () => searchStore.refresh(),
+        }),
+        getFileOps: () => ({
             busy: fileOpsBusy,
             progress: fileOpsProgress,
             notice: fileOpsNotice,
@@ -2052,8 +2247,12 @@
           ? healthStatus.message
           : "接続確認中"}
     ></span>
-    <span class="source-badge" class:library={catalogSource === "library"}>
-      {catalogSource === "library" ? "ライブラリ" : "一時走査"}
+    <span
+      class="source-badge"
+      class:library={catalogSource === "library"}
+      class:search={searchActive}
+    >
+      {searchActive ? "検索結果" : catalogSource === "library" ? "ライブラリ" : "一時走査"}
     </span>
     {#if scanBusy}
       <span class="scan-indicator" title="スキャン進行中">
@@ -2139,7 +2338,31 @@
     <section class="center-pane">
       <div class="toolbar">
         <nav class="breadcrumb" aria-label="現在場所">
-          {#if activeCollection !== null}
+          {#if searchActive}
+            <span class="coll-current">
+              <span class="coll-current-kind" aria-hidden="true">⌕</span>
+              検索結果
+              <span class="coll-current-count" data-testid="search-status">
+                ({(searchStore.lastResult?.total ?? 0).toLocaleString()}件・
+                {(searchStore.lastResult?.elapsedMs ?? 0).toLocaleString()}ms)
+              </span>
+            </span>
+            <button
+              class="crumb"
+              title="検索条件を新しいDB状態で再実行"
+              onclick={() => void refreshSearch()}
+              disabled={searchStore.running}
+            >
+              再実行
+            </button>
+            <button
+              class="crumb"
+              title="通常のライブラリ表示へ戻る"
+              onclick={() => void exitSearch()}
+            >
+              閉じる
+            </button>
+          {:else if activeCollection !== null}
             <span class="coll-current">
               <span class="coll-current-kind" aria-hidden="true">
                 {activeCollection.kind === "smart" ? "✦" : "▤"}
@@ -2292,6 +2515,160 @@
           </button>
         </span>
       </div>
+      <div class="search-bar" role="search" data-testid="search-bar">
+        <input
+          type="search"
+          class="search-input"
+          placeholder="検索 (例: 青い髪の少女 tag:night rating:>=3 type:png)"
+          aria-label="検索クエリ"
+          data-testid="search-input"
+          value={searchInput}
+          oninput={(event) => (searchInput = event.currentTarget.value)}
+          onkeydown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              void runSearch();
+            }
+          }}
+        />
+        <select
+          class="search-scope"
+          aria-label="検索範囲"
+          title="検索範囲"
+          value={searchScopeMode}
+          onchange={(event) =>
+            (searchScopeMode = event.currentTarget.value as typeof searchScopeMode)}
+        >
+          <option value="library">ライブラリ全体</option>
+          <option value="folder">現在のフォルダ</option>
+          <option value="collection">表示中コレクション</option>
+        </select>
+        <button
+          class:active={searchFiltersOpen || searchFiltersActive}
+          onclick={() => (searchFiltersOpen = !searchFiltersOpen)}
+          title="評価・選別・お気に入り・形式・タグ・日付で絞り込み (検索語とAND合成)"
+          data-testid="search-filter-toggle"
+        >
+          フィルター{searchFiltersActive ? " ●" : ""}
+        </button>
+        <button
+          onclick={() => void runSearch()}
+          disabled={searchStore.running}
+          data-testid="search-run"
+        >
+          {searchStore.running ? "検索中…" : "検索"}
+        </button>
+        <button
+          onclick={() => void saveCurrentSearch()}
+          disabled={searchStore.lastResult === null}
+          title="現在の検索条件を保存済み検索 (スマートコレクション) として保存"
+          data-testid="search-save"
+        >
+          保存
+        </button>
+        {#if searchStore.lastResult !== null && searchStore.lastResult.warnings.length > 0}
+          <span class="search-warn" title={searchStore.lastResult.warnings.join("\n")}>
+            ⚠ {searchStore.lastResult.warnings.length}件の警告
+          </span>
+        {/if}
+        {#if searchFiltersOpen}
+          <div class="search-filters" data-testid="search-filters">
+            <label>
+              評価≥
+              <select
+                value={searchFilters.ratingMin === null ? "" : String(searchFilters.ratingMin)}
+                onchange={(event) => {
+                  const value = event.currentTarget.value;
+                  searchFilters = {
+                    ...searchFilters,
+                    ratingMin: value === "" ? null : Number(value),
+                  };
+                }}
+              >
+                <option value="">-</option>
+                {#each [1, 2, 3, 4, 5] as rating (rating)}
+                  <option value={rating}>★{rating}</option>
+                {/each}
+              </select>
+            </label>
+            <label>
+              選別
+              <select
+                value={searchFilters.cull ?? ""}
+                onchange={(event) => {
+                  const value = event.currentTarget.value;
+                  searchFilters = {
+                    ...searchFilters,
+                    cull:
+                      value === "picked" || value === "rejected" || value === "unselected"
+                        ? value
+                        : null,
+                  };
+                }}
+              >
+                <option value="">-</option>
+                <option value="picked">採用</option>
+                <option value="rejected">除外</option>
+                <option value="unselected">未選別</option>
+              </select>
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={searchFilters.favorite === true}
+                onchange={(event) =>
+                  (searchFilters = {
+                    ...searchFilters,
+                    favorite: event.currentTarget.checked ? true : null,
+                  })}
+              />
+              ♥ お気に入り
+            </label>
+            <label>
+              形式
+              <select
+                value={searchFilters.type}
+                onchange={(event) =>
+                  (searchFilters = { ...searchFilters, type: event.currentTarget.value })}
+              >
+                {#each ["", "png", "jpg", "webp", "gif", "avif", "bmp", "tiff"] as format (format)}
+                  <option value={format}>{format === "" ? "-" : format}</option>
+                {/each}
+              </select>
+            </label>
+            <label>
+              タグ
+              <input
+                type="text"
+                placeholder="tag"
+                value={searchFilters.tag}
+                oninput={(event) =>
+                  (searchFilters = { ...searchFilters, tag: event.currentTarget.value })}
+              />
+            </label>
+            <label>
+              追加日
+              <input
+                type="date"
+                value={searchFilters.addedFrom}
+                onchange={(event) =>
+                  (searchFilters = { ...searchFilters, addedFrom: event.currentTarget.value })}
+              />
+              〜
+              <input
+                type="date"
+                value={searchFilters.addedTo}
+                onchange={(event) =>
+                  (searchFilters = { ...searchFilters, addedTo: event.currentTarget.value })}
+              />
+            </label>
+            <button onclick={() => (searchFilters = { ...EMPTY_FILTERS })}>クリア</button>
+          </div>
+        {/if}
+      </div>
+      {#if searchNotice}
+        <p class="toolbar-notice error" role="alert" data-testid="search-notice">{searchNotice}</p>
+      {/if}
       {#if viewerNotice}
         <p class="toolbar-notice">{viewerNotice}</p>
       {/if}
@@ -2331,6 +2708,7 @@
             onOpen={(index) => void openViewerForChoice(index)}
             onSelectionChange={onGridSelectionChange}
             onContextMenu={openGridContextMenu}
+            tooltipOf={(item) => cellTooltip(item.displayName, item.id)}
             {renameId}
             {renameInitial}
             onRenameCommit={(name) => void commitRename(name)}
@@ -2388,6 +2766,7 @@
           item={focusInfo}
           selectionCount={gridSelection.ids.length}
           libraryMode={catalogSource === "library"}
+          searchEvidence={searchEvidenceOf(focusInfo?.id ?? "")}
           sessionCounts={sessionCounts}
           sessionOrigin={sessionSnapshot.origin}
           resumable={sessionResumable}
@@ -2598,6 +2977,53 @@
   .source-badge.library {
     border-color: light-dark(#1a7f37, #238636);
     color: light-dark(#1a7f37, #3fb950);
+  }
+
+  .source-badge.search {
+    border-color: light-dark(#8250df, #a371f7);
+    color: light-dark(#8250df, #a371f7);
+  }
+
+  /* WP-8: 検索バー */
+  .search-bar {
+    flex: none;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    padding: 0.25rem 0.6rem;
+    border-bottom: 1px solid light-dark(#d0d7de, #30363d);
+  }
+
+  .search-input {
+    flex: 1 1 16rem;
+    min-width: 12rem;
+  }
+
+  .search-scope {
+    flex: none;
+  }
+
+  .search-warn {
+    font-size: 0.75rem;
+    color: light-dark(#9a6700, #d29922);
+  }
+
+  .search-filters {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+    width: 100%;
+    padding: 0.3rem 0.2rem;
+    font-size: 0.78rem;
+    border-top: 1px dashed light-dark(#d0d7de, #30363d);
+  }
+
+  .search-filters label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
   }
 
   .scan-indicator {

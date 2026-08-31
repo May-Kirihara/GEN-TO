@@ -123,6 +123,20 @@ export function patchOfEvent(event: AssetUpdatedEvent): LocalItemPatch {
   return patch;
 }
 
+/**
+ * メタデータ編集可否 (仕様§4.1)。表示がDBアセット裏付けのlibrary系
+ * (ライブラリ表示・コレクション・検索結果 — api-contract §42。検索結果は
+ * backend側もCatalogMode::Libraryで安定AssetId) で、項目がAsset確定済みの
+ * 場合のみ編集可。一時走査 (未登録フォルダ) とハッシュ計算待ち (provisional)
+ * は不可。InfoPanelの編集UI・Appの詳細取得ゲートがこの同一規則を共有する。
+ */
+export function canEditMetadata(
+  libraryBacked: boolean,
+  item: { dbState: string } | null,
+): boolean {
+  return item !== null && libraryBacked && item.dbState === "asset";
+}
+
 export class MetadataStore {
   lastError: string | null = null;
   version = 0;

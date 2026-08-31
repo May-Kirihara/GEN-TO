@@ -17,6 +17,8 @@ gento-db = { workspace = true }
 gento-image = { workspace = true }
 # OS差の土台 (ゴミ箱・OSファイルID。WP-7)
 gento-platform = { workspace = true }
+gento-search = { workspace = true }
+serde_json = { workspace = true }
 serde = { workspace = true }
 tauri = { workspace = true }
 tracing = { workspace = true }
@@ -37,7 +39,7 @@ blake3 = { workspace = true }
 tauri-plugin-opener = "=2.5.4"
 
 [dev-dependencies]
-serde_json = { workspace = true }
+
 image = { workspace = true }
 
 [features]

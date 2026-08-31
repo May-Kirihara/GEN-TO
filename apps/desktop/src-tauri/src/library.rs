@@ -123,6 +123,8 @@ impl LibraryHost for TauriLibraryHost {
         if let Some(records) = snapshot {
             crate::catalog::apply_library_snapshot(app, records);
         }
+        // 走査後のFTS索引保守 (WP-8。整合時は軽量な件数照合のみ)
+        crate::search::ensure_fts_after_scan(app);
     }
 }
 

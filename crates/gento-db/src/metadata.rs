@@ -253,13 +253,30 @@ impl TagRepo for SqliteRepos<'_> {
     fn delete_tag(&self, tag_id: i64) -> Result<(), RepoError> {
         // 削除は「使用中のasset_tagsごと削除」で実行する (付随解除)。
         // tags削除に対しasset_tagsはON DELETE CASCADE。
-        let changed = self
+        let tx = self
             .conn()
+            .unchecked_transaction()
+            .map_err(|e| RepoError::Db(e.to_string()))?;
+        let affected: Vec<i64> = {
+            let mut stmt = tx
+                .prepare("SELECT asset_id FROM asset_tags WHERE tag_id = ?1")
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map([tag_id], |row| row.get(0))
+                .map_err(map_err)?
+                .collect::<rusqlite::Result<Vec<i64>>>()
+                .map_err(map_err)?;
+            rows
+        };
+        let changed = tx
             .execute("DELETE FROM tags WHERE id = ?1", [tag_id])
             .map_err(map_err)?;
         if changed == 0 {
             return Err(RepoError::NotFound);
         }
+        // 付随解除されたassetの文書を同一txで再構築 (WP-8)
+        crate::search::rebuild_docs_for_assets(&tx, &affected)?;
+        tx.commit().map_err(map_err)?;
         Ok(())
     }
 }
@@ -357,13 +374,18 @@ impl AssetTagRepo for SqliteRepos<'_> {
             }
             out
         };
+        // タグ変更を検索文書へ反映 (同一tx。WP-8)
+        crate::search::rebuild_docs_for_assets(&tx, asset_ids)?;
         tx.commit().map_err(map_err)?;
         Ok(out)
     }
 
     fn remove_tag_from_asset(&self, asset_id: i64, tag_id: i64) -> Result<(), RepoError> {
-        let changed = self
+        let tx = self
             .conn()
+            .unchecked_transaction()
+            .map_err(|e| RepoError::Db(e.to_string()))?;
+        let changed = tx
             .execute(
                 "DELETE FROM asset_tags WHERE asset_id = ?1 AND tag_id = ?2",
                 params![asset_id, tag_id],
@@ -372,6 +394,9 @@ impl AssetTagRepo for SqliteRepos<'_> {
         if changed == 0 {
             return Err(RepoError::NotFound);
         }
+        // タグ変更を検索文書へ反映 (同一tx。WP-8)
+        crate::search::rebuild_docs_for_assets(&tx, &[asset_id])?;
+        tx.commit().map_err(map_err)?;
         Ok(())
     }
 
@@ -442,6 +467,15 @@ impl CaptionRepo for SqliteRepos<'_> {
             tx.query_row(&sql, params![asset_id, kind.as_str()], map_caption)
                 .map_err(map_err)?
         };
+        // 文書対象のキャプション種のみ検索文書へ反映 (同一tx。WP-8)。
+        // embedded_promptはWP-9接続、embedded_negative_promptは意味文書に
+        // 含めない (data-model §9)。
+        if matches!(
+            kind,
+            CaptionKind::Description | CaptionKind::SdTags | CaptionKind::UserNote
+        ) {
+            crate::search::rebuild_docs_for_assets(&tx, &[asset_id])?;
+        }
         tx.commit().map_err(map_err)?;
         Ok(record)
     }

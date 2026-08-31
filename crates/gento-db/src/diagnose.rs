@@ -34,12 +34,38 @@ pub struct DbStatus {
 
 impl Db {
     /// 整合性検査・診断を実行する。読み取りのみ (writerを止めない)。
+    ///
+    /// ただし `PRAGMA integrity_check` はFTS5テーブル (asset_docs, WP-8) の
+    /// 検査で内部書き込みを必要とするため、その部分だけwriter接続で
+    /// 実行する (query_onlyのreaderでは「attempt to write a readonly
+    /// database」になり検査にならない)。
     pub fn diagnose(&self) -> Result<DbStatus, DbError> {
+        let integrity_check = self
+            .with_writer(|repos| run_integrity_check(repos.conn()))
+            .map_err(|e| DbError::Query(e.to_string()))?;
         self.with_reader(|repos| {
-            collect_status(repos.conn(), &self.path, self.options.busy_timeout_ms)
+            collect_status(
+                repos.conn(),
+                &self.path,
+                self.options.busy_timeout_ms,
+                integrity_check,
+            )
         })
         .map_err(|e| DbError::Query(e.to_string()))
     }
+}
+
+/// `PRAGMA integrity_check` を実行して要約文字列へまとめる。
+/// FTS5の検査が書き込みを試みるため、書き込み可能な接続で呼ぶこと。
+fn run_integrity_check(conn: &Connection) -> Result<String, gento_core::RepoError> {
+    let sql_err = |e: rusqlite::Error| gento_core::RepoError::Db(e.to_string());
+    let mut stmt = conn.prepare("PRAGMA integrity_check").map_err(sql_err)?;
+    let mut rows = stmt.query([]).map_err(sql_err)?;
+    let mut messages: Vec<String> = Vec::new();
+    while let Some(row) = rows.next().map_err(sql_err)? {
+        messages.push(row.get(0).map_err(sql_err)?);
+    }
+    Ok(summarize_integrity_messages(messages))
 }
 
 /// integrity_checkの診断行を応答へ収める上限。破損時はページ数分の
@@ -72,6 +98,7 @@ fn collect_status(
     conn: &Connection,
     path: &std::path::Path,
     busy_timeout_ms: u64,
+    integrity_check: String,
 ) -> Result<DbStatus, gento_core::RepoError> {
     let sql_err = |e: rusqlite::Error| gento_core::RepoError::Db(e.to_string());
     let schema_version: i32 = conn
@@ -80,23 +107,14 @@ fn collect_status(
     let journal_mode: String = conn
         .query_row("PRAGMA journal_mode", [], |r| r.get(0))
         .map_err(sql_err)?;
-    // integrity_checkは問題ごとに複数行を返すため全行収集する
-    let mut integrity_stmt = conn.prepare("PRAGMA integrity_check").map_err(sql_err)?;
-    let mut integrity_rows = integrity_stmt.query([]).map_err(sql_err)?;
-    let mut messages: Vec<String> = Vec::new();
-    while let Some(row) = integrity_rows.next().map_err(sql_err)? {
-        messages.push(row.get(0).map_err(sql_err)?);
-    }
-    drop(integrity_rows);
-    drop(integrity_stmt);
-    let integrity_check = summarize_integrity_messages(messages);
-
     let mut fk_stmt = conn.prepare("PRAGMA foreign_key_check").map_err(sql_err)?;
     let mut rows = fk_stmt.query([]).map_err(sql_err)?;
     let mut foreign_key_violations: u64 = 0;
     while rows.next().map_err(sql_err)?.is_some() {
         foreign_key_violations += 1;
     }
+    drop(rows);
+    drop(fk_stmt);
 
     let mut table_row_counts = BTreeMap::new();
     for table in crate::schema::TABLES {

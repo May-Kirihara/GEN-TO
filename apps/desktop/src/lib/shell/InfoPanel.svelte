@@ -14,8 +14,10 @@
   import type { SessionCounts } from "../session/selection-session";
   import { formatBytes } from "../thumbnails";
   import { formatTimestamp } from "../browse";
+  import type { SearchFieldMatch } from "../search";
   import {
     CAPTION_KINDS,
+    canEditMetadata,
     type AssetDetailDto,
     type CullValue,
     type TagDto,
@@ -44,6 +46,7 @@
     collectionMemoContext = null,
     collectionMemoNote = null,
     onSaveCollectionMemo = undefined,
+    searchEvidence = null,
   }: {
     item: ImageListItem | null;
     selectionCount: number;
@@ -83,6 +86,8 @@
     collectionMemoNote?: string | null;
     /** WP-6: コレクション内メモの保存。 */
     onSaveCollectionMemo?: (note: string) => void;
+    /** WP-8: 検索一致根拠 (検索結果表示中のみ。null=非表示)。 */
+    searchEvidence?: SearchFieldMatch[] | null;
   } = $props();
 
   const DB_STATE_LABELS: Record<string, string> = {
@@ -98,6 +103,14 @@
     corrupt: "破損",
   };
 
+  /** WP-8: 検索一致根拠のフィールド表示名。 */
+  const EVIDENCE_FIELD_LABELS: Record<string, string> = {
+    filename: "ファイル名",
+    path: "パス",
+    tags: "タグ",
+    captions: "キャプション",
+    note: "メモ",
+  };
   function dbStateLabel(item: ImageListItem): string {
     if (libraryMode && item.dbState === "adhoc") {
       return "未登録 (DB外)";
@@ -107,8 +120,9 @@
 
   // ===== WP-5: 編集可否・一括適用 =====
 
-  /** 編集可能 = Library表示でAsset確定済み (仕様§4.1: 未登録は編集不可)。 */
-  const canEdit = $derived(item !== null && item.dbState === "asset" && libraryMode);
+  /** 編集可能 = library系表示 (Library・コレクション・検索結果) でAsset確定済み
+   * (仕様§4.1: 未登録は編集不可。規則の正本は lib/metadata.ts canEditMetadata)。 */
+  const canEdit = $derived(canEditMetadata(libraryMode, item));
   const bulk = $derived(selectionCount > 1 && canEdit);
 
   /** 確認待ちの一括操作 (適用/取消)。 */
@@ -376,6 +390,19 @@
           {/if}
         </dd>
       </dl>
+      {#if searchEvidence !== null && searchEvidence.length > 0}
+        <div class="search-evidence" data-testid="search-evidence">
+          <h4>検索一致</h4>
+          <ul>
+            {#each searchEvidence as match (match.field)}
+              <li>
+                <span class="evidence-field">{EVIDENCE_FIELD_LABELS[match.field] ?? match.field}</span>
+                <span class="evidence-snippet" title={match.snippet}>{match.snippet}</span>
+              </li>
+            {/each}
+          </ul>
+        </div>
+      {/if}
     {/if}
   </section>
 
@@ -674,6 +701,39 @@
     margin: 0;
     min-width: 0;
     overflow-wrap: anywhere;
+  }
+
+  .search-evidence {
+    margin-top: 0.5rem;
+  }
+
+  .search-evidence h4 {
+    margin: 0 0 0.25rem;
+    font-size: 0.75rem;
+  }
+
+  .search-evidence ul {
+    margin: 0;
+    padding-left: 1rem;
+    font-size: 0.75rem;
+  }
+
+  .search-evidence li {
+    display: flex;
+    gap: 0.4rem;
+    align-items: baseline;
+  }
+
+  .evidence-field {
+    flex: none;
+    font-weight: 600;
+  }
+
+  .evidence-snippet {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 12rem;
   }
 
   .info-path {

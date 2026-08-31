@@ -1429,6 +1429,7 @@ name = "gento-db"
 version = "0.1.0"
 dependencies = [
  "gento-core",
+ "gento-search",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1462,6 +1463,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gento-search"
+version = "0.1.0"
+dependencies = [
+ "gento-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "gento-tauri"
 version = "0.1.0"
 dependencies = [
@@ -1471,6 +1481,7 @@ dependencies = [
  "gento-db",
  "gento-image",
  "gento-platform",
+ "gento-search",
  "image",
  "libc",
  "notify",

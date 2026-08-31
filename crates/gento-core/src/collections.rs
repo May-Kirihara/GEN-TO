@@ -341,6 +341,17 @@ pub trait CollectionRepo {
         query: &SmartQuery,
     ) -> Result<CollectionRecord, RepoError>;
 
+    /// WP-8: 検索AST (gento-search) を正本とするスマートコレクションを作る。
+    /// `search_json` は gento-search の保存形式 (version 2)。AST型は
+    /// gento-search crateにあるため、ここでは検証済み正規JSON文字列を
+    /// 受け取る (検証・正規化は実装層がgento-search経由で行う)。
+    /// 旧最小条件形式での新規書き込みは不可 (読み取り互換のみ)。
+    fn create_smart_collection_search(
+        &self,
+        name: &str,
+        search_json: &str,
+    ) -> Result<CollectionRecord, RepoError>;
+
     /// 改名する。存在しないIDは[`RepoError::NotFound`]。
     fn rename_collection(
         &self,
@@ -403,6 +414,15 @@ pub trait CollectionRepo {
         collection_id: i64,
         name: &str,
         query: &SmartQuery,
+    ) -> Result<CollectionRecord, RepoError>;
+
+    /// WP-8: 検索AST正本のスマートコレクションを更新する
+    /// (形式は[`CollectionRepo::create_smart_collection_search`]と同じ)。
+    fn update_smart_collection_search(
+        &self,
+        collection_id: i64,
+        name: &str,
+        search_json: &str,
     ) -> Result<CollectionRecord, RepoError>;
 
     /// スマートコレクションを評価する (条件→SQL。パラメータバインドのみ)。

@@ -407,6 +407,42 @@ describe("GridStore — 世代ガード", () => {
     expect(grid.thumbUrlFor("3")).toBeNull();
   });
 
+  it("WP-7既知1: generation変化のみ (スクロール・件数変化なし) でもサムネイル需要が再計画される", async () => {
+    // 再現: ファイル操作後のカタログ更新 (リネーム等・total不変) で
+    // generationが進む → onResetがready地図をクリア → 従来は
+    // viewportChangedが再発火しないため再要求が恒久的に起きず、
+    // 可視セルが空白化した (表示のみ。DB/FSは正しい)。
+    const { ipc, listeners, calls } = makeIpc();
+    const grid = new GridStore(ipc, { debounceMs: 150, prefetchRows: 0 });
+    await grid.init();
+    grid.viewportChanged({ start: 0, end: 2 }, 0, 0, 3);
+    await vi.advanceTimersByTimeAsync(200);
+    emit(listeners, "thumb:ready", readyItems(["3"], 1));
+    expect(grid.thumbUrlFor("3")).toContain("v=1");
+    const before = requestCalls(calls).length;
+
+    // generation変化 (total同一・スクロール無し = virtualizerの再発火なし)
+    grid.syncSummary({
+      generation: 2,
+      mode: "virtual",
+      total: 50_000,
+      scanning: false,
+      scanned_count: 1615,
+      error_count: 0,
+      last_scan_elapsed_ms: 1,
+      sort: "name",
+    });
+    expect(grid.thumbUrlFor("3")).toBeNull();
+    // デバウンス後に可視範囲の需要が再計画される (修复: onResetが
+    // scheduleDemandを呼ぶ)
+    await vi.advanceTimersByTimeAsync(200);
+    const after = requestCalls(calls).length;
+    expect(after).toBeGreaterThan(before);
+    // 再要求したIDが再度readyになれば表示が復帰する
+    emit(listeners, "thumb:ready", readyItems(["0", "1", "2"], 2));
+    expect(grid.thumbUrlFor("0")).toContain("v=2");
+  });
+
   it("キャッシュクリア後の古い世代readyイベントは破棄される", async () => {
     const { ipc, listeners } = makeIpc();
     const grid = new GridStore(ipc, { debounceMs: 150 });

@@ -240,8 +240,11 @@ fn create_backup(
     let dest_str = dest.to_string_lossy().into_owned();
     conn.execute("VACUUM INTO ?1", [dest_str.as_str()])?;
 
-    // 検証: 読み取り専用で開いてintegrity_check。失敗なら移行を止める。
-    let check = Connection::open_with_flags(&dest, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    // 検証: 開いてintegrity_check。失敗なら移行を止める。
+    // READ_ONLYフラグを付けない: FTS5テーブル (asset_docs, WP-8) の
+    // integrity検査は内部で書き込みを試みるため、読み取り専用接続では
+    // 「attempt to write a readonly database」で検査が失敗する。
+    let check = Connection::open(&dest)?;
     let result: String = check.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
     drop(check);
     if result != "ok" {
@@ -309,17 +312,17 @@ mod tests {
         }
     }
 
-    fn failing_migration_v7() -> Migration {
+    fn failing_migration_v8() -> Migration {
         Migration {
-            version: 7,
+            version: 8,
             name: "test_failing",
             sql: "CREATE TABLE wp1_test_extra (id INTEGER PRIMARY KEY); INSERT INTO wp1_test_extra VALUES (1); INSERT INTO nonexistent_table VALUES (1);",
         }
     }
 
-    fn ok_migration_v7() -> Migration {
+    fn ok_migration_v8() -> Migration {
         Migration {
-            version: 7,
+            version: 8,
             name: "test_ok_extra",
             sql: "CREATE TABLE wp1_test_extra (id INTEGER PRIMARY KEY);",
         }
@@ -330,7 +333,7 @@ mod tests {
         let tmp = TempDir::new("fresh");
         let mut conn = Connection::open(tmp.path().join("db.sqlite3")).unwrap();
         let outcome = run_migrations(&mut conn, MIGRATIONS, &MigrationOpts::default()).unwrap();
-        assert_eq!(outcome.applied, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(outcome.applied, vec![1, 2, 3, 4, 5, 6, 7]);
         assert_eq!(outcome.backup, None); // 新規DB (v0) はbackup不要
         assert_eq!(read_user_version(&conn).unwrap(), LATEST_VERSION);
 
@@ -429,7 +432,7 @@ mod tests {
             keep_generations: 3,
         };
         let outcome = run_migrations(&mut conn, MIGRATIONS, &opts).unwrap();
-        assert_eq!(outcome.applied, vec![3, 4, 5, 6]);
+        assert_eq!(outcome.applied, vec![3, 4, 5, 6, 7]);
         assert_eq!(read_user_version(&conn).unwrap(), LATEST_VERSION);
         let backup = outcome.backup.expect("v2からの移行でbackup作成");
         assert!(backup.starts_with(&backup_dir));
@@ -488,7 +491,7 @@ mod tests {
             keep_generations: 3,
         };
         let outcome = run_migrations(&mut conn, MIGRATIONS, &opts).unwrap();
-        assert_eq!(outcome.applied, vec![4, 5, 6]);
+        assert_eq!(outcome.applied, vec![4, 5, 6, 7]);
         assert_eq!(read_user_version(&conn).unwrap(), LATEST_VERSION);
         assert!(outcome
             .backup
@@ -543,7 +546,7 @@ mod tests {
 
         // 実migration一覧の後に、途中で失敗するテストmigrationを注入して実行
         let mut list: Vec<Migration> = MIGRATIONS.to_vec();
-        list.push(failing_migration_v7());
+        list.push(failing_migration_v8());
         let opts = MigrationOpts {
             backup_dir: Some(backup_dir.clone()),
             keep_generations: 3,
@@ -581,7 +584,7 @@ mod tests {
 
         // 再実行 (今度は成功するテストmigration) で最新→+1へ進めることもできる
         let mut list_ok: Vec<Migration> = MIGRATIONS.to_vec();
-        list_ok.push(ok_migration_v7());
+        list_ok.push(ok_migration_v8());
         let outcome = run_migrations(&mut conn, &list_ok, &opts).unwrap();
         assert_eq!(outcome.applied, vec![LATEST_VERSION + 1]);
         assert_eq!(read_user_version(&conn).unwrap(), LATEST_VERSION + 1);
@@ -595,7 +598,7 @@ mod tests {
         run_migrations(&mut conn, MIGRATIONS, &MigrationOpts::default()).unwrap();
 
         let mut list: Vec<Migration> = MIGRATIONS.to_vec();
-        list.push(ok_migration_v7());
+        list.push(ok_migration_v8());
         let opts = MigrationOpts {
             backup_dir: Some(backup_dir.clone()),
             keep_generations: 3,
@@ -624,7 +627,7 @@ mod tests {
         let mut conn = Connection::open(tmp.path().join("db.sqlite3")).unwrap();
         run_migrations(&mut conn, MIGRATIONS, &MigrationOpts::default()).unwrap();
         let mut list: Vec<Migration> = MIGRATIONS.to_vec();
-        list.push(ok_migration_v7());
+        list.push(ok_migration_v8());
         let opts = MigrationOpts {
             backup_dir: Some(backup_dir.clone()),
             keep_generations: 3,

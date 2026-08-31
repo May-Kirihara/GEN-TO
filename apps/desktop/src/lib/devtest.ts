@@ -47,6 +47,23 @@ export type DevBridgeStores = {
   getCollections: () => CollectionsLike | null;
   /** WP-7(MVP): ファイル操作状態 (E2E検証用)。 */
   getFileOps: () => FileOpsLike | null;
+  /** WP-8: 検索状態 (E2E検証用)。lastResultの件数・警告と一致根拠保持数)。 */
+  getSearch: () => {
+    lastResult: {
+      total: number;
+      shown: number;
+      elapsedMs: number;
+      warnings: string[];
+      queryJson: string;
+    } | null;
+    lastQuery: string;
+    running: boolean;
+    evidenceCount: number;
+    /** 保存 (スマートコレクション作成)。E2Eから固定名で呼ぶ。 */
+    save: (name: string) => Promise<boolean>;
+    /** 表示中検索の再実行 (search_refresh)。 */
+    refresh: () => Promise<boolean>;
+  } | null;
   /** WP-7: invoke (エラー注入など)。App.svelteのcore invokeを流用。 */
   invoke: <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
 };
@@ -478,6 +495,28 @@ export function installDevBridge(stores: DevBridgeStores): void {
     },
     // QA-WP4: 走査キャンセルボタン (走査中のみ出現)
     cancelScan: () => clickButton("走査をキャンセル"),
+    // WP-8 E2E: 検索バーの駆動 (foCmdModeのh/j)
+    srFocusInput: () => {
+      const input = document.querySelector<HTMLInputElement>(
+        '[data-testid="search-input"]',
+      );
+      input?.focus();
+      input?.select();
+    },
+    srRun: () => {
+      document
+        .querySelector<HTMLButtonElement>('[data-testid="search-run"]')
+        ?.click();
+    },
+    srSave: () => {
+      const search = stores.getSearch();
+      if (search?.lastResult !== null && search !== null) {
+        void search.save("E2E保存検索");
+      }
+    },
+    srRefresh: () => {
+      void stores.getSearch()?.refresh();
+    },
     // WP-5: メタデータ編集 (InfoPanelの本物のボタン/DOMイベントで駆動)
     metaRate5: () => {
       document.querySelector<HTMLButtonElement>('[data-meta="rating"] button[aria-label="評価 5"]')
@@ -1051,8 +1090,29 @@ export function installDevBridge(stores: DevBridgeStores): void {
   }
 
   /** 機械可読チャネル: 1行テキストを devtest: ログと document.title へ送る。 */
+  /** WP-8: 検索状態の機械可読1行 (E2E検証用)。 */
+  function searchLines(): string[] {
+    const search = stores.getSearch();
+    if (search === null) {
+      return [];
+    }
+    const result = search.lastResult;
+    return [
+      `S act=${result === null ? 0 : 1} q="${search.lastQuery}"` +
+        ` tot=${result?.total ?? -1} shown=${result?.shown ?? -1}` +
+        ` ms=${result?.elapsedMs ?? -1} warn=${result?.warnings.length ?? 0}` +
+        ` ev=${search.evidenceCount} run=${search.running ? 1 : 0}`,
+    ];
+  }
+
   function reportCompact(): void {
-    const single = [...dumpLines(), ...gridLines(), ...thumbLines(), ...perfLines()]
+    const single = [
+      ...dumpLines(),
+      ...gridLines(),
+      ...searchLines(),
+      ...thumbLines(),
+      ...perfLines(),
+    ]
       .join(" | ")
       .replaceAll("\n", " ");
     try {
@@ -1095,6 +1155,10 @@ export function installDevBridge(stores: DevBridgeStores): void {
           g: "foForeverConfirm",
           r: "foRetryConfirm",
           n: "foFocusRename",
+          h: "srFocusInput",
+          j: "srRun",
+          l: "srRefresh",
+          u: "srSave",
         };
         const action = foKeys[event.key];
         if (action !== undefined) {

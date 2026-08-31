@@ -50,6 +50,7 @@
     onRenameCommit,
     onRenameCancel,
     dragPathsOf,
+    tooltipOf = null,
   }: {
     grid: GridStore;
     scrollStore: ScrollPositionStore;
@@ -75,6 +76,8 @@
     onRenameCancel?: () => void;
     /** WP-7: ドラッグで運ぶパス列 (選択全体。未指定ならD&D無効)。 */
     dragPathsOf?: (index: number) => string[];
+    /** WP-8: セルツールチップ文言の構築 (検索一致根拠の併記。既定=表示名)。 */
+    tooltipOf?: ((item: ImageListItem) => string) | null;
   } = $props();
 
   // GridStoreはプレーンクラスのため、版番号でUIへ変更を伝える (WP-2の教訓)
@@ -535,7 +538,7 @@
               data-index={cell.index}
               style="width:{cellPx}px; height:{cellPx}px"
               aria-selected={item !== null && sel.selected.has(item.id)}
-              title={item?.displayName ?? ""}
+              title={item !== null ? (tooltipOf?.(item) ?? item.displayName) : ""}
               draggable={dragPathsOf !== undefined && !isRenaming(item)}
               tabindex={-1}
               ondragstart={(event) => handleDragStart(event, cell.index)}

@@ -6,6 +6,7 @@ edition.workspace = true
 
 [dependencies]
 gento-core = { workspace = true }
+gento-search = { workspace = true }
 rusqlite = { workspace = true }
 uuid = { workspace = true }
 serde = { workspace = true }

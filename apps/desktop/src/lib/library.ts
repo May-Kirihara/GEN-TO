@@ -55,8 +55,11 @@ export type LibraryScanStatus = {
   hash_retry_exhausted: number;
 };
 
-/** カタログ表示ソース (temp=一時走査 / library=登録ルートDB)。 */
-export type CatalogSource = "temp" | "library";
+/**
+ * カタログ表示ソース (temp=一時走査 / library=登録ルートDB /
+ * search=最後の検索結果。WP-8)。
+ */
+export type CatalogSource = "temp" | "library" | "search";
 
 export const EMPTY_SCAN_STATUS: LibraryScanStatus = {
   scanning: false,

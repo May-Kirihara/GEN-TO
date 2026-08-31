@@ -152,7 +152,9 @@
   }
 
   async function removeCollection(collection: CollectionDto): Promise<void> {
-    const kindLabel = collection.kind === "smart" ? "スマートコレクション" : "コレクション";
+    // WP-8: smartコレクションは「保存済み検索」と同一実体の別ビュー
+    // (設計判断 — api-contract §42。二重実体を作らない)。
+    const kindLabel = collection.kind === "smart" ? "保存済み検索" : "コレクション";
     if (!window.confirm(`${kindLabel}「${collection.name}」を削除しますか? (元画像は影響しません)`)) {
       return;
     }
@@ -226,7 +228,7 @@
       </button>
       <button
         class:active={createMode === "smart"}
-        title="スマートコレクションを作成 (検索条件で自動的にまとまる)"
+        title="保存済み検索を作成 (検索条件で自動的にまとまる)"
         onclick={() => (createMode === "smart" ? (createMode = "none") : startCreate("smart"))}
       >
         + スマート
@@ -238,7 +240,7 @@
     <div class="coll-create">
       <input
         class="coll-name-input"
-        placeholder={createMode === "manual" ? "コレクション名" : "スマートコレクション名"}
+        placeholder={createMode === "manual" ? "コレクション名" : "保存済み検索の名前"}
         value={newName}
         oninput={(event) => (newName = event.currentTarget.value)}
         onkeydown={(event) => {

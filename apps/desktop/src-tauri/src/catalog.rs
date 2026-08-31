@@ -67,6 +67,10 @@ pub struct CatalogInner {
     /// (asset:updatedのin-placeパッチのみ適用。再評価は明示
     /// `smart_collection_refresh` / 再選択 — トリガー連鎖回避の設計)。
     collection: Option<CollectionView>,
+    /// 検索結果表示中の状態 (WP-8)。コレクション表示と同じ方針:
+    /// 表示中はlibraryスナップショットの自動反映を行わず、明示再実行
+    /// (search_run) で更新する。
+    search: Option<SearchDisplay>,
     /// 表示ソート (WP-4。走査バッチ・ソース切替・スナップショット反映に適用)。
     sort: CatalogSort,
     /// 現在の一時走査トークン (世代。QA-WP4)。`begin_scan` で進み、
@@ -81,6 +85,16 @@ pub struct CatalogInner {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CollectionView {
     pub collection_id: i64,
+}
+
+/// 検索結果表示の状態 (WP-8)。query_jsonはgento-search保存形式 (v2)。
+/// `records` は検索結果の表示レコード (再選択時に復元するため保持)。
+#[derive(Debug, Clone)]
+pub struct SearchDisplay {
+    pub query_json: String,
+    pub scope_root_id: Option<i64>,
+    pub scope_collection_id: Option<i64>,
+    pub records: Vec<ImageRecord>,
 }
 
 #[derive(Default)]
@@ -110,6 +124,7 @@ impl CatalogInner {
             real: Vec::new(),
             library: Vec::new(),
             collection: None,
+            search: None,
             sort: CatalogSort::default(),
             scan_token: 0,
             progress: ProgressCounters::default(),
@@ -121,6 +136,11 @@ impl CatalogInner {
     /// 現在表示中のコレクション (WP-6)。非表示中はNone。
     pub fn collection_view(&self) -> Option<CollectionView> {
         self.collection
+    }
+
+    /// 現在表示中 (または最後の) 検索表示 (WP-8)。実行後はNoneまで保持。
+    pub fn search_display(&self) -> Option<&SearchDisplay> {
+        self.search.as_ref()
     }
 
     /// 現在のソートモードで表示レコードを並べ替える。
@@ -245,6 +265,20 @@ impl CatalogInner {
         records: Vec<ImageRecord>,
     ) -> u64 {
         self.collection = Some(view);
+        self.search = None;
+        self.state.mode = CatalogMode::Library;
+        self.state.scanning = false;
+        self.state.records = records;
+        self.state.generation += 1;
+        self.state.generation
+    }
+
+    /// 検索結果表示へ切替える (WP-8)。コレクション表示を終了し、
+    /// generationを進めて新しいgenerationを返す。
+    pub fn set_search_display(&mut self, display: SearchDisplay) -> u64 {
+        let records = display.records.clone();
+        self.search = Some(display);
+        self.collection = None;
         self.state.mode = CatalogMode::Library;
         self.state.scanning = false;
         self.state.records = records;
@@ -256,6 +290,7 @@ impl CatalogInner {
     /// generationを進めて新しいgenerationを返す (表示が存在しない場合は
     /// 何もせず0)。
     pub fn clear_collection_display(&mut self) -> u64 {
+        self.search = None;
         if self.collection.take().is_none() {
             return 0;
         }
@@ -319,6 +354,8 @@ pub enum CatalogChangeReason {
     CollectionSwitch,
     /// 表示中コレクションの再評価・項目変更反映 (WP-6)。
     CollectionRefresh,
+    /// 検索結果表示の開始・切替 (WP-8)。
+    SearchSwitch,
 }
 
 /// `catalog:changed` イベントペイロード。
@@ -369,6 +406,7 @@ fn begin_scan(inner: &mut CatalogInner) -> (u64, u64) {
     inner.state.records.clear();
     inner.state.mode = CatalogMode::Real;
     inner.collection = None;
+    inner.search = None;
     inner.state.generation += 1;
     inner.scan_token += 1;
     inner.progress = ProgressCounters::default();
@@ -528,7 +566,8 @@ pub(crate) fn switch_catalog_source(
     target: CatalogMode,
 ) -> ModeSwitchOutcome {
     let exited_collection = inner.collection.take().is_some();
-    if inner.state.mode == target && !exited_collection {
+    let exited_search = inner.search.is_some();
+    if inner.state.mode == target && !exited_collection && !exited_search {
         return ModeSwitchOutcome::Unchanged(summary_of(inner));
     }
     match target {
@@ -559,7 +598,32 @@ pub fn set_catalog_source(
     let target = match source.as_str() {
         "temp" => CatalogMode::Real,
         "library" => CatalogMode::Library,
-        other => return Err(format!("不明なカタログソースです: {other} (temp|library)")),
+        "search" => {
+            // 検索結果表示へ (再) 切替。対象は「最後の検索結果」—
+            // 再実行 (新しいDB状態の反映) はsearch_runで明示的に行う。
+            let mut inner = lock(&state.catalog);
+            if inner.state.scanning {
+                return Err("走査中はカタログソースを切替できません".to_string());
+            }
+            let display = inner.search_display().cloned().ok_or_else(|| {
+                "表示できる検索結果がありません (先に検索を実行してください)".to_string()
+            })?;
+            let generation = inner.set_search_display(display);
+            let summary = summary_of(&inner);
+            let _ = app.emit(
+                "catalog:changed",
+                CatalogChangedPayload {
+                    generation,
+                    reason: CatalogChangeReason::SearchSwitch,
+                },
+            );
+            return Ok(summary);
+        }
+        other => {
+            return Err(format!(
+                "不明なカタログソースです: {other} (temp|library|search)"
+            ))
+        }
     };
     let outcome = {
         let mut inner = lock(&state.catalog);
@@ -588,9 +652,9 @@ pub fn set_catalog_source(
 /// ライブラリスナップショットをカタログへ反映する (WP-2)。
 /// Libraryモード表示中は表示レコードを差し替え、generationを進めて
 /// `catalog:changed` をemitする (ページ再取得でAssetIdの確定へ追従)。
-/// コレクション表示中 (WP-6) は `library` スナップショットのみ更新する
-/// — コレクションビューの内容は明示refresh・再選択まで保持する
-/// (asset:updatedのトリガー連鎖を避ける設計。collections.rs参照)。
+/// コレクション表示中 (WP-6)・検索結果表示中 (WP-8) は `library`
+/// スナップショットのみ更新する — ビューの内容は明示refresh・再選択まで
+/// 保持する (asset:updatedのトリガー連鎖を避ける設計。collections.rs参照)。
 pub fn apply_library_snapshot(app: &AppHandle, records: Vec<ImageRecord>) {
     let state = app.state::<AppState>();
     let generation = {
@@ -599,6 +663,7 @@ pub fn apply_library_snapshot(app: &AppHandle, records: Vec<ImageRecord>) {
         if inner.state.mode == CatalogMode::Library
             && !inner.state.scanning
             && inner.collection.is_none()
+            && inner.search.is_none()
         {
             inner.state.records = inner.library.clone();
             inner.apply_sort();

@@ -54,6 +54,7 @@ mod migrate;
 mod paths;
 mod repos;
 mod schema;
+mod search;
 
 pub use diagnose::DbStatus;
 /// backup/restore正準表現 (パーセントエスケープUTF-8。WP-13で使用)。
@@ -61,6 +62,12 @@ pub use paths::{percent_decode_to_bytes, percent_encode_bytes};
 pub use repos::SqliteRepos;
 /// このbuildの最新schema version。
 pub use schema::LATEST_VERSION;
+/// FTS5検索 (WP-8): 文書構築・整合性診断・AST検索実行・一致根拠。
+pub use search::{
+    build_asset_doc, fts_counts, fts_integrity, fts_rebuild, fts_repair, prune_orphan_docs,
+    rebuild_docs_for_assets, search_asset_ids, search_evidence, AssetDoc, DocField, FieldEvidence,
+    FtsIntegrityReport, SearchScope,
+};
 
 /// 既定のbusy_timeout (ms)。PM計画§6-2。
 pub(crate) const DEFAULT_BUSY_TIMEOUT_MS: u64 = 5_000;

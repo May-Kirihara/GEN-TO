@@ -356,8 +356,11 @@ impl FileRepo for SqliteRepos<'_> {
     }
 
     fn set_scan_state(&self, file_id: i64, state: ScanState) -> Result<(), RepoError> {
-        let changed = self
+        let tx = self
             .conn
+            .unchecked_transaction()
+            .map_err(|e| RepoError::Db(e.to_string()))?;
+        let changed = tx
             .execute(
                 "UPDATE files SET scan_state = ?2, updated_at = ?3 WHERE id = ?1",
                 params![file_id, state.as_str(), now_utc_rfc3339()],
@@ -366,6 +369,18 @@ impl FileRepo for SqliteRepos<'_> {
         if changed == 0 {
             return Err(RepoError::NotFound);
         }
+        // present⇄不在の切替は文書の有無に影響するため同一txで再構築 (WP-8)
+        let linked_asset: Option<i64> = tx
+            .query_row("SELECT asset_id FROM files WHERE id = ?1", [file_id], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(map_err)?
+            .flatten();
+        if let Some(asset_id) = linked_asset {
+            crate::search::rebuild_docs_for_assets(&tx, &[asset_id])?;
+        }
+        tx.commit().map_err(map_err)?;
         Ok(())
     }
 
@@ -432,7 +447,25 @@ impl FileRepo for SqliteRepos<'_> {
                         updated_at = excluded.updated_at",
                 )
                 .map_err(map_err)?;
+            let mut detached_assets: Vec<i64> = Vec::new();
             for file in files {
+                if file.detach_asset {
+                    // リンク解除前に旧asset_idを記録 (文書再構築対象。WP-8)
+                    let (rel_blob, enc) = encode_path(&file.rel_path);
+                    if let Some(asset_id) = tx
+                        .query_row(
+                            "SELECT asset_id FROM files \
+                             WHERE root_id = ?1 AND path_encoding = ?2 AND rel_path = ?3",
+                            params![file.root_id, enc.as_str(), rel_blob],
+                            |r| r.get::<_, Option<i64>>(0),
+                        )
+                        .optional()
+                        .map_err(map_err)?
+                        .flatten()
+                    {
+                        detached_assets.push(asset_id);
+                    }
+                }
                 let (rel_blob, enc) = encode_path(&file.rel_path);
                 let now = now_utc_rfc3339();
                 stmt.execute(params![
@@ -451,6 +484,9 @@ impl FileRepo for SqliteRepos<'_> {
                     file.detach_asset as i64,
                 ])
                 .map_err(map_err)?;
+            }
+            if !detached_assets.is_empty() {
+                crate::search::rebuild_docs_for_assets(&tx, &detached_assets)?;
             }
         }
         tx.commit().map_err(map_err)?;
@@ -487,8 +523,11 @@ impl FileRepo for SqliteRepos<'_> {
     fn relocate_file(&self, file_id: i64, file: FileUpsert) -> Result<FileRecord, RepoError> {
         let (rel_blob, enc) = encode_path(&file.rel_path);
         let now = now_utc_rfc3339();
-        let changed = self
+        let tx = self
             .conn
+            .unchecked_transaction()
+            .map_err(|e| RepoError::Db(e.to_string()))?;
+        let changed = tx
             .execute(
                 "UPDATE files SET
                     rel_path = ?2, path_encoding = ?3, display_name = ?4,
@@ -514,13 +553,19 @@ impl FileRepo for SqliteRepos<'_> {
             return Err(RepoError::NotFound);
         }
         // rel_path一意制約違反はDuplicateで伝える (呼び出し側はupsertへフォールバック)
-        self.conn
+        let record = tx
             .query_row(
                 &format!("SELECT {FILE_COLUMNS} FROM files WHERE id = ?1"),
                 [file_id],
                 map_file,
             )
-            .map_err(map_err)
+            .map_err(map_err)?;
+        // 移動・改名で文書のfilename/pathが変わるため同一txで再構築 (WP-8)
+        if let Some(asset_id) = record.asset_id {
+            crate::search::rebuild_docs_for_assets(&tx, &[asset_id])?;
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(record)
     }
 
     fn set_scan_state_batch(&self, file_ids: &[i64], state: ScanState) -> Result<usize, RepoError> {
@@ -532,6 +577,23 @@ impl FileRepo for SqliteRepos<'_> {
             .unchecked_transaction()
             .map_err(|e| RepoError::Db(e.to_string()))?;
         let changed = {
+            // 対象行のassetリンクを先に集める (更新後は文書再構築に必要)
+            let mut affected_assets: Vec<i64> = Vec::new();
+            {
+                let mut stmt = tx
+                    .prepare("SELECT asset_id FROM files WHERE id = ?1")
+                    .map_err(map_err)?;
+                for id in file_ids {
+                    if let Some(asset_id) = stmt
+                        .query_row([id], |r| r.get::<_, Option<i64>>(0))
+                        .optional()
+                        .map_err(map_err)?
+                        .flatten()
+                    {
+                        affected_assets.push(asset_id);
+                    }
+                }
+            }
             let mut stmt = tx
                 .prepare(
                     "UPDATE files SET scan_state = ?2, updated_at = ?3
@@ -543,6 +605,9 @@ impl FileRepo for SqliteRepos<'_> {
                 changed += stmt
                     .execute(params![id, state.as_str(), now_utc_rfc3339()])
                     .map_err(map_err)?;
+            }
+            if changed > 0 {
+                crate::search::rebuild_docs_for_assets(&tx, &affected_assets)?;
             }
             changed
         };
@@ -631,13 +696,28 @@ impl FileRepo for SqliteRepos<'_> {
     }
 
     fn delete_file(&self, file_id: i64) -> Result<(), RepoError> {
-        let changed = self
+        let tx = self
             .conn
+            .unchecked_transaction()
+            .map_err(|e| RepoError::Db(e.to_string()))?;
+        let linked_asset: Option<i64> = tx
+            .query_row("SELECT asset_id FROM files WHERE id = ?1", [file_id], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(map_err)?
+            .flatten();
+        let changed = tx
             .execute("DELETE FROM files WHERE id = ?1", [file_id])
             .map_err(map_err)?;
         if changed == 0 {
             return Err(RepoError::NotFound);
         }
+        // File削除で文書のfilename/pathが変わる (最後のpresent fileなら文書削除)
+        if let Some(asset_id) = linked_asset {
+            crate::search::rebuild_docs_for_assets(&tx, &[asset_id])?;
+        }
+        tx.commit().map_err(map_err)?;
         Ok(())
     }
 }
@@ -928,9 +1008,12 @@ impl AssetRepo for SqliteRepos<'_> {
     }
 
     fn link_file(&self, file_id: i64, asset_id: i64) -> Result<(), RepoError> {
-        // 先に双方の存在を確認し、「どちらが無いか」をNotFoundで返せるようにする
-        let asset_exists: Option<i64> = self
+        let tx = self
             .conn
+            .unchecked_transaction()
+            .map_err(|e| RepoError::Db(e.to_string()))?;
+        // 先に双方の存在を確認し、「どちらが無いか」をNotFoundで返せるようにする
+        let asset_exists: Option<i64> = tx
             .query_row("SELECT id FROM assets WHERE id = ?1", [asset_id], |r| {
                 r.get(0)
             })
@@ -939,8 +1022,7 @@ impl AssetRepo for SqliteRepos<'_> {
         if asset_exists.is_none() {
             return Err(RepoError::NotFound);
         }
-        let changed = self
-            .conn
+        let changed = tx
             .execute(
                 "UPDATE files SET asset_id = ?2, updated_at = ?3 WHERE id = ?1",
                 params![file_id, asset_id, now_utc_rfc3339()],
@@ -949,6 +1031,9 @@ impl AssetRepo for SqliteRepos<'_> {
         if changed == 0 {
             return Err(RepoError::NotFound);
         }
+        // リンクで文書の対象集合が変わるため同一txで再構築 (WP-8)
+        crate::search::rebuild_docs_for_assets(&tx, std::slice::from_ref(&asset_id))?;
+        tx.commit().map_err(map_err)?;
         Ok(())
     }
 

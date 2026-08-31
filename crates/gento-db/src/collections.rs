@@ -2,11 +2,13 @@
 //!
 //! [`SqliteRepos`] へ [`gento_core::collections::CollectionRepo`] を実装する。
 //!
-//! # スマートコレクション評価のSQL構築規約
+//! # スマートコレクション評価 (WP-8: ASTへ移行)
 //!
-//! 条件→SQLは**固定断片 + パラメータバインドのみ**で構成する
-//! (ユーザー入力がSQL文字列へ連結される経路は存在しない — 受入条件4。
-//! `smart_where` が唯一の構築点で、断片は静的文字列リテラル)。
+//! WP-6のSQL直クエリ評価 (`smart_where`) から、検索AST
+//! (`gento_search::SearchQuery`) 経由の [`crate::search::search_asset_ids`]
+//! へ移行した。旧query_json (最小条件形式) は読み取り時にASTへ変換する
+//! (`legacy_to_query`)。AST→SQLは**固定断片 + パラメータバインドのみ**
+//! (ユーザー入力がSQL文字列へ連結される経路は存在しない — 受入条件4)。
 //!
 //! # position維持
 //!
@@ -14,11 +16,9 @@
 //! 追加=末尾・削除=詰め・reorder=全順序振り直し。
 
 use gento_core::collections::{
-    CollectionItemRecord, CollectionKind, CollectionRecord, CollectionRepo, SmartCondition,
-    SmartQuery,
+    CollectionItemRecord, CollectionKind, CollectionRecord, CollectionRepo, SmartQuery,
 };
 use gento_core::repo::RepoError;
-use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
 use crate::ids::{new_uuid_v7, now_utc_rfc3339};
@@ -72,64 +72,42 @@ fn get_collection_row(conn: &Connection, id: i64) -> Result<Option<CollectionRec
         .map_err(map_err)
 }
 
-/// 条件列 → (WHERE句 " AND " 結合, バインド値列)。
-/// 断片はすべて静的リテラル — ユーザー入力は値側のみ。
-fn smart_where(conditions: &[SmartCondition]) -> (String, Vec<SqlValue>) {
-    let mut fragments: Vec<&'static str> = Vec::with_capacity(conditions.len());
-    let mut values: Vec<SqlValue> = Vec::with_capacity(conditions.len());
-    for condition in conditions {
-        match condition {
-            SmartCondition::RatingGe { value } => {
-                fragments.push("a.rating >= ?");
-                values.push(SqlValue::Integer(*value as i64));
-            }
-            SmartCondition::CullState { value } => {
-                fragments.push("a.triage = ?");
-                values.push(SqlValue::Text(value.as_str().to_string()));
-            }
-            SmartCondition::Favorite { value } => {
-                fragments.push("a.favorite = ?");
-                values.push(SqlValue::Integer(i64::from(*value)));
-            }
-            SmartCondition::MimeType { value } => {
-                fragments.push("a.mime_type = ?");
-                values.push(SqlValue::Text(value.clone()));
-            }
-            SmartCondition::HasTag { name } => {
-                fragments.push(
-                    "EXISTS (SELECT 1 FROM asset_tags at2 \
-                     JOIN tags t2 ON t2.id = at2.tag_id \
-                     WHERE at2.asset_id = a.id AND t2.normalized_name = ?)",
-                );
-                values.push(SqlValue::Text(name.clone()));
-            }
-        }
-    }
-    if fragments.is_empty() {
-        (String::new(), values)
-    } else {
-        (format!(" WHERE {}", fragments.join(" AND ")), values)
-    }
-}
-
-/// スマートコレクションの保存済み条件を読む (JSON不正はConstraint)。
-fn stored_query(record: &CollectionRecord) -> Result<SmartQuery, RepoError> {
+/// 保存済みquery_jsonを検索ASTへ読み出す (WP-8)。
+/// 旧形式 (最小条件) はASTへ変換する。JSON不正はConstraint。
+fn stored_ast(record: &CollectionRecord) -> Result<gento_search::SearchQuery, RepoError> {
     let json = record
         .query_json
         .as_deref()
         .ok_or_else(|| RepoError::Constraint("smart collection has no query_json".to_string()))?;
-    SmartQuery::parse(json).map_err(|e| RepoError::Constraint(e.0))
+    match gento_search::stored::parse_stored(json) {
+        Ok(gento_search::stored::StoredSearch::Ast(query)) => Ok(query),
+        Ok(gento_search::stored::StoredSearch::Legacy(legacy)) => {
+            Ok(gento_search::stored::legacy_to_query(&legacy))
+        }
+        Err(e) => Err(RepoError::Constraint(e.0)),
+    }
 }
 
-/// smart件数 (評価)。manual行へ呼ぶとConstraint。
+/// 書き込み用の検索AST JSONを検証して正規形へ直す (WP-8)。
+/// 新規書き込みはversion 2 (AST) 形式のみ。
+fn canonical_search_json(search_json: &str) -> Result<String, RepoError> {
+    match gento_search::stored::parse_stored(search_json) {
+        Ok(gento_search::stored::StoredSearch::Ast(query)) => {
+            Ok(gento_search::stored::to_json(&query))
+        }
+        Ok(gento_search::stored::StoredSearch::Legacy(_)) => Err(RepoError::Constraint(
+            "旧形式の検索条件では保存できません (検索AST形式で指定してください)".to_string(),
+        )),
+        Err(e) => Err(RepoError::Constraint(e.0)),
+    }
+}
+
+/// smart件数 (AST評価)。manual行へ呼ぶとConstraint。
 fn smart_count(conn: &Connection, record: &CollectionRecord) -> Result<u64, RepoError> {
-    let query = stored_query(record)?;
-    let (where_clause, values) = smart_where(&query.conditions);
-    let sql = format!("SELECT count(*) FROM assets a{where_clause}");
-    let count: i64 = conn
-        .query_row(&sql, params_from_iter(values), |r| r.get(0))
-        .map_err(map_err)?;
-    Ok(count.max(0) as u64)
+    let query = stored_ast(record)?;
+    let scope = crate::search::SearchScope::for_smart_collection();
+    let (_, total) = crate::search::search_asset_ids(conn, &query, &scope, 0, 1)?;
+    Ok(total)
 }
 
 /// コレクション行へ件数を補完する (smart=評価値。不正JSONは0扱い —
@@ -187,6 +165,19 @@ impl CollectionRepo for SqliteRepos<'_> {
             CollectionKind::Smart,
             Some(&canonical.to_json()),
         )?;
+        let record = get_collection_row(self.conn(), id)?
+            .ok_or_else(|| RepoError::Db("inserted collection row is not readable".to_string()))?;
+        Ok(complete_count(self.conn(), record))
+    }
+
+    fn create_smart_collection_search(
+        &self,
+        name: &str,
+        search_json: &str,
+    ) -> Result<CollectionRecord, RepoError> {
+        let name = validate_collection_name(name)?;
+        let canonical = canonical_search_json(search_json)?;
+        let id = insert_collection(self.conn(), &name, CollectionKind::Smart, Some(&canonical))?;
         let record = get_collection_row(self.conn(), id)?
             .ok_or_else(|| RepoError::Db("inserted collection row is not readable".to_string()))?;
         Ok(complete_count(self.conn(), record))
@@ -483,6 +474,30 @@ impl CollectionRepo for SqliteRepos<'_> {
         Ok(complete_count(self.conn(), updated))
     }
 
+    fn update_smart_collection_search(
+        &self,
+        collection_id: i64,
+        name: &str,
+        search_json: &str,
+    ) -> Result<CollectionRecord, RepoError> {
+        let name = validate_collection_name(name)?;
+        let canonical = canonical_search_json(search_json)?;
+        let record = get_collection_row(self.conn(), collection_id)?.ok_or(RepoError::NotFound)?;
+        if record.kind != CollectionKind::Smart {
+            return Err(RepoError::Constraint(
+                "cannot update query of a manual collection".to_string(),
+            ));
+        }
+        self.conn()
+            .execute(
+                "UPDATE collections SET name = ?2, query_json = ?3, updated_at = ?4 WHERE id = ?1",
+                params![collection_id, name, canonical, now_utc_rfc3339()],
+            )
+            .map_err(map_err)?;
+        let updated = get_collection_row(self.conn(), collection_id)?.ok_or(RepoError::NotFound)?;
+        Ok(complete_count(self.conn(), updated))
+    }
+
     fn evaluate_smart_collection(
         &self,
         collection_id: i64,
@@ -495,33 +510,9 @@ impl CollectionRepo for SqliteRepos<'_> {
                 "cannot evaluate a manual collection".to_string(),
             ));
         }
-        let query = stored_query(&record)?;
-        let (where_clause, values) = smart_where(&query.conditions);
-        let tx = self
-            .conn()
-            .unchecked_transaction()
-            .map_err(|e| RepoError::Db(e.to_string()))?;
-        let total: i64 = tx
-            .query_row(
-                &format!("SELECT count(*) FROM assets a{where_clause}"),
-                params_from_iter(values.iter()),
-                |r| r.get(0),
-            )
-            .map_err(map_err)?;
-        let mut page_values = values;
-        page_values.push(SqlValue::Integer(limit as i64));
-        page_values.push(SqlValue::Integer(offset as i64));
-        let sql =
-            format!("SELECT a.id FROM assets a{where_clause} ORDER BY a.id ASC LIMIT ? OFFSET ?");
-        let mut stmt = tx.prepare(&sql).map_err(map_err)?;
-        let rows = stmt
-            .query_map(params_from_iter(page_values.iter()), |row| row.get(0))
-            .map_err(map_err)?
-            .collect::<rusqlite::Result<Vec<i64>>>()
-            .map_err(map_err)?;
-        drop(stmt);
-        tx.commit().map_err(map_err)?;
-        Ok((rows, total.max(0) as u64))
+        let query = stored_ast(&record)?;
+        let scope = crate::search::SearchScope::for_smart_collection();
+        crate::search::search_asset_ids(self.conn(), &query, &scope, offset, limit)
     }
 
     fn list_present_files_of_assets(
@@ -607,7 +598,7 @@ mod tests {
     use super::*;
     use crate::migrate::{run_migrations, MigrationOpts};
     use crate::schema::MIGRATIONS;
-    use gento_core::collections::SmartCullValue;
+    use gento_core::collections::{SmartCondition, SmartCullValue};
     use gento_core::metadata::{AssetTagRepo, CaptionKind, CaptionRepo};
     use gento_core::repo::{
         AssetRepo, FileRepo, FileUpsert, LibraryRootRepo, NewAsset, ScanState, TriageState,
