@@ -61,11 +61,16 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "fgwp22_files_mtime_ns",
         sql: MIGRATION_V4_SQL,
     },
+    Migration {
+        version: 5,
+        name: "wp7_file_operations_status",
+        sql: MIGRATION_V5_SQL,
+    },
 ];
 
 /// 現在の最新schema version (`PRAGMA user_version` の目標値)。
 /// このbuildの [`crate::Db::open`] は既存DBを必ずこの値へ移行する。
-pub const LATEST_VERSION: i32 = 4;
+pub const LATEST_VERSION: i32 = 5;
 
 /// WP-2 (登録ルート・差分スキャン) のindex追加。
 /// 列追加は不要 — 設定列は#1に含まれ、os_file_idも#1でNULL可として定義済み。
@@ -98,6 +103,41 @@ CREATE INDEX idx_files_root_os_file_id
 /// migration #1は凍結済みのため、greenfieldでも列追加は#4とする。
 const MIGRATION_V4_SQL: &str = r"
 ALTER TABLE files ADD COLUMN mtime_ns INTEGER NULL;
+";
+
+/// WP-7: `file_operations.status` のCHECKを拡張する (計画書§15の実行
+/// モデル: planned / executing / done / partial / failed / undone)。
+/// #1の初期CHECK ('pending','succeeded',…) はWP-7の状態機構と名前が
+/// 合わないため、SQLiteのCHECK変更に必要なテーブル再構築で置き換える。
+/// 旧値は「未完了→executing」「成功→done」へマップ (WP-7以前に行が書か
+/// れる経路は無かったが、安全のため恒等でない変換を明示)。
+const MIGRATION_V5_SQL: &str = r"
+CREATE TABLE file_operations_v5 (
+    id INTEGER PRIMARY KEY,
+    uuid TEXT NOT NULL UNIQUE
+        CHECK (length(uuid) = 36 AND uuid = lower(uuid)),
+    operation_type TEXT NOT NULL,
+    status TEXT NOT NULL
+        CHECK (status IN ('planned', 'executing', 'done', 'partial', 'failed', 'undone')),
+    undoable INTEGER NOT NULL DEFAULT 0 CHECK (undoable IN (0, 1)),
+    -- 操作要求 (複数ファイルの一括操作は1論理操作として記録)。
+    request_json TEXT NOT NULL,
+    result_json TEXT,
+    created_at TEXT NOT NULL,
+    undone_at TEXT
+);
+INSERT INTO file_operations_v5 (id, uuid, operation_type, status, undoable,
+                                request_json, result_json, created_at, undone_at)
+    SELECT id, uuid, operation_type,
+           CASE status
+               WHEN 'pending' THEN 'executing'
+               WHEN 'succeeded' THEN 'done'
+               ELSE status
+           END,
+           undoable, request_json, result_json, created_at, undone_at
+      FROM file_operations;
+DROP TABLE file_operations;
+ALTER TABLE file_operations_v5 RENAME TO file_operations;
 ";
 
 const MIGRATION_V1_SQL: &str = r#"

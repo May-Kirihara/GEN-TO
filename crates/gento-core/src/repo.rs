@@ -425,6 +425,11 @@ pub trait FileRepo {
     /// ルート配下でAsset未リンク (asset_id NULL = ハッシュ未計算) のFile一覧。
     /// ハッシュ処理の再開 (resume) 判定に使用。
     fn list_files_without_asset(&self, root_id: i64) -> Result<Vec<FileRecord>, RepoError>;
+
+    /// File行を削除する (WP-7。ファイル操作の上書き・再配置で経路を明け
+    /// 渡すときのDB側整合。AssetはRESTRICTで残る)。存在しないIDは
+    /// [`RepoError::NotFound`]。
+    fn delete_file(&self, file_id: i64) -> Result<(), RepoError>;
 }
 
 /// 画像内容 (Asset) のrepository。

@@ -213,7 +213,17 @@ pub const IMAGE_EXTENSIONS: [&str; 9] = [
 ];
 
 /// 拡張子がMVP対象画像形式か (大小文字無視)。
+/// WP-7のコピー進行中テンポラリ (`.gento-tmp-`接頭辞) は画像扱いしない
+/// — 「コピー完了前のファイルを正規ファイルとして登録しない」安全原則の
+/// 走査側強制 (異常終了で残った掃除漏れも登録しない)。
 pub fn is_image_entry(path: &Path) -> bool {
+    if path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with(gento_core::file_ops::TMP_FILE_PREFIX))
+    {
+        return false;
+    }
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| {
@@ -225,17 +235,9 @@ pub fn is_image_entry(path: &Path) -> bool {
 }
 
 /// metadataからOSファイルIDを取り出す (WP-2。Linux: dev+inode)。
-/// シンボリックリンクは走査対象外のため、常に実ファイルのmetadata。
-#[cfg(unix)]
-pub fn os_file_id_of(md: &Metadata) -> Option<gento_core::repo::OsFileId> {
-    use std::os::unix::fs::MetadataExt;
-    Some(gento_core::repo::OsFileId::new(md.dev(), md.ino()))
-}
-
-#[cfg(not(unix))]
-pub fn os_file_id_of(_md: &Metadata) -> Option<gento_core::repo::OsFileId> {
-    None
-}
+/// 実装はgento-platformへ集約移動した (WP-7。platform差の土台)。
+/// 既存利用箇所 (hash.rs等) の互換のため再エポートする。
+pub use gento_platform::os_file_id_of;
 
 /// 走査で列挙した画像ファイル (WP-2。os_file_id付き)。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -583,6 +585,20 @@ mod tests {
         for ng in ["x.pngx", "x.txt", "png", "x.PNG ", ".png"] {
             assert!(!is_image_entry(Path::new(&format!("/a/{ng}"))), "{ng}");
         }
+    }
+
+    #[test]
+    fn is_image_entry_rejects_gento_tmp_in_progress_files() {
+        // WP-7安全原則: コピー完了前テンポラリ (・異常終了残骸) は
+        // 画像走査・登録対象外。
+        for ng in [".gento-tmp-x.png", ".gento-tmp-photo.JPG", ".gento-tmp-"] {
+            assert!(
+                !is_image_entry(Path::new(&format!("/a/{ng}"))),
+                "tmpは対象外: {ng}"
+            );
+        }
+        // 接頭辞が付かなければ通常どおり対象
+        assert!(is_image_entry(Path::new("/a/x-gento-tmp.png")));
     }
 
     #[test]

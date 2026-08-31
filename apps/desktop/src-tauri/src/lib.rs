@@ -12,6 +12,7 @@ pub mod collections;
 pub mod db;
 #[cfg(any(debug_assertions, feature = "devtools"))]
 pub mod devtools;
+pub mod fileops;
 pub mod fsview;
 pub mod library;
 pub mod metadata;
@@ -189,6 +190,13 @@ pub fn run() {
         fsview::fs_list_dirs,
         fsview::reveal_in_file_manager,
         fsview::open_with_default_app,
+        fileops::file_ops_plan,
+        fileops::file_ops_execute,
+        fileops::file_ops_undo_check,
+        fileops::file_ops_undo,
+        fileops::file_ops_history,
+        fileops::file_ops_cancel,
+        fileops::folder_create,
         thumbnails::request_thumbnails,
         thumbnails::reprioritize_thumbnails,
         thumbnails::cancel_thumbnail_requests,
@@ -245,6 +253,13 @@ pub fn run() {
         fsview::fs_list_dirs,
         fsview::reveal_in_file_manager,
         fsview::open_with_default_app,
+        fileops::file_ops_plan,
+        fileops::file_ops_execute,
+        fileops::file_ops_undo_check,
+        fileops::file_ops_undo,
+        fileops::file_ops_history,
+        fileops::file_ops_cancel,
+        fileops::folder_create,
         thumbnails::request_thumbnails,
         thumbnails::reprioritize_thumbnails,
         thumbnails::cancel_thumbnail_requests,
@@ -301,7 +316,7 @@ pub fn run() {
             // (UIブロックなし。再起動復元はスナップショット生成で担保)。
             if let Some(db) = state.db.as_ref().and_then(|d| d.db.clone()) {
                 match library::LibraryController::new(
-                    db,
+                    db.clone(),
                     std::sync::Arc::new(library::TauriLibraryHost {
                         app: app.handle().clone(),
                     }),
@@ -325,6 +340,18 @@ pub fn run() {
                                 tracing::warn!(error = %err, "failed to list roots at startup")
                             }
                         }
+                        // WP-7: ファイル操作サービス + 起動時回復
+                        // (executing残留の確定と .gento-tmp- 掃除)。
+                        let file_ops_service = fileops::FileOpsService::new(
+                            db,
+                            std::sync::Arc::new(fileops::TauriFileOpsHost {
+                                app: app.handle().clone(),
+                            }),
+                        );
+                        for notice in file_ops_service.recover_at_startup() {
+                            tracing::warn!(notice = %notice, "file ops recovery");
+                        }
+                        state.file_ops = Some(file_ops_service);
                         controller.enqueue_scan_all();
                         state.library = Some(controller);
                     }

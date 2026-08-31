@@ -15,6 +15,8 @@ tauri-build = { workspace = true }
 gento-core = { workspace = true }
 gento-db = { workspace = true }
 gento-image = { workspace = true }
+# OS差の土台 (ゴミ箱・OSファイルID。WP-7)
+gento-platform = { workspace = true }
 serde = { workspace = true }
 tauri = { workspace = true }
 tracing = { workspace = true }
@@ -24,6 +26,8 @@ dirs = { workspace = true }
 libc = "0.2"
 # 登録ルートのフォルダ監視 (MVP WP-2)。Linux: inotify backend。
 notify = { workspace = true }
+# ファイル操作のテンポラリ名採番 (WP-7)。workspace既存pin。
+uuid = { workspace = true }
 # OSファイルマネージャーで表示・外部アプリで開く (MVP WP-4)。
 # Rust API (reveal_item_in_dir / open_path) のみ使用し、JS側plugin commandは
 # 叩かないため capability への権限追加は不要。

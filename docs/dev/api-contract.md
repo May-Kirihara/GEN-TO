@@ -1423,3 +1423,126 @@ type CollectionsChangedEvent = {
 - dev bridge: `CL` 行 (一覧・表示中・メモ・エクスポート入口) とコレクション
   コマンドモード (ctrl+shift+F1 → 数字キーでアクション1回実行。3修飾キー
   ctrl+shift+altはWM/WebKitへ到達しないための代替チャネル)
+
+## 39. Commands (WP-7: 安全なファイル操作とUndo)
+
+### `file_ops_plan` — dry-run (計画)
+
+```ts
+invoke<FileOpPlanDto>("file_ops_plan", {
+  kind: "copy" | "move" | "rename" | "mkdir" | "trash" | "delete_forever",
+  paths: string[],           // 操作対象の絶対パス (登録ルート内)
+  destDir: string | null,    // copy/moveの宛先ディレクトリ
+  newName: string | null,    // renameの新しい名前
+});
+```
+
+応答 (`FileOpPlanDto`):
+
+```ts
+{
+  kind: string,
+  steps: Array<{
+    file_id: string,          // files.id (10進文字列)
+    src: string, dst: string,
+    display_name: string,
+    conflict: {               // 宛先に同名ファイルが存在する場合のみ
+      dst: string,
+      dst_byte_size: number,
+      dst_mtime_ms: number,
+      hash_matches: boolean | null,  // null=未比較 (サイズ不一致等)
+      keep_both_name: string,        // "name (2).ext"
+    } | null,
+    plan_error: string | null,       // src不在・シンボリックリンク等
+  }>,
+  plan_errors: string[],             // 実行不可 (renameに複数ファイル等)
+  dest_root_id: string | null,
+  disk_shortfall_bytes: number | null,  // 容量不足 (バイト差)
+}
+```
+
+### `file_ops_execute` — 実行 (async command)
+
+```ts
+invoke<FileOpOutcomeDto>("file_ops_execute", {
+  args: {
+    kind: string,
+    paths: string[],
+    dest_dir: string | null,
+    new_name: string | null,
+    resolutions: {              // 衝突解決 (未指定の衝突はskip = 安全側)
+      global: "overwrite" | "skip" | "keep_both" | null,
+      per_file: Record<string, string> | null,  // file_id → 方針
+    } | null,
+  },
+});
+```
+
+応答 (`FileOpOutcomeDto`): `{ op_id, kind, status: "done"|"partial"|"failed",
+undoable, steps: Array<{ file_id, from, to, status, resolution, error }> }`。
+**実行は (a) file_operations行をexecutingで確保 → (b) ファイル単位FS+DB
+(1tx) → (c) result JSON確定、の順。この応答を受けた時点で操作ログは
+確定済み** (安全原則「操作ログ確定後にUI成功通知」)。内部で計画を再計算
+する (クライアント由来の計画を信頼しない)。
+
+### `file_ops_undo_check` / `file_ops_undo` — Undo (2段)
+
+```ts
+invoke<UndoCheckDto>("file_ops_undo_check", { opId: string });
+// → { op_id, ok, kind, refusals: string[] }  前提検証のみ (何も実行しない)
+
+invoke<UndoOutcomeDto>("file_ops_undo", { opId: string });
+// → { op_id, fully_undone: boolean, errors: string[], refusals: string[] }
+```
+
+前提検証 (全ステップ all-or-nothing): 対象の存在・世代トークン一致
+(os_file_id+size+mtime_ns)・戻し先の不在。外部変更で前提が崩れていれば
+**何も実行せず**理由を返す (安全原則3)。Undo対象: copy(生成物削除=ゴミ箱) /
+move・rename(巻き戻し) / trash(ゴミ箱復帰)。mkdir・delete_foreverは対象外。
+
+### `file_ops_history` / `file_ops_cancel` / `folder_create`
+
+```ts
+invoke<FileOpHistoryDto[]>("file_ops_history", { limit: number });  // 既定50・上限200
+invoke<void>("file_ops_cancel");  // 協調キャンセル (ファイル境界で停止)
+invoke<FileOpOutcomeDto>("folder_create", { parent: string, name: string });
+```
+
+## 40. Events (WP-7)
+
+### `file_ops:progress` — ファイル単位の進捗
+
+```ts
+type FileOpsProgressEvent = {
+  op_id: string;
+  index: number;  // 0開始
+  total: number;
+  from: string;
+  to: string | null;
+  done: boolean;  // ファイル単位の開始/完了
+};
+```
+
+## 41. ファイル操作の安全規約 (WP-7。Codexレビュー対象)
+
+- **通常削除はゴミ箱** (`trash`)。`delete_forever` は別コマンドとして分離し、
+  UIでは確認ダイアログ+「完全に削除する」チェックボックスの2段明示。
+  ゴミ箱移動の失敗は通常削除へフォールバックしない (エラー表示のみ)。
+- **上書きは明示確認**: dry-runで衝突を検出し、overwriteが明示された場合
+  のみ置換。未指定の衝突はskip。「操作先==操作元」の上書きは拒否。
+- **コピーの中間生成物は非登録**: コピーは `.gento-tmp-` 接頭辞のテンポラリ
+  名で書き込み・fsync後に最終名へrenameしてからDB反映。走査
+  (is_image_entry) も同接頭辞を画像扱いしないため、異常終了残骸も一覧・
+  DBに現れない (起動時に掃除)。
+- **移動の原子性**: 同一FSはfs::rename。跨界 (EXDEV) はcopy+fsync+rename→
+  元削除へフォールバック。
+- **DB反映**: ファイル単位で1トランザクション。移動=rel_path更新
+  (uuid・Asset・os_file_id保持)、ゴミ箱/完全削除/ルート外移動=missing化
+  (`.gento-trash` 仮想化はしない — 再出現で復帰)。コピーは元Assetへ即時
+  共有リンク (hash共有)。
+- **watcher抑制**: 操作実行中、対象パス (元・先) の監視イベントを無視
+  (WatchBuffer抑制キー)。DB反映完了後に解除。
+- **異常終了回復**: 起動時に `executing` 残留のfile_operationsを検出→
+  `failed`確定+再スキャンで収束 (「安全な再開」= 失敗項目のUI再試行)。
+- IDs: file_id/op_idは10進文字列 (JS安全整数規約に合わせる)。
+- `GENTO_API_VERSION` 据え置き (1): 追加のみで破壊的変更なし。

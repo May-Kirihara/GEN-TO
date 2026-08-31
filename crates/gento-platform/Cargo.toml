@@ -1,0 +1,14 @@
+[package]
+name = "gento-platform"
+description = "GEN-TO platform abstraction base: OS trash, OS file identity (WP-7 / WP-17拡張点)"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gento-core = { workspace = true }
+# OSゴミ箱への移動 (freedesktop.org Trash仕様)。失敗時の通常削除
+# フォールバックは安全原則上禁止 (呼び出し側でエラー表示のみ)。
+trash = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

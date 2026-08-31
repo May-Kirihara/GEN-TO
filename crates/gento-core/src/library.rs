@@ -284,10 +284,19 @@ pub trait ScanFs: Send + Sync {
     ) -> Result<HashedFile, HashFileError>;
 }
 
-/// 3 repository traitの統合ビュー (dyn運用用)。
-pub trait AllRepos: crate::repo::LibraryRootRepo + FileRepo + crate::repo::AssetRepo {}
+/// 4 repository traitの統合ビュー (dyn運用用)。WP-7でFileOpsRepoを追加。
+pub trait AllRepos:
+    crate::repo::LibraryRootRepo + FileRepo + crate::repo::AssetRepo + crate::file_ops::FileOpsRepo
+{
+}
 
-impl<T: crate::repo::LibraryRootRepo + FileRepo + crate::repo::AssetRepo> AllRepos for T {}
+impl<T> AllRepos for T where
+    T: crate::repo::LibraryRootRepo
+        + FileRepo
+        + crate::repo::AssetRepo
+        + crate::file_ops::FileOpsRepo
+{
+}
 
 /// DBアクセス境界の抽象 (実装: gento-db)。
 ///
@@ -970,10 +979,18 @@ impl FsChange {
 /// debounceウィンドウ内のイベントをパス単位で合流させ、最終状態のみを
 /// 扱う。イベント欠落 (inotify overflow等) は [`WatchBuffer::mark_overflow`]
 /// で記録し、呼び出し側は全体再スキャンで収束させる。
+///
+/// WP-7: アプリ内ファイル操作由来のイベントを抑制するキー照合を持つ
+/// (二重反映防止)。操作実行前に [`WatchBuffer::suppress`] で対象パスを
+/// 登録すると、そのパスのイベントは [`WatchBuffer::push`] で無視される。
+/// 走査の冪等性により抑制漏れは無害 (最終状態へ収束する) ため、抑制は
+/// 性能・イベント嵐対策と位置づける。
 pub struct WatchBuffer {
     changes: Mutex<HashMap<PathBuf, FsChange>>,
     overflow: AtomicBool,
     count: AtomicU64,
+    /// アプリ内操作中のパス集合 (抑制キー)。
+    suppressed: Mutex<std::collections::HashSet<PathBuf>>,
 }
 
 impl Default for WatchBuffer {
@@ -988,11 +1005,16 @@ impl WatchBuffer {
             changes: Mutex::new(HashMap::new()),
             overflow: AtomicBool::new(false),
             count: AtomicU64::new(0),
+            suppressed: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
-    /// 生イベントを1件投入。
+    /// 生イベントを1件投入。抑制キー ([`WatchBuffer::suppress`]) に一致する
+    /// パスのイベントは無視する (アプリ内操作由来 — 二重反映防止)。
     pub fn push(&self, change: FsChange, path: PathBuf) {
+        if self.is_suppressed(&path) {
+            return;
+        }
         let mut guard = self.changes.lock().unwrap_or_else(|p| p.into_inner());
         let next = match guard.get(&path) {
             Some(previous) => FsChange::merge(*previous, change),
@@ -1000,6 +1022,29 @@ impl WatchBuffer {
         };
         guard.insert(path, next);
         self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// アプリ内ファイル操作の対象パスを抑制キーへ登録 (操作開始前)。
+    pub fn suppress(&self, paths: &[PathBuf]) {
+        let mut guard = self.suppressed.lock().unwrap_or_else(|p| p.into_inner());
+        guard.extend(paths.iter().cloned());
+    }
+
+    /// 抑制キーを解除 (操作のDB反映完了後。漏れたイベントは走査の冪等性
+    /// で最終状態へ収束するため安全)。
+    pub fn unsuppress(&self, paths: &[PathBuf]) {
+        let mut guard = self.suppressed.lock().unwrap_or_else(|p| p.into_inner());
+        for path in paths {
+            guard.remove(path);
+        }
+    }
+
+    /// パスが抑制キーに一致するか。
+    pub fn is_suppressed(&self, path: &Path) -> bool {
+        self.suppressed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(path)
     }
 
     /// イベント欠落を記録 (全体再スキャンが必要)。
@@ -1060,6 +1105,7 @@ mod tests {
         roots: StdMutex<Vec<LibraryRootRecord>>,
         files: StdMutex<Vec<FileRecord>>,
         assets: StdMutex<Vec<AssetRecord>>,
+        operations: StdMutex<Vec<crate::file_ops::FileOpRecord>>,
         write_calls: StdMutex<Vec<&'static str>>,
         /// テスト注入: relocate_fileをこのエラーで失敗させる。
         relocate_failure: StdMutex<Option<RepoError>>,
@@ -1314,6 +1360,104 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter(|f| f.root_id == root_id && f.asset_id.is_none())
+                .cloned()
+                .collect())
+        }
+        fn delete_file(&self, file_id: i64) -> Result<(), RepoError> {
+            let mut files = self.files.lock().unwrap();
+            let before = files.len();
+            files.retain(|f| f.id != file_id);
+            if files.len() == before {
+                return Err(RepoError::NotFound);
+            }
+            Ok(())
+        }
+    }
+
+    impl crate::file_ops::FileOpsRepo for FakeRepos {
+        fn insert_operation(
+            &self,
+            op: crate::file_ops::NewFileOp,
+        ) -> Result<crate::file_ops::FileOpRecord, RepoError> {
+            let id = *self.next_id.lock().unwrap() + 1;
+            *self.next_id.lock().unwrap() += 1;
+            let record = crate::file_ops::FileOpRecord {
+                id,
+                uuid: format!("00000000-0000-7000-8000-{id:012}"),
+                operation_type: op.operation_type,
+                status: op.status,
+                undoable: op.undoable,
+                request_json: op.request_json,
+                result_json: None,
+                created_at: "2026-08-31T00:00:00.000Z".to_string(),
+                undone_at: None,
+            };
+            self.operations.lock().unwrap().push(record.clone());
+            Ok(record)
+        }
+
+        fn update_operation(
+            &self,
+            id: i64,
+            status: crate::file_ops::FileOpStatus,
+            result_json: Option<&str>,
+            undoable: bool,
+        ) -> Result<(), RepoError> {
+            let mut ops = self.operations.lock().unwrap();
+            let record = ops
+                .iter_mut()
+                .find(|o| o.id == id)
+                .ok_or(RepoError::NotFound)?;
+            record.status = status;
+            record.result_json = result_json.map(str::to_string);
+            record.undoable = undoable;
+            Ok(())
+        }
+
+        fn mark_undone(&self, id: i64) -> Result<(), RepoError> {
+            let mut ops = self.operations.lock().unwrap();
+            let record = ops
+                .iter_mut()
+                .find(|o| o.id == id)
+                .ok_or(RepoError::NotFound)?;
+            record.status = crate::file_ops::FileOpStatus::Undone;
+            record.undoable = false;
+            record.undone_at = Some("2026-08-31T01:00:00.000Z".to_string());
+            Ok(())
+        }
+
+        fn get_operation(
+            &self,
+            id: i64,
+        ) -> Result<Option<crate::file_ops::FileOpRecord>, RepoError> {
+            Ok(self
+                .operations
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|o| o.id == id)
+                .cloned())
+        }
+
+        fn list_recent_operations(
+            &self,
+            limit: u32,
+        ) -> Result<Vec<crate::file_ops::FileOpRecord>, RepoError> {
+            let mut ops = self.operations.lock().unwrap().clone();
+            ops.sort_by_key(|o| std::cmp::Reverse(o.id));
+            ops.truncate(limit as usize);
+            Ok(ops)
+        }
+
+        fn list_executing_operations(
+            &self,
+        ) -> Result<Vec<crate::file_ops::FileOpRecord>, RepoError> {
+            Ok(self
+                .operations
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|o| o.status == crate::file_ops::FileOpStatus::Executing)
                 .cloned()
                 .collect())
         }
@@ -2589,6 +2733,31 @@ mod tests {
             "drainで overflow を受け取りリセット"
         );
         assert!(!buffer.is_overflow());
+    }
+
+    // ===== WP-7: アプリ内操作由来イベントの抑制 (二重反映防止) =====
+
+    #[test]
+    fn watch_buffer_suppresses_self_operation_paths() {
+        let buffer = WatchBuffer::new();
+        let op_paths = vec![PathBuf::from("/r/from.png"), PathBuf::from("/r/to.png")];
+        buffer.suppress(&op_paths);
+        assert!(buffer.is_suppressed(Path::new("/r/from.png")));
+        // 抑制中の自操作由来イベントは記録も計上もされない
+        buffer.push(FsChange::Removed, PathBuf::from("/r/from.png"));
+        buffer.push(FsChange::Created, PathBuf::from("/r/to.png"));
+        assert_eq!(buffer.observed_events(), 0);
+        assert!(buffer.is_empty());
+        // 無関係パスは通常どおり通す
+        buffer.push(FsChange::Modified, PathBuf::from("/r/other.png"));
+        assert_eq!(buffer.observed_events(), 1);
+        // 解除後は再び通る
+        buffer.unsuppress(&op_paths);
+        assert!(!buffer.is_suppressed(Path::new("/r/from.png")));
+        buffer.push(FsChange::Modified, PathBuf::from("/r/from.png"));
+        assert_eq!(buffer.observed_events(), 2);
+        let coalesced = buffer.drain();
+        assert_eq!(coalesced.changes.len(), 2);
     }
 
     // ===== AssetId符号化 =====

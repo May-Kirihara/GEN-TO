@@ -45,6 +45,11 @@
     onSelectionChange,
     onContextMenu,
     showStats = true,
+    renameId = null,
+    renameInitial = "",
+    onRenameCommit,
+    onRenameCancel,
+    dragPathsOf,
   }: {
     grid: GridStore;
     scrollStore: ScrollPositionStore;
@@ -60,6 +65,16 @@
     onContextMenu?: (event: MouseEvent, index: number) => void;
     /** 診断行 (DOMセル数等) の表示。製品UIでは通常false。 */
     showStats?: boolean;
+    /** WP-7: リネーム中の項目id (F2インライン編集)。 */
+    renameId?: string | null;
+    /** WP-7: リネーム編集の初期値 (元の表示名)。 */
+    renameInitial?: string;
+    /** WP-7: インラインリネームの確定 (Enter)。 */
+    onRenameCommit?: (name: string) => void;
+    /** WP-7: インラインリネームの中止 (Escape/フォーカス喪失)。 */
+    onRenameCancel?: () => void;
+    /** WP-7: ドラッグで運ぶパス列 (選択全体。未指定ならD&D無効)。 */
+    dragPathsOf?: (index: number) => string[];
   } = $props();
 
   // GridStoreはプレーンクラスのため、版番号でUIへ変更を伝える (WP-2の教訓)
@@ -327,6 +342,58 @@
     }
   }
 
+  // ===== WP-7: リネーム (F2インライン) =====
+
+  let renameValue = $state("");
+  // 編集開始 (renameId変化) のたびに初期値へリセットする
+  $effect(() => {
+    const current = renameId;
+    if (current !== null) {
+      renameValue = renameInitial;
+    }
+  });
+
+  function isRenaming(item: ImageListItem | null): boolean {
+    return item !== null && renameId !== null && item.id === renameId;
+  }
+
+  function submitRename(): void {
+    const value = renameValue.trim();
+    renameValue = "";
+    if (value !== "") {
+      onRenameCommit?.(value);
+    } else {
+      onRenameCancel?.();
+    }
+  }
+
+  function cancelRename(): void {
+    renameValue = "";
+    onRenameCancel?.();
+  }
+
+  // ===== WP-7: ドラッグ (グリッド→フォルダツリー) =====
+
+  function handleDragStart(event: DragEvent, index: number): void {
+    if (dragPathsOf === undefined) {
+      return;
+    }
+    const paths = dragPathsOf(index);
+    if (paths.length === 0) {
+      return;
+    }
+    if (event.dataTransfer !== null) {
+      event.dataTransfer.setData("application/x-gento-paths", JSON.stringify(paths));
+      event.dataTransfer.effectAllowed = "copyMove";
+    }
+  }
+
+  /** リネーム入力をDOM挿入時にフォーカスする (Svelte action)。 */
+  function autofocusAction(node: HTMLInputElement): void {
+    node.focus();
+    node.select();
+  }
+
   /** プログラム選択 (セッション位置・クイックプレビュー移動の同期、WP-4)。 */
   export function selectAndFocus(index: number): void {
     if (!Number.isInteger(index) || index < 0 || index >= total) {
@@ -469,6 +536,9 @@
               style="width:{cellPx}px; height:{cellPx}px"
               aria-selected={item !== null && sel.selected.has(item.id)}
               title={item?.displayName ?? ""}
+              draggable={dragPathsOf !== undefined && !isRenaming(item)}
+              tabindex={-1}
+              ondragstart={(event) => handleDragStart(event, cell.index)}
             >
               {#if item !== null}
                 {@const url = urlFor(item)}
@@ -484,6 +554,30 @@
                     {#if badges.triage === "keep"}<span class="badge badge-keep" title="採用">✓</span>{/if}
                     {#if badges.triage === "reject"}<span class="badge badge-reject" title="除外">✗</span>{/if}
                   </span>
+                {/if}
+                {#if isRenaming(item)}
+                  <input
+                    class="rename-input"
+                    data-testid="rename-input"
+                    use:autofocusAction
+                    value={renameValue}
+                    aria-label="新しい名前"
+                    onclick={(event) => event.stopPropagation()}
+                    oninput={(event) => (renameValue = event.currentTarget.value)}
+                    onkeydown={(event) => {
+                      // Enter/Escapeのみ処理して伝播は止めない (入力中の
+                      // 他キーは編集対象として素通し — dev bridgeのF-keyも
+                      // ここを通ってwindowへ到達する必要があるため)。
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        submitRename();
+                      } else if (event.key === "Escape") {
+                        event.preventDefault();
+                        cancelRename();
+                      }
+                    }}
+                    onblur={() => cancelRename()}
+                  />
                 {/if}
               {/if}
             </div>
@@ -619,5 +713,21 @@
 
   .badge-reject {
     background: light-dark(#cf222edd, #b62324dd);
+  }
+
+  /* WP-7: F2インラインリネーム入力 (セル下端に重ねる) */
+  .rename-input {
+    position: absolute;
+    left: 2px;
+    right: 2px;
+    bottom: 2px;
+    z-index: 2;
+    font-size: 0.72rem;
+    padding: 0.1rem 0.25rem;
+    border: 1px solid light-dark(#0969da, #58a6ff);
+    border-radius: 0.25rem;
+    background: light-dark(#ffffff, #0d1117);
+    color: inherit;
+    min-width: 0;
   }
 </style>

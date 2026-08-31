@@ -220,6 +220,8 @@ struct WatchState {
     _watcher: notify::RecommendedWatcher,
     debouncer: Option<std::thread::JoinHandle<()>>,
     stop: Arc<AtomicBool>,
+    /// イベント結合バッファ (WP-7の自操作抑制キーを共有する)。
+    buffer: Arc<WatchBuffer>,
 }
 
 /// ルートごとの監視状態表 (controller・worker・debouncerスレッドで共有)。
@@ -426,6 +428,23 @@ impl LibraryController {
         stop_watcher(&self.watchers, root_id);
     }
 
+    /// WP-7: アプリ内ファイル操作の対象パスを監視抑制へ登録する
+    /// (実行開始前。二重反映防止)。全監視中ルートのバッファへ反映する。
+    pub fn suppress_paths(&self, paths: &[PathBuf]) {
+        let watchers = self.watchers.lock().unwrap_or_else(|p| p.into_inner());
+        for state in watchers.values() {
+            state.buffer.suppress(paths);
+        }
+    }
+
+    /// WP-7: 監視抑制を解除する (DB反映完了後)。
+    pub fn unsuppress_paths(&self, paths: &[PathBuf]) {
+        let watchers = self.watchers.lock().unwrap_or_else(|p| p.into_inner());
+        for state in watchers.values() {
+            state.buffer.unsuppress(paths);
+        }
+    }
+
     /// 監視を停止しワーカー・ハッシュプールを終了する (アプリ終了時)。
     pub fn shutdown(&self) {
         let ids: Vec<i64> = self
@@ -561,7 +580,7 @@ fn start_watcher(
 
     let stop = Arc::new(AtomicBool::new(false));
     let debouncer = spawn_debouncer(DebouncerParams {
-        buffer,
+        buffer: Arc::clone(&buffer),
         event_rx,
         stop: Arc::clone(&stop),
         root: root_path,
@@ -576,6 +595,7 @@ fn start_watcher(
             _watcher: watcher,
             debouncer: Some(debouncer),
             stop,
+            buffer,
         },
     );
     Ok(())

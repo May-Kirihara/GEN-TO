@@ -18,6 +18,7 @@ export type KeyAction =
   | "back"
   | "rename"
   | "trash"
+  | "deleteForever"
   | "prevImage"
   | "nextImage";
 
@@ -26,15 +27,23 @@ export type KeyBinding = {
   /** KeyboardEvent.key 値 ("Space" / "Enter" / "F2" ...)。 */
   key: string;
   label: string;
+  /** `true` の場合Shift押下時のみ一致 (未指定はShift無しのみ)。 */
+  shift?: boolean;
 };
 
 export const DEFAULT_KEYMAP: Record<KeyAction, KeyBinding> = {
   quickPreview: { action: "quickPreview", key: "Space", label: "クイックプレビュー" },
   openViewer: { action: "openViewer", key: "Enter", label: "ビューアで開く" },
   back: { action: "back", key: "Escape", label: "閉じる / 戻る" },
-  // F2=リネーム / Delete=ゴミ箱 はWP-7で実装。本WPでは割り当ての登録のみ。
-  rename: { action: "rename", key: "F2", label: "リネーム (WP-7)" },
-  trash: { action: "trash", key: "Delete", label: "ゴミ箱へ移動 (WP-7)" },
+  // WP-7: F2=リネーム / Delete=ゴミ箱 / Shift+Delete=完全削除 (確認ダイアログ)。
+  rename: { action: "rename", key: "F2", label: "リネーム" },
+  trash: { action: "trash", key: "Delete", label: "ゴミ箱へ移動" },
+  deleteForever: {
+    action: "deleteForever",
+    key: "Delete",
+    shift: true,
+    label: "完全削除 (確認あり)",
+  },
   prevImage: { action: "prevImage", key: "ArrowLeft", label: "前の画像" },
   nextImage: { action: "nextImage", key: "ArrowRight", label: "次の画像" },
 };
@@ -70,8 +79,15 @@ export function matchBinding(
     return null;
   }
   const key = event.key === " " ? "Space" : event.key;
+  // Shift必須の割り当てを優先 (Shift+Delete=完全削除 等)。通常割り当ては
+  // Shift押下でも従来どおり一致 (Shift+Space等を潰さない)。
   for (const binding of Object.values(bindings)) {
-    if (binding.key === key) {
+    if (binding.shift === true && event.shiftKey && binding.key === key) {
+      return binding.action;
+    }
+  }
+  for (const binding of Object.values(bindings)) {
+    if (binding.shift !== true && binding.key === key) {
       return binding.action;
     }
   }

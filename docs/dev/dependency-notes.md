@@ -312,3 +312,32 @@
   - 入手元: crates.io (serde-json)。workspaceに既存 (gento-db等が使用済み) のため
     gento-coreへ直付け。新規外部依存なし。
   - license: MIT OR Apache-2.0。native依存なし。全対応プラットフォーム。
+
+## WP-7 (MVP) で追加した依存 (2026-08-31。安全なファイル操作とUndo)
+
+- **`trash` =5.2.6** (gento-platform, 通常依存)
+  - 用途: OSゴミ箱への移動 (WP-7。通常削除はゴミ箱が原則)。Linux実装は
+    freedesktop.org Trash Specification に従い `$XDG_DATA_HOME/Trash`
+    (`~/.local/share/Trash`) の `files/` + `info/*.trashinfo` へ移動する
+    (GIO/D-Bus非依存 — ディスプレイ無しヘッドレス環境でも動作する。
+    cargo test/E2Eで確認済み)。
+  - 入手元: crates.io (ArturKovecs/trash)。
+  - ライセンス: **MIT**。
+  - 依存するnative library: なし (Linux実装はpure Rust + libc。
+    WindowsはPowerShell/COM、macOSはNSWorkspace実装)。
+    推移依存: log (既存) / chrono (default feature。Windows日付処理用。
+    MIT OR Apache-2.0) / windows-sys等は対象OSのみ。
+  - 対応プラットフォーム: Linux/macOS/Windows (WP-17でWindows/macOS実機確認)。
+  - バージョンpin理由: 2026-08時点の最新安定版。5系API (`trash::delete`) は
+    2020年以来安定。
+  - **ゴミ箱移動の失敗時は通常削除へフォールバックしない** (設計方針3。
+    エラー表示のみ)。
+  - feature: defaultのまま (`coinit_apartmentthreaded` はWindows COM初期化既定、
+    `chrono`はWindowsの trashinfo 日付解析に必要)。
+- **`gento-platform` 新crate** (workspace member追加): OS差の土台集約
+  (ゴミ箱・OSファイルID取得)。gento-coreにのみ依存 (依存方向:
+  platform → core。db/image/tauri → platform)。
+  - OSファイルID取得 (`os_file_id_of`) はgento-image/src/scan.rsから移動集約。
+    gento-imageは再エポートで追随 (既存外部API互換維持)。
+  - ゴミ箱復帰 (Undo用): XDG trashinfo を走査して元パスへ戻す実装は
+    自前 (trash crateに単一項目復帰APIが無いため。WP-17でWindows対応検討)。

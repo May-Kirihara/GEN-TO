@@ -56,6 +56,28 @@
     type CollectionsChangedEvent,
   } from "./lib/collections";
   import { UndoStack } from "./lib/undo";
+  import {
+    applyConflictChoice,
+    cancelFileOps,
+    createConflictSession,
+    describeKind,
+    diskWarningOf,
+    executeFileOp,
+    outcomeNotice,
+    planFileOp,
+    resolutionsOf,
+    retryArgsOf,
+    undoCheck,
+    undoFileOp,
+    type ConflictResolution,
+    type ConflictSession,
+    type ExecuteArgs,
+    type FileOpOutcomeDto,
+    type FileOpsProgressEvent,
+  } from "./lib/fileops";
+  import DestPicker from "./lib/ui/DestPicker.svelte";
+  import ConflictDialog from "./lib/ui/ConflictDialog.svelte";
+  import DeleteForeverDialog from "./lib/ui/DeleteForeverDialog.svelte";
   type TriageKeyAction = import("./lib/triage-keys").TriageKeyAction;
   import ContextMenu, { type MenuAction } from "./lib/ui/ContextMenu.svelte";
   import FolderTree from "./lib/shell/FolderTree.svelte";
@@ -171,6 +193,303 @@
   undo.onChange(() => {
     undoLabel = undo.peekLabel();
   });
+
+  // ===== ファイル操作 (WP-7) =====
+
+  const fileOpsIpc = { invoke };
+  /** 実行中 (進捗表示・操作ガード)。 */
+  let fileOpsBusy = $state(false);
+  let fileOpsProgress = $state<{ index: number; total: number; from: string } | null>(null);
+  let fileOpsNotice = $state("");
+  let fileOpsError = $state<string | null>(null);
+  /** 宛先選択ダイアログ (コピー/移動)。 */
+  let destPickerFor = $state<{ kind: "copy" | "move"; paths: string[] } | null>(null);
+  /** 衝突ダイアログ (計画実行の保留中)。 */
+  let conflictOf = $state<{ session: ConflictSession; args: ExecuteArgs } | null>(null);
+  /** 完全削除の確認。 */
+  let deleteForeverFor = $state<string[] | null>(null);
+  /** 部分成功レポート (再試行)。 */
+  let retryReport = $state<{ outcome: FileOpOutcomeDto; args: ExecuteArgs } | null>(null);
+  /** F2インラインリネーム中の項目id。 */
+  let renameId = $state<string | null>(null);
+  let renameInitial = $state("");
+  let disposeFileOpsProgress: (() => void) | null = null;
+
+  /** 選択項目のパス列 (ライブラリ表示中のみ。ファイル操作の対象)。 */
+  function selectedLibraryPaths(): string[] {
+    if (catalogSource !== "library") {
+      return [];
+    }
+    const paths: string[] = [];
+    for (const id of gridSelection.ids) {
+      const found = grid.pager.findIndicesByIds(new Set([id])).get(id);
+      const item = found !== undefined ? grid.getItem(found) : null;
+      if (item !== null) {
+        paths.push(item.path);
+      }
+    }
+    return paths;
+  }
+
+  /** フォーカス項目 (単一操作: リネーム等)。 */
+  function focusLibraryPath(): { path: string; displayName: string } | null {
+    if (catalogSource !== "library") {
+      return null;
+    }
+    const focus = gridSelection.focusIndex;
+    if (focus === null) {
+      return null;
+    }
+    const item = grid.getItem(focus);
+    if (item === null) {
+      return null;
+    }
+    return { path: item.path, displayName: item.displayName };
+  }
+
+  /** ライブラリモードで無い旨の通知 (操作ガード共通)。 */
+  function requireLibraryMode(): boolean {
+    if (catalogSource !== "library") {
+      fileOpsNotice = "ファイル操作はライブラリ表示中のみ利用できます";
+      return false;
+    }
+    if (fileOpsBusy) {
+      fileOpsNotice = "別のファイル操作が実行中です";
+      return false;
+    }
+    return true;
+  }
+
+  /** コピー/移動の開始 (宛先ダイアログ)。 */
+  function startCopyMove(kind: "copy" | "move"): void {
+    if (!requireLibraryMode()) {
+      return;
+    }
+    const paths = selectedLibraryPaths();
+    if (paths.length === 0) {
+      fileOpsNotice = "対象ファイルを選択してください";
+      return;
+    }
+    fileOpsNotice = "";
+    destPickerFor = { kind, paths };
+  }
+
+  /** 宛先確定 → 計画 (dry-run) → 衝突があれば解決ダイアログ → 実行。 */
+  async function runPlannedOp(args: ExecuteArgs): Promise<void> {
+    fileOpsError = null;
+    fileOpsNotice = "";
+    const plan = await planFileOp(fileOpsIpc, args);
+    if (plan.plan_errors.length > 0) {
+      fileOpsError = plan.plan_errors.join(" / ");
+      return;
+    }
+    const warning = diskWarningOf(plan);
+    if (warning !== null && !window.confirm(`${warning}\n続行しますか?`)) {
+      return;
+    }
+    const session = createConflictSession(plan.steps);
+    if (session.current !== null) {
+      conflictOf = { session, args };
+      return;
+    }
+    await doExecute(args);
+  }
+
+  /** 実行 + 結果通知 + Undo登録 (操作ログ確定後の応答で通知する)。 */
+  async function doExecute(args: ExecuteArgs): Promise<void> {
+    conflictOf = null;
+    fileOpsError = null;
+    fileOpsBusy = true;
+    fileOpsProgress = null;
+    try {
+      const outcome = await executeFileOp(fileOpsIpc, args);
+      fileOpsNotice = outcomeNotice(outcome);
+      if (outcome.undoable) {
+        registerFileOpsUndo(outcome);
+      }
+      const failed = outcome.steps.some((step) => step.status === "failed");
+      if (failed) {
+        retryReport = { outcome, args };
+      }
+    } catch (error) {
+      fileOpsError = toErrorMessage(error);
+    } finally {
+      fileOpsBusy = false;
+      fileOpsProgress = null;
+    }
+  }
+
+  /** 衝突ダイアログの選択反映。 */
+  function onConflictChoose(choice: ConflictResolution, applyAll: boolean): void {
+    if (conflictOf === null) {
+      return;
+    }
+    const session = applyConflictChoice(conflictOf.session, choice, applyAll);
+    if (session.current !== null) {
+      conflictOf = { ...conflictOf, session };
+      return;
+    }
+    // 全衝突が解決 → 実行
+    const perFile = resolutionsOf(session);
+    void doExecute({ ...conflictOf.args, resolutions: { per_file: perFile } });
+  }
+
+  /** ゴミ箱への移動 (Delete。確認なし — ゴミ箱から復帰可能なため)。 */
+  function startTrash(): void {
+    if (!requireLibraryMode()) {
+      return;
+    }
+    const paths = selectedLibraryPaths();
+    if (paths.length === 0) {
+      fileOpsNotice = "対象ファイルを選択してください";
+      return;
+    }
+    void runPlannedOp({ kind: "trash", paths });
+  }
+
+  /** 完全削除 (Shift+Delete。確認ダイアログ+チェックボックス)。 */
+  function startDeleteForever(): void {
+    if (!requireLibraryMode()) {
+      return;
+    }
+    const paths = selectedLibraryPaths();
+    if (paths.length === 0) {
+      fileOpsNotice = "対象ファイルを選択してください";
+      return;
+    }
+    deleteForeverFor = paths;
+  }
+
+  async function confirmDeleteForever(): Promise<void> {
+    const paths = deleteForeverFor;
+    deleteForeverFor = null;
+    if (paths === null) {
+      return;
+    }
+    await doExecute({ kind: "delete_forever", paths });
+  }
+
+  /** F2リネーム開始 (グリッド内インライン編集)。 */
+  function startRename(): void {
+    if (!requireLibraryMode()) {
+      return;
+    }
+    if (gridSelection.ids.length !== 1) {
+      fileOpsNotice = "リネームは1ファイルずつ行います (1件を選択してください)";
+      return;
+    }
+    const focus = focusLibraryPath();
+    if (focus === null) {
+      fileOpsNotice = "対象ファイルを選択してください";
+      return;
+    }
+    renameInitial = focus.displayName;
+    renameId = gridSelection.ids[0];
+  }
+
+  /** インラインリネーム確定。 */
+  async function commitRename(name: string): Promise<void> {
+    const focus = focusLibraryPath();
+    renameId = null;
+    if (focus === null) {
+      return;
+    }
+    if (name === focus.displayName) {
+      return; // 変化なし
+    }
+    await runPlannedOp({ kind: "rename", paths: [focus.path], new_name: name });
+  }
+
+  /** フォルダツリーへのドロップ (デフォルト=移動 / Ctrl=コピー)。 */
+  function handleTreeDrop(destPath: string, paths: string[], copy: boolean): void {
+    if (!requireLibraryMode()) {
+      return;
+    }
+    void runPlannedOp({ kind: copy ? "copy" : "move", paths, dest_dir: destPath });
+  }
+
+  /** ツールバー: 新規フォルダ (現在フォルダ配下。ライブラリ時は最初のルート)。 */
+  async function startNewFolder(): Promise<void> {
+    if (!requireLibraryMode()) {
+      return;
+    }
+    const parent =
+      catalogSource === "library"
+        ? (libraryRoots.find((root) => root.available)?.path ?? null)
+        : currentFolder;
+    if (parent === null) {
+      fileOpsNotice = "登録ルートがありません";
+      return;
+    }
+    const name = window.prompt("新しいフォルダ名", "");
+    if (name === null || name.trim() === "") {
+      return;
+    }
+    try {
+      const outcome = await invoke<{ status: string; steps: Array<{ error: string | null }> }>(
+        "folder_create",
+        { parent, name: name.trim() },
+      );
+      if (outcome.status !== "done") {
+        fileOpsError = outcome.steps[0]?.error ?? "フォルダを作成できませんでした";
+        return;
+      }
+      fileOpsNotice = `「${name.trim()}」を作成しました`;
+    } catch (error) {
+      fileOpsError = toErrorMessage(error);
+    }
+  }
+
+  /**
+   * ファイル操作のUndo登録 (メタデータUndoと混在する統合スタック)。
+   * 前提検証で拒否された場合は理由を通知してスタックから外す。
+   */
+  function registerFileOpsUndo(outcome: FileOpOutcomeDto): void {
+    const label = describeKind(outcome.kind);
+    const opId = outcome.op_id;
+    undo.push({
+      label,
+      undo: async () => {
+        const check = await undoCheck(fileOpsIpc, opId);
+        if (!check.ok) {
+          throw new Error(check.refusals.join(" / "));
+        }
+        const result = await undoFileOp(fileOpsIpc, opId);
+        if (!result.fully_undone) {
+          const reasons = [...result.refusals, ...result.errors];
+          throw new Error(reasons.length > 0 ? reasons.join(" / ") : "元に戻せませんでした");
+        }
+      },
+    });
+  }
+
+  /** パス→サムネイルURL (衝突ダイアログのプレビュー。表示中カタログ内のみ)。 */
+  function thumbUrlForPath(path: string | null): string | null {
+    if (path === null) {
+      return null;
+    }
+    void gridTick;
+    for (let index = 0; index < (grid.summary?.total ?? 0); index++) {
+      const item = grid.getItem(index);
+      if (item !== null && item.path === path) {
+        return grid.thumbUrlFor(item.id);
+      }
+    }
+    return null;
+  }
+
+  /** 進捗イベント購読。 */
+  function initFileOpsProgress(): void {
+    void (async () => {
+      disposeFileOpsProgress = await listen<FileOpsProgressEvent>("file_ops:progress", (event) => {
+        fileOpsProgress = {
+          index: event.payload.index,
+          total: event.payload.total,
+          from: event.payload.from,
+        };
+      });
+    })();
+  }
 
   // ===== コレクション (WP-6) =====
 
@@ -1152,6 +1471,53 @@
     const inManualCollection =
       activeCollection !== null && activeCollection.kind === "manual" && canCollection;
     const actions: MenuAction[] = [];
+    // ファイル操作 (WP-7。ライブラリ表示中のみ)
+    const canFileOps = catalogSource === "library";
+    if (canFileOps) {
+      actions.push(
+        {
+          id: "file-copy",
+          label:
+            items.length > 1
+              ? `コピー… (${items.length.toLocaleString()}件)`
+              : "コピー…",
+          run: async () => {
+            startCopyMove("copy");
+          },
+        },
+        {
+          id: "file-move",
+          label:
+            items.length > 1
+              ? `移動… (${items.length.toLocaleString()}件)`
+              : "移動…",
+          run: async () => {
+            startCopyMove("move");
+          },
+        },
+        {
+          id: "file-rename",
+          label: "リネーム (F2)",
+          run: async () => {
+            startRename();
+          },
+        },
+        {
+          id: "file-trash",
+          label: "ゴミ箱へ移動 (Delete)",
+          run: async () => {
+            startTrash();
+          },
+        },
+        {
+          id: "file-delete-forever",
+          label: "完全削除… (Shift+Delete)",
+          run: async () => {
+            startDeleteForever();
+          },
+        },
+      );
+    }
     if (canCollection) {
       actions.push({
         id: "add-to-collection",
@@ -1305,23 +1671,31 @@
         return true;
       }),
     );
-    // F2=リネーム / Delete=ゴミ箱 はWP-7で実装 (割り当てのみ登録)。
+    // F2=リネーム / Delete=ゴミ箱 / Shift+Delete=完全削除 (WP-7)。
     // dev bridge有効時はF2が選択操作に使われるため干渉を避ける。
     unregisterKeys.push(
       keys.register("rename", () => {
         if (keyContext.devBridge) {
           return false;
         }
-        osNotice = "リネームはWP-7で実装予定です (F2)";
+        if (renameId !== null) {
+          return true; // 編集中はグリッド側inputが処理
+        }
+        startRename();
+        return true;
+      }),
+    );
+    // Delete/Shift+Deleteはdev bridgeと衝突しない (F-keyのみ使用のため
+    // ゲート不要。リネームのF2のみ衝突するため既定のゲートを維持)。
+    unregisterKeys.push(
+      keys.register("trash", () => {
+        startTrash();
         return true;
       }),
     );
     unregisterKeys.push(
-      keys.register("trash", () => {
-        if (keyContext.devBridge) {
-          return false;
-        }
-        osNotice = "ゴミ箱への移動はWP-7で実装予定です (Delete)";
+      keys.register("deleteForever", () => {
+        startDeleteForever();
         return true;
       }),
     );
@@ -1425,6 +1799,7 @@
     registerKeys();
     unregisterKeys.push(keys.install());
     window.addEventListener("keydown", onGlobalKeydown, true);
+    initFileOpsProgress();
     void (async () => {
       const stop = await metadata.init();
       disposeMetadata = stop;
@@ -1535,6 +1910,19 @@
                 ? (collectionNotes[focusInfo.id] ?? null)
                 : null,
           }),
+          getFileOps: () => ({
+            busy: fileOpsBusy,
+            progress: fileOpsProgress,
+            notice: fileOpsNotice,
+            error: fileOpsError,
+            destPicker: destPickerFor !== null,
+            conflict: conflictOf !== null,
+            forever: deleteForeverFor !== null,
+            retry: retryReport !== null,
+            renaming: renameId !== null,
+            undoDepth: undo.depth,
+            undoLabel: undo.peekLabel(),
+          }),
           invoke,
         });
       }
@@ -1542,6 +1930,7 @@
   });
 
   onDestroy(() => {
+    disposeFileOpsProgress?.();
     stopChangeNotification();
     stopGridNotifyForPerf();
     stopLibraryNotification();
@@ -1687,6 +2076,7 @@
           {currentFolder}
           libraryMode={catalogSource === "library"}
           onSelect={(path) => void selectFolder(path)}
+          onDrop={handleTreeDrop}
         />
         <CollectionsPane
           store={collectionsStore}
@@ -1816,6 +2206,14 @@
             エクスポート…
           </button>
         {/if}
+        <button
+          class="toolbar-folder"
+          disabled={catalogSource !== "library" || fileOpsBusy}
+          title="現在の登録ルートに新しいフォルダを作成"
+          onclick={() => void startNewFolder()}
+        >
+          + 新規フォルダ
+        </button>
         <div class="toolbar-spacer"></div>
         <label class="size-label" title="サムネイルサイズ">
           サイズ
@@ -1867,6 +2265,22 @@
       {#if collectionNotice}
         <p class="toolbar-notice error" role="status">{collectionNotice}</p>
       {/if}
+      {#if fileOpsNotice}
+        <p class="toolbar-notice" role="status" data-testid="fileops-notice">{fileOpsNotice}</p>
+      {/if}
+      {#if fileOpsError !== null}
+        <p class="toolbar-notice error" role="alert" data-testid="fileops-error">{fileOpsError}</p>
+      {/if}
+      {#if fileOpsBusy && fileOpsProgress !== null}
+        <div class="fileops-progress" role="status" data-testid="fileops-progress">
+          <span>
+            {describeKind(conflictOf?.args.kind ?? "copy")}中
+            {fileOpsProgress.index + 1}/{fileOpsProgress.total}
+          </span>
+          <progress max={fileOpsProgress.total} value={fileOpsProgress.index + 1}></progress>
+          <button onclick={() => void cancelFileOps(fileOpsIpc)}>キャンセル</button>
+        </div>
+      {/if}
 
       <div class="grid-wrap">
         {#key `${gridModeKey}-${cellClass}`}
@@ -1881,6 +2295,21 @@
             onOpen={(index) => void openViewerForChoice(index)}
             onSelectionChange={onGridSelectionChange}
             onContextMenu={openGridContextMenu}
+            {renameId}
+            {renameInitial}
+            onRenameCommit={(name) => void commitRename(name)}
+            onRenameCancel={() => (renameId = null)}
+            dragPathsOf={(index) => {
+              const item = grid.getItem(index);
+              if (item === null) {
+                return [];
+              }
+              // ドラッグ起点が選択内なら選択全体を運ぶ (ファイルマネージャ規約)
+              if (gridSelection.ids.includes(item.id)) {
+                return selectedLibraryPaths();
+              }
+              return [item.path];
+            }}
           />
         {/key}
         {#if emptyState !== null}
@@ -1980,6 +2409,84 @@
     assetIds={collectionPickerFor}
     onClose={() => (collectionPickerFor = null)}
   />
+{/if}
+
+{#if destPickerFor !== null}
+  <DestPicker
+    roots={libraryRoots}
+    title={destPickerFor.kind === "copy" ? "コピー先フォルダ" : "移動先フォルダ"}
+    confirmLabel={destPickerFor.kind === "copy" ? "コピー" : "移動"}
+    onPick={(destDir) => {
+      const target = destPickerFor;
+      destPickerFor = null;
+      if (target !== null) {
+        void runPlannedOp({
+          kind: target.kind,
+          paths: target.paths,
+          dest_dir: destDir,
+        });
+      }
+    }}
+    onClose={() => (destPickerFor = null)}
+  />
+{/if}
+
+{#if conflictOf !== null && conflictOf.session.current !== null}
+  {@const conflictStep = conflictOf.session.current}
+  <ConflictDialog
+    session={conflictOf.session}
+    totalCount={conflictOf.args.paths.length}
+    srcThumbUrl={thumbUrlForPath(conflictStep.src)}
+    dstThumbUrl={thumbUrlForPath(conflictStep.conflict?.dst ?? null)}
+    onChoose={onConflictChoose}
+    onCancel={() => {
+      conflictOf = null;
+      fileOpsNotice = "操作を中止しました";
+    }}
+  />
+{/if}
+
+{#if deleteForeverFor !== null}
+  <DeleteForeverDialog
+    count={deleteForeverFor.length}
+    onConfirm={() => void confirmDeleteForever()}
+    onCancel={() => (deleteForeverFor = null)}
+  />
+{/if}
+
+{#if retryReport !== null}
+  <div class="retry-backdrop" role="presentation">
+    <div class="retry" role="dialog" aria-modal="true" aria-label="一部のファイルで失敗">
+      <h2>一部のファイルを処理できませんでした</h2>
+      <ul class="retry-list" data-testid="retry-list">
+        {#each retryReport.outcome.steps.filter((step) => step.status === "failed") as step (step.file_id)}
+          <li>
+            <span class="retry-path">{step.from}</span>
+            <span class="retry-error">{step.error ?? ""}</span>
+          </li>
+        {/each}
+      </ul>
+      <div class="retry-actions">
+        <button onclick={() => (retryReport = null)}>閉じる</button>
+        <button
+          class="primary"
+          data-testid="retry-button"
+          onclick={() => {
+            const report = retryReport;
+            retryReport = null;
+            if (report !== null) {
+              const retry = retryArgsOf(report.outcome, report.args);
+              if (retry !== null) {
+                void doExecute(retry);
+              }
+            }
+          }}
+        >
+          失敗した {retryReport.outcome.steps.filter((s) => s.status === "failed").length.toLocaleString()}件を再試行
+        </button>
+      </div>
+    </div>
+  </div>
 {/if}
 
 <QuickPreview store={quickPreview} onClose={() => quickPreview.close()} />
@@ -2237,6 +2744,33 @@
     color: light-dark(#57606a, #8b949e);
   }
 
+  .fileops-progress {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.78rem;
+  }
+
+  .fileops-progress progress {
+    width: 10rem;
+  }
+
+  .toolbar-folder {
+    font: inherit;
+    font-size: 0.78rem;
+    padding: 0.15rem 0.5rem;
+    border-radius: 0.375rem;
+    border: 1px solid light-dark(#d0d7de, #30363d);
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+  }
+
+  .toolbar-folder:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
   .toolbar-notice.error {
     color: light-dark(#cf222e, #f85149);
   }
@@ -2296,5 +2830,73 @@
 
   .status-hint {
     color: light-dark(#8b949e, #6e7681);
+  }
+
+  .retry-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 660;
+    background: rgba(0, 0, 0, 0.4);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .retry {
+    width: min(36rem, 92vw);
+    max-height: 70vh;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    background: light-dark(#ffffff, #1c2128);
+    border: 1px solid light-dark(#d0d7de, #444c56);
+    border-radius: 0.6rem;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+    padding: 0.9rem 1rem;
+    font-size: 0.85rem;
+  }
+
+  .retry h2 {
+    font-size: 1rem;
+    margin: 0;
+  }
+
+  .retry-list {
+    margin: 0;
+    padding: 0 0 0 1.2rem;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    font-size: 0.78rem;
+  }
+
+  .retry-list li {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .retry-path {
+    overflow-wrap: anywhere;
+  }
+
+  .retry-error {
+    color: light-dark(#cf222e, #f85149);
+    overflow-wrap: anywhere;
+  }
+
+  .retry-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.4rem;
+  }
+
+  .retry-actions .primary {
+    background: light-dark(#0969da, #1f6feb);
+    color: #ffffff;
+    border: none;
+    border-radius: 0.375rem;
+    padding: 0.3rem 0.8rem;
+    cursor: pointer;
   }
 </style>

@@ -45,8 +45,35 @@ export type DevBridgeStores = {
   getMeta: () => MetaLike | null;
   /** WP-6: コレクション状態 (E2E検証用)。 */
   getCollections: () => CollectionsLike | null;
+  /** WP-7(MVP): ファイル操作状態 (E2E検証用)。 */
+  getFileOps: () => FileOpsLike | null;
   /** WP-7: invoke (エラー注入など)。App.svelteのcore invokeを流用。 */
   invoke: <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
+};
+
+/** WP-7(MVP): ファイル操作状態の読み出し口 (E2E検証用)。 */
+export type FileOpsLike = {
+  /** 実行中か。 */
+  busy: boolean;
+  /** 進捗 (index/total)。null=非実行。 */
+  progress: { index: number; total: number } | null;
+  /** 直近の通知文。 */
+  notice: string;
+  /** 直近のエラー。 */
+  error: string | null;
+  /** 宛先ダイアログ表示中か。 */
+  destPicker: boolean;
+  /** 衝突ダイアログ表示中か。 */
+  conflict: boolean;
+  /** 完全削除確認表示中か。 */
+  forever: boolean;
+  /** 再試行レポート表示中か。 */
+  retry: boolean;
+  /** リネーム入力表示中か。 */
+  renaming: boolean;
+  /** Undoスタック (混在履歴の深度・ラベル)。 */
+  undoDepth: number;
+  undoLabel: string | null;
 };
 
 /** WP-6: コレクション状態の読み出し口 (E2E検証用)。 */
@@ -370,6 +397,7 @@ export function installDevBridge(stores: DevBridgeStores): void {
   let injectionState = 0; // 0=none 1=decode0.30 2=cache_write0.30
   // WP-6 E2E: コレクションコマンドモード (ctrl+shift+F1でトグル)
   let collCmdMode = false;
+  let foCmdMode = false;
 
   const actions: Record<string, () => void> = {
     // WP-4計測: WebViewのlocalStorage (レイアウト・フォルダ・セッション状態) を
@@ -499,6 +527,7 @@ export function installDevBridge(stores: DevBridgeStores): void {
     focusCell0: () => clickCell(0),
     focusCell1: () => clickCell(1),
     focusCell2: () => clickCell(2),
+    focusCell3: () => clickCell(3),
     // WP-6 E2E: コレクション (本物のDOM要素 → 生産経路で駆動)
     /** 「+ 手動」フォームを開き名前入力へフォーカス (xdotool typeの着地)。 */
     collCreateManualForm: () => {
@@ -531,6 +560,18 @@ export function installDevBridge(stores: DevBridgeStores): void {
     /** cell0でコンテキストメニューを開く (コレクションへ追加の導線)。 */
     contextMenuCell0: () => {
       cellAt(0)?.dispatchEvent(
+        new MouseEvent("contextmenu", { bubbles: true, cancelable: true }),
+      );
+    },
+    /** フォーカス中セルでコンテキストメニューを開く (WP-7 E2E: 選択対象に
+     * 操作したいセルがcell0以外の場合)。 */
+    contextMenuFocused: () => {
+      const sel = stores.getSelection();
+      const index = sel?.focusIndex ?? -1;
+      if (index < 0) {
+        return;
+      }
+      cellAt(index)?.dispatchEvent(
         new MouseEvent("contextmenu", { bubbles: true, cancelable: true }),
       );
     },
@@ -570,6 +611,165 @@ export function installDevBridge(stores: DevBridgeStores): void {
     // の生産経路を通る)
     openTreeFsRoot: () => {
       document.querySelector<HTMLButtonElement>('.tree-label[title="/"]')?.click();
+    },
+    // WP-7 E2E: ファイル操作 (本物のDOM要素 → 生産経路で駆動)
+    /** 宛先ダイアログ: 最初のノード (登録ルート) を選択して確定。 */
+    foDestPickFirst: () => {
+      document.querySelector<HTMLButtonElement>(".node-label")?.click();
+      setTimeout(() => {
+        document.querySelector<HTMLButtonElement>(".picker-actions .primary")?.click();
+      }, 150);
+    },
+    /** 宛先ダイアログ: 最初のノードを展開し最初の子を選択して確定。 */
+    foDestPickFirstSub: () => {
+      document.querySelector<HTMLButtonElement>(".node-toggle")?.click();
+      setTimeout(() => {
+        document
+          .querySelectorAll<HTMLButtonElement>(".node-label")[1]
+          ?.click();
+      }, 400);
+      setTimeout(() => {
+        document.querySelector<HTMLButtonElement>(".picker-actions .primary")?.click();
+      }, 700);
+    },
+    foConflictKeepBoth: () => {
+      document
+        .querySelector<HTMLButtonElement>('[data-testid="conflict-keep-both"]')
+        ?.click();
+    },
+    foConflictOverwrite: () => {
+      document
+        .querySelector<HTMLButtonElement>('[data-testid="conflict-overwrite"]')
+        ?.click();
+    },
+    foConflictSkip: () => {
+      document
+        .querySelector<HTMLButtonElement>('[data-testid="conflict-skip"]')
+        ?.click();
+    },
+    foConflictApplyAll: () => {
+      (document.querySelector('[data-testid="conflict-apply-all"]') as HTMLInputElement | null)
+        ?.click();
+    },
+    foForeverCheck: () => {
+      (document.querySelector('[data-testid="forever-check"]') as HTMLInputElement | null)
+        ?.click();
+    },
+    foForeverConfirm: () => {
+      document
+        .querySelector<HTMLButtonElement>('[data-testid="forever-confirm"]')
+        ?.click();
+    },
+    foMenuCopy: () => {
+      const item = Array.from(
+        document.querySelectorAll<HTMLButtonElement>(".context-menu button"),
+      ).find((b) => (b.textContent ?? "").startsWith("コピー"));
+      item?.click();
+    },
+    foMenuMove: () => {
+      const item = Array.from(
+        document.querySelectorAll<HTMLButtonElement>(".context-menu button"),
+      ).find((b) => (b.textContent ?? "").startsWith("移動"));
+      item?.click();
+    },
+    foMenuTrash: () => {
+      const item = Array.from(
+        document.querySelectorAll<HTMLButtonElement>(".context-menu button"),
+      ).find((b) => (b.textContent ?? "").startsWith("ゴミ箱"));
+      item?.click();
+    },
+    /** コンテキストメニュー「リネーム」(F2相当 — dev bridgeがF2を使うため)。 */
+    foMenuRename: () => {
+      const item = Array.from(
+        document.querySelectorAll<HTMLButtonElement>(".context-menu button"),
+      ).find((b) => (b.textContent ?? "").startsWith("リネーム"));
+      item?.click();
+    },
+    foRetryConfirm: () => {
+      document
+        .querySelector<HTMLButtonElement>('[data-testid="retry-button"]')
+        ?.click();
+    },
+    /** F2リネーム入力へフォーカス (xdotool typeの着地)。 */
+    foFocusRename: () => {
+      document.querySelector<HTMLInputElement>('[data-testid="rename-input"]')?.focus();
+    },
+    /**
+     * WP-7 E2E (共有デスクトップでxdotool typeが不安定な環境向け):
+     * 登録ルート追加フォームに --dataset のパスを設定して追加
+     * (input値設定+inputイベント+追加ボタンclick = 生産経路)。
+     */
+    foAddRootDataset: () => {
+      void (async () => {
+        const health = await stores
+          .invoke<{ dataset_path: string | null }>("health")
+          .catch(() => null);
+        const path = health?.dataset_path ?? null;
+        const input = document.querySelector<HTMLInputElement>(".roots-add input");
+        if (path === null || path === "" || input === null) {
+          return;
+        }
+        input.value = path;
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        setTimeout(() => {
+          document
+            .querySelectorAll<HTMLButtonElement>(".roots-add button")
+            .forEach((b) => {
+              if ((b.textContent ?? "").includes("追加")) {
+                b.click();
+              }
+            });
+        }, 100);
+      })();
+    },
+    /**
+     * リネーム入力へ "will-revert.png" を設定して確定 (E2E固定値。
+     * input値設定+inputイベント+Enter合成keydown = 生産経路)。
+     */
+    foRenameWillRevert: () => {
+      const input = document.querySelector<HTMLInputElement>('[data-testid="rename-input"]');
+      if (input === null) {
+        return;
+      }
+      input.value = "will-revert.png";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      setTimeout(() => {
+        input.dispatchEvent(
+          new KeyboardEvent("keydown", {
+            key: "Enter",
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+      }, 120);
+    },
+    /** Deleteキー相当 (ゴミ箱) の合成keydown。 */
+    pressKeyDelete: () => {
+      window.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Delete", bubbles: true, cancelable: true }),
+      );
+    },
+    /** Shift+Delete (完全削除ダイアログ) の合成keydown。 */
+    pressKeyShiftDelete: () => {
+      window.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Delete",
+          shiftKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+    },
+    /** Ctrl+Z (Undo) の合成keydown。 */
+    pressCtrlZ: () => {
+      window.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "z",
+          ctrlKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
     },
     openFirstHomeChild: () => {
       const labels = Array.from(document.querySelectorAll<HTMLElement>(".tree-label"));
@@ -680,6 +880,22 @@ export function installDevBridge(stores: DevBridgeStores): void {
         ` cnt=${a?.itemCount ?? -1} memo=${collections.focusMemo === null ? "-" : "1"}` +
         ` exp=${exportButtons} pick=${picker} cmd=${collCmdMode ? 1 : 0}` +
         ` list=${collections.list.map((c) => `${c.kind === "smart" ? "s" : "m"}${c.itemCount}`).join(",")}`,
+    ];
+  }
+
+  /** WP-7(MVP): ファイル操作状態行 (E2Eの機械検証用。FO接頭辞)。 */
+  function fileOpsLines(): string[] {
+    const fo = stores.getFileOps();
+    if (fo === null) {
+      return [];
+    }
+    return [
+      `FO busy=${fo.busy ? 1 : 0}` +
+        ` prog=${fo.progress === null ? "-" : `${fo.progress.index + 1}/${fo.progress.total}`}` +
+        ` dst=${fo.destPicker ? 1 : 0} cf=${fo.conflict ? 1 : 0} fv=${fo.forever ? 1 : 0}` +
+        ` rt=${fo.retry ? 1 : 0} rn=${fo.renaming ? 1 : 0}` +
+        ` undo=${fo.undoDepth}:${fo.undoLabel ?? "-"}` +
+        ` note=${fo.notice.slice(0, 40)} err=${fo.error === null ? "-" : fo.error.slice(0, 40)}`,
     ];
   }
 
@@ -803,6 +1019,7 @@ export function installDevBridge(stores: DevBridgeStores): void {
       ...sessionLines(),
       ...metaLines(),
       ...collectionLines(),
+      ...fileOpsLines(),
     );
     if (!lines.some((line) => line.startsWith("V ") || line.startsWith("C "))) {
       lines.push("idle (viewer closed)");
@@ -834,6 +1051,41 @@ export function installDevBridge(stores: DevBridgeStores): void {
       // モード中の数字/記号キーは**1回のアクション実行で自動退出**する
       // (モーメンタリ方式 — モード残留による入力食いを構造的に防ぐ。
       // 3修飾キーctrl+shift+altはWM/WebKitへ到達しないための代替チャネル)。
+      if (foCmdMode) {
+        const foKeys: Record<string, string> = {
+          "0": "foAddRootDataset",
+          "4": "contextMenuCell0",
+          "5": "contextMenuFocused",
+          "3": "focusCell3",
+          c: "foMenuCopy",
+          v: "foMenuMove",
+          t: "foMenuTrash",
+          e: "foMenuRename",
+          w: "foRenameWillRevert",
+          x: "pressKeyDelete",
+          y: "pressKeyShiftDelete",
+          z: "pressCtrlZ",
+          d: "foDestPickFirst",
+          b: "foDestPickFirstSub",
+          k: "foConflictKeepBoth",
+          o: "foConflictOverwrite",
+          s: "foConflictSkip",
+          a: "foConflictApplyAll",
+          f: "foForeverCheck",
+          g: "foForeverConfirm",
+          r: "foRetryConfirm",
+          n: "foFocusRename",
+        };
+        const action = foKeys[event.key];
+        if (action !== undefined) {
+          actions[action]?.();
+        }
+        foCmdMode = false;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        setTimeout(dump, 600);
+        return;
+      }
       if (collCmdMode) {
         const collKeys: Record<string, string> = {
           "1": "collCreateManualForm",
@@ -866,6 +1118,15 @@ export function installDevBridge(stores: DevBridgeStores): void {
       // WP-6 E2E: コマンドモードのトグル本体。
       if (event.ctrlKey && event.shiftKey && !event.altKey && key === "F1") {
         collCmdMode = true;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        setTimeout(dump, 300);
+        return;
+      }
+      // WP-7 E2E: ファイル操作コマンドモード (ctrl+shift+F12で入る。
+      // F2はリネーム本体に取られているため)。
+      if (event.ctrlKey && event.shiftKey && !event.altKey && key === "F12") {
+        foCmdMode = true;
         event.preventDefault();
         event.stopImmediatePropagation();
         setTimeout(dump, 300);

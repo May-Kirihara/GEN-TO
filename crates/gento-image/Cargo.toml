@@ -12,6 +12,8 @@ devtools = []
 
 [dependencies]
 gento-core = { workspace = true }
+# OS差の土台 (OSファイルID取得の正本はgento-platform。WP-7で集約移動)。
+gento-platform = { workspace = true }
 tracing = { workspace = true }
 walkdir = { workspace = true }
 png = { workspace = true }

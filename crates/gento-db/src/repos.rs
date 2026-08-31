@@ -629,6 +629,175 @@ impl FileRepo for SqliteRepos<'_> {
             .map_err(map_err)?;
         Ok(rows)
     }
+
+    fn delete_file(&self, file_id: i64) -> Result<(), RepoError> {
+        let changed = self
+            .conn
+            .execute("DELETE FROM files WHERE id = ?1", [file_id])
+            .map_err(map_err)?;
+        if changed == 0 {
+            return Err(RepoError::NotFound);
+        }
+        Ok(())
+    }
+}
+
+// ===== WP-7: ファイル操作履歴 =====
+
+impl gento_core::file_ops::FileOpsRepo for SqliteRepos<'_> {
+    fn insert_operation(
+        &self,
+        op: gento_core::file_ops::NewFileOp,
+    ) -> Result<gento_core::file_ops::FileOpRecord, RepoError> {
+        self.conn
+            .execute(
+                "INSERT INTO file_operations
+                     (uuid, operation_type, status, undoable, request_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    new_uuid_v7(),
+                    op.operation_type.as_str(),
+                    op.status.as_str(),
+                    op.undoable as i64,
+                    op.request_json,
+                    now_utc_rfc3339(),
+                ],
+            )
+            .map_err(map_err)?;
+        let id = self.conn.last_insert_rowid();
+        self.get_operation(id)?
+            .ok_or_else(|| RepoError::Db("inserted file_operation row is not readable".to_string()))
+    }
+
+    fn update_operation(
+        &self,
+        id: i64,
+        status: gento_core::file_ops::FileOpStatus,
+        result_json: Option<&str>,
+        undoable: bool,
+    ) -> Result<(), RepoError> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE file_operations
+                 SET status = ?2, result_json = ?3, undoable = ?4
+                 WHERE id = ?1",
+                params![id, status.as_str(), result_json, undoable as i64],
+            )
+            .map_err(map_err)?;
+        if changed == 0 {
+            return Err(RepoError::NotFound);
+        }
+        Ok(())
+    }
+
+    fn mark_undone(&self, id: i64) -> Result<(), RepoError> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE file_operations
+                 SET status = 'undone', undone_at = ?2, undoable = 0
+                 WHERE id = ?1",
+                params![id, now_utc_rfc3339()],
+            )
+            .map_err(map_err)?;
+        if changed == 0 {
+            return Err(RepoError::NotFound);
+        }
+        Ok(())
+    }
+
+    fn get_operation(
+        &self,
+        id: i64,
+    ) -> Result<Option<gento_core::file_ops::FileOpRecord>, RepoError> {
+        self.conn
+            .query_row(
+                &format!("SELECT {FILE_OP_COLUMNS} FROM file_operations WHERE id = ?1"),
+                [id],
+                map_file_operation,
+            )
+            .optional()
+            .map_err(map_err)
+    }
+
+    fn list_recent_operations(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<gento_core::file_ops::FileOpRecord>, RepoError> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT {FILE_OP_COLUMNS} FROM file_operations ORDER BY id DESC LIMIT ?1"
+            ))
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([limit as i64], map_file_operation)
+            .map_err(map_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_err)?;
+        Ok(rows)
+    }
+
+    fn list_executing_operations(
+        &self,
+    ) -> Result<Vec<gento_core::file_ops::FileOpRecord>, RepoError> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT {FILE_OP_COLUMNS} FROM file_operations
+                 WHERE status = 'executing' ORDER BY id"
+            ))
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], map_file_operation)
+            .map_err(map_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_err)?;
+        Ok(rows)
+    }
+}
+
+/// file_operations行のSELECT列一覧 (map_file_operationと共通)。
+const FILE_OP_COLUMNS: &str = "id, uuid, operation_type, status, undoable, request_json, \
+     result_json, created_at, undone_at";
+
+fn map_file_operation(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<gento_core::file_ops::FileOpRecord> {
+    use gento_core::file_ops::{FileOpKind, FileOpStatus};
+    use std::str::FromStr;
+    let kind_str: String = row.get("operation_type")?;
+    let status_str: String = row.get("status")?;
+    let parse = |s: &str| -> rusqlite::Result<_> {
+        FileOpKind::from_str(s).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                format!("unknown operation_type: {s}").into(),
+            )
+        })
+    };
+    let parse_status = |s: &str| -> rusqlite::Result<_> {
+        FileOpStatus::from_str(s).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                format!("unknown file_operations.status: {s}").into(),
+            )
+        })
+    };
+    Ok(gento_core::file_ops::FileOpRecord {
+        id: row.get("id")?,
+        uuid: row.get("uuid")?,
+        operation_type: parse(&kind_str)?,
+        status: parse_status(&status_str)?,
+        undoable: row.get::<_, i64>("undoable")? != 0,
+        request_json: row.get("request_json")?,
+        result_json: row.get("result_json")?,
+        created_at: row.get("created_at")?,
+        undone_at: row.get("undone_at")?,
+    })
 }
 
 /// JOINクエリ用: files列をエイリアス付きで読む (map_fileと同意味)。
@@ -1866,5 +2035,146 @@ mod tests {
             assert!(!created_b);
             assert_eq!(a.id, b.id, "同一ハッシュは既存を返す");
         });
+    }
+
+    // ===== WP-7: FileOpsRepo (file_operations) =====
+
+    use gento_core::file_ops::{FileOpKind, FileOpStatus, FileOpsRepo, NewFileOp};
+
+    fn new_op(kind: FileOpKind, status: FileOpStatus, undoable: bool) -> NewFileOp {
+        NewFileOp {
+            operation_type: kind,
+            status,
+            undoable,
+            request_json: r#"{"kind":"copy","files":[]}"#.to_string(),
+        }
+    }
+
+    #[test]
+    fn file_operations_round_trip_and_update() {
+        with_repos("fileops", |repos| {
+            let record = repos
+                .insert_operation(new_op(FileOpKind::Move, FileOpStatus::Executing, false))
+                .unwrap();
+            assert_eq!(record.operation_type, FileOpKind::Move);
+            assert_eq!(record.status, FileOpStatus::Executing);
+            assert!(!record.undoable);
+            assert_eq!(record.result_json, None);
+            assert_eq!(record.uuid.len(), 36);
+
+            // executingは異常終了検出で拾える
+            assert_eq!(repos.list_executing_operations().unwrap().len(), 1);
+
+            // status/result/undoable更新 (操作ログ確定)
+            repos
+                .update_operation(
+                    record.id,
+                    FileOpStatus::Partial,
+                    Some(r#"{"steps":[]}"#),
+                    true,
+                )
+                .unwrap();
+            let updated = repos.get_operation(record.id).unwrap().unwrap();
+            assert_eq!(updated.status, FileOpStatus::Partial);
+            assert!(updated.undoable);
+            assert_eq!(updated.result_json.as_deref(), Some(r#"{"steps":[]}"#));
+            // executing一覧からは消える
+            assert!(repos.list_executing_operations().unwrap().is_empty());
+
+            // undo済み遷移
+            repos.mark_undone(record.id).unwrap();
+            let undone = repos.get_operation(record.id).unwrap().unwrap();
+            assert_eq!(undone.status, FileOpStatus::Undone);
+            assert!(!undone.undoable);
+            assert!(undone.undone_at.is_some());
+
+            // 不存在idはNotFound
+            assert_eq!(
+                repos.update_operation(9999, FileOpStatus::Done, None, false),
+                Err(RepoError::NotFound)
+            );
+        });
+    }
+
+    #[test]
+    fn file_operations_list_recent_orders_desc() {
+        with_repos("fileops-list", |repos| {
+            for i in 0..5 {
+                repos
+                    .insert_operation(new_op(FileOpKind::Trash, FileOpStatus::Done, false))
+                    .unwrap();
+                let _ = i;
+            }
+            let recent = repos.list_recent_operations(3).unwrap();
+            assert_eq!(recent.len(), 3);
+            assert!(
+                recent[0].id > recent[1].id && recent[1].id > recent[2].id,
+                "新着順"
+            );
+        });
+    }
+
+    #[test]
+    fn file_operations_status_check_rejects_unknown_value() {
+        with_repos("fileops-check", |repos| {
+            let record = repos
+                .insert_operation(new_op(FileOpKind::Copy, FileOpStatus::Planned, false))
+                .unwrap();
+            // migration #1の旧値 'pending' は #5のCHECKで拒否される
+            let err = repos
+                .conn()
+                .execute(
+                    "UPDATE file_operations SET status = 'pending' WHERE id = ?1",
+                    [record.id],
+                )
+                .unwrap_err();
+            assert!(err.to_string().contains("CHECK"), "{err}");
+        });
+    }
+
+    #[test]
+    fn migration_v5_maps_legacy_status_values() {
+        // v4 DBに旧status値の行がある状態からv5へ移行すると新値へ写る
+        let tmp = TempDir::new("v5legacy");
+        let db_path = tmp.0.join("db.sqlite3");
+        {
+            let mut conn = Connection::open(&db_path).unwrap();
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
+            run_migrations(&mut conn, &MIGRATIONS[..4], &MigrationOpts::default()).unwrap();
+            for (i, legacy) in ["pending", "succeeded", "partial", "undone"]
+                .iter()
+                .enumerate()
+            {
+                conn.execute(
+                    "INSERT INTO file_operations (uuid, operation_type, status, request_json, created_at)
+                     VALUES (?1, 'copy', ?2, '{}', '2026-08-31T00:00:00.000Z')",
+                    params![
+                        format!("00000000-0000-7000-8000-{i:012}"),
+                        legacy
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        // v5まで適用
+        {
+            let mut conn = Connection::open(&db_path).unwrap();
+            run_migrations(&mut conn, MIGRATIONS, &MigrationOpts::default()).unwrap();
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
+            let repos = SqliteRepos::new(&conn);
+            let all = repos.list_recent_operations(10).unwrap();
+            assert_eq!(all.len(), 4);
+            let by_status: std::collections::HashMap<_, _> =
+                all.into_iter().map(|r| (r.id, r.status)).collect();
+            let expected = [
+                (1, FileOpStatus::Executing), // pending → executing
+                (2, FileOpStatus::Done),      // succeeded → done
+                (3, FileOpStatus::Partial),
+                (4, FileOpStatus::Undone),
+            ];
+            for (id, status) in expected {
+                assert_eq!(by_status.get(&id), Some(&status), "id={id}");
+            }
+        }
     }
 }

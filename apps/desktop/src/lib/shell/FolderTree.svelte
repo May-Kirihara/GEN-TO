@@ -6,6 +6,8 @@
     * - 登録ルート (またはその配下) はバッジ表示
     * - クリックでフォルダ選択 (Appが登録/未登録でソースを切替)
     * - コレクション領域はWP-6でCollectionsPaneへ分離 (Appの左ペイン参照)
+    * - WP-7: グリッドからのドラッグ&ドロップの受け口 (デフォルト=移動、
+    *   Ctrl修飾=コピー。ツリーノードへドロップ)
     */
   import { onDestroy } from "svelte";
   import type { FolderTreeStore } from "../fsview";
@@ -18,6 +20,7 @@
     currentFolder,
     libraryMode,
     onSelect,
+    onDrop,
   }: {
     tree: FolderTreeStore;
     roots: LibraryRoot[];
@@ -25,6 +28,10 @@
     currentFolder: string | null;
     libraryMode: boolean;
     onSelect: (path: string) => void;
+    /** グリッド選択のドロップ (WP-7)。destPathへ移動/コピー。 */
+    onDrop:
+      | ((destPath: string, paths: string[], copy: boolean) => void)
+      | undefined;
   } = $props();
 
   let treeTick = $state(0);
@@ -58,6 +65,69 @@
     void treeTick;
     return !libraryMode && currentFolder === path;
   }
+
+  /** WP-7: ドロップ先として意味があるか (登録ルート配下のフォルダのみ)。 */
+  function droppable(path: string): boolean {
+    if (onDrop === undefined) {
+      return false;
+    }
+    const state = registeredStateFor(path, roots);
+    return state === "root" || state === "inside";
+  }
+
+  function extractPaths(event: DragEvent): string[] {
+    const raw = event.dataTransfer?.getData("application/x-gento-paths");
+    if (raw === "" || raw === undefined) {
+      return [];
+    }
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (!Array.isArray(parsed)) {
+        return [];
+      }
+      return parsed.filter((item): item is string => typeof item === "string");
+    } catch {
+      return [];
+    }
+  }
+
+  let dropTargetPath = $state<string | null>(null);
+
+  function handleDragOver(event: DragEvent, path: string): void {
+    if (!droppable(path)) {
+      return;
+    }
+    const hasPayload =
+      event.dataTransfer?.types.includes("application/x-gento-paths") ?? false;
+    if (!hasPayload) {
+      return;
+    }
+    event.preventDefault();
+    if (event.dataTransfer !== null) {
+      // Ctrl修飾 = コピー (MVPのD&D規約)
+      event.dataTransfer.dropEffect = event.ctrlKey || event.metaKey ? "copy" : "move";
+    }
+    dropTargetPath = path;
+  }
+
+  function handleDragLeave(path: string): void {
+    if (dropTargetPath === path) {
+      dropTargetPath = null;
+    }
+  }
+
+  function handleDrop(event: DragEvent, path: string): void {
+    dropTargetPath = null;
+    if (!droppable(path) || onDrop === undefined) {
+      return;
+    }
+    const paths = extractPaths(event);
+    if (paths.length === 0) {
+      return;
+    }
+    event.preventDefault();
+    onDrop(path, paths, event.ctrlKey || event.metaKey);
+  }
 </script>
 
 <div class="tree-pane">
@@ -67,10 +137,15 @@
         class="tree-row"
         class:row-selected={isCurrent(row.path)}
         class:row-error={row.error !== null}
+        class:row-drop-target={dropTargetPath === row.path}
         style="padding-left:{0.35 + row.depth * 0.9}rem"
         role="treeitem"
         aria-expanded={row.hasChildren === false ? undefined : row.expanded}
         aria-selected={isCurrent(row.path)}
+        tabindex={-1}
+        ondragover={(event) => handleDragOver(event, row.path)}
+        ondragleave={() => handleDragLeave(row.path)}
+        ondrop={(event) => handleDrop(event, row.path)}
       >
         <button
           class="tree-expander"
@@ -148,6 +223,13 @@
 
   .tree-row.row-selected {
     background: light-dark(#ddf4ff, #121d2f);
+  }
+
+  /* WP-7: ドロップ先ハイライト */
+  .tree-row.row-drop-target {
+    outline: 2px dashed light-dark(#0969da, #58a6ff);
+    outline-offset: -2px;
+    border-radius: 0.25rem;
   }
 
   .tree-row.row-error .tree-name {

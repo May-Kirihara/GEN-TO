@@ -3,11 +3,20 @@
 
 pub mod catalog;
 pub mod collections;
+pub mod file_ops;
 pub mod jobs;
 pub mod library;
 pub mod metadata;
 pub mod repo;
 
+pub use file_ops::{
+    execute_file_op, execute_mkdir, execute_undo, plan_file_op, undo_candidate_of,
+    validate_new_name, verify_undo, ConflictInfo, ConflictResolution, FileOpFile, FileOpKind,
+    FileOpOutcome, FileOpPlan, FileOpProgress, FileOpRecord, FileOpStatus, FileOpsFs, FileOpsRepo,
+    FileRootRef, FileStat, FsOpError, FsOpErrorKind, NewFileOp, PlannedStep, ResolutionSpec,
+    StepResult, StepStatus, TokenDto, UndoAction, UndoCandidate, UndoOutcome, UndoRefusal,
+    UndoStepResult, TMP_FILE_PREFIX,
+};
 pub use jobs::{ParsePriorityError, ParseSizeClassError, Priority, SizeClass};
 pub use library::{
     decode_library_asset_id, library_asset_id, provisional_file_asset_id, CoalescedChanges,
