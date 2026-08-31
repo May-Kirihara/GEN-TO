@@ -8,6 +8,7 @@
 //! のときのみコンパイルされる。通常releaseビルドからは完全に除去される。
 
 pub mod catalog;
+pub mod collections;
 pub mod db;
 #[cfg(any(debug_assertions, feature = "devtools"))]
 pub mod devtools;
@@ -171,6 +172,20 @@ pub fn run() {
         metadata::asset_caption_get,
         metadata::asset_caption_set,
         metadata::asset_detail,
+        collections::collections_list,
+        collections::collection_create,
+        collections::collection_rename,
+        collections::collection_delete,
+        collections::collection_add_items,
+        collections::collection_remove_item,
+        collections::collection_reorder,
+        collections::collection_items,
+        collections::collection_set_item_note,
+        collections::smart_collection_create,
+        collections::smart_collection_update,
+        collections::smart_collection_items,
+        collections::smart_collection_refresh,
+        collections::collection_show,
         fsview::fs_list_dirs,
         fsview::reveal_in_file_manager,
         fsview::open_with_default_app,
@@ -213,6 +228,20 @@ pub fn run() {
         metadata::asset_caption_get,
         metadata::asset_caption_set,
         metadata::asset_detail,
+        collections::collections_list,
+        collections::collection_create,
+        collections::collection_rename,
+        collections::collection_delete,
+        collections::collection_add_items,
+        collections::collection_remove_item,
+        collections::collection_reorder,
+        collections::collection_items,
+        collections::collection_set_item_note,
+        collections::smart_collection_create,
+        collections::smart_collection_update,
+        collections::smart_collection_items,
+        collections::smart_collection_refresh,
+        collections::collection_show,
         fsview::fs_list_dirs,
         fsview::reveal_in_file_manager,
         fsview::open_with_default_app,

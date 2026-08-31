@@ -59,6 +59,12 @@ pub struct CatalogInner {
     real: Vec<ImageRecord>,
     /// 登録ルート由来のスナップショット (WP-2。DBから再生成可能)。
     library: Vec<ImageRecord>,
+    /// コレクション表示中の対象 (WP-6)。Someの間は `state.records` が
+    /// コレクションビュー (manual=position順 / smart=評価結果) であり、
+    /// `library` スナップショット更新の自動反映を**行わない**
+    /// (asset:updatedのin-placeパッチのみ適用。再評価は明示
+    /// `smart_collection_refresh` / 再選択 — トリガー連鎖回避の設計)。
+    collection: Option<CollectionView>,
     /// 表示ソート (WP-4。走査バッチ・ソース切替・スナップショット反映に適用)。
     sort: CatalogSort,
     /// 現在の一時走査トークン (世代。QA-WP4)。`begin_scan` で進み、
@@ -67,6 +73,12 @@ pub struct CatalogInner {
     progress: ProgressCounters,
     scan_started_at: Option<Instant>,
     last_scan_elapsed_ms: Option<u64>,
+}
+
+/// コレクション表示の対象識別 (WP-6)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollectionView {
+    pub collection_id: i64,
 }
 
 #[derive(Default)]
@@ -95,12 +107,18 @@ impl CatalogInner {
             state: CatalogState::new(),
             real: Vec::new(),
             library: Vec::new(),
+            collection: None,
             sort: CatalogSort::default(),
             scan_token: 0,
             progress: ProgressCounters::default(),
             scan_started_at: None,
             last_scan_elapsed_ms: None,
         }
+    }
+
+    /// 現在表示中のコレクション (WP-6)。非表示中はNone。
+    pub fn collection_view(&self) -> Option<CollectionView> {
+        self.collection
     }
 
     /// 現在のソートモードで表示レコードを並べ替える。
@@ -205,11 +223,44 @@ impl CatalogInner {
         for record in self.library.iter_mut().filter(|r| matches(r)) {
             f(record);
         }
+        // Library系表示 (通常ライブラリ + コレクションビュー) のレコードへ
+        // in-place適用。コレクションビューのレコードもstable AssetIdを持つ
+        // ため同じパッチ経路で追従する (WP-6)。
         if self.state.mode == CatalogMode::Library && !self.state.scanning {
             for record in self.state.records.iter_mut().filter(|r| matches(r)) {
                 f(record);
             }
         }
+    }
+
+    /// コレクションビューへ切替える (WP-6)。`records` は呼び出し側が構築した
+    /// 表示順 (manual=position順 / smart=評価順)。**ソートは適用しない**
+    /// (表示順の正本はコレクション)。generationを進めて新しいgenerationを返す。
+    pub fn set_collection_display(
+        &mut self,
+        view: CollectionView,
+        records: Vec<ImageRecord>,
+    ) -> u64 {
+        self.collection = Some(view);
+        self.state.mode = CatalogMode::Library;
+        self.state.scanning = false;
+        self.state.records = records;
+        self.state.generation += 1;
+        self.state.generation
+    }
+
+    /// コレクション表示を終了し、通常ライブラリ表示へ戻す (WP-6)。
+    /// generationを進めて新しいgenerationを返す (表示が存在しない場合は
+    /// 何もせず0)。
+    pub fn clear_collection_display(&mut self) -> u64 {
+        if self.collection.take().is_none() {
+            return 0;
+        }
+        self.state.mode = CatalogMode::Library;
+        self.state.records = self.library.clone();
+        self.apply_sort();
+        self.state.generation += 1;
+        self.state.generation
     }
 }
 
@@ -261,6 +312,10 @@ pub enum CatalogChangeReason {
     ModeSwitch,
     /// ソート変更 (WP-4)。表示順のみ変化 (generationは進む)。
     SortChange,
+    /// コレクション表示の開始・切替 (WP-6)。
+    CollectionSwitch,
+    /// 表示中コレクションの再評価・項目変更反映 (WP-6)。
+    CollectionRefresh,
 }
 
 /// `catalog:changed` イベントペイロード。
@@ -297,13 +352,20 @@ fn summary_of(inner: &CatalogInner) -> CatalogSummary {
     }
 }
 
+/// summary_ofのcrate内公開ラッパ (collections.rsのcollection_show応答用)。
+pub(crate) fn summary_of_pub(inner: &CatalogInner) -> CatalogSummary {
+    summary_of(inner)
+}
+
 /// 走査開始の状態遷移。旧走査トークンを無効化し (走査中でも再投入可能。
-/// QA-WP4)、新トークンを返す。
+/// QA-WP4)、新トークンを返す。コレクション表示も終了する (Realモードへ
+/// 戻るため。WP-6)。
 fn begin_scan(inner: &mut CatalogInner) -> (u64, u64) {
     inner.state.scanning = true;
     // 再走査はカタログを置き換えるためRealモードへ戻し、内容をクリアする
     inner.state.records.clear();
     inner.state.mode = CatalogMode::Real;
+    inner.collection = None;
     inner.state.generation += 1;
     inner.scan_token += 1;
     inner.progress = ProgressCounters::default();
@@ -412,7 +474,7 @@ fn cancel_scan_transition(inner: &mut CatalogInner) -> Option<ScanProgressPayloa
 // 通常releaseビルドでは set_catalog_mode commandごと存在しない (WP-0)。
 
 #[derive(Debug)]
-enum ModeSwitchOutcome {
+pub(crate) enum ModeSwitchOutcome {
     Changed(CatalogSummary),
     /// 同一モードへの切替は何も変えない (generation不変)。
     Unchanged(CatalogSummary),
@@ -454,6 +516,30 @@ fn switch_mode(inner: &mut CatalogInner, want_virtual: bool) -> Result<ModeSwitc
     inner.state.generation += 1;
     Ok(ModeSwitchOutcome::Changed(summary_of(inner)))
 }
+/// カタログソース切替の状態遷移 (set_catalog_source本体)。
+/// コレクション表示中はmodeが既にLibraryでも実質表示が異なるため
+/// (state.recordsがコレクションビュー)、「同一モード=変化なし」の
+/// 早期リターンから復帰経路へ回す (WP-6)。
+pub(crate) fn switch_catalog_source(
+    inner: &mut CatalogInner,
+    target: CatalogMode,
+) -> ModeSwitchOutcome {
+    let exited_collection = inner.collection.take().is_some();
+    if inner.state.mode == target && !exited_collection {
+        return ModeSwitchOutcome::Unchanged(summary_of(inner));
+    }
+    match target {
+        CatalogMode::Real => inner.state.records = inner.real.clone(),
+        CatalogMode::Library => inner.state.records = inner.library.clone(),
+        CatalogMode::Virtual => unreachable!("target is Real|Library here"),
+    }
+    inner.state.mode = target;
+    // ソース切替後は現在のソートモードで並べ替える (WP-4)
+    inner.apply_sort();
+    inner.state.generation += 1;
+    ModeSwitchOutcome::Changed(summary_of(inner))
+}
+
 /// カタログ表示ソースの切替 (WP-2。production command)。
 ///
 /// - `temp`: 一時走査カタログ (Realモード。`--dataset` の走査結果)
@@ -477,20 +563,7 @@ pub fn set_catalog_source(
         if inner.state.scanning {
             return Err("走査中はカタログソースを切替できません".to_string());
         }
-        if inner.state.mode == target {
-            ModeSwitchOutcome::Unchanged(summary_of(&inner))
-        } else {
-            match target {
-                CatalogMode::Real => inner.state.records = inner.real.clone(),
-                CatalogMode::Library => inner.state.records = inner.library.clone(),
-                CatalogMode::Virtual => unreachable!("target is Real|Library here"),
-            }
-            inner.state.mode = target;
-            // ソース切替後は現在のソートモードで並べ替える (WP-4)
-            inner.apply_sort();
-            inner.state.generation += 1;
-            ModeSwitchOutcome::Changed(summary_of(&inner))
-        }
+        switch_catalog_source(&mut inner, target)
     };
     if let ModeSwitchOutcome::Changed(summary) = outcome {
         let _ = app.emit(
@@ -512,12 +585,18 @@ pub fn set_catalog_source(
 /// ライブラリスナップショットをカタログへ反映する (WP-2)。
 /// Libraryモード表示中は表示レコードを差し替え、generationを進めて
 /// `catalog:changed` をemitする (ページ再取得でAssetIdの確定へ追従)。
+/// コレクション表示中 (WP-6) は `library` スナップショットのみ更新する
+/// — コレクションビューの内容は明示refresh・再選択まで保持する
+/// (asset:updatedのトリガー連鎖を避ける設計。collections.rs参照)。
 pub fn apply_library_snapshot(app: &AppHandle, records: Vec<ImageRecord>) {
     let state = app.state::<AppState>();
     let generation = {
         let mut inner = lock(&state.catalog);
         inner.library = records;
-        if inner.state.mode == CatalogMode::Library && !inner.state.scanning {
+        if inner.state.mode == CatalogMode::Library
+            && !inner.state.scanning
+            && inner.collection.is_none()
+        {
             inner.state.records = inner.library.clone();
             inner.apply_sort();
             inner.state.generation += 1;
@@ -809,8 +888,34 @@ fn validate_folder(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// ソート変更の状態遷移 (set_catalog_sort本体。走査中・コレクション表示中は拒否)。
+pub(crate) fn apply_sort_change(
+    inner: &mut CatalogInner,
+    parsed: CatalogSort,
+) -> Result<ModeSwitchOutcome, String> {
+    if inner.state.scanning {
+        return Err("走査中はソートを変更できません".to_string());
+    }
+    if inner.collection.is_some() {
+        return Err(
+            "コレクション表示中はソートを変更できません (並び順はコレクションが保持します)"
+                .to_string(),
+        );
+    }
+    if inner.sort == parsed {
+        Ok(ModeSwitchOutcome::Unchanged(summary_of(inner)))
+    } else {
+        inner.sort = parsed;
+        inner.apply_sort();
+        inner.state.generation += 1;
+        Ok(ModeSwitchOutcome::Changed(summary_of(inner)))
+    }
+}
+
 /// 表示ソートを切り替える (WP-4)。recordsを並べ替え、generationを進めて
 /// `catalog:changed` をemitする (ページ再取得で追従)。
+/// コレクション表示中は拒否する (WP-6: manual=position順・smart=評価順が
+/// 表示の正本であるため、ソートで壊せないようにする)。
 #[tauri::command]
 pub fn set_catalog_sort(
     app: AppHandle,
@@ -821,17 +926,7 @@ pub fn set_catalog_sort(
         .ok_or_else(|| format!("不明なソートです: {sort} (name|date_desc|size_desc)"))?;
     let outcome = {
         let mut inner = lock(&state.catalog);
-        if inner.state.scanning {
-            return Err("走査中はソートを変更できません".to_string());
-        }
-        if inner.sort == parsed {
-            ModeSwitchOutcome::Unchanged(summary_of(&inner))
-        } else {
-            inner.sort = parsed;
-            inner.apply_sort();
-            inner.state.generation += 1;
-            ModeSwitchOutcome::Changed(summary_of(&inner))
-        }
+        apply_sort_change(&mut inner, parsed)?
     };
     match outcome {
         ModeSwitchOutcome::Changed(summary) => {
@@ -1202,6 +1297,57 @@ mod tests {
             ModeSwitchOutcome::Unchanged(_) => panic!("expected change"),
         }
         assert_eq!(inner.state.records.len(), 2);
+    }
+
+    // ===== コレクション表示とソース切替 (WP-6) =====
+
+    #[test]
+    fn source_switch_from_collection_view_restores_library_records() {
+        // コレクション表示中はmode=Libraryのままstate.recordsがビューを
+        // 持つ。同一モードへの切替でもlibrary recordsへ復帰しなければ
+        // ならない (WP-6実機E2Eで発見した回帰)。
+        let mut inner = CatalogInner::new();
+        let lib = vec![record("a.png"), record("b.png"), record("c.png")];
+        inner.library = lib.clone();
+        inner.state.records = lib.clone();
+        inner.state.mode = CatalogMode::Library;
+        // コレクション表示 (1件のみ) へ切替
+        let gen0 = inner.state.generation;
+        let gen1 = inner.set_collection_display(
+            CollectionView { collection_id: 7 },
+            vec![record("only.png")],
+        );
+        assert_eq!(gen1, gen0 + 1);
+        assert_eq!(inner.state.records.len(), 1);
+        assert_eq!(
+            inner.collection_view(),
+            Some(CollectionView { collection_id: 7 })
+        );
+        // libraryソースへの切替 (同一モード) は「変化なし」ではなく復帰
+        let gen2 = inner.state.generation;
+        match switch_catalog_source(&mut inner, CatalogMode::Library) {
+            ModeSwitchOutcome::Changed(summary) => {
+                assert_eq!(summary.total, 3, "libraryの全件が復帰する");
+                assert_eq!(summary.generation, gen2 + 1);
+            }
+            ModeSwitchOutcome::Unchanged(_) => panic!("collection view must not be unchanged"),
+        }
+        assert_eq!(inner.state.records.len(), 3);
+        assert!(inner.collection_view().is_none());
+        // 通常の同一モード切替は変化なし (generation不変)
+        let gen3 = inner.state.generation;
+        assert!(matches!(
+            switch_catalog_source(&mut inner, CatalogMode::Library),
+            ModeSwitchOutcome::Unchanged(_)
+        ));
+        assert_eq!(inner.state.generation, gen3);
+        // コレクション表示中のtemp切替も復帰経路 (Realモード差し替え)
+        inner.set_collection_display(CollectionView { collection_id: 9 }, vec![record("x.png")]);
+        match switch_catalog_source(&mut inner, CatalogMode::Real) {
+            ModeSwitchOutcome::Changed(summary) => assert_eq!(summary.mode, CatalogMode::Real),
+            ModeSwitchOutcome::Unchanged(_) => panic!("expected change to real"),
+        }
+        assert!(inner.collection_view().is_none());
     }
 
     #[test]

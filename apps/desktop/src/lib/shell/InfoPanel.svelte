@@ -41,6 +41,9 @@
     suggestTags,
     undoLabel,
     bulkTargetIds = [],
+    collectionMemoContext = null,
+    collectionMemoNote = null,
+    onSaveCollectionMemo = undefined,
   }: {
     item: ImageListItem | null;
     selectionCount: number;
@@ -74,6 +77,12 @@
     undoLabel: string | null;
     /** 一括適用対象のID列 (Appが選択から供給)。 */
     bulkTargetIds?: string[];
+    /** WP-6: 表示中manualコレクション名 (編集可能なときのみ。null=非表示)。 */
+    collectionMemoContext?: string | null;
+    /** WP-6: フォーカス項目のコレクション内メモ現在値。 */
+    collectionMemoNote?: string | null;
+    /** WP-6: コレクション内メモの保存。 */
+    onSaveCollectionMemo?: (note: string) => void;
   } = $props();
 
   const DB_STATE_LABELS: Record<string, string> = {
@@ -302,6 +311,37 @@
     const current = captionOf(kind);
     return (captionDrafts[kind] ?? "") !== (current?.body ?? "");
   }
+
+  // ===== WP-6: コレクション内メモ (表示中manualコレクションのフォーカス項目) =====
+
+  let collectionMemoDraft = $state("");
+  let lastCollectionMemoSaved = "";
+
+  $effect(() => {
+    // フォーカス項目・コレクションが変わったら下書きを同期 (未編集時のみ。
+    // captionDraftsと同じ無限ループ回避のuntrackパターン)
+    void collectionMemoContext;
+    const saved = collectionMemoNote ?? "";
+    void untrack(() => {
+      if (collectionMemoDraft === lastCollectionMemoSaved) {
+        collectionMemoDraft = saved;
+      }
+      lastCollectionMemoSaved = saved;
+    });
+  });
+
+  function saveCollectionMemo(): void {
+    if (collectionMemoContext === null || item === null || busy) {
+      return;
+    }
+    void run(async () => {
+      await onSaveCollectionMemo?.(collectionMemoDraft);
+    });
+  }
+
+  function collectionMemoDirty(): boolean {
+    return collectionMemoDraft !== (collectionMemoNote ?? "");
+  }
 </script>
 
 <div class="info-pane">
@@ -524,6 +564,27 @@
       <p class="info-error">{metaError}</p>
     {/if}
   </section>
+
+  {#if collectionMemoContext !== null}
+    <section class="info-section">
+      <h3>コレクション内メモ</h3>
+      <p class="placeholder-note">「{collectionMemoContext}」内でのみ表示されるメモです</p>
+      <div class="caption-edit" data-meta="collection-memo">
+        <textarea
+          rows="3"
+          placeholder="このコレクションでのメモ (任意)"
+          value={collectionMemoDraft}
+          oninput={(event) => (collectionMemoDraft = event.currentTarget.value)}
+          disabled={busy}
+        ></textarea>
+        <div class="caption-controls">
+          <button class="primary" onclick={saveCollectionMemo} disabled={busy || !collectionMemoDirty()}>
+            保存
+          </button>
+        </div>
+      </div>
+    </section>
+  {/if}
 
   <section class="info-section">
     <h3>選別セッション</h3>

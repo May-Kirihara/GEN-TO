@@ -2,6 +2,7 @@
 //! (docs/implementation-plan.md §5.1)。
 
 pub mod catalog;
+pub mod collections;
 pub mod jobs;
 pub mod library;
 pub mod metadata;

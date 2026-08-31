@@ -49,10 +49,18 @@
     type AssetDetailDto,
     type CullValue,
   } from "./lib/metadata";
+  import {
+    CollectionsStore,
+    planReorder,
+    type CollectionDto,
+    type CollectionsChangedEvent,
+  } from "./lib/collections";
   import { UndoStack } from "./lib/undo";
   type TriageKeyAction = import("./lib/triage-keys").TriageKeyAction;
   import ContextMenu, { type MenuAction } from "./lib/ui/ContextMenu.svelte";
   import FolderTree from "./lib/shell/FolderTree.svelte";
+  import CollectionsPane from "./lib/shell/CollectionsPane.svelte";
+  import CollectionPicker from "./lib/ui/CollectionPicker.svelte";
   import LibraryPanel from "./lib/shell/LibraryPanel.svelte";
   import InfoPanel from "./lib/shell/InfoPanel.svelte";
   import DevDrawer from "./lib/shell/DevDrawer.svelte";
@@ -163,6 +171,199 @@
   undo.onChange(() => {
     undoLabel = undo.peekLabel();
   });
+
+  // ===== コレクション (WP-6) =====
+
+  const collectionsStore = new CollectionsStore(ipc);
+  /** 表示中のコレクション (中央グリッドがその内容を表示中)。 */
+  let activeCollection: CollectionDto | null = $state(null);
+  /** 表示中manualコレクションの項目メモ (assetId → 本文)。 */
+  let collectionNotes = $state<Record<string, string>>({});
+  let collectionNotice = $state("");
+  let collectionBusy = $state(false);
+  /** 「コレクションへ追加」ピッカーへ渡す対象ID列 (null=閉)。 */
+  let collectionPickerFor: string[] | null = $state(null);
+  /** 位置入力による並び替え (1-based表示 → 0-basedへ変換して適用)。 */
+  let collectionPositionInput = $state("");
+  let disposeCollections: (() => void) | null = null;
+  let stopCollectionsChanged: (() => void) | null = null;
+
+  /**
+   * collections:changed → 表示追従。backendは表示中コレクションの内容変化で
+   * catalog:changed (collection_refresh) を出すため、ここでは主に
+   * activeCollection DTOの最新化とメモ再取得を行う。
+   */
+  function onCollectionsChangedEvent(event: CollectionsChangedEvent): void {
+    const current = activeCollection;
+    if (current === null) {
+      return;
+    }
+    if (event.reason === "deleted" && event.collection_id === current.id) {
+      // backendがlibrary表示へ戻している (clear_collection_display)
+      activeCollection = null;
+      collectionNotes = {};
+      return;
+    }
+    if (event.collection_id === current.id) {
+      const updated =
+        collectionsStore.collections.find((c) => c.id === current.id) ?? null;
+      activeCollection = updated;
+      if (updated !== null && updated.kind === "manual" && event.reason === "items") {
+        void refreshCollectionNotes(updated.id);
+      }
+    }
+  }
+
+  /** コレクションを中央グリッドへ表示 (catalog:changedでCatalogStoreが追従)。 */
+  async function showCollection(collection: CollectionDto): Promise<boolean> {
+    collectionNotice = "";
+    collectionBusy = true;
+    try {
+      await collectionsStore.show(collection.id);
+      activeCollection = collection;
+      catalogSource = "library";
+      gridSelection = { ids: [], focusIndex: null };
+      collectionPositionInput = "";
+      if (collection.kind === "manual") {
+        await refreshCollectionNotes(collection.id);
+      } else {
+        collectionNotes = {};
+      }
+      return true;
+    } catch (error) {
+      collectionNotice = error instanceof Error ? error.message : String(error);
+      return false;
+    } finally {
+      collectionBusy = false;
+    }
+  }
+
+  async function refreshCollectionNotes(collectionId: string): Promise<void> {
+    try {
+      const page = await collectionsStore.items(collectionId, 0, 1000);
+      const notes: Record<string, string> = {};
+      for (const item of page.items) {
+        if (typeof item.note === "string" && item.note !== "") {
+          notes[item.asset_id] = item.note;
+        }
+      }
+      collectionNotes = notes;
+    } catch {
+      collectionNotes = {};
+    }
+  }
+
+  /** コレクション表示をやめて通常ライブラリ表示へ戻る。 */
+  async function exitCollection(): Promise<void> {
+    collectionNotice = "";
+    const ok = await library.useSource("library");
+    if (ok) {
+      activeCollection = null;
+      collectionNotes = {};
+      await catalog.refreshSummary();
+      await catalog.loadPage(0);
+    } else {
+      libraryError = library.lastError ?? "ライブラリ表示へ戻せませんでした";
+    }
+  }
+
+  /** manual表示中: 選択項目を移動 (先頭/末尾/位置入力)。 */
+  async function moveSelectedInCollection(target: "front" | "back" | "position"): Promise<void> {
+    const collection = activeCollection;
+    if (collection === null || collection.kind !== "manual" || collectionBusy) {
+      return;
+    }
+    const ids = await collectAllIds();
+    if (ids.length === 0 || gridSelection.ids.length === 0) {
+      collectionNotice = "移動する画像を選択してください";
+      return;
+    }
+    let plan: string[] | null;
+    if (target === "position") {
+      const index = Number.parseInt(collectionPositionInput, 10);
+      if (!Number.isInteger(index) || index < 1 || index > ids.length) {
+        collectionNotice = `位置は1〜${ids.length}の整数で指定してください`;
+        return;
+      }
+      // 1-based表示 → 選択を除いた残りの世界の0-based位置へ変換
+      const selected = new Set(gridSelection.ids);
+      const staying = ids.filter((id) => !selected.has(id));
+      const position = Math.min(index - 1, staying.length);
+      plan = planReorder(ids, gridSelection.ids, { kind: "position", index: position });
+    } else {
+      plan = planReorder(ids, gridSelection.ids, { kind: target });
+    }
+    if (plan === null) {
+      collectionNotice = "移動できませんでした";
+      return;
+    }
+    collectionBusy = true;
+    collectionNotice = "";
+    try {
+      await collectionsStore.reorder(collection.id, plan);
+      collectionPositionInput = "";
+    } catch (error) {
+      collectionNotice = error instanceof Error ? error.message : String(error);
+    } finally {
+      collectionBusy = false;
+    }
+  }
+
+  /** manual表示中: 選択項目をコレクションから除外 (元画像は影響しない)。 */
+  async function removeSelectedFromCollection(): Promise<void> {
+    const collection = activeCollection;
+    if (collection === null || collection.kind !== "manual" || collectionBusy) {
+      return;
+    }
+    if (gridSelection.ids.length === 0) {
+      collectionNotice = "除外する画像を選択してください";
+      return;
+    }
+    collectionBusy = true;
+    collectionNotice = "";
+    try {
+      for (const assetId of gridSelection.ids) {
+        await collectionsStore.removeItem(collection.id, assetId);
+      }
+      gridSelection = { ids: [], focusIndex: null };
+    } catch (error) {
+      collectionNotice = error instanceof Error ? error.message : String(error);
+    } finally {
+      collectionBusy = false;
+    }
+  }
+
+  /** スマートコレクションの明示再評価 (メタデータ変更後の反映)。 */
+  async function refreshActiveSmartCollection(): Promise<void> {
+    const collection = activeCollection;
+    if (collection === null || collection.kind !== "smart" || collectionBusy) {
+      return;
+    }
+    collectionBusy = true;
+    collectionNotice = "";
+    try {
+      const updated = await collectionsStore.refreshSmart(collection.id);
+      activeCollection = updated;
+    } catch (error) {
+      collectionNotice = error instanceof Error ? error.message : String(error);
+    } finally {
+      collectionBusy = false;
+    }
+  }
+
+  /** InfoPanelのコレクション内メモ保存 (フォーカス項目)。 */
+  async function saveCollectionMemo(assetId: string, note: string): Promise<void> {
+    const collection = activeCollection;
+    if (collection === null || collection.kind !== "manual") {
+      return;
+    }
+    try {
+      await collectionsStore.setItemNote(collection.id, assetId, note === "" ? null : note);
+      collectionNotes = { ...collectionNotes, [assetId]: note };
+    } catch (error) {
+      collectionNotice = error instanceof Error ? error.message : String(error);
+    }
+  }
 
   // ===== コンテキストメニュー (WP-4) =====
 
@@ -289,6 +490,7 @@
    */
   async function selectFolder(path: string, sortOverride?: CatalogSort): Promise<boolean> {
     osNotice = "";
+    collectionNotice = "";
     const registered = registeredStateFor(path, libraryRoots) !== null;
     tree.select(path);
     if (registered) {
@@ -296,6 +498,8 @@
       if (ok) {
         catalogSource = "library";
         currentFolder = path;
+        activeCollection = null;
+        collectionNotes = {};
         gridSelection = { ids: [], focusIndex: null };
         await applySavedSort(LIBRARY_SORT_KEY, sortOverride);
         await catalog.refreshSummary();
@@ -313,6 +517,8 @@
     if (ok) {
       catalogSource = "temp";
       currentFolder = path;
+      activeCollection = null;
+      collectionNotes = {};
       gridSelection = { ids: [], focusIndex: null };
       saveFolderPrefs();
       return true;
@@ -490,14 +696,22 @@
   }
 
   function sessionOriginLabel(count: number): string {
+    const collection = activeCollection;
+    if (collection !== null) {
+      return `コレクション「${collection.name}」 (${count.toLocaleString()}件)`;
+    }
     const place = catalogSource === "library"
       ? "ライブラリ"
       : (currentFolder ?? "(未選択)");
     return `${place} (${count.toLocaleString()}件)`;
   }
 
-  /** セッション開始時のorigin詳細 (再開時のフォルダ/ソート復元用。QA-WP4)。 */
+  /** セッション開始時のorigin詳細 (再開時のフォルダ/ソート/コレクション復元用)。 */
   function sessionOriginDetail(): SessionOriginDetail {
+    const collection = activeCollection;
+    if (collection !== null) {
+      return { kind: "collection", collectionId: collection.id };
+    }
     if (catalogSource === "library") {
       return { kind: "library" };
     }
@@ -559,7 +773,24 @@
       return;
     }
     const detail = persisted.detail;
-    if (detail !== null && detail.kind !== "library") {
+    // コレクション由来セッション: 同一コレクションを再表示してからID解決
+    // (WP-6。stable AssetIdなので走査待ち・ドリフト判定は不要)
+    if (detail !== null && detail.kind === "collection") {
+      const target =
+        collectionsStore.collections.find((c) => c.id === detail.collectionId) ?? null;
+      if (target === null) {
+        sessionNotice = "セッションのコレクションが見つからないため再開を中止しました";
+        return;
+      }
+      if (activeCollection?.id !== target.id) {
+        const ok = await showCollection(target);
+        if (!ok) {
+          sessionNotice = "セッションのコレクションを表示できないため再開を中止しました";
+          return;
+        }
+      }
+    }
+    if (detail !== null && detail.kind !== "library" && detail.kind !== "collection") {
       const plan = planAdhocResume(persisted, {
         source: catalogSource,
         folderPath: currentFolder,
@@ -916,48 +1147,77 @@
     }
     const focus = items[0];
     const suffix = items.length > 1 ? ` (${items.length.toLocaleString()}件中先頭)` : "";
+    // Library表示中のみコレクション操作を載せる (stable AssetIdが必要なため)
+    const canCollection = catalogSource === "library" && items.every((entry) => entry.dbState === "asset");
+    const inManualCollection =
+      activeCollection !== null && activeCollection.kind === "manual" && canCollection;
+    const actions: MenuAction[] = [];
+    if (canCollection) {
+      actions.push({
+        id: "add-to-collection",
+        label:
+          items.length > 1
+            ? `コレクションへ追加… (${items.length.toLocaleString()}件)`
+            : "コレクションへ追加…",
+        run: async () => {
+          collectionPickerFor = items.map((entry) => entry.id);
+        },
+      });
+    }
+    if (inManualCollection) {
+      actions.push({
+        id: "remove-from-collection",
+        label: "このコレクションから除外",
+        run: async () => {
+          for (const entry of items) {
+            await collectionsStore.removeItem(activeCollection!.id, entry.id);
+          }
+        },
+      });
+    }
+    actions.push(
+      {
+        id: "reveal",
+        label: `OSのファイルマネージャーで表示${suffix}`,
+        run: async () => {
+          osNotice = "";
+          try {
+            await invoke("reveal_in_file_manager", { path: focus.path });
+          } catch (error) {
+            osNotice = toErrorMessage(error);
+          }
+        },
+      },
+      {
+        id: "open",
+        label: "外部アプリで開く",
+        run: async () => {
+          osNotice = "";
+          try {
+            await invoke("open_with_default_app", { path: focus.path });
+          } catch (error) {
+            osNotice = toErrorMessage(error);
+          }
+        },
+      },
+      {
+        id: "copy-path",
+        label:
+          items.length > 1
+            ? `パスをコピー (${items.length.toLocaleString()}件)`
+            : "パスをコピー",
+        run: async () => {
+          const ok = await copyText(items.map((entry) => entry.path).join("\n"));
+          osNotice = ok
+            ? `パスをコピーしました (${items.length.toLocaleString()}件)`
+            : "クリップボードへのコピーに失敗しました";
+        },
+      },
+    );
     contextMenu = {
       x: event.clientX,
       y: event.clientY,
-      actions: [
-        {
-          id: "reveal",
-          label: `OSのファイルマネージャーで表示${suffix}`,
-          run: async () => {
-            osNotice = "";
-            try {
-              await invoke("reveal_in_file_manager", { path: focus.path });
-            } catch (error) {
-              osNotice = toErrorMessage(error);
-            }
-          },
-        },
-        {
-          id: "open",
-          label: "外部アプリで開く",
-          run: async () => {
-            osNotice = "";
-            try {
-              await invoke("open_with_default_app", { path: focus.path });
-            } catch (error) {
-              osNotice = toErrorMessage(error);
-            }
-          },
-        },
-        {
-          id: "copy-path",
-          label:
-            items.length > 1
-              ? `パスをコピー (${items.length.toLocaleString()}件)`
-              : "パスをコピー",
-          run: async () => {
-            const ok = await copyText(items.map((entry) => entry.path).join("\n"));
-            osNotice = ok
-              ? `パスをコピーしました (${items.length.toLocaleString()}件)`
-              : "クリップボードへのコピーに失敗しました";
-          },
-        },
-      ],
+      actions,
     };
   }
 
@@ -1170,6 +1430,11 @@
       disposeMetadata = stop;
       stopMetadataUpdates = metadata.onAssetUpdated(onAssetUpdated);
     })();
+    // コレクション (WP-6): リスナ登録後に初期化 (イベント取りこぼし防止)
+    stopCollectionsChanged = collectionsStore.onCollectionsChanged(onCollectionsChangedEvent);
+    void collectionsStore.init().then((dispose) => {
+      disposeCollections = dispose;
+    });
 
     void refreshHealth();
     void catalog.init().then(async (dispose) => {
@@ -1250,6 +1515,26 @@
                   dbState: focusInfo.dbState,
                 },
           }),
+          getCollections: () => ({
+            active: activeCollection === null
+              ? null
+              : {
+                  id: activeCollection.id,
+                  kind: activeCollection.kind,
+                  name: activeCollection.name,
+                  itemCount: activeCollection.item_count,
+                },
+            list: collectionsStore.collections.map((c) => ({
+              id: c.id,
+              kind: c.kind,
+              name: c.name,
+              itemCount: c.item_count,
+            })),
+            focusMemo:
+              collectionMemoContext !== null && focusInfo !== null
+                ? (collectionNotes[focusInfo.id] ?? null)
+                : null,
+          }),
           invoke,
         });
       }
@@ -1263,6 +1548,8 @@
     stopSessionNotify();
     stopMetadataUpdates?.();
     disposeMetadata?.();
+    stopCollectionsChanged?.();
+    disposeCollections?.();
     window.removeEventListener("keydown", onGlobalKeydown, true);
     for (const unregister of unregisterKeys.splice(0)) {
       unregister();
@@ -1307,6 +1594,24 @@
   const sortValue = $derived(summaryNow()?.sort ?? "name");
 
   const focusInfo = $derived(focusItem());
+
+  /** コレクション内メモの編集可否 (manual表示 + Asset確定 + フォーカス)。 */
+  const collectionMemoContext = $derived.by(() => {
+    const collection = activeCollection;
+    const item = focusInfo;
+    if (collection === null || collection.kind !== "manual" || item === null) {
+      return null;
+    }
+    return item.dbState === "asset" ? collection.name : null;
+  });
+
+  const focusCollectionNote = $derived.by(() => {
+    const item = focusInfo;
+    if (collectionMemoContext === null || item === null) {
+      return null;
+    }
+    return collectionNotes[item.id] ?? "";
+  });
 </script>
 
 <div class="app-shell">
@@ -1383,6 +1688,11 @@
           libraryMode={catalogSource === "library"}
           onSelect={(path) => void selectFolder(path)}
         />
+        <CollectionsPane
+          store={collectionsStore}
+          activeCollectionId={activeCollection?.id ?? null}
+          onSelect={(collection) => void showCollection(collection)}
+        />
         <LibraryPanel
           {library}
           roots={libraryRoots}
@@ -1403,7 +1713,25 @@
     <section class="center-pane">
       <div class="toolbar">
         <nav class="breadcrumb" aria-label="現在場所">
-          {#if catalogSource === "library"}
+          {#if activeCollection !== null}
+            <span class="coll-current">
+              <span class="coll-current-kind" aria-hidden="true">
+                {activeCollection.kind === "smart" ? "✦" : "▤"}
+              </span>
+              コレクション「{activeCollection.name}」
+              <span class="coll-current-count">
+                ({activeCollection.item_count.toLocaleString()}件
+                {activeCollection.kind === "smart" ? "・評価結果" : ""})
+              </span>
+            </span>
+            <button
+              class="crumb"
+              title="通常のライブラリ表示へ戻る"
+              onclick={() => void exitCollection()}
+            >
+              閉じる
+            </button>
+          {:else if catalogSource === "library"}
             <span class="crumb-current">ライブラリ (登録ルート全体)</span>
           {:else}
             {#each crumbs as crumb, index (crumb.path)}
@@ -1414,17 +1742,80 @@
             {/each}
           {/if}
         </nav>
-        <label class="sort-label">
-          ソート
-          <select
-            value={sortValue}
-            onchange={(event) => onSortChange(event.currentTarget.value as CatalogSort)}
-          >
-            <option value="name">名前</option>
-            <option value="date_desc">更新日時</option>
-            <option value="size_desc">容量</option>
-          </select>
-        </label>
+        {#if activeCollection === null}
+          <label class="sort-label">
+            ソート
+            <select
+              value={sortValue}
+              onchange={(event) => onSortChange(event.currentTarget.value as CatalogSort)}
+            >
+              <option value="name">名前</option>
+              <option value="date_desc">更新日時</option>
+              <option value="size_desc">容量</option>
+            </select>
+          </label>
+        {:else if activeCollection.kind === "manual"}
+          <span class="collection-tools" role="group" aria-label="コレクション内の並び替え">
+            <button
+              disabled={collectionBusy || gridSelection.ids.length === 0}
+              title="選択項目をコレクションの先頭へ移動"
+              onclick={() => void moveSelectedInCollection("front")}
+            >
+              選択を先頭へ
+            </button>
+            <button
+              disabled={collectionBusy || gridSelection.ids.length === 0}
+              title="選択項目をコレクションの末尾へ移動"
+              onclick={() => void moveSelectedInCollection("back")}
+            >
+              選択を末尾へ
+            </button>
+            <span class="position-move">
+              <input
+                type="number"
+                min="1"
+                placeholder="位置"
+                aria-label="移動先の位置 (1-based)"
+                value={collectionPositionInput}
+                oninput={(event) => (collectionPositionInput = event.currentTarget.value)}
+                onkeydown={(event) => {
+                  if (event.key === "Enter") {
+                    void moveSelectedInCollection("position");
+                  }
+                }}
+              />
+              <button
+                disabled={collectionBusy || gridSelection.ids.length === 0}
+                title="選択項目を指定位置へ移動"
+                onclick={() => void moveSelectedInCollection("position")}
+              >
+                へ移動
+              </button>
+            </span>
+            <button
+              disabled={collectionBusy || gridSelection.ids.length === 0}
+              title="選択項目をこのコレクションから除外 (元画像は影響しません)"
+              onclick={() => void removeSelectedFromCollection()}
+            >
+              コレクションから除外
+            </button>
+          </span>
+        {:else}
+          <span class="collection-tools" role="group" aria-label="スマートコレクション操作">
+            <button
+              disabled={collectionBusy}
+              title="検索条件を再評価して内容を更新 (評価・タグ等の変更後)"
+              onclick={() => void refreshActiveSmartCollection()}
+            >
+              再評価
+            </button>
+          </span>
+        {/if}
+        {#if activeCollection !== null}
+          <button class="export-entry" disabled title="エクスポートはWP-14で実装予定です">
+            エクスポート…
+          </button>
+        {/if}
         <div class="toolbar-spacer"></div>
         <label class="size-label" title="サムネイルサイズ">
           サイズ
@@ -1472,6 +1863,9 @@
       {/if}
       {#if folderNotice}
         <p class="toolbar-notice error">{folderNotice}</p>
+      {/if}
+      {#if collectionNotice}
+        <p class="toolbar-notice error" role="status">{collectionNotice}</p>
       {/if}
 
       <div class="grid-wrap">
@@ -1545,6 +1939,14 @@
           suggestTags={(prefix) => metadata.suggestTags(prefix)}
           undoLabel={undoLabel}
           bulkTargetIds={gridSelection.ids}
+          collectionMemoContext={collectionMemoContext}
+          collectionMemoNote={focusCollectionNote}
+          onSaveCollectionMemo={(note) => {
+            const item = focusInfo;
+            if (item !== null) {
+              void saveCollectionMemo(item.id, note);
+            }
+          }}
         />
       </aside>
     {/if}
@@ -1569,6 +1971,14 @@
     y={contextMenu.y}
     actions={contextMenu.actions}
     onClose={() => (contextMenu = null)}
+  />
+{/if}
+
+{#if collectionPickerFor !== null}
+  <CollectionPicker
+    store={collectionsStore}
+    assetIds={collectionPickerFor}
+    onClose={() => (collectionPickerFor = null)}
   />
 {/if}
 
@@ -1746,6 +2156,46 @@
 
   .crumb-current {
     font-weight: bold;
+  }
+
+  .coll-current {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    font-weight: bold;
+  }
+
+  .coll-current-kind {
+    color: light-dark(#0969da, #58a6ff);
+  }
+
+  .coll-current-count {
+    font-weight: normal;
+    font-size: 0.72rem;
+    color: light-dark(#57606a, #8b949e);
+  }
+
+  .collection-tools {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    flex-wrap: wrap;
+  }
+
+  .position-move {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.2rem;
+  }
+
+  .position-move input {
+    width: 4.5rem;
+    font: inherit;
+    font-size: 0.78rem;
+  }
+
+  .export-entry:disabled {
+    opacity: 0.55;
   }
 
   .crumb-sep {

@@ -162,8 +162,8 @@ pub(crate) fn parse_stable_asset_ids(
     Ok(out)
 }
 
-/// 現在のカタログモードを読む。
-fn current_mode(state: &AppState) -> CatalogMode {
+/// 現在のカタログモードを読む (collections.rsのWP-6ガードからも使用)。
+pub(crate) fn current_mode(state: &AppState) -> CatalogMode {
     lock(&state.catalog).mode()
 }
 

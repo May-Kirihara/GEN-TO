@@ -42,7 +42,13 @@ export type SessionOriginDetail =
       folderPath: string;
       sort: CatalogSortValue;
     }
-  | { kind: "library" };
+  | { kind: "library" }
+  | {
+      /** コレクション表示から開始 (WP-6。spec §9.3)。再開時は同一
+       * コレクションを再表示してからID解決する。 */
+      kind: "collection";
+      collectionId: string;
+    };
 
 export type PersistedSession = {
   v: 1;
@@ -91,6 +97,13 @@ function parseOriginDetail(
   const kind = (value as Record<string, unknown>)["kind"];
   if (kind === "library") {
     return { kind: "library" };
+  }
+  if (kind === "collection") {
+    const collectionId = (value as Record<string, unknown>)["collectionId"];
+    if (typeof collectionId !== "string" || collectionId.length === 0) {
+      return null;
+    }
+    return { kind: "collection", collectionId };
   }
   if (kind !== "adhoc-folder" && kind !== "adhoc-selection") {
     return null;
@@ -172,7 +185,9 @@ export function planAdhocResume(
   current: ResumeCurrentState,
 ): ResumePlan {
   const detail = persisted.detail;
-  if (detail === null || detail.kind === "library") {
+  if (detail === null || detail.kind === "library" || detail.kind === "collection") {
+    // collection由来のIDはstable AssetIdのためフォルダ復元は不要
+    // (コレクション再表示はAppのresumeSessionが行う)
     return { action: "resume" };
   }
   const sameFolder =

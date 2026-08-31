@@ -305,3 +305,10 @@
     api-contract §29参照)。
   - 注: ルートCargo.tomlは変更せず `crates/gento-core/Cargo.toml` へ直付け
     (workspace.dependenciesは共有crateのみ。単一crate利用のため)。
+
+### WP-6 追加 (PM補記 2026-08-31)
+
+- **`serde_json`** (gento-core、通常依存) — SmartQuery条件JSONの直列化/検証のため。
+  - 入手元: crates.io (serde-json)。workspaceに既存 (gento-db等が使用済み) のため
+    gento-coreへ直付け。新規外部依存なし。
+  - license: MIT OR Apache-2.0。native依存なし。全対応プラットフォーム。

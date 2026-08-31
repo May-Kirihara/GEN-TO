@@ -43,8 +43,20 @@ export type DevBridgeStores = {
   getSessionNotice: () => string;
   /** WP-5: メタデータ編集状態 (InfoPanel詳細・undo・高速選別)。 */
   getMeta: () => MetaLike | null;
+  /** WP-6: コレクション状態 (E2E検証用)。 */
+  getCollections: () => CollectionsLike | null;
   /** WP-7: invoke (エラー注入など)。App.svelteのcore invokeを流用。 */
   invoke: <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
+};
+
+/** WP-6: コレクション状態の読み出し口 (E2E検証用)。 */
+export type CollectionsLike = {
+  /** 表示中コレクション (null=非表示)。 */
+  active: { id: string; kind: string; name: string; itemCount: number } | null;
+  /** 一覧 (id昇順 = 作成順)。 */
+  list: Array<{ id: string; kind: string; name: string; itemCount: number }>;
+  /** 表示中フォーカス項目のコレクション内メモ (未編集・対象外はnull)。 */
+  focusMemo: string | null;
 };
 
 /** WP-5: メタデータ編集状態の読み出し口 (E2E検証用)。 */
@@ -356,6 +368,8 @@ export function installDevBridge(stores: DevBridgeStores): void {
   };
 
   let injectionState = 0; // 0=none 1=decode0.30 2=cache_write0.30
+  // WP-6 E2E: コレクションコマンドモード (ctrl+shift+F1でトグル)
+  let collCmdMode = false;
 
   const actions: Record<string, () => void> = {
     // WP-4計測: WebViewのlocalStorage (レイアウト・フォルダ・セッション状態) を
@@ -485,6 +499,72 @@ export function installDevBridge(stores: DevBridgeStores): void {
     focusCell0: () => clickCell(0),
     focusCell1: () => clickCell(1),
     focusCell2: () => clickCell(2),
+    // WP-6 E2E: コレクション (本物のDOM要素 → 生産経路で駆動)
+    /** 「+ 手動」フォームを開き名前入力へフォーカス (xdotool typeの着地)。 */
+    collCreateManualForm: () => {
+      clickButton("+ 手動");
+      setTimeout(() => {
+        document.querySelector<HTMLInputElement>(".coll-create .coll-name-input")?.focus();
+      }, 100);
+    },
+    /** 「+ スマート」フォームを開き名前入力へフォーカス (既定条件=評価≥4)。 */
+    collCreateSmartForm: () => {
+      clickButton("+ スマート");
+      setTimeout(() => {
+        document.querySelector<HTMLInputElement>(".coll-create .coll-name-input")?.focus();
+      }, 100);
+    },
+    /** 次のコレクションを表示 (活性の次。非表示時は最初。一覧末尾で先頭へ戻る)。 */
+    collShowNext: () => {
+      const labels = Array.from(
+        document.querySelectorAll<HTMLButtonElement>(".coll-list .coll-label"),
+      );
+      if (labels.length === 0) {
+        return;
+      }
+      const state = stores.getCollections();
+      const activeId = state?.active?.id ?? null;
+      const activeIndex =
+        activeId === null ? -1 : (state?.list.findIndex((c) => c.id === activeId) ?? -1);
+      labels[(activeIndex + 1) % labels.length]?.click();
+    },
+    /** cell0でコンテキストメニューを開く (コレクションへ追加の導線)。 */
+    contextMenuCell0: () => {
+      cellAt(0)?.dispatchEvent(
+        new MouseEvent("contextmenu", { bubbles: true, cancelable: true }),
+      );
+    },
+    /** 開いたコンテキストメニューの「コレクションへ追加…」をクリック。 */
+    clickCollMenuAdd: () => {
+      const item = Array.from(
+        document.querySelectorAll<HTMLButtonElement>(".context-menu button"),
+      ).find((b) => (b.textContent ?? "").startsWith("コレクションへ追加"));
+      item?.click();
+    },
+    /** ピッカーの最初の既存コレクションへ追加。 */
+    pickerPickFirst: () => {
+      document.querySelector<HTMLButtonElement>(".picker-row")?.click();
+    },
+    /** ピッカーの新規コレクション名入力へフォーカス。 */
+    focusPickerNewInput: () => {
+      document.querySelector<HTMLInputElement>(".picker-new input")?.focus();
+    },
+    /** 「選択を先頭へ」ボタン (manual表示中の並び替え)。 */
+    collMoveFront: () => clickButton("選択を先頭へ"),
+    /** 「選択を末尾へ」ボタン。 */
+    collMoveBack: () => clickButton("選択を末尾へ"),
+    /** スマート「再評価」ボタン。 */
+    collRefresh: () => clickButton("再評価"),
+    /** コレクション内メモのtextareaへフォーカス。 */
+    focusCollectionMemo: () => {
+      document.querySelector<HTMLTextAreaElement>('[data-meta="collection-memo"] textarea')
+        ?.focus();
+    },
+    collSaveMemo: () => {
+      document
+        .querySelector<HTMLButtonElement>('[data-meta="collection-memo"] .caption-controls button')
+        ?.click();
+    },
     // QA-WP4: ツリー行クリック (xdotoolポインタが環境により不安定なため
     // 本物のtree-labelボタンをDOM clickで駆動。selectFolder→open_folder
     // の生産経路を通る)
@@ -582,6 +662,24 @@ export function installDevBridge(stores: DevBridgeStores): void {
         ` foc=${sel?.focusIndex ?? -1} fn=${focusItem?.displayName ?? "-"}` +
         ` k=${keep} r=${reject} u=${undecided}` +
         ` note=${stores.getSessionNotice().slice(0, 48)}`,
+    ];
+  }
+
+  /** WP-6: コレクション状態行 (E2Eの機械検証用。比較表示C行と区別するためCL接頭辞)。 */
+  function collectionLines(): string[] {
+    const collections = stores.getCollections();
+    if (collections === null) {
+      return [];
+    }
+    const a = collections.active;
+    const exportButtons = document.querySelectorAll("button.export-entry[disabled]").length;
+    const picker = document.querySelectorAll(".picker").length;
+    return [
+      `CL n=${collections.list.length} act=${a === null ? "-" : a.id}` +
+        ` kind=${a === null ? "-" : a.kind === "smart" ? "s" : "m"}` +
+        ` cnt=${a?.itemCount ?? -1} memo=${collections.focusMemo === null ? "-" : "1"}` +
+        ` exp=${exportButtons} pick=${picker} cmd=${collCmdMode ? 1 : 0}` +
+        ` list=${collections.list.map((c) => `${c.kind === "smart" ? "s" : "m"}${c.itemCount}`).join(",")}`,
     ];
   }
 
@@ -697,7 +795,15 @@ export function installDevBridge(stores: DevBridgeStores): void {
           ` sw=${c.stats.swaps} creq=${c.stats.requests}`,
       );
     }
-    lines.push(...gridLines(), ...thumbLines(), ...perfLines(), ...uiLines(), ...sessionLines(), ...metaLines());
+    lines.push(
+      ...gridLines(),
+      ...thumbLines(),
+      ...perfLines(),
+      ...uiLines(),
+      ...sessionLines(),
+      ...metaLines(),
+      ...collectionLines(),
+    );
     if (!lines.some((line) => line.startsWith("V ") || line.startsWith("C "))) {
       lines.push("idle (viewer closed)");
     }
@@ -724,10 +830,50 @@ export function installDevBridge(stores: DevBridgeStores): void {
   window.addEventListener(
     "keydown",
     (event) => {
-      if (!event.key.startsWith("F") || event.altKey) {
+      // WP-6 E2E: コレクションコマンドモード (ctrl+shift+F1で入る)。
+      // モード中の数字/記号キーは**1回のアクション実行で自動退出**する
+      // (モーメンタリ方式 — モード残留による入力食いを構造的に防ぐ。
+      // 3修飾キーctrl+shift+altはWM/WebKitへ到達しないための代替チャネル)。
+      if (collCmdMode) {
+        const collKeys: Record<string, string> = {
+          "1": "collCreateManualForm",
+          "2": "collCreateSmartForm",
+          "3": "collShowNext",
+          "4": "contextMenuCell0",
+          "5": "clickCollMenuAdd",
+          "6": "pickerPickFirst",
+          "7": "focusPickerNewInput",
+          "8": "collMoveFront",
+          "9": "collMoveBack",
+          "0": "collRefresh",
+          m: "focusCollectionMemo",
+          s: "collSaveMemo",
+        };
+        const action = collKeys[event.key];
+        if (action !== undefined) {
+          actions[action]?.();
+        }
+        collCmdMode = false;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        setTimeout(dump, 600);
+        return;
+      }
+      if (!event.key.startsWith("F")) {
         return;
       }
       const key = event.key;
+      // WP-6 E2E: コマンドモードのトグル本体。
+      if (event.ctrlKey && event.shiftKey && !event.altKey && key === "F1") {
+        collCmdMode = true;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        setTimeout(dump, 300);
+        return;
+      }
+      if (event.altKey) {
+        return;
+      }
       let handled = true;
       // WP-5 E2E: ctrl+shift+F2..F8 はメタデータ編集の着地フォーカス等。
       // 未割り当てなら通常割り当て (F9..F12のctrl+shift) へ落とす

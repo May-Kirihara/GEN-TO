@@ -138,6 +138,10 @@ export class GridStore {
       this.failures.clear();
       this.pending.clear();
       this.version++;
+      // generation変化でページキャッシュがクリアされるため、可視範囲を
+      // 再取得する (スクロールを伴わない内容差替 — ソート変更・コレクション
+      // 並び替え等でvirtualizerがrangeを再通知しない場合の追随。WP-6で顕在化)
+      this.refetchVisibleAfterReset();
     };
   }
 
@@ -283,6 +287,22 @@ export class GridStore {
     const start = Math.max(0, range.start) * columns;
     const end = Math.min(this.pager.total - 1, (range.end + 1) * columns - 1);
     return { start, end };
+  }
+
+  /**
+   * ページキャッシュクリア後の可視範囲再取得 (onResetから呼ぶ)。
+   * ensureRangeの完了通知でUI (gridTick) が進み、staleなセル表示が
+   * 新しいカタログ内容へ置き換わる。
+   */
+  private refetchVisibleAfterReset(): void {
+    const snapshot = this.pendingViewport;
+    if (snapshot === null) {
+      return;
+    }
+    const indexRange = this.rowRangeToIndices(snapshot.range, snapshot.columns);
+    void this.pager.ensureRange(indexRange.start, indexRange.end).then(() => {
+      this.notify();
+    });
   }
 
   private async fireDemand(): Promise<void> {

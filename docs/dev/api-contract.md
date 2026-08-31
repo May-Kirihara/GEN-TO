@@ -1288,3 +1288,138 @@ type ImageListItem = {
 - dev bridge: `M` 行 (編集可否・rating・triage・favorite・タグ数・undo残数・
   高速選別モード) と操作アクション (`metaRate5`・`metaPick`・`metaReject`・
   `metaUndo`・`metaBulkConfirm`・`metaToggleTriage`・`pressKey0/3/5/X/P`) を追加
+
+## 34. Commands (WP-6: コレクション)
+
+コレクションIDは10進文字列 (collections行ID。AssetIdとは別物)。
+stable AssetIdを受け取るcommandはWP-5と同じガード (Library表示 + 仮ID拒否)。
+すべて**fs無操作** (コレクションは仮想分類。spec §7)。
+
+### `collections_list` / `collection_create` / `collection_rename` / `collection_delete`
+
+```ts
+invoke<CollectionDto[]>("collections_list")
+invoke<CollectionDto>("collection_create", { name: string })
+invoke<CollectionDto>("collection_rename", { collectionId: string, name: string })
+invoke<null>("collection_delete", { collectionId: string })
+```
+
+- `CollectionDto`: `{ id, uuid, name, kind: "manual"|"smart",
+  query_json?: string, item_count: number, created_at, updated_at }`
+  (snake_case — WP-5委任仕様系と同じ表記規約)。
+- `item_count` は manual=項目数 / smart=**評価結果の現在件数** (list時点)。
+- **同名許可** (識別はuuid。WP-6の確定方針)。名前はtrim、空は日本語エラー。
+- 削除はitemsごと (CASCADE)。表示中だった場合はbackendが通常ライブラリ
+  表示へ戻す (`catalog:changed`)。
+
+### manual項目操作
+
+```ts
+invoke<null>("collection_add_items", { collectionId: string, ids: string[] })  // stable AssetId
+invoke<null>("collection_remove_item", { collectionId: string, assetId: string })
+invoke<null>("collection_reorder", { collectionId: string, assetIds: string[] })  // 全順序送り
+invoke<CollectionItemsDto>("collection_items", { collectionId: string, offset?: number, limit?: number })
+invoke<CollectionItemDto>("collection_set_item_note", { collectionId: string, assetId: string, note: string | null })
+```
+
+- 追加は末尾 (position=追加前の件数)。既存含めは冪等スキップ。
+  1トランザクション (不在asset混入でロールバック)。
+- **positionは常時0開始連番**: 削除で詰め、reorderで0から振り直し。
+  reorderは現在の項目集合と完全一致が必要 (部分更新は`Constraint`エラー)。
+- `CollectionItemDto`: `{ asset_id, position, note? }`。
+- 同じAssetを複数コレクションへ追加可能 (受入条件2)。
+
+### スマートコレクション
+
+```ts
+invoke<CollectionDto>("smart_collection_create", { name: string, queryJson: string })
+invoke<CollectionDto>("smart_collection_update", { collectionId: string, name: string, queryJson: string })
+invoke<SmartItemsDto>("smart_collection_items", { collectionId: string, offset?: number, limit?: number })
+invoke<CollectionDto>("smart_collection_refresh", { collectionId: string })
+```
+
+- `queryJson` は§35のschemaを厳密検証 (不正JSON・未知条件型・余分/欠落
+  フィールド・値域外は日本語エラー)。保存時は正規形 (has_tag名正規化)。
+- `SmartItemsDto`: `{ total, asset_ids: string[] }` (id昇順)。
+- manualコレクションへのsmart操作 (update/refresh) はエラー。
+
+### `collection_show` (中央グリッド表示)
+
+```ts
+invoke<CatalogSummary>("collection_show", { collectionId: string })
+```
+
+- manual=position順 / smart=**表示時評価** のレコードでLibraryモード表示を
+  置き換える (generation進行 + `catalog:changed` reason=`collection_switch`)。
+- 表示できないasset (presentなFileを持たない) はビューから除外される
+  (件数 item_count は保持)。
+- コレクション表示中は `set_catalog_sort` が拒否される
+  (並び順の正本はコレクション)。ソース切替 (`set_catalog_source`) で
+  コレクション表示は終了し通常表示へ復帰する。
+
+## 35. query_json schema (WP-6時点の確定形)
+
+```json
+{
+  "conditions": [
+    { "type": "rating_ge",  "value": 4 },
+    { "type": "cull_state", "value": "picked" },
+    { "type": "favorite",   "value": true },
+    { "type": "has_tag",    "name": "sky" },
+    { "type": "mime_type",  "value": "image/png" }
+  ]
+}
+```
+
+- トップレベルは `conditions` 配列のみ (未知キー拒否 — WP-8の検索AST接続時に
+  version付きで拡張)。条件は**AND結合**・順序保存。空配列=全Asset。
+- `rating_ge`: 整数0..=5 / `cull_state`: "unselected"|"picked"|"rejected" /
+  `favorite`: 真偽値 / `has_tag`: タグ名 (保存時に`normalize_tag_name`で正規化) /
+  `mime_type`: 非空文字列 (assets.mime_type完全一致)
+- **SQL文はユーザーデータとして保存しない** (受入条件4)。条件→SQLは
+  gento-db実装が固定断片+パラメータバインドのみで構築する。
+
+## 36. Events (WP-6)
+
+### `collections:changed` — コレクション変更通知 (左ペイン更新用)
+
+```ts
+type CollectionsChangedEvent = {
+  reason: "created" | "renamed" | "deleted" | "items" | "query" | "refreshed";
+  collection_id?: string;
+};
+```
+
+### `catalog:changed` のreason追加
+
+- `collection_switch`: コレクション表示の開始・切替
+- `collection_refresh`: 表示中コレクションの再評価・項目変更反映
+
+## 37. 明示refresh設計 (二重反映防止。WP-6)
+
+`asset:updated` (WP-5) が発生してもスマートコレクションの内容は**自動再評価
+しない**。再評価は (1) `smart_collection_refresh` の明示呼び出し、
+(2) 次の `collection_show` (表示時評価) のみ。メタデータ編集 → スマート再評価
+→ (将来の) 再索引化…というトリガー連鎖を避けるための設計。
+編集済み項目のバッジ等は `patch_library_assets` のin-placeパッチでコレクション
+ビューにも反映される (membershipの変化のみ明示refresh)。
+
+## 38. フロントエンド実装 (WP-6。commandではなくWebView側)
+
+- `lib/collections.ts`: CollectionsStore (IPCラップ + `collections:changed`購読
+  で一覧自動再取得) + 条件ビルダー純粋関数 (`buildQueryJson` /
+  `parseQueryJson` / `planReorder` — vitest対象)
+- 左ペイン `CollectionsPane.svelte`: manual/smart区別アイコン・件数・作成
+  (manual=名前入力 / smart=最小条件ビルダー: 評価≥/選別/お気に入り/タグ/形式
+  のドロップダウン+値、AND結合のみ)・改名・削除・再評価
+- `CollectionPicker.svelte`: グリッドのコンテキストメニュー「コレクションへ
+  追加…」から開くピッカー (既存へ追加 / 新規作成して追加)
+- コレクション表示中のツールバー: manual=「選択を先頭/末尾/位置入力へ移動」
+  「コレクションから除外」/ smart=「再評価」/ 共通=エクスポート入口
+  (無効 + 「WP-14で実装」表示)
+- InfoPanel: 表示中manualコレクションのフォーカス項目に「コレクション内メモ」
+- 選別セッション: `SessionOriginDetail` に `collection` kindを追加
+  (再開時に対象コレクションを再表示してからID解決)
+- dev bridge: `CL` 行 (一覧・表示中・メモ・エクスポート入口) とコレクション
+  コマンドモード (ctrl+shift+F1 → 数字キーでアクション1回実行。3修飾キー
+  ctrl+shift+altはWM/WebKitへ到達しないための代替チャネル)

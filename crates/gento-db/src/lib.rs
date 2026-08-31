@@ -46,6 +46,7 @@ use gento_core::library::{AllRepos, RepoStore};
 use gento_core::repo::RepoError;
 use rusqlite::Connection;
 
+mod collections;
 mod diagnose;
 mod ids;
 mod metadata;

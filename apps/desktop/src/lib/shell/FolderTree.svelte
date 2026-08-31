@@ -1,12 +1,12 @@
 <script lang="ts">
   /**
-   * フォルダツリーペイン (MVP WP-4)。
-   *
-   * - FolderTreeStoreの平坦行を描画 (遅延ロード・読み取り不能表示)
-   * - 登録ルート (またはその配下) はバッジ表示
-   * - クリックでフォルダ選択 (Appが登録/未登録でソースを切替)
-   * - コレクション/保存済み検索はWP-6/8のプレースホルダ領域
-   */
+    * フォルダツリーペイン (MVP WP-4)。
+    *
+    * - FolderTreeStoreの平坦行を描画 (遅延ロード・読み取り不能表示)
+    * - 登録ルート (またはその配下) はバッジ表示
+    * - クリックでフォルダ選択 (Appが登録/未登録でソースを切替)
+    * - コレクション領域はWP-6でCollectionsPaneへ分離 (Appの左ペイン参照)
+    */
   import { onDestroy } from "svelte";
   import type { FolderTreeStore } from "../fsview";
   import { registeredStateFor } from "../fsview";
@@ -118,21 +118,16 @@
   {#if libraryMode}
     <p class="tree-note">ライブラリ表示中 (登録ルート全体)</p>
   {/if}
-
-  <div class="tree-placeholder">
-    <h3>コレクション</h3>
-    <p class="placeholder-note">WP-6で実装予定</p>
-    <h3>保存済み検索</h3>
-    <p class="placeholder-note">WP-8で実装予定</p>
-  </div>
 </div>
 
 <style>
   .tree-pane {
     display: flex;
     flex-direction: column;
-    height: 100%;
-    min-height: 0;
+    /* 左ペインはFolderTree + CollectionsPane + LibraryPanelの3子なので
+     * height:100%でなくflex配分にする (WP-6)。 */
+    flex: 1 1 auto;
+    min-height: 6rem;
   }
 
   .tree-scroll {
@@ -232,21 +227,5 @@
     margin: 0.25rem 0.5rem;
     font-size: 0.75rem;
     color: light-dark(#57606a, #8b949e);
-  }
-
-  .tree-placeholder {
-    border-top: 1px solid light-dark(#d0d7de, #30363d);
-    padding: 0.5rem 0.75rem;
-  }
-
-  .tree-placeholder h3 {
-    font-size: 0.8rem;
-    margin: 0.4rem 0 0.15rem;
-  }
-
-  .placeholder-note {
-    margin: 0;
-    font-size: 0.75rem;
-    color: light-dark(#8b949e, #6e7681);
   }
 </style>

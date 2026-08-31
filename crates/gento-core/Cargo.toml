@@ -12,6 +12,9 @@ devtools = []
 
 [dependencies]
 serde = { workspace = true }
+# スマートコレクション条件JSON (query_json) の直列化・解析 (MVP WP-6)。
+# workspace共有依存 (gento-db等と同pin) のため新規外部依存ではない。
+serde_json = { workspace = true }
 # タグ正規化名のNFC正規化 (WP-5。docs/dev/dependency-notes.md参照)。
 # workspace共有ではなく単一crate依存として直付け。
 unicode-normalization = "=0.1.25"

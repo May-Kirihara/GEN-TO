@@ -632,7 +632,7 @@ impl FileRepo for SqliteRepos<'_> {
 }
 
 /// JOINクエリ用: files列をエイリアス付きで読む (map_fileと同意味)。
-fn map_file_prefixed(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
+pub(crate) fn map_file_prefixed(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
     let rel_bytes: Vec<u8> = row.get("rel_path")?;
     let scan_state_str: String = row.get("scan_state")?;
     let scan_state = scan_state_from_db_value(&scan_state_str)?;
@@ -659,7 +659,7 @@ fn map_file_prefixed(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
 }
 
 /// JOINクエリ用: assets列をエイリアス付きで読む (map_assetと同意味)。
-fn map_asset_prefixed(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord> {
+pub(crate) fn map_asset_prefixed(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord> {
     let triage_str: String = row.get("triage")?;
     let hash_state_str: String = row.get("hash_state")?;
     let triage = match triage_str.as_str() {
