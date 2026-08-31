@@ -41,6 +41,8 @@ function makePage(offset: number, count: number, total: number, generation: numb
     mtimeMs: 1000 + offset + i,
     mimeType: "image/png",
     dbState: "adhoc" as const,
+    rating: 0,
+    favorite: false,
     triage: "undecided" as const,
   }));
   return { generation, total, offset, items, has_more: offset + count < total };
@@ -276,5 +278,55 @@ describe("CatalogPager", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("CatalogPager.patchItems (WP-5: asset:updatedの局所反映)", () => {
+  it("キャッシュ済み項目をin-placeで書き換え、未取得分は0件のまま", async () => {
+    const calls: InvokeCall[] = [];
+    const pages = new Map<number, CatalogPage>([
+      [0, makePage(0, 200, 50_000, 1)],
+      [200, makePage(200, 200, 50_000, 1)],
+    ]);
+    const pager = new CatalogPager(makeIpc(pages, calls));
+    pager.reset(1, 50_000);
+    await pager.ensureRange(0, 5);
+    expect(pager.getItem(0)?.triage).toBe("undecided");
+
+    const patched = pager.patchItems(new Set(["0", "5", "999999"]), {
+      triage: "keep",
+      rating: 4,
+      favorite: true,
+    });
+    // 0と5 (未取得の999999は対象外)
+    expect(patched).toBe(2);
+    const item = pager.getItem(0);
+    expect(item?.triage).toBe("keep");
+    expect(item?.rating).toBe(4);
+    expect(item?.favorite).toBe(true);
+    // 別セル (id=5) も一括更新される。未取得ページのID (999999) は対象外
+    expect(pager.getItem(5)?.triage).toBe("keep");
+  });
+
+  it("空パッチ・空ID集合は何もしない", async () => {
+    const pages = new Map<number, CatalogPage>([[0, makePage(0, 10, 10, 1)]]);
+    const pager = new CatalogPager(makeIpc(pages, []));
+    pager.reset(1, 10);
+    await pager.ensureRange(0, 0);
+    expect(pager.patchItems(new Set(["0"]), {})).toBe(0);
+    expect(pager.patchItems(new Set(), { rating: 5 })).toBe(0);
+  });
+
+  it("部分パッチは指定フィールドのみ更新する", async () => {
+    const pages = new Map<number, CatalogPage>([[0, makePage(0, 10, 10, 1)]]);
+    const pager = new CatalogPager(makeIpc(pages, []));
+    pager.reset(1, 10);
+    await pager.ensureRange(0, 0);
+    pager.patchItems(new Set(["3"]), { favorite: true });
+    const item = pager.getItem(3);
+    expect(item?.favorite).toBe(true);
+    // 未指定フィールドは不変
+    expect(item?.rating).toBe(0);
+    expect(item?.triage).toBe("undecided");
   });
 });

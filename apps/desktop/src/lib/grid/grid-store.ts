@@ -10,7 +10,7 @@
  * Svelte 5の `$state` はクラスインスタンスを深くプロキシしないため、
  * UI側は onChange でローカル $state 変数へ同期する (WP-2の教訓)。
  */
-import type { CatalogSummary } from "../catalog-types";
+import type { CatalogSummary, ImageListItem } from "../catalog-types";
 import type {
   CancelThumbnailResult,
   RequestAccepted,
@@ -221,6 +221,21 @@ export class GridStore {
 
   getItem(index: number) {
     return this.pager.getItem(index);
+  }
+
+  /**
+   * `asset:updated` 由来のローカル項目パッチ (WP-5)。
+   * キャッシュ済みページの該当項目を書き換え、版を進めてセル再描画させる。
+   */
+  applyItemPatch(
+    ids: ReadonlySet<string>,
+    patch: Partial<Pick<ImageListItem, "rating" | "triage" | "favorite">>,
+  ): void {
+    const patched = this.pager.patchItems(ids, patch);
+    if (patched > 0) {
+      this.version++;
+      this.notify();
+    }
   }
 
   /** ready地図からプロトコルURLを構成する (未生成はnull)。 */

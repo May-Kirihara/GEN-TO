@@ -1363,6 +1363,15 @@ mod tests {
                 .find(|a| a.content_hash == hash)
                 .cloned())
         }
+        fn get_asset(&self, asset_id: i64) -> Result<Option<AssetRecord>, RepoError> {
+            Ok(self
+                .assets
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|a| a.id == asset_id)
+                .cloned())
+        }
         fn link_file(&self, file_id: i64, asset_id: i64) -> Result<(), RepoError> {
             let mut files = self.files.lock().unwrap();
             let record = files
@@ -1377,6 +1386,58 @@ mod tests {
                 return Ok((existing, false));
             }
             Ok((self.create_asset(asset)?, true))
+        }
+        fn set_rating(&self, asset_id: i64, rating: u8) -> Result<(), RepoError> {
+            if rating > 5 {
+                return Err(RepoError::Constraint("rating must be 0..=5".to_string()));
+            }
+            let mut assets = self.assets.lock().unwrap();
+            let record = assets
+                .iter_mut()
+                .find(|a| a.id == asset_id)
+                .ok_or(RepoError::NotFound)?;
+            record.rating = rating;
+            Ok(())
+        }
+        fn set_cull_state(&self, asset_id: i64, triage: TriageState) -> Result<(), RepoError> {
+            let mut assets = self.assets.lock().unwrap();
+            let record = assets
+                .iter_mut()
+                .find(|a| a.id == asset_id)
+                .ok_or(RepoError::NotFound)?;
+            record.triage = triage;
+            Ok(())
+        }
+        fn set_favorite(&self, asset_id: i64, favorite: bool) -> Result<(), RepoError> {
+            let mut assets = self.assets.lock().unwrap();
+            let record = assets
+                .iter_mut()
+                .find(|a| a.id == asset_id)
+                .ok_or(RepoError::NotFound)?;
+            record.favorite = favorite;
+            Ok(())
+        }
+        fn set_rating_batch(&self, asset_ids: &[i64], rating: u8) -> Result<(), RepoError> {
+            for id in asset_ids {
+                self.set_rating(*id, rating)?;
+            }
+            Ok(())
+        }
+        fn set_cull_state_batch(
+            &self,
+            asset_ids: &[i64],
+            triage: TriageState,
+        ) -> Result<(), RepoError> {
+            for id in asset_ids {
+                self.set_cull_state(*id, triage)?;
+            }
+            Ok(())
+        }
+        fn set_favorite_batch(&self, asset_ids: &[i64], favorite: bool) -> Result<(), RepoError> {
+            for id in asset_ids {
+                self.set_favorite(*id, favorite)?;
+            }
+            Ok(())
         }
     }
 

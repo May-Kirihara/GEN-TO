@@ -1,14 +1,17 @@
 <script lang="ts">
   /**
-   * 2枚・4枚比較のオーバーレイ (WP-6 / フェーズ7、spec §9.4)。
-   *
-   * - レイアウト: 2枚=横並び50/50、4枚=2x2
-   * - 操作: クリック/1〜4/Tab=アクティブスロット、ドラッグ/ホイール=パン・ズーム
-   *   (sync ON→共有状態、OFF/detached→対象スロットのみ)
-   * - s=入れ替え (2枚)、p=昇格、d=一時解除、g=次グループ、b=基準固定、f=fit、Esc=閉じる
-   * - 各スロットは旧画像保持レイヤーを持つ (URL差し替えで空白を出さない)
-   * - 同期パン中はrAFのフレーム時間を計測する
-   */
+    * 2枚・4枚比較のオーバーレイ (WP-6 / フェーズ7、spec §9.4 + WP-5選別)。
+    *
+    * - レイアウト: 2枚=横並び50/50、4枚=2x2
+    * - 操作: クリック/1〜4/Tab=アクティブスロット、ドラッグ/ホイール=パン・ズーム
+    *   (sync ON→共有状態、OFF/detached→対象スロットのみ)
+    * - s=入れ替え (2枚)、p=昇格、d=一時解除、g=次グループ、b=基準固定、f=fit、Esc=閉じる
+    * - WP-5: 各スロットに採用/除外ボタン。X=アクティブスロット除外、
+    *   K=アクティブスロット採用 (p=昇格と衝突するためK。spec §9.4「1枚または
+    *   複数枚の採用・残り画像の除外」の最小実装)
+    * - 各スロットは旧画像保持レイヤーを持つ (URL差し替えで空白を出さない)
+    * - 同期パン中はrAFのフレーム時間を計測する
+    */
   import { onDestroy, onMount } from "svelte";
   import { toCss } from "../viewer/transform";
   import type { CompareStore } from "./compare-store";
@@ -16,9 +19,12 @@
   let {
     store,
     onClose,
+    onCullSlot,
   }: {
     store: CompareStore;
     onClose: () => void;
+    /** スロット単位の採用/除外 (WP-5。AppがMetadataStoreへ接続)。 */
+    onCullSlot?: (slotIndex: number, value: "picked" | "rejected") => void;
   } = $props();
 
   let overlayEl: HTMLElement | null = $state(null);
@@ -185,6 +191,16 @@
       case "G":
         event.preventDefault();
         void store.nextGroup();
+        break;
+      case "x":
+      case "X":
+        event.preventDefault();
+        onCullSlot?.(store.active, "rejected");
+        break;
+      case "k":
+      case "K":
+        event.preventDefault();
+        onCullSlot?.(store.active, "picked");
         break;
       case "b":
       case "B":
@@ -379,6 +395,26 @@
           {slot.isOriginal ? "[ORIG]" : "[PREV]"}{slot.detached ? " [解除]" : ""}
           {baseNow() === index ? " [基準]" : ""}
         </div>
+        {#if onCullSlot !== undefined}
+          <div class="slot-cull">
+            <button
+              class="cull-pick"
+              onclick={(event) => {
+                event.stopPropagation();
+                onCullSlot(index, "picked");
+              }}
+              title="この画像を採用 (K)"
+            >採用</button>
+            <button
+              class="cull-reject"
+              onclick={(event) => {
+                event.stopPropagation();
+                onCullSlot(index, "rejected");
+              }}
+              title="この画像を除外 (X)"
+            >除外</button>
+          </div>
+        {/if}
         {#if slot.note}
           <div class="note">{slot.note}</div>
         {/if}
@@ -499,6 +535,31 @@
     font-size: 0.7rem;
     white-space: nowrap;
     pointer-events: none;
+  }
+
+  /* WP-5: スロット単位の採用/除外ボタン (右下) */
+  .slot-cull {
+    position: absolute;
+    right: 0.35rem;
+    bottom: 0.35rem;
+    z-index: 2;
+    display: flex;
+    gap: 0.3rem;
+  }
+
+  .slot-cull button {
+    font-size: 0.75rem;
+    padding: 0.1rem 0.55rem;
+  }
+
+  .slot-cull .cull-pick {
+    border-color: light-dark(#1a7f37, #238636);
+    color: light-dark(#1a7f37, #3fb950);
+  }
+
+  .slot-cull .cull-reject {
+    border-color: light-dark(#cf222e, #f85149);
+    color: light-dark(#cf222e, #f85149);
   }
 
   .compare-stats {

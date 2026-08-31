@@ -152,6 +152,11 @@ impl AppState {
 }
 
 impl CatalogInner {
+    /// 現在の稼働モード (WP-5: metadataコマンドのモードガード用)。
+    pub fn mode(&self) -> CatalogMode {
+        self.state.mode
+    }
+
     /// IDからレコードを引く (線形探索。コマンド単位の規模想定)。
     pub fn record(&self, id: AssetId) -> Option<&ImageRecord> {
         self.state.records.iter().find(|r| r.id == id)
@@ -160,6 +165,51 @@ impl CatalogInner {
     /// 表示中カタログのレコード列 (スナップショット抽出用)。
     pub fn records(&self) -> &[ImageRecord] {
         &self.state.records
+    }
+
+    /// ライブラリAssetのメタデータ編集を表示済みレコードへ反映する (WP-5)。
+    ///
+    /// - `inner.library` (DB由来スナップショット) は常に更新
+    /// - `inner.state.records` はLibrary表示中のみ更新 (Real/Virtualの
+    ///   レコードはadhoc採番IDで数値が偶発一致する可能性があるため触らない)
+    /// - `inner.real` (一時走査) は更新しない (同上)
+    ///
+    /// generationを進めない: ページ再取得は不要で、フロントは
+    /// `asset:updated` イベントでローカルコピーを更新する。既存generationの
+    /// ページ取得は更新済みレコードから値を返す。
+    /// テスト用: カタログモードを強制設定する (metadataコマンドの
+    /// Library/Real/Virtualガード検証。productionはset_catalog_source経由)。
+    #[cfg(test)]
+    pub(crate) fn force_mode_for_test(&mut self, mode: CatalogMode) {
+        self.state.mode = mode;
+    }
+
+    /// テスト用: Libraryモード表示レコードとlibraryスナップショットへ
+    /// レコードを追加する (メタデータ編集のin-place反映検証用)。
+    #[cfg(test)]
+    pub(crate) fn push_library_record_for_test(&mut self, record: ImageRecord) {
+        if self.state.mode != CatalogMode::Library {
+            self.state.mode = CatalogMode::Library;
+        }
+        self.state.records.push(record);
+        self.library = self.state.records.clone();
+    }
+
+    pub fn patch_library_assets(&mut self, asset_ids: &[i64], f: impl Fn(&mut ImageRecord)) {
+        use gento_core::library::{decode_library_asset_id, LibraryAssetRef};
+        let wanted: std::collections::HashSet<i64> = asset_ids.iter().copied().collect();
+        let matches = |record: &ImageRecord| match decode_library_asset_id(record.id) {
+            LibraryAssetRef::Asset(row_id) => wanted.contains(&row_id),
+            LibraryAssetRef::ProvisionalFile(_) => false,
+        };
+        for record in self.library.iter_mut().filter(|r| matches(r)) {
+            f(record);
+        }
+        if self.state.mode == CatalogMode::Library && !self.state.scanning {
+            for record in self.state.records.iter_mut().filter(|r| matches(r)) {
+                f(record);
+            }
+        }
     }
 }
 
@@ -221,7 +271,7 @@ pub struct CatalogChangedPayload {
 }
 
 /// poisoning時も内容を復旧扱いにする (走査スレッドpanicでUIが固まらないよう)。
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -524,6 +574,10 @@ pub struct CatalogItemDto {
     pub db_state: ItemDbState,
     /// 選別状態 (WP-4。セッションの採用/除外カウント用。編集UIはWP-5)。
     pub triage: Triage,
+    /// 星評価 0..=5 (WP-5。グリッドセルの星バッジ表示)。
+    pub rating: u8,
+    /// お気に入り (WP-5。グリッドセルの♥バッジ表示)。
+    pub favorite: bool,
 }
 
 /// 項目のDB状態 (WP-4。AssetId符号化 gento-core library に基づく)。
@@ -623,6 +677,8 @@ fn augment_page_with_versions(state: &AppState, page: PageResult) -> CatalogPage
                     mime_type: e.and_then(|e| e.mime_type.clone()),
                     db_state: e.map(|e| e.db_state).unwrap_or(ItemDbState::Adhoc),
                     triage: item.triage,
+                    rating: item.rating,
+                    favorite: item.favorite,
                 }
             })
             .collect(),
@@ -862,6 +918,7 @@ fn run_scan(app: AppHandle, dataset: PathBuf, generation: u64, token: u64) {
                 thumb_state: ThumbnailState::Missing,
                 rating: 0,
                 triage: Triage::Undecided,
+                favorite: false,
             });
             next_id += 1;
         }
@@ -974,6 +1031,7 @@ mod tests {
             thumb_state: ThumbnailState::Missing,
             rating: 0,
             triage: Triage::Undecided,
+            favorite: false,
         }
     }
 
@@ -1199,6 +1257,7 @@ mod tests {
             thumb_state: ThumbnailState::Missing,
             rating: 0,
             triage: Triage::Undecided,
+            favorite: false,
         }
     }
 
@@ -1265,6 +1324,9 @@ mod tests {
                 "mimeType": "image/png",
                 "dbState": "adhoc", // Real (一時走査) モード
                 "triage": "undecided",
+                // WP-5: グリッドバッジ表示用フィールド
+                "rating": 0,
+                "favorite": false,
             })
         );
     }

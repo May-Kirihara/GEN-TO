@@ -435,6 +435,9 @@ pub trait AssetRepo {
 
     fn find_by_hash(&self, content_hash: &str) -> Result<Option<AssetRecord>, RepoError>;
 
+    /// 主キーでAssetを引く (WP-5。asset_detail等の読み取り用)。
+    fn get_asset(&self, asset_id: i64) -> Result<Option<AssetRecord>, RepoError>;
+
     /// File → Asset のリンクを設定する。
     /// FileまたはAssetが存在しない場合は [`RepoError::NotFound`]。
     fn link_file(&self, file_id: i64, asset_id: i64) -> Result<(), RepoError>;
@@ -443,6 +446,28 @@ pub trait AssetRepo {
     /// 戻り値は (Asset, 新規作成か)。[`AssetRepo::create_asset`] の
     /// Duplicate処理 (find→create→競合時再find) を冪等にまとめたもの。
     fn create_or_get_asset(&self, asset: NewAsset) -> Result<(AssetRecord, bool), RepoError>;
+
+    /// 星評価 (0..=5) を設定する。6以上は [`RepoError::Constraint`]。
+    /// 存在しないIDは [`RepoError::NotFound`]。`updated_at` を進める (WP-5)。
+    fn set_rating(&self, asset_id: i64, rating: u8) -> Result<(), RepoError>;
+
+    /// 選別状態 (採用/除外/未選別) を設定する。ファイル削除は行わない
+    /// (spec §9.2「除外は削除と区別する」)。存在しないIDは [`RepoError::NotFound`]。
+    fn set_cull_state(&self, asset_id: i64, triage: TriageState) -> Result<(), RepoError>;
+
+    /// お気に入りを設定する。存在しないIDは [`RepoError::NotFound`]。
+    fn set_favorite(&self, asset_id: i64, favorite: bool) -> Result<(), RepoError>;
+
+    /// 複数Assetへ星評価を一括適用する (1トランザクション。
+    /// 一部失敗時は全体ロールバック)。値検証・不在扱いは単一版と同じ。
+    fn set_rating_batch(&self, asset_ids: &[i64], rating: u8) -> Result<(), RepoError>;
+
+    /// 複数Assetへ選別状態を一括適用する (1トランザクション)。
+    fn set_cull_state_batch(&self, asset_ids: &[i64], triage: TriageState)
+        -> Result<(), RepoError>;
+
+    /// 複数Assetへお気に入りを一括適用する (1トランザクション)。
+    fn set_favorite_batch(&self, asset_ids: &[i64], favorite: bool) -> Result<(), RepoError>;
 }
 
 /// `child` が `parent` 配下 (または同一) のパスかをコンポーネント単位で

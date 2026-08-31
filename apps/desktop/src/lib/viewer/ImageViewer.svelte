@@ -1,15 +1,18 @@
 <script lang="ts">
   /**
-   * 単一画像ビューアのオーバーレイ (WP-6 / フェーズ6)。
-   *
-   * - 表示: 現行レイヤー + 保持 (retained) レイヤーの積層。新画像のonloadまで
-   *   旧画像を表示し続ける (空白を出さない)
-   * - 操作: ホイール=ズーム (ポインタ中心)、ドラッグ=パン、ダブルクリック=fit⇔actual、
-   *   ←/→=前/次画像、+/-/0/1/r、Esc=閉じる
-   * - 画像要素は論理寸法 (実寸) で配置しCSS transformで操作する
-   *   (preview→original差し替えで幾何不変)
-   * - 開発統計: 表示準備時間 p50/p95/p99 (先読みon/off別)、center/zoomFactor数値
-   */
+    * 単一画像ビューアのオーバーレイ (WP-6 / フェーズ6 + WP-5高速選別)。
+    *
+    * - 表示: 現行レイヤー + 保持 (retained) レイヤーの積層。新画像のonloadまで
+    *   旧画像を表示し続ける (空白を出さない)
+    * - 操作: ホイール=ズーム (ポインタ中心)、ドラッグ=パン、ダブルクリック=fit⇔actual、
+    *   ←/→=前/次画像、+/-/0/1/r、Esc=閉じる
+    * - WP-5 高速選別モード (トグル): 数字1-5=星評価、0=評価解除、X=除外、
+    *   P/A=採用。入力後自動的に次の画像へ送る。OFF中は既存のズームキー
+    *   (0=fit / 1=actual) が優先される。
+    * - 画像要素は論理寸法 (実寸) で配置しCSS transformで操作する
+    *   (preview→original差し替えで幾何不変)
+    * - 開発統計: 表示準備時間 p50/p95/p99 (先読みon/off別)、center/zoomFactor数値
+    */
   import { onDestroy, onMount } from "svelte";
   import { toCss, type ViewTransform } from "./transform";
   import {
@@ -21,19 +24,32 @@
     saveBackground,
     type ViewerBackground,
   } from "./background";
+  import { parseTriageKey, triageActionLabel, type TriageKeyAction } from "../triage-keys";
   import type { ViewerStore } from "./viewer-store";
 
   let {
     store,
     onClose,
+    triageMode = false,
+    onToggleTriageMode,
+    onTriageAction,
   }: {
     store: ViewerStore;
     onClose: () => void;
+    /** 高速選別モード (Appが保持。ビューアを開いても引き継ぐ)。 */
+    triageMode?: boolean;
+    onToggleTriageMode?: () => void;
+    /** 高速選別キーの適用 (AppがMetadataStore/undo/自動次送りを担う)。
+     *  true=処理済み (自動次送りする)、false=編集不可。 */
+    onTriageAction?: (action: TriageKeyAction) => boolean;
   } = $props();
 
   let overlayEl: HTMLElement | null = $state(null);
   let stageEl: HTMLElement | null = $state(null);
   let viewerTick = $state(0);
+  /** 高速選別の直近の適用結果 (一瞬表示するフィードバック)。 */
+  let triageFeedback: { label: string; ok: boolean } | null = $state(null);
+  let triageFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
   // 透過背景 (市松/白/黒)。localStorageから復元し切替時に永続化 (WP-3)
   let background: ViewerBackground = $state(loadBackground(safeLocalStorage()));
   const stopNotify = store.onChange(() => {
@@ -140,6 +156,20 @@
     if (isFormTarget(event)) {
       return;
     }
+    // 高速選別モード (WP-5): 1-5/0/X/P/A を選別操作へ優先適用し、
+    // 成功時は自動次送りする。ズームキー (0=fit/1=actual) はモードOFF中のみ。
+    if (triageMode) {
+      const action = parseTriageKey(event.key, {
+        ctrlKey: event.ctrlKey,
+        metaKey: event.metaKey,
+        altKey: event.altKey,
+      });
+      if (action !== null) {
+        event.preventDefault();
+        applyTriageAction(action);
+        return;
+      }
+    }
     switch (event.key) {
       case "ArrowLeft":
         event.preventDefault();
@@ -178,6 +208,19 @@
         store.setMode("fit");
         break;
     }
+  }
+
+  /** 高速選別キーの適用 + フィードバック表示。次送りはApp側で行う。 */
+  function applyTriageAction(action: TriageKeyAction): void {
+    const handled = onTriageAction?.(action) ?? false;
+    const label = triageActionLabel(action);
+    if (triageFeedbackTimer !== null) {
+      clearTimeout(triageFeedbackTimer);
+    }
+    triageFeedback = { label: handled ? label : `${label} (編集不可)`, ok: handled };
+    triageFeedbackTimer = setTimeout(() => {
+      triageFeedback = null;
+    }, 900);
   }
 
   function centerPointer(): { x: number; y: number } {
@@ -284,6 +327,9 @@
 
   onDestroy(() => {
     stopNotify();
+    if (triageFeedbackTimer !== null) {
+      clearTimeout(triageFeedbackTimer);
+    }
   });
 </script>
 
@@ -291,8 +337,15 @@
 
 <div class="viewer-overlay" bind:this={overlayEl} tabindex="-1">
   <div class="viewer-toolbar">
-    <button onclick={() => store.setMode("fit")}>fit (0)</button>
-    <button onclick={() => store.setMode("actual")}>原寸 (1)</button>
+    <button
+      class:triage-on={triageMode}
+      onclick={() => onToggleTriageMode?.()}
+      title="数字1-5=評価 / 0=評価解除 / X=除外 / P=採用。入力後自動で次へ進みます"
+    >
+      高速選別: {triageMode ? "ON" : "OFF"}
+    </button>
+    <button onclick={() => store.setMode("fit")}>fit {triageMode ? "" : "(0)"}</button>
+    <button onclick={() => store.setMode("actual")}>原寸 {triageMode ? "" : "(1)"}</button>
     <button onclick={() => store.setMode("fit")}>リセット (r)</button>
     <button onclick={() => toggleFullscreen()}>
       全画面 (f){isFullscreen() ? " ✓" : ""}
@@ -357,6 +410,9 @@
     {/if}
     {#if currentImg()?.note}
       <div class="note">{currentImg()!.note}</div>
+    {/if}
+    {#if triageFeedback !== null}
+      <div class="triage-feedback" class:triage-ng={!triageFeedback.ok}>{triageFeedback.label}</div>
     {/if}
   </div>
 
@@ -436,6 +492,29 @@
     border-radius: 0.5rem;
     background: light-dark(#ffffffdd, #1e1e1edd);
     font-size: 0.9rem;
+  }
+
+  /* WP-5: 高速選別キーの適用フィードバック (ステージ右上) */
+  .triage-feedback {
+    position: absolute;
+    right: 12px;
+    top: 12px;
+    z-index: 2;
+    padding: 0.3rem 0.8rem;
+    border-radius: 0.5rem;
+    background: light-dark(#1a7f37dd, #238636dd);
+    color: #ffffff;
+    font-size: 0.85rem;
+    pointer-events: none;
+  }
+
+  .triage-feedback.triage-ng {
+    background: light-dark(#9a6700dd, #9e6a03dd);
+  }
+
+  .triage-on {
+    border-color: light-dark(#1a7f37, #238636);
+    font-weight: bold;
   }
 
   .viewer-stats {

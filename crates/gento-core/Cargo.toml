@@ -12,6 +12,9 @@ devtools = []
 
 [dependencies]
 serde = { workspace = true }
+# タグ正規化名のNFC正規化 (WP-5。docs/dev/dependency-notes.md参照)。
+# workspace共有ではなく単一crate依存として直付け。
+unicode-normalization = "=0.1.25"
 
 [dev-dependencies]
 serde_json = { workspace = true }

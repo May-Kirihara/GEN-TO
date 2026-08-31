@@ -59,7 +59,7 @@ impl<'a> SqliteRepos<'a> {
 /// - CHECK・NOT NULL等、一意・FK以外の制約違反 → [`RepoError::Constraint`]
 ///   (Duplicateと誤分類すると呼び出し側が「重複」処理をしてしまうため区別)
 /// - 外部キー違反 → 「foreign key violation」付きの [`RepoError::Db`]
-fn map_err(e: rusqlite::Error) -> RepoError {
+pub(crate) fn map_err(e: rusqlite::Error) -> RepoError {
     if let rusqlite::Error::SqliteFailure(code, msg) = &e {
         if code.code == rusqlite::ffi::ErrorCode::ConstraintViolation {
             let is_fk = code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY
@@ -750,6 +750,14 @@ impl AssetRepo for SqliteRepos<'_> {
             .map_err(map_err)
     }
 
+    fn get_asset(&self, asset_id: i64) -> Result<Option<AssetRecord>, RepoError> {
+        let sql = format!("SELECT {ASSET_COLUMNS} FROM assets WHERE id = ?1");
+        self.conn
+            .query_row(&sql, [asset_id], map_asset)
+            .optional()
+            .map_err(map_err)
+    }
+
     fn link_file(&self, file_id: i64, asset_id: i64) -> Result<(), RepoError> {
         // 先に双方の存在を確認し、「どちらが無いか」をNotFoundで返せるようにする
         let asset_exists: Option<i64> = self
@@ -789,6 +797,116 @@ impl AssetRepo for SqliteRepos<'_> {
             }
             Err(err) => Err(err),
         }
+    }
+
+    fn set_rating(&self, asset_id: i64, rating: u8) -> Result<(), RepoError> {
+        if rating > 5 {
+            return Err(RepoError::Constraint("rating must be 0..=5".to_string()));
+        }
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE assets SET rating = ?2, updated_at = ?3 WHERE id = ?1",
+                params![asset_id, rating, now_utc_rfc3339()],
+            )
+            .map_err(map_err)?;
+        if changed == 0 {
+            return Err(RepoError::NotFound);
+        }
+        Ok(())
+    }
+
+    fn set_cull_state(&self, asset_id: i64, triage: TriageState) -> Result<(), RepoError> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE assets SET triage = ?2, updated_at = ?3 WHERE id = ?1",
+                params![asset_id, triage.as_str(), now_utc_rfc3339()],
+            )
+            .map_err(map_err)?;
+        if changed == 0 {
+            return Err(RepoError::NotFound);
+        }
+        Ok(())
+    }
+
+    fn set_favorite(&self, asset_id: i64, favorite: bool) -> Result<(), RepoError> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE assets SET favorite = ?2, updated_at = ?3 WHERE id = ?1",
+                params![asset_id, favorite as i64, now_utc_rfc3339()],
+            )
+            .map_err(map_err)?;
+        if changed == 0 {
+            return Err(RepoError::NotFound);
+        }
+        Ok(())
+    }
+
+    fn set_rating_batch(&self, asset_ids: &[i64], rating: u8) -> Result<(), RepoError> {
+        self.update_assets_batch(
+            asset_ids,
+            "rating",
+            rusqlite::types::Value::Integer(rating as i64),
+        )
+    }
+
+    fn set_cull_state_batch(
+        &self,
+        asset_ids: &[i64],
+        triage: TriageState,
+    ) -> Result<(), RepoError> {
+        self.update_assets_batch(
+            asset_ids,
+            "triage",
+            rusqlite::types::Value::Text(triage.as_str().to_string()),
+        )
+    }
+
+    fn set_favorite_batch(&self, asset_ids: &[i64], favorite: bool) -> Result<(), RepoError> {
+        self.update_assets_batch(
+            asset_ids,
+            "favorite",
+            rusqlite::types::Value::Integer(favorite as i64),
+        )
+    }
+}
+
+impl<'a> SqliteRepos<'a> {
+    /// assets列の一括更新 (WP-5)。1呼び出し=1トランザクション:
+    /// 途中の失敗 (不在ID含む) はロールバックされ、一部だけ適用された
+    /// 状態を残さない (メタデータ一括編集の整合)。
+    ///
+    /// `set_column` はこのモジュール内の静的文字列リテラルのみ
+    /// (ユーザー入力の挿入はしない)。
+    fn update_assets_batch(
+        &self,
+        asset_ids: &[i64],
+        set_column: &'static str,
+        value: rusqlite::types::Value,
+    ) -> Result<(), RepoError> {
+        if asset_ids.is_empty() {
+            return Ok(());
+        }
+        let sql = format!("UPDATE assets SET {set_column} = ?2, updated_at = ?3 WHERE id = ?1");
+        let now = now_utc_rfc3339();
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| RepoError::Db(e.to_string()))?;
+        {
+            let mut stmt = tx.prepare(&sql).map_err(map_err)?;
+            for id in asset_ids {
+                let changed = stmt.execute(params![id, &value, &now]).map_err(map_err)?;
+                if changed == 0 {
+                    // 不在ID: バッチ全体をロールバック (部分適用を残さない)
+                    return Err(RepoError::NotFound);
+                }
+            }
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(())
     }
 }
 

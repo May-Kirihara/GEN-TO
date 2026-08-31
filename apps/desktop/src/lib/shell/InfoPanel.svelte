@@ -1,16 +1,25 @@
 <script lang="ts">
   /**
-   * 情報パネル (MVP WP-4 / 仕様§8の3ペイン目)。
-   *
-   * - 選択 (フォーカス) 項目のファイル情報: 名前・パス・寸法・容量・形式・
-   *   更新日時・DB状態 (登録/Asset有無)・スキャン状態
-   * - 選別セッションの開始・再開・進捗 (順序・位置・カウント。WP-5への足場)
-   * - 評価・タグ編集はWP-5のプレースホルダ領域
-   */
+    * 情報パネル (MVP WP-4 / 仕様§8の3ペイン目 + WP-5メタデータ編集)。
+    *
+    * - 選択 (フォーカス) 項目のファイル情報: 名前・パス・寸法・容量・形式・
+    *   更新日時・DB状態 (登録/Asset有無)・スキャン状態
+    * - 選別セッションの開始・再開・進捗 (順序・位置・カウント)
+    * - WP-5: 星0-5・採用/未選別/除外・お気に入り・タグ編集 (候補・使用数)・
+    *   キャプション3種 (description/sd_tags/user_note)。複数選択時は
+    *   一括編集 (確認表示付き)。adhoc (未登録) では編集UIを無効化。
+    */
+  import { untrack } from "svelte";
   import type { ImageListItem } from "../catalog-types";
   import type { SessionCounts } from "../session/selection-session";
   import { formatBytes } from "../thumbnails";
   import { formatTimestamp } from "../browse";
+  import {
+    CAPTION_KINDS,
+    type AssetDetailDto,
+    type CullValue,
+    type TagDto,
+  } from "../metadata";
 
   let {
     item,
@@ -25,6 +34,13 @@
     onResume,
     onEnd,
     onSessionMove,
+    detail,
+    metaBusy,
+    metaError,
+    actions,
+    suggestTags,
+    undoLabel,
+    bulkTargetIds = [],
   }: {
     item: ImageListItem | null;
     selectionCount: number;
@@ -39,6 +55,25 @@
     onResume: () => void;
     onEnd: () => void;
     onSessionMove: (delta: number) => void;
+    /** フォーカス項目のメタデータ詳細 (asset_detail)。 */
+    detail: AssetDetailDto | null;
+    metaBusy: boolean;
+    metaError: string | null;
+    /** メタデータ編集操作 (Appが構築。idsは呼び出し側で選択へ拡張)。 */
+    actions: {
+      setRating: (ids: string[], rating: number) => Promise<void>;
+      setCull: (ids: string[], value: CullValue) => Promise<void>;
+      setFavorite: (ids: string[], favorite: boolean) => Promise<void>;
+      addTags: (ids: string[], names: string[]) => Promise<void>;
+      removeTag: (assetId: string, tagId: string) => Promise<void>;
+      setCaption: (assetId: string, kind: "description" | "sd_tags" | "user_note", body: string) => Promise<void>;
+      undo: () => void;
+    };
+    suggestTags: (prefix: string) => Promise<TagDto[]>;
+    /** 次に巻き戻せる操作のラベル (無しnull)。 */
+    undoLabel: string | null;
+    /** 一括適用対象のID列 (Appが選択から供給)。 */
+    bulkTargetIds?: string[];
   } = $props();
 
   const DB_STATE_LABELS: Record<string, string> = {
@@ -59,6 +94,213 @@
       return "未登録 (DB外)";
     }
     return DB_STATE_LABELS[item.dbState] ?? item.dbState;
+  }
+
+  // ===== WP-5: 編集可否・一括適用 =====
+
+  /** 編集可能 = Library表示でAsset確定済み (仕様§4.1: 未登録は編集不可)。 */
+  const canEdit = $derived(item !== null && item.dbState === "asset" && libraryMode);
+  const bulk = $derived(selectionCount > 1 && canEdit);
+
+  /** 確認待ちの一括操作 (適用/取消)。 */
+  let pendingBulk: { label: string; run: (ids: string[]) => Promise<void> } | null = $state(null);
+
+  let busy = $state(false);
+  let notice = $state("");
+
+  async function run(action: () => Promise<void>): Promise<void> {
+    busy = true;
+    notice = "";
+    try {
+      await action();
+    } catch (error) {
+      notice = error instanceof Error ? error.message : String(error);
+    } finally {
+      busy = false;
+    }
+  }
+
+  /** 編集対象のID列 (一括時は選択全体)。AppがbulkTargetIdsへ設定する。 */
+  function editIds(): string[] {
+    if (item === null) {
+      return [];
+    }
+    return bulk && bulkTargetIds.length > 0 ? [...bulkTargetIds] : [item.id];
+  }
+
+  function applyRating(rating: number): void {
+    if (!canEdit || busy) {
+      return;
+    }
+    const ids = editIds();
+    if (bulk) {
+      pendingBulk = {
+        label: `選択 ${ids.length.toLocaleString()}件へ 評価 ★${rating} を適用`,
+        run: (target) => actions.setRating(target, rating),
+      };
+      return;
+    }
+    void run(() => actions.setRating(ids, rating));
+  }
+
+  function applyCull(value: CullValue): void {
+    if (!canEdit || busy) {
+      return;
+    }
+    const ids = editIds();
+    if (bulk) {
+      const label = value === "picked" ? "採用" : value === "rejected" ? "除外" : "未選別";
+      pendingBulk = {
+        label: `選択 ${ids.length.toLocaleString()}件へ ${label} を適用`,
+        run: (target) => actions.setCull(target, value),
+      };
+      return;
+    }
+    void run(() => actions.setCull(ids, value));
+  }
+
+  function applyFavorite(favorite: boolean): void {
+    if (!canEdit || busy) {
+      return;
+    }
+    const ids = editIds();
+    if (bulk) {
+      pendingBulk = {
+        label: `選択 ${ids.length.toLocaleString()}件へ お気に入り${favorite ? "ON" : "OFF"} を適用`,
+        run: (target) => actions.setFavorite(target, favorite),
+      };
+      return;
+    }
+    void run(() => actions.setFavorite(ids, favorite));
+  }
+
+  function confirmBulk(): void {
+    if (pendingBulk === null) {
+      return;
+    }
+    const pending = pendingBulk;
+    pendingBulk = null;
+    void run(() => pending.run(editIds()));
+  }
+
+  // ===== タグ編集 =====
+
+  let tagInput = $state("");
+  let suggestions: TagDto[] = $state([]);
+  let suggestBusy = $state(false);
+  let suggestTimer: ReturnType<typeof setTimeout> | null = null;
+
+  $effect(() => {
+    // タグ入力→候補絞り込み (200msデバウンス。表示は最大8件)
+    void tagInput;
+    if (suggestTimer !== null) {
+      clearTimeout(suggestTimer);
+    }
+    if (!canEdit) {
+      suggestions = [];
+      return;
+    }
+    suggestTimer = setTimeout(() => {
+      suggestBusy = true;
+      void suggestTags(tagInput)
+        .then((hits) => {
+          suggestions = hits.slice(0, 8);
+        })
+        .catch(() => {
+          suggestions = [];
+        })
+        .finally(() => {
+          suggestBusy = false;
+        });
+    }, 200);
+    return () => {
+      if (suggestTimer !== null) {
+        clearTimeout(suggestTimer);
+      }
+    };
+  });
+
+  function submitTags(): void {
+    if (!canEdit || busy) {
+      return;
+    }
+    // カンマ・空白区切りも受け付ける (SD運用での連続入力)
+    const names = tagInput
+      .split(/[,、\n]/)
+      .map((n) => n.trim())
+      .filter((n) => n.length > 0);
+    if (names.length === 0) {
+      return;
+    }
+    const ids = editIds();
+    tagInput = "";
+    if (bulk) {
+      pendingBulk = {
+        label: `選択 ${ids.length.toLocaleString()}件へ タグ ${names.join(", ")} を付与`,
+        run: (target) => actions.addTags(target, names),
+      };
+      return;
+    }
+    void run(() => actions.addTags(ids, names));
+  }
+
+  function removeTag(tagId: string): void {
+    if (!canEdit || item === null || busy) {
+      return;
+    }
+    void run(() => actions.removeTag(item.id, tagId));
+  }
+
+  // ===== キャプション編集 (フォーカス項目のみ。一括は非対応) =====
+
+  /** 編集中の下書き (kind→本文)。確定ボタンで保存。 */
+  let captionDrafts = $state<Record<string, string>>({});
+  /** 前回のdetail読み取り時の保存済み本文 (未編集判定用。非リアクティブ)。 */
+  let lastSavedBodies: Record<string, string> = {};
+
+  $effect(() => {
+    // detailが変わったら下書きを同期。依存はdetailのみ (captionDraftsの読み
+    // 取りはuntrack — 書き込みが自分を再トリガーする無限ループになるため)。
+    // 未編集 (前回保存値のまま) の下書きのみ新保存値へ追従し、編集中の
+    // 下書きは保持する (同一assetへの無関係な更新でタイプ中の本文を失わない)
+    void detail;
+    const saved: Record<string, string> = {};
+    for (const { kind } of CAPTION_KINDS) {
+      saved[kind] = detail?.captions.find((c) => c.kind === kind)?.body ?? "";
+    }
+    const previous = lastSavedBodies;
+    lastSavedBodies = saved;
+    captionDrafts = untrack(() => {
+      const next: Record<string, string> = {};
+      for (const { kind } of CAPTION_KINDS) {
+        const draft = captionDrafts[kind] ?? "";
+        next[kind] = draft === (previous[kind] ?? "") ? saved[kind] : draft;
+      }
+      return next;
+    });
+  });
+
+  function captionOf(kind: string): { body: string; manuallyEdited: boolean } | null {
+    const found = detail?.captions.find((c) => c.kind === kind);
+    if (found === undefined) {
+      return null;
+    }
+    return { body: found.body, manuallyEdited: found.manually_edited };
+  }
+
+  function saveCaption(kind: "description" | "sd_tags" | "user_note"): void {
+    if (!canEdit || item === null || busy) {
+      return;
+    }
+    const body = captionDrafts[kind] ?? "";
+    void run(async () => {
+      await actions.setCaption(item.id, kind, body);
+    });
+  }
+
+  function captionDirty(kind: string): boolean {
+    const current = captionOf(kind);
+    return (captionDrafts[kind] ?? "") !== (current?.body ?? "");
   }
 </script>
 
@@ -86,8 +328,200 @@
         <dt>スキャン状態</dt>
         <dd>{SCAN_STATE_LABELS[item.state] ?? item.state}</dd>
         <dt>選別</dt>
-        <dd>{item.triage === "keep" ? "採用" : item.triage === "reject" ? "除外" : "未選別"}</dd>
+        <dd>
+          {#if detail !== null}
+            {detail.triage === "picked" ? "採用" : detail.triage === "rejected" ? "除外" : "未選別"}
+          {:else}
+            {item.triage === "keep" ? "採用" : item.triage === "reject" ? "除外" : "未選別"}
+          {/if}
+        </dd>
       </dl>
+    {/if}
+  </section>
+
+  <section class="info-section">
+    <h3>評価・選別・タグ・キャプション</h3>
+    {#if item === null}
+      <p class="placeholder-note">画像を選択すると編集できます</p>
+    {:else if !canEdit}
+      <p class="placeholder-note">
+        {libraryMode
+          ? "ハッシュ計算待ちの項目です (計算完了後に編集できます)"
+          : "未登録フォルダではメタデータを編集できません (登録ルートをライブラリ表示してください)"}
+      </p>
+    {:else}
+      {#if bulk}
+        <p class="bulk-note">選択 {selectionCount.toLocaleString()}件へ一括適用します (適用前に確認します)</p>
+      {/if}
+
+      {#if pendingBulk !== null}
+        <div class="bulk-confirm" role="alertdialog" aria-label="一括適用の確認">
+          <p>{pendingBulk.label}</p>
+          <div class="session-controls">
+            <button class="primary" onclick={confirmBulk} disabled={busy}>適用</button>
+            <button onclick={() => (pendingBulk = null)}>取消</button>
+          </div>
+        </div>
+      {/if}
+
+      <!-- 評価 -->
+      <div class="meta-row" data-meta="rating">
+        <span class="meta-label">評価</span>
+        <span class="star-row" role="radiogroup" aria-label="星評価">
+          {#each [1, 2, 3, 4, 5] as star (star)}
+            <button
+              class="star"
+              class:filled={(detail?.rating ?? item.rating) >= star}
+              onclick={() => applyRating((detail?.rating ?? item.rating) === star ? 0 : star)}
+              disabled={busy}
+              title={star === 0 ? "評価解除" : `★${star}`}
+              aria-label={`評価 ${star}`}
+            >★</button>
+          {/each}
+          <span class="meta-value">{(detail?.rating ?? item.rating) || "—"}</span>
+        </span>
+      </div>
+
+      <!-- 選別状態 -->
+      <div class="meta-row" data-meta="cull">
+        <span class="meta-label">選別</span>
+        <span class="cull-row">
+          <button
+            class:cull-active={(detail?.triage ?? "unselected") === "picked"}
+            onclick={() => applyCull("picked")}
+            disabled={busy}
+          >採用 (P)</button>
+          <button
+            class:cull-active={(detail?.triage ?? "unselected") === "rejected"}
+            onclick={() => applyCull("rejected")}
+            disabled={busy}
+          >除外 (X)</button>
+          <button
+            class:cull-active={(detail?.triage ?? "unselected") === "unselected"}
+            onclick={() => applyCull("unselected")}
+            disabled={busy}
+          >未選別</button>
+        </span>
+      </div>
+
+      <!-- お気に入り -->
+      <div class="meta-row" data-meta="favorite">
+        <span class="meta-label">お気に入り</span>
+        <button
+          class="fav"
+          class:fav-on={detail?.favorite ?? item.favorite}
+          onclick={() => applyFavorite(!(detail?.favorite ?? item.favorite))}
+          disabled={busy}
+        >{detail?.favorite ?? item.favorite ? "♥ お気に入り済み" : "♡ 登録"}</button>
+      </div>
+
+      <!-- タグ -->
+      <div class="meta-row meta-col" data-meta="tags">
+        <span class="meta-label">タグ</span>
+        <div class="tag-list">
+          {#each detail?.tags ?? [] as tag (tag.id)}
+            <span class="tag-chip" title="使用数: {tag.usage_count.toLocaleString()} · クリックで解除">
+              {tag.name}
+              {#if tag.manually_edited}<span class="tag-manual" title="手動編集済み (AI再生成で保護)">✎</span>{/if}
+              <button
+                class="tag-remove"
+                onclick={() => removeTag(tag.id)}
+                disabled={busy}
+                aria-label="{tag.name}を解除"
+              >×</button>
+            </span>
+          {:else}
+            <span class="placeholder-note">タグなし</span>
+          {/each}
+        </div>
+        <div class="tag-input-row">
+          <input
+            type="text"
+            placeholder="タグ名 (カンマ区切り可)"
+            value={tagInput}
+            oninput={(event) => (tagInput = event.currentTarget.value)}
+            onkeydown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                submitTags();
+              }
+            }}
+            disabled={busy}
+            list="gento-tag-suggestions"
+          />
+          <button onclick={submitTags} disabled={busy || tagInput.trim().length === 0}>追加</button>
+        </div>
+        {#if suggestBusy}
+          <p class="placeholder-note">候補を検索中…</p>
+        {:else if suggestions.length > 0 && tagInput.trim().length > 0}
+          <div class="tag-suggest" data-meta="tag-suggest">
+            {#each suggestions as tag (tag.id)}
+              <button
+                class="tag-suggest-item"
+                onclick={() => {
+                  tagInput = tag.name;
+                  submitTags();
+                }}
+                disabled={busy}
+              >{tag.name} <span class="tag-usage">{tag.usage_count.toLocaleString()}</span></button>
+            {/each}
+          </div>
+        {/if}
+      </div>
+
+      <!-- キャプション3種 (フォーカス項目のみ) -->
+      {#if !bulk}
+        {#each CAPTION_KINDS as { kind, label, hint } (kind)}
+          {@const current = captionOf(kind)}
+          <div class="meta-row meta-col" data-meta="caption-{kind}">
+            <span class="meta-label">
+              {label}
+              <span class="meta-hint">{hint}</span>
+              {#if current?.manuallyEdited}
+                <span class="tag-manual" title="手動編集済み (AI再生成で上書きされません)">✎手動編集済み</span>
+              {/if}
+            </span>
+            <textarea
+              rows={kind === "sd_tags" ? 2 : 3}
+              placeholder="{label}を入力"
+              bind:value={captionDrafts[kind]}
+              disabled={busy}
+            ></textarea>
+            <div class="caption-controls">
+              <button
+                onclick={() => saveCaption(kind)}
+                disabled={busy || !captionDirty(kind)}
+              >保存</button>
+              {#if captionDirty(kind)}
+                <button
+                  onclick={() => {
+                    captionDrafts[kind] = current?.body ?? "";
+                  }}
+                  disabled={busy}
+                >元に戻す</button>
+              {/if}
+            </div>
+          </div>
+        {/each}
+      {:else}
+        <p class="placeholder-note">キャプション編集は単一選択時のみ (フォーカス項目へ適用されます)</p>
+      {/if}
+
+      <!-- Undo (メタデータ操作のみ。ファイル操作はWP-7) -->
+      <div class="meta-row" data-meta="undo">
+        <button onclick={() => actions.undo()} disabled={busy || undoLabel === null} title="Ctrl+Z">
+          {undoLabel === null ? "元に戻す (履歴なし)" : `元に戻す: ${undoLabel}`}
+        </button>
+      </div>
+    {/if}
+    {#if metaBusy}
+      <p class="placeholder-note">読み込み中…</p>
+    {/if}
+    {#if notice}
+      <p class="info-error">{notice}</p>
+    {/if}
+    {#if metaError}
+      <p class="info-error">{metaError}</p>
     {/if}
   </section>
 
@@ -110,7 +544,7 @@
           <button onclick={() => onSessionMove(1)}>次へ →</button>
           <button class="danger" onclick={onEnd}>終了</button>
         </div>
-        <p class="session-note">採用・除外のマーク付けはWP-5で追加されます</p>
+        <p class="session-note">ビューアで 1-5=評価 / X=除外 / P=採用 (高速選別モード)</p>
       </div>
     {:else}
       <div class="session-controls">
@@ -132,12 +566,13 @@
       <p class="info-error">{sessionNotice}</p>
     {/if}
   </section>
-
-  <section class="info-section info-placeholder">
-    <h3>評価・タグ・キャプション</h3>
-    <p class="placeholder-note">WP-5で実装予定 (同一Assetで共有されます)</p>
-  </section>
 </div>
+
+<datalist id="gento-tag-suggestions">
+  {#each suggestions as tag (tag.id)}
+    <option value={tag.name}></option>
+  {/each}
+</datalist>
 
 <style>
   .info-pane {
@@ -218,10 +653,7 @@
     margin: 0.3rem 0 0;
     font-size: 0.78rem;
     color: light-dark(#cf222e, #f85149);
-  }
-
-  .info-placeholder {
-    opacity: 0.7;
+    overflow-wrap: anywhere;
   }
 
   .placeholder-note {
@@ -233,5 +665,187 @@
   button.danger {
     border-color: light-dark(#cf222e, #f85149);
     color: light-dark(#cf222e, #f85149);
+  }
+
+  button.primary {
+    border-color: light-dark(#1a7f37, #238636);
+    color: light-dark(#1a7f37, #3fb950);
+    font-weight: bold;
+  }
+
+  .bulk-note {
+    margin: 0 0 0.3rem;
+    font-size: 0.75rem;
+    color: light-dark(#9a6700, #d29922);
+  }
+
+  .bulk-confirm {
+    border: 1px solid light-dark(#9a6700, #d29922);
+    border-radius: 0.4rem;
+    padding: 0.4rem;
+    margin: 0.3rem 0;
+    background: light-dark(#fff8c5, #25170a);
+  }
+
+  .bulk-confirm p {
+    margin: 0 0 0.3rem;
+    font-size: 0.78rem;
+    overflow-wrap: anywhere;
+  }
+
+  .meta-row {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    margin: 0.35rem 0;
+    flex-wrap: wrap;
+  }
+
+  .meta-col {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .meta-label {
+    color: light-dark(#57606a, #8b949e);
+    font-size: 0.78rem;
+    min-width: 5.5rem;
+  }
+
+  .meta-col .meta-label {
+    min-width: 0;
+  }
+
+  .meta-hint {
+    font-size: 0.7rem;
+    color: light-dark(#8b949e, #6e7681);
+    margin-left: 0.3rem;
+  }
+
+  .meta-value {
+    font-size: 0.78rem;
+    color: light-dark(#57606a, #8b949e);
+  }
+
+  .star-row {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.1rem;
+  }
+
+  .star {
+    border: none;
+    background: transparent;
+    padding: 0 0.05rem;
+    font-size: 1.05rem;
+    line-height: 1;
+    color: light-dark(#d0d7de, #30363d);
+    cursor: pointer;
+  }
+
+  .star.filled {
+    color: light-dark(#d29922, #e3b341);
+  }
+
+  .cull-row {
+    display: inline-flex;
+    gap: 0.3rem;
+    flex-wrap: wrap;
+  }
+
+  .cull-active {
+    border-color: light-dark(#0969da, #58a6ff);
+    font-weight: bold;
+  }
+
+  .fav {
+    font-size: 0.8rem;
+  }
+
+  .fav-on {
+    color: light-dark(#cf222e, #f85149);
+    border-color: light-dark(#cf222e, #f85149);
+  }
+
+  .tag-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+  }
+
+  .tag-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.2rem;
+    border: 1px solid light-dark(#d0d7de, #30363d);
+    border-radius: 999px;
+    padding: 0.05rem 0.45rem;
+    font-size: 0.78rem;
+    background: light-dark(#eaeef2, #21262d);
+  }
+
+  .tag-manual {
+    color: light-dark(#9a6700, #d29922);
+    font-size: 0.7rem;
+  }
+
+  .tag-remove {
+    border: none;
+    background: transparent;
+    color: light-dark(#57606a, #8b949e);
+    padding: 0;
+    font-size: 0.85rem;
+    line-height: 1;
+    cursor: pointer;
+  }
+
+  .tag-remove:hover {
+    color: light-dark(#cf222e, #f85149);
+  }
+
+  .tag-input-row {
+    display: flex;
+    gap: 0.3rem;
+    margin-top: 0.25rem;
+  }
+
+  .tag-input-row input {
+    flex: 1;
+    min-width: 0;
+    font-size: 0.8rem;
+  }
+
+  .tag-suggest {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+    margin-top: 0.25rem;
+  }
+
+  .tag-suggest-item {
+    font-size: 0.75rem;
+    display: inline-flex;
+    gap: 0.3rem;
+    align-items: baseline;
+  }
+
+  .tag-usage {
+    color: light-dark(#8b949e, #6e7681);
+    font-size: 0.68rem;
+  }
+
+  .meta-col textarea {
+    width: 100%;
+    box-sizing: border-box;
+    font: inherit;
+    font-size: 0.8rem;
+    resize: vertical;
+    min-height: 2.2rem;
+  }
+
+  .caption-controls {
+    display: flex;
+    gap: 0.3rem;
+    margin-top: 0.2rem;
   }
 </style>

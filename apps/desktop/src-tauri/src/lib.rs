@@ -13,6 +13,7 @@ pub mod db;
 pub mod devtools;
 pub mod fsview;
 pub mod library;
+pub mod metadata;
 pub mod protocol;
 pub mod thumbnails;
 
@@ -158,6 +159,18 @@ pub fn run() {
         library::scan_start,
         library::scan_stop,
         library::scan_status,
+        metadata::asset_set_rating,
+        metadata::asset_set_cull,
+        metadata::asset_set_favorite,
+        metadata::asset_tags_add,
+        metadata::asset_tags_remove,
+        metadata::asset_tags_list,
+        metadata::tag_suggest,
+        metadata::tag_list,
+        metadata::tag_delete,
+        metadata::asset_caption_get,
+        metadata::asset_caption_set,
+        metadata::asset_detail,
         fsview::fs_list_dirs,
         fsview::reveal_in_file_manager,
         fsview::open_with_default_app,
@@ -188,6 +201,18 @@ pub fn run() {
         library::scan_start,
         library::scan_stop,
         library::scan_status,
+        metadata::asset_set_rating,
+        metadata::asset_set_cull,
+        metadata::asset_set_favorite,
+        metadata::asset_tags_add,
+        metadata::asset_tags_remove,
+        metadata::asset_tags_list,
+        metadata::tag_suggest,
+        metadata::tag_list,
+        metadata::tag_delete,
+        metadata::asset_caption_get,
+        metadata::asset_caption_set,
+        metadata::asset_detail,
         fsview::fs_list_dirs,
         fsview::reveal_in_file_manager,
         fsview::open_with_default_app,

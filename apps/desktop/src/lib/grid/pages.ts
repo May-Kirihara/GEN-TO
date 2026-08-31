@@ -134,6 +134,41 @@ export class CatalogPager {
     return this.pages.get(page)?.[index - page * this.pageSize] ?? null;
   }
 
+  /**
+   * キャッシュ済みページ内の項目をin-placeで書き換える (WP-5。
+   * `asset:updated` 受信時のセル/InfoPanel/セッション集計の局所更新)。
+   * generationは進めない — backendのカタログレコードも同一トランザクション
+   * 直後に更新済みのため、以後のページ取得は新しい値を返す。
+   * 戻り値は書き換えた項目数 (未取得ページの項目は0のまま次回取得で解決)。
+   */
+  patchItems(
+    ids: ReadonlySet<string>,
+    patch: Partial<Pick<ImageListItem, "rating" | "triage" | "favorite">>,
+  ): number {
+    if (ids.size === 0 || Object.keys(patch).length === 0) {
+      return 0;
+    }
+    let patched = 0;
+    for (const items of this.pages.values()) {
+      for (const item of items) {
+        if (!ids.has(item.id)) {
+          continue;
+        }
+        if (patch.rating !== undefined) {
+          item.rating = patch.rating;
+        }
+        if (patch.triage !== undefined) {
+          item.triage = patch.triage;
+        }
+        if (patch.favorite !== undefined) {
+          item.favorite = patch.favorite;
+        }
+        patched++;
+      }
+    }
+    return patched;
+  }
+
   /** 表示index範囲 (endは含む) に必要なページを取得する (並行呼び出しは1回にdedup)。 */
   async ensureRange(start: number, end: number): Promise<void> {
     if (this.generation === null) {

@@ -44,6 +44,8 @@ function makeIpc(opts?: {
           mtimeMs: 1000 + offset + i,
           mimeType: "image/png",
           dbState: "adhoc" as const,
+    rating: 0,
+    favorite: false,
           triage: "undecided" as const,
         }));
         return {

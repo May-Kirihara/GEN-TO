@@ -19,6 +19,8 @@ function makeItems(count: number): ImageListItem[] {
     mtimeMs: 1000 + i,
     mimeType: "image/png",
     dbState: "adhoc",
+    rating: 0,
+    favorite: false,
     triage: "undecided",
   }));
 }

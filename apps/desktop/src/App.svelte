@@ -43,6 +43,14 @@
   import { FolderPrefsStore, LIBRARY_SORT_KEY } from "./lib/ui/folder-prefs";
   import { copyText } from "./lib/ui/clipboard";
   import { KeyDispatcher } from "./lib/keys";
+  import {
+    MetadataStore,
+    patchOfEvent,
+    type AssetDetailDto,
+    type CullValue,
+  } from "./lib/metadata";
+  import { UndoStack } from "./lib/undo";
+  type TriageKeyAction = import("./lib/triage-keys").TriageKeyAction;
   import ContextMenu, { type MenuAction } from "./lib/ui/ContextMenu.svelte";
   import FolderTree from "./lib/shell/FolderTree.svelte";
   import LibraryPanel from "./lib/shell/LibraryPanel.svelte";
@@ -137,6 +145,25 @@
   // eslint-disable-next-line svelte/prefer-svelte-reactivity -- 永続化不要な補助写像
   const sessionIndex = new Map<string, number>();
 
+  // ===== メタデータ編集 (WP-5) =====
+
+  const metadata = new MetadataStore(ipc);
+  const undo = new UndoStack();
+  let metaDetail: AssetDetailDto | null = $state(null);
+  let metaBusy = $state(false);
+  let metaError = $state<string | null>(null);
+  let undoLabel = $state<string | null>(null);
+  /** フォーカス項目の詳細取得世代 (古い応答の破棄)。 */
+  let detailGeneration = 0;
+  /** 高速選別モード (ビューア内。アプリ稼働中は引き継ぐ — 設定トグル)。 */
+  let triageModeOn = $state(false);
+  /** 編集操作の通知 (InfoPanel外 — ツールバー横の短いフィードバック)。 */
+  let metaNotice = $state("");
+
+  undo.onChange(() => {
+    undoLabel = undo.peekLabel();
+  });
+
   // ===== コンテキストメニュー (WP-4) =====
 
   let contextMenu: { x: number; y: number; actions: MenuAction[] } | null = $state(null);
@@ -183,13 +210,37 @@
 
   const stopSessionNotify = session.onChange(() => {
     refreshSessionCounts();
+    surfaceSessionError();
   });
+
+  // フォーカス項目 or 表示モードが変わったら詳細を引き直す (WP-5)
+  $effect(() => {
+    const item = focusInfo;
+    const library = catalogSource === "library";
+    if (item !== null && library && item.dbState === "asset") {
+      void refreshMetaDetail(item.id);
+    } else {
+      detailGeneration++;
+      metaDetail = null;
+      metaBusy = false;
+    }
+  });
+
+  // Ctrl+Z: メタデータUndo (KeyDispatcherは修飾キー付きを扱わないため個別リスナ)
+  function onGlobalKeydown(event: KeyboardEvent): void {
+    if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "z") {
+      event.preventDefault();
+      metaActions.undo();
+    }
+  }
 
   let disposeCatalog: (() => void) | null = null;
   let disposeThumbnails: (() => void) | null = null;
   let disposeGrid: (() => void) | null = null;
   let disposeLibrary: (() => void) | null = null;
   let disposeQuickPreview: (() => void) | null = null;
+  let disposeMetadata: (() => void) | null = null;
+  let stopMetadataUpdates: (() => void) | null = null;
 
   function toErrorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
@@ -590,6 +641,256 @@
     sessionCounts = null;
   }
 
+  // ===== メタデータ編集 (WP-5) =====
+
+  /** セッション保存失敗等のlastErrorを通知へ出す (QA-WP4 Minor-7)。 */
+  function surfaceSessionError(): void {
+    if (session.lastError !== null) {
+      sessionNotice = `セッション状態の保存に失敗しました: ${session.lastError}`;
+      session.lastError = null;
+    }
+  }
+
+  /** 項目の現在値読み取り (pagerキャッシュ優先、無ければdetail)。 */
+  function itemRatingOf(id: string): number {
+    const found = grid.pager.findIndicesByIds(new Set([id])).get(id);
+    if (found !== undefined) {
+      return grid.getItem(found)?.rating ?? 0;
+    }
+    return metaDetail?.id === id ? metaDetail.rating : 0;
+  }
+
+  function itemCullOf(id: string): CullValue {
+    const found = grid.pager.findIndicesByIds(new Set([id])).get(id);
+    const triage = found !== undefined
+      ? grid.getItem(found)?.triage
+      : metaDetail?.id === id
+        ? metaDetail.triage === "picked"
+          ? "keep"
+          : metaDetail.triage === "rejected"
+            ? "reject"
+            : "undecided"
+        : undefined;
+    return triage === "keep" ? "picked" : triage === "reject" ? "rejected" : "unselected";
+  }
+
+  function itemFavoriteOf(id: string): boolean {
+    const found = grid.pager.findIndicesByIds(new Set([id])).get(id);
+    if (found !== undefined) {
+      return grid.getItem(found)?.favorite ?? false;
+    }
+    return metaDetail?.id === id ? metaDetail.favorite : false;
+  }
+
+  function showMetaNotice(text: string): void {
+    metaNotice = text;
+    setTimeout(() => {
+      metaNotice = "";
+    }, 2500);
+  }
+
+  /** Undo付きの評価編集 (before値を捕捉して巻き戻し可能にする)。 */
+  async function applyRating(ids: string[], rating: number): Promise<void> {
+    const before = ids.map((id) => ({ id, rating: itemRatingOf(id) }));
+    await metadata.setRating(ids, rating);
+    undo.push({
+      label: before.length > 1 ? `評価 ★${rating} (${before.length}件)` : `評価 ★${rating}`,
+      undo: async () => {
+        for (const entry of before) {
+          await metadata.setRating([entry.id], entry.rating);
+        }
+      },
+    });
+    showMetaNotice(`評価 ★${rating} を適用しました (${ids.length.toLocaleString()}件)`);
+  }
+
+  async function applyCull(ids: string[], value: CullValue): Promise<void> {
+    const before = ids.map((id) => ({ id, cull: itemCullOf(id) }));
+    await metadata.setCull(ids, value);
+    const label = value === "picked" ? "採用" : value === "rejected" ? "除外" : "未選別";
+    undo.push({
+      label: before.length > 1 ? `${label} (${before.length}件)` : label,
+      undo: async () => {
+        for (const entry of before) {
+          await metadata.setCull([entry.id], entry.cull);
+        }
+      },
+    });
+    showMetaNotice(`${label}を適用しました (${ids.length.toLocaleString()}件)`);
+  }
+
+  async function applyFavorite(ids: string[], favorite: boolean): Promise<void> {
+    const before = ids.map((id) => ({ id, favorite: itemFavoriteOf(id) }));
+    await metadata.setFavorite(ids, favorite);
+    undo.push({
+      label: favorite
+        ? `お気に入りON (${before.length}件)`
+        : `お気に入りOFF (${before.length}件)`,
+      undo: async () => {
+        for (const entry of before) {
+          await metadata.setFavorite([entry.id], entry.favorite);
+        }
+      },
+    });
+  }
+
+  async function applyAddTags(ids: string[], names: string[]): Promise<void> {
+    await metadata.addTags(ids, names);
+    // undo: 付与したタグを各assetから解除する (タグIDは付与後に名前解決)
+    undo.push({
+      label: `タグ付与 ${names.join(", ")} (${ids.length}件)`,
+      undo: async () => {
+        for (const id of ids) {
+          const tags = await metadata.listTags(id);
+          for (const tag of tags) {
+            if (names.some((n) => n.trim().toLowerCase() === tag.normalized_name)) {
+              await metadata.removeTag(id, tag.id);
+            }
+          }
+        }
+      },
+    });
+    showMetaNotice(`タグ ${names.join(", ")} を付与しました (${ids.length.toLocaleString()}件)`);
+  }
+
+  async function applyRemoveTag(assetId: string, tagId: string, tagName = "タグ"): Promise<void> {
+    await metadata.removeTag(assetId, tagId);
+    undo.push({
+      label: `タグ解除 ${tagName}`,
+      undo: async () => {
+        await metadata.addTags([assetId], [tagName]);
+      },
+    });
+  }
+
+  async function applyCaption(
+    assetId: string,
+    kind: "description" | "sd_tags" | "user_note",
+    body: string,
+  ): Promise<void> {
+    const before =
+      metaDetail?.id === assetId
+        ? (metaDetail.captions.find((c) => c.kind === kind)?.body ?? "")
+        : "";
+    await metadata.setCaption(assetId, kind, body);
+    undo.push({
+      label: `${kind === "user_note" ? "メモ" : kind === "sd_tags" ? "SDタグ列" : "説明"}編集`,
+      undo: async () => {
+        await metadata.setCaption(assetId, kind, before);
+      },
+    });
+  }
+
+  const metaActions = {
+    setRating: applyRating,
+    setCull: applyCull,
+    setFavorite: applyFavorite,
+    addTags: applyAddTags,
+    removeTag: (assetId: string, tagId: string) => applyRemoveTag(assetId, tagId),
+    setCaption: applyCaption,
+    undo: () => {
+      void undo.undo().then((done) => {
+        if (!done && undo.lastError !== null) {
+          metaError = `元に戻せませんでした: ${undo.lastError}`;
+        } else if (done) {
+          showMetaNotice("元に戻しました");
+        }
+      });
+    },
+  };
+
+  /** asset:updated → セル/InfoPanel/セッション集計の局所更新。 */
+  function onAssetUpdated(event: import("./lib/metadata").AssetUpdatedEvent): void {
+    const ids = new Set(event.ids);
+    const patch = patchOfEvent(event);
+    if (Object.keys(patch).length > 0) {
+      grid.applyItemPatch(ids, patch);
+    }
+    // tags/caption変更・一括適用はフォーカス項目のdetail再取得で追従
+    const focus = gridSelection.focusIndex !== null ? grid.getItem(gridSelection.focusIndex) : null;
+    if (focus !== null && ids.has(focus.id)) {
+      void refreshMetaDetail(focus.id);
+    }
+    refreshSessionCounts();
+  }
+
+  /** フォーカス項目の詳細取得 (InfoPanel表示用。世代ガード付き)。 */
+  async function refreshMetaDetail(assetId: string): Promise<void> {
+    const generation = ++detailGeneration;
+    metaBusy = true;
+    try {
+      const detail = await metadata.assetDetail(assetId);
+      if (generation === detailGeneration) {
+        metaDetail = detail;
+        metaError = null;
+      }
+    } catch (error) {
+      if (generation === detailGeneration) {
+        metaDetail = null;
+        metaError = error instanceof Error ? error.message : String(error);
+      }
+    } finally {
+      if (generation === detailGeneration) {
+        metaBusy = false;
+      }
+    }
+  }
+
+  /** 高速選別キーの適用 (ビューアから。true=適用済み→自動次送り)。 */
+  function handleTriageAction(action: TriageKeyAction): boolean {
+    const id = viewerStore?.current?.assetId ?? null;
+    if (id === null) {
+      return false;
+    }
+    // Library表示 + Asset確定済み (stable ID) のみ編集可。dbState判定は
+    // ページDTO由来 (backendのAssetId符号化が正本)
+    if (catalogSource !== "library" || !gridPagerHasId(id)) {
+      return false;
+    }
+    const apply =
+      action.kind === "rating"
+        ? applyRating([id], action.value)
+        : applyCull([id], action.value);
+    void apply.catch((error) => {
+      showMetaNotice(error instanceof Error ? error.message : String(error));
+    });
+    return true;
+  }
+
+  function gridPagerHasId(id: string): boolean {
+    const focus = gridSelection.focusIndex;
+    if (focus !== null) {
+      const item = grid.getItem(focus);
+      if (item?.id === id) {
+        return item.dbState === "asset";
+      }
+    }
+    const found = grid.pager.findIndicesByIds(new Set([id])).get(id);
+    return found !== undefined ? grid.getItem(found)?.dbState === "asset" : false;
+  }
+
+  /** ビューアの表示indexへグリッド選択を同期 (高速選別の自動次送り後)。 */
+  function syncSelectionToViewer(): void {
+    if (viewerStore === null) {
+      return;
+    }
+    const index = viewerStore.displayIndex;
+    if (index >= 0 && grid.getItem(index) !== null) {
+      gridComponent?.selectAndFocus(index);
+    }
+  }
+
+  /** 比較スロットの採用/除外 (WP-5)。 */
+  function handleCullSlot(slotIndex: number, value: "picked" | "rejected"): void {
+    const id = compareStore?.slots[slotIndex]?.assetId ?? null;
+    if (id === null) {
+      return;
+    }
+    void applyCull([id], value).catch((error) => {
+      showMetaNotice(error instanceof Error ? error.message : String(error));
+    });
+  }
+
   // ===== コンテキストメニュー・OS連携 (WP-4) =====
 
   function openGridContextMenu(event: MouseEvent, index: number): void {
@@ -863,6 +1164,12 @@
 
     registerKeys();
     unregisterKeys.push(keys.install());
+    window.addEventListener("keydown", onGlobalKeydown, true);
+    void (async () => {
+      const stop = await metadata.init();
+      disposeMetadata = stop;
+      stopMetadataUpdates = metadata.onAssetUpdated(onAssetUpdated);
+    })();
 
     void refreshHealth();
     void catalog.init().then(async (dispose) => {
@@ -925,6 +1232,24 @@
           getSelection: () => gridSelection,
           getSession: () => session,
           getSessionNotice: () => sessionNotice,
+          getMeta: () => ({
+            detail: metaDetail,
+            triageMode: triageModeOn,
+            undoDepth: undo.depth,
+            canEdit:
+              focusInfo !== null &&
+              catalogSource === "library" &&
+              focusInfo.dbState === "asset",
+            focusItem: focusInfo === null
+              ? null
+              : {
+                  id: focusInfo.id,
+                  rating: focusInfo.rating,
+                  triage: focusInfo.triage,
+                  favorite: focusInfo.favorite,
+                  dbState: focusInfo.dbState,
+                },
+          }),
           invoke,
         });
       }
@@ -936,6 +1261,9 @@
     stopGridNotifyForPerf();
     stopLibraryNotification();
     stopSessionNotify();
+    stopMetadataUpdates?.();
+    disposeMetadata?.();
+    window.removeEventListener("keydown", onGlobalKeydown, true);
     for (const unregister of unregisterKeys.splice(0)) {
       unregister();
     }
@@ -1014,6 +1342,9 @@
       </span>
     {/if}
     <div class="header-spacer"></div>
+    {#if metaNotice}
+      <span class="header-notice">{metaNotice}</span>
+    {/if}
     {#if osNotice}
       <span class="header-notice">{osNotice}</span>
     {/if}
@@ -1207,6 +1538,13 @@
           onResume={() => void resumeSession()}
           onEnd={endSession}
           onSessionMove={sessionMove}
+          detail={metaDetail}
+          metaBusy={metaBusy}
+          metaError={metaError}
+          actions={metaActions}
+          suggestTags={(prefix) => metadata.suggestTags(prefix)}
+          undoLabel={undoLabel}
+          bulkTargetIds={gridSelection.ids}
         />
       </aside>
     {/if}
@@ -1237,9 +1575,23 @@
 <QuickPreview store={quickPreview} onClose={() => quickPreview.close()} />
 
 {#if viewerMode === "single" && viewerStore !== null}
-  <ImageViewer store={viewerStore} onClose={closeViewer} />
+  <ImageViewer
+    store={viewerStore}
+    onClose={closeViewer}
+    triageMode={triageModeOn}
+    onToggleTriageMode={() => (triageModeOn = !triageModeOn)}
+    onTriageAction={(action) => {
+      const handled = handleTriageAction(action);
+      if (handled) {
+        // 自動次送り (spec §9.2 高速選別モード)
+        viewerStore?.nav(1);
+        syncSelectionToViewer();
+      }
+      return handled;
+    }}
+  />
 {:else if (viewerMode === "compare2" || viewerMode === "compare4") && compareStore !== null}
-  <CompareView store={compareStore} onClose={closeViewer} />
+  <CompareView store={compareStore} onClose={closeViewer} onCullSlot={handleCullSlot} />
 {/if}
 
 <style>

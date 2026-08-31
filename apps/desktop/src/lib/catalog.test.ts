@@ -114,6 +114,8 @@ function makePage(generation: number, offset: number, names: string[]): CatalogP
       mtimeMs: 1_700_000_000_000,
       mimeType: "image/png",
       dbState: "adhoc" as const,
+    rating: 0,
+    favorite: false,
       triage: "undecided" as const,
     })),
   };

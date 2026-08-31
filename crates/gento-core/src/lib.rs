@@ -4,6 +4,7 @@
 pub mod catalog;
 pub mod jobs;
 pub mod library;
+pub mod metadata;
 pub mod repo;
 
 pub use jobs::{ParsePriorityError, ParseSizeClassError, Priority, SizeClass};

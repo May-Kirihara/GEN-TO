@@ -978,7 +978,17 @@ fn spawn_hash_accountant(
         .spawn(move || {
             while let Ok(completion) = completions.recv() {
                 if completion.key.starts_with("hash:") {
-                    shared.hash_pending.fetch_sub(1, Ordering::SeqCst);
+                    // fetch_subは旧値を返す: 旧値1 = 自分の完了でpendingが0に
+                    // なった「最後の1件」。この場合は進捗間引き (100ms) を
+                    // バイパスしてスナップショットを確定反映する —
+                    // ハッシュ完了直前のemitが間引きに吸収されると、確定済み
+                    // Asset (stable ID) への切り替わりが次のトリガまで
+                    // 表示へ反映されない (WP-5実機E2Eで発見。仮IDのまま
+                    // 編集不可状態が残る)。
+                    let remaining_before = shared.hash_pending.fetch_sub(1, Ordering::SeqCst);
+                    if remaining_before == 1 {
+                        shared.host.library_snapshot_changed();
+                    }
                     if let Some(pool) = pool.upgrade() {
                         resubmit_ready(&shared, &pool);
                     }
@@ -1286,7 +1296,7 @@ pub fn build_library_snapshot(
         let Some(root_path) = root_paths.get(&file.root_id) else {
             continue;
         };
-        let (id, width, height, mime, is_animated, rating, triage) = match &asset {
+        let (id, width, height, mime, is_animated, rating, triage, favorite) = match &asset {
             Some(asset) => (
                 library_asset_id(asset.id),
                 asset.width,
@@ -1299,6 +1309,7 @@ pub fn build_library_snapshot(
                     gento_core::repo::TriageState::Picked => Triage::Keep,
                     gento_core::repo::TriageState::Rejected => Triage::Reject,
                 },
+                asset.favorite,
             ),
             None => (
                 provisional_file_asset_id(file.id),
@@ -1308,6 +1319,7 @@ pub fn build_library_snapshot(
                 false,
                 0,
                 Triage::Undecided,
+                false,
             ),
         };
         records.push(ImageRecord {
@@ -1324,6 +1336,7 @@ pub fn build_library_snapshot(
             thumb_state: ThumbnailState::Missing,
             rating,
             triage,
+            favorite,
         });
     }
     records.sort_by(|a, b| {

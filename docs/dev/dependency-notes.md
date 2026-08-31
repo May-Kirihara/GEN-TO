@@ -1,6 +1,6 @@
 # 依存ライブラリメモ (Phase 2 / WP-2時点)
 
-- 記録日: 2026-08-28 (Phase 1 → WP-2更新 → WP-3更新 2026-08-29 → WP-4更新 2026-08-29 → WP-5更新 2026-08-29 → WP-0確認 2026-08-30 → AVIF-1更新 2026-08-31)
+- 記録日: 2026-08-28 (Phase 1 → WP-2更新 → WP-3更新 2026-08-29 → WP-4更新 2026-08-29 → WP-5更新 2026-08-29 → WP-0確認 2026-08-30 → AVIF-1更新 2026-08-31 → WP-5 (MVP) 更新 2026-08-31)
 - 方針: バージョンはpin (npmは正確なバージョン指定、Cargoは `=` 付き + Cargo.lock)。追加・変更時に本メモへ記録する。
 
 ## Rust (workspace直依存)
@@ -286,3 +286,22 @@
     (webkit2gtk系経由) のため新規コンパイルコストなし。
   - 代替案: `signal-hook` / `ctrlc` crate。ハンドラ1本のため直接libc呼び出しを
     選択 (依存追加を最小化)。async-signal-safeな操作のみ使用。
+
+## WP-5 (MVP) で追加した依存 (2026-08-31。評価・選別・タグ・キャプション)
+
+- **`unicode-normalization` =0.1.25** (gento-core、通常依存)
+  - 用途: タグ正規化名のNIF正規化 (NFC)。`normalize_tag_name` は
+    「trim + NFC + ASCII小文字化 + 内部空白の連続を1つに圧縮」の順で適用し、
+    `tags.normalized_name` (UNIQUE) の正本とする (MVP実装計画§13「タグ正規化
+    規則を固定する」/ data-model §4.1)。
+  - 入手元: crates.io (rustunicode/unicode-normalization)。Rust標準の
+    Unicode characterization系クレート群の1つで `str::nfc()` イテレータを提供。
+  - ライセンス: MIT OR Apache-2.0。再配布義務なし (通常のOSSライセンス表示
+    対象。licenses.mdへ自動生成で載る)。
+  - native依存: なし (pure Rust。テーブル内蔵)。全プラットフォーム対応。
+  - 代替案: 手書きNFC実装はUnicode結合文字表の維持コストが不当に大きいため
+    不採用。NFKC (正規化で全角半角を畳む) は仕様上「ASCII小文字化のみ」と
+    しているため不使用 — 全角英数字は別タグとして扱う (仕様判断は
+    api-contract §29参照)。
+  - 注: ルートCargo.tomlは変更せず `crates/gento-core/Cargo.toml` へ直付け
+    (workspace.dependenciesは共有crateのみ。単一crate利用のため)。

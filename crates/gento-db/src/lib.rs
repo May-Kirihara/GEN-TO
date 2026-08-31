@@ -48,6 +48,7 @@ use rusqlite::Connection;
 
 mod diagnose;
 mod ids;
+mod metadata;
 mod migrate;
 mod paths;
 mod repos;

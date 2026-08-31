@@ -1126,3 +1126,165 @@ type ImageListItem = {
   復元後も件数ずれ (>5%) や現在位置のID解決失敗があれば警告表示して
   再開を中止する (adhocの走査連番IDはフォルダ+ソート+走査順の組でのみ
   安定なため。誤画像へのサイレント再開防止)
+
+---
+
+# 評価・選別・タグ・キャプション (WP-5 / 2026-08-31 追加)
+
+## 29. Commands
+
+メタデータ編集はすべて**stable AssetId (assets.id。§19)** を指定して行う。
+IDは10進文字列 (AssetId IPC規約)。
+
+### ガード (adhoc編集不可)
+
+- カタログがLibraryモードでない (`get_catalog_summary.mode != "library"`) 場合、
+  全編集コマンドは日本語エラー
+  「未登録フォルダ表示中はメタデータを編集できません。登録ルートをライブラリとして表示してから編集してください」
+  を返す (仕様§4.1「未登録はライブラリ機能なし」)。
+  一時走査のIDは1開始連番でassets.idと数値が偶発一致し得るため、
+  **モードガードが唯一の安全な判別**である (値だけでは区別できない)。
+- 仮ID (bit63。ハッシュ計算待ち) を指定した場合も拒否
+  (「ハッシュ計算待ちの項目は編集できません」)。UI側は
+  `dbState === "asset"` で編集可否を判定して無効化する。
+- 無効値 (rating 6以上・不明なcull/kind文字列) は日本語エラー。
+
+### `asset_set_rating` / `asset_set_cull` / `asset_set_favorite`
+
+```ts
+invoke<null>("asset_set_rating", { ids: string[], rating: number })   // 0..=5
+invoke<null>("asset_set_cull", { ids: string[], cull: "picked" | "rejected" | "unselected" })
+invoke<null>("asset_set_favorite", { ids: string[], favorite: boolean })
+```
+
+- `ids` 一括対応。**1トランザクションで適用**し、途中の不在ID等で失敗した
+  場合は全体ロールバック (一部だけ適用された状態を残さない — 受入条件5)。
+- 除外 (`rejected`) は**ファイルを削除しない** (fs無操作。受入条件3)。
+- 成功時 `asset:updated` イベント (下記) をemitし、表示済みカタログレコードを
+  in-place更新する (generation不変 — ページ再取得不要)。
+
+### `asset_tags_add` / `asset_tags_remove` / `asset_tags_list`
+
+```ts
+invoke<null>("asset_tags_add", { ids: string[], names: string[] })  // N asset × M tag
+invoke<null>("asset_tags_remove", { assetId: string, tagId: string })
+invoke<TagDto[]>("asset_tags_list", { assetId: string })
+```
+
+- `asset_tags_add` は名前からタグを**作成 or 既存統合**して付与する
+  (手動追加: `source=manual`・`manually_edited=1`)。同一assetへの再付与は
+  冪等 (行を重複させず `manually_edited=1` を再設定。`source` は初回由来を保持)。
+- 付与も1トランザクション (一部asset不在でロールバック)。
+- `TagDto`: `{ id: string, name: string, normalized_name: string,
+  usage_count: number, manually_edited: boolean }` (camelCase)。
+
+### `tag_suggest` / `tag_list` / `tag_delete`
+
+```ts
+invoke<TagDto[]>("tag_suggest", { prefix: string, limit?: number })  // 既定20・上限100
+invoke<TagDto[]>("tag_list")
+invoke<null>("tag_delete", { tagId: string })
+```
+
+- 候補は**正規化名の前方一致**・使用数降順 (同数は正規化名昇順)。
+  `prefix` も正規化して照合 (大文字入力可)。LIKE特殊文字 (`%_\`) はエスケープ。
+- `tag_delete` は**使用中のasset_tagsごと削除** (付随解除。ON DELETE CASCADE)。
+  削除されたタグを付与されていたassetへむけ `asset:updated` (`changes:["tags"]`)
+  をemitする。
+
+### `asset_caption_get` / `asset_caption_set`
+
+```ts
+invoke<CaptionDto | null>("asset_caption_get", { assetId: string, kind: "description" | "sd_tags" | "user_note" })
+invoke<CaptionDto>("asset_caption_set", { assetId: string, kind: ..., body: string })
+```
+
+- `CaptionDto`: `{ kind, body, source: "manual"|..., manually_edited: boolean,
+  updated_at: string }`。
+- 手動編集は「新行挿入 (`source=manual`・`manually_edited=1`・`current=1`) +
+  旧現行行の `current=0` 化」で行う (履歴保持。data-model §5)。
+  kindごとに現行は高々1行 (schemaの部分UNIQUE index)。
+- `manually_edited=1` の行はWP-10のAI再生成で上書きされない
+  (受入条件4「ユーザー編集済みキャプションを明確に識別」)。
+- `ai_run_id` 列はWP-10でai_runsテーブル作成と同時にADD COLUMN予定
+  (本WPでは構造のみ。source enumに `ai` を含む)。
+
+### `asset_detail`
+
+```ts
+invoke<AssetDetailDto>("asset_detail", { assetId: string })
+// { id, rating, triage, favorite, tags: TagDto[], captions: CaptionDto[] }
+```
+
+InfoPanel用の一括取得。`captions` は現行のみ (未設定のkindは含めない)。
+
+## 30. Events
+
+### `asset:updated` — メタデータ変更通知
+
+```ts
+type AssetUpdatedEvent = {
+  ids: string[];              // 変更されたstable AssetId (10進文字列)
+  changes: string[];          // "rating" | "cull" | "favorite" | "tags" | "caption"
+  rating?: number;            // 変更後の値 (rating変更時のみ)
+  triage?: "picked" | "rejected" | "unselected";  // cull変更時のみ
+  favorite?: boolean;         // favorite変更時のみ
+};
+```
+
+- フロントはこのイベントで (1) グリッドセルのキャッシュ済み項目をin-place
+  更新 (`CatalogPager.patchItems` — rating/triage/favorite)、(2) フォーカス
+  項目なら `asset_detail` 再取得 (tags/caption追従)、(3) セッション集計
+  (採用/除外/保留カウント) を再計算する。
+- backendも表示済みカタログレコード (`CatalogInner.library`、Library表示中は
+  `state.records` も) を同一トランザクション直後に更新するため、以後の
+  ページ取得は新しい値を返す (generation不変)。
+
+## 31. タグ正規化規則 (確定)
+
+`normalize_tag_name` (gento-core metadata) — **trim → NFC → ASCII小文字化 →
+内部空白の連続を1つの半角空白へ圧縮** の順:
+
+- 前後空白 (全角空白U+3000・タブ含む) を除去
+- NFC正規化 (分解形の濁点 `か+゛` → `が` を統合)
+- ASCII大文字を小文字へ (`Sky` と `SKY` は同一タグ)
+- 内部の空白連続 (種類混在含む) を半角空白1つへ (`青　空` と `青 空` は同一)
+- **全角英数字 (ＴＡＧ) はNFKCを適用しないため半角 (TAG) と別タグ**
+  (正規化の範囲をASCII小文字化に限定する仕様判断)
+- 正規化結果が空 (空白のみ) の入力は拒否 (`Constraint`)
+- `tags.normalized_name` はUNIQUE — 表記違いは作成時に既存タグへ統合
+  (受入「重複→統合」)。表示名 (`display_name`) は初回登録時の入力 (trim済み) のまま
+
+## 32. ページDTOへの追加フィールド (minor。`GENTO_API_VERSION` 据え置き)
+
+```ts
+type ImageListItem = {
+  // ... 既存フィールド ...
+  rating: number;      // 0..=5 (グリッドの星バッジ)
+  favorite: boolean;   // (♥バッジ)
+};
+```
+
+- library表示は `assets.rating/favorite` から供給。一時走査・仮想は 0/false
+
+## 33. フロントエンド実装 (WP-5。commandではなくWebView側)
+
+- **Undo**: `lib/undo.ts` — メタデータ操作のみのUndoスタック (直近50操作の
+  逆適用関数。Ctrl+Z)。before値 (評価/選別/お気に入り/キャプション本文) は
+  操作前に捕捉、タグ付与のundoは付与後の名前解決で解除する。
+  **ファイル操作のUndoはWP-7で統合** (本WPスコープ外)
+- **高速選別モード** (ビューア内トグル): 数字1-5=星評価・0=評価解除・
+  X=除外・P/A=採用、入力後自動次送り (`lib/triage-keys.ts` の純粋関数)。
+  ON中はズームキー (0=fit/1=actual) より優先。ビューアフォーカス時のみ有効
+- **比較表示**: 各スロットに採用/除外ボタン + X=アクティブスロット除外・
+  K=アクティブスロット採用 (Pは既存のoriginal昇格と衝突するためK)
+- **一括編集**: 複数選択時、InfoPanelの操作は「選択N件へ適用」の確認表示を
+  经て実行 (キャプション編集は単一選択時のみ)
+- **セッション集計**: 採用/除外/保留カウントは `asset:updated` 駆動で再計算
+  (値はDB正本→カタログ項目→セッション集計の流れ)
+- **QA-WP4残課題対応**: Minor-6 (同一フォルダ再走査のスクロール復元 —
+  空カタログ中のscrollTop=0を保存せず、total復帰時に直前位置へjump) /
+  Minor-7 (セッション保存失敗 `lastError` をInfoPanel通知へ表示)
+- dev bridge: `M` 行 (編集可否・rating・triage・favorite・タグ数・undo残数・
+  高速選別モード) と操作アクション (`metaRate5`・`metaPick`・`metaReject`・
+  `metaUndo`・`metaBulkConfirm`・`metaToggleTriage`・`pressKey0/3/5/X/P`) を追加

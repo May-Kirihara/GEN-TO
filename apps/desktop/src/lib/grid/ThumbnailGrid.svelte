@@ -103,6 +103,10 @@
   // 起動直後 (フォルダ切替直後) はカタログが空でscrollTopが保持できないため、
   // 内容が載った時点 (total>0) で改めて復元する
   let pendingRestore: number | null = restoredOffset > 0 ? restoredOffset : null;
+  // 再走査 (同一フォルダのbegin_scan) でrecordsが破棄されるとscrollTopが
+  // 0へ落ちる。その直前の位置を覚えておき、内容が戻った時点で復元する
+  // (QA-WP4 Minor-6。{#key}による再構築が走らない同一フォルダ再走査向け)。
+  let lastPositiveOffset = restoredOffset;
 
   const virtualizer = createVirtualizer({
     count: rowCount,
@@ -126,7 +130,14 @@
     const offset = instance.scrollOffset ?? 0;
     if (offset !== scrollTop) {
       scrollTop = offset;
-      scrollStore.saveThrottled(modeKey, offset);
+      // 空カタログ中のscrollTop=0は「実位置」ではないため保存しない
+      // (再走査で保存位置が0で上書きされるのを防ぐ — QA-WP4 Minor-6)
+      if (offset > 0 || total > 0) {
+        scrollStore.saveThrottled(modeKey, offset);
+      }
+      if (offset > 0) {
+        lastPositiveOffset = offset;
+      }
     }
   }
 
@@ -156,10 +167,21 @@
   });
 
   // カタログが空の間はscrollTopを保持できないため、total>0になった時点で
-  // 復元位置へjumpする (起動・フォルダ切替直後の復元、WP-4)
+  // 復元位置へjumpする (起動・フォルダ切替直後の復元、WP-4)。
+  // 同一フォルダ再走査 (totalがN→0→Nへ遷移) では、直前の非ゼロ位置へ
+  // 戻す (QA-WP4 Minor-6)。
   $effect(() => {
     void total;
-    if (pendingRestore !== null && total > 0 && virtualizerInstance !== null) {
+    if (virtualizerInstance === null) {
+      return;
+    }
+    if (total === 0) {
+      if (pendingRestore === null && lastPositiveOffset > 0) {
+        pendingRestore = lastPositiveOffset;
+      }
+      return;
+    }
+    if (pendingRestore !== null) {
       const target = pendingRestore;
       pendingRestore = null;
       virtualizerInstance.scrollToOffset(target, { align: "start" });
@@ -333,6 +355,21 @@
     return grid.isFailed(item.id);
   }
 
+  /**
+   * セルバッジ表示値 (WP-5)。pagerのin-placeパッチ (asset:updated) は項目
+   * オブジェクトの同一性を保つため、gridTickを読むへルパ経由で評価する
+   * (urlForと同じ規約 — 参照が同じままだとSvelteの細粒度更新が走らない)。
+   */
+  function cellBadges(
+    item: ImageListItem,
+  ): { rating: number; favorite: boolean; triage: "undecided" | "keep" | "reject" } | null {
+    void gridTick;
+    if (item.rating <= 0 && !item.favorite && item.triage === "undecided") {
+      return null;
+    }
+    return { rating: item.rating, favorite: item.favorite, triage: item.triage };
+  }
+
   function cellsOf(rowIndex: number): Array<{ index: number; key: string }> {
     void gridTick;
     const cells: Array<{ index: number; key: string }> = [];
@@ -420,6 +457,7 @@
         >
           {#each cellsOf(row.index) as cell (cell.key)}
             {@const item = itemAt(cell.index)}
+            {@const badges = item !== null ? cellBadges(item) : null}
             <div
               role="gridcell"
               class="cell"
@@ -438,6 +476,14 @@
                   <img src={url} alt={item.displayName} loading="lazy" decoding="async" draggable="false" />
                 {:else if failed(item)}
                   <span class="cell-fail-mark" role="img" aria-label="サムネイル生成失敗">✕</span>
+                {/if}
+                {#if badges !== null}
+                  <span class="cell-badges" aria-hidden="true">
+                    {#if badges.favorite}<span class="badge badge-fav">♥</span>{/if}
+                    {#if badges.rating > 0}<span class="badge badge-rating">★{badges.rating}</span>{/if}
+                    {#if badges.triage === "keep"}<span class="badge badge-keep" title="採用">✓</span>{/if}
+                    {#if badges.triage === "reject"}<span class="badge badge-reject" title="除外">✗</span>{/if}
+                  </span>
                 {/if}
               {/if}
             </div>
@@ -534,5 +580,44 @@
     height: 100%;
     object-fit: contain;
     pointer-events: none;
+  }
+
+  /* WP-5: 評価・選別・お気に入りバッジ (左下に重ねる) */
+  .cell-badges {
+    position: absolute;
+    left: 2px;
+    bottom: 2px;
+    z-index: 1;
+    display: flex;
+    gap: 2px;
+    pointer-events: none;
+  }
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 0 4px;
+    border-radius: 4px;
+    font-size: 0.68rem;
+    line-height: 1.3;
+    color: light-dark(#ffffff, #f0f6fc);
+    background: light-dark(#000000aa, #000000aa);
+    user-select: none;
+  }
+
+  .badge-rating {
+    color: light-dark(#eac54f, #e3b341);
+  }
+
+  .badge-fav {
+    color: light-dark(#ff6b81, #f85149);
+  }
+
+  .badge-keep {
+    background: light-dark(#1a7f37dd, #238636dd);
+  }
+
+  .badge-reject {
+    background: light-dark(#cf222edd, #b62324dd);
   }
 </style>

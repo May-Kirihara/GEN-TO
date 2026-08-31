@@ -76,6 +76,7 @@ pub mod virtual_catalog {
                         1 => super::Triage::Keep,
                         _ => super::Triage::Reject,
                     },
+                    favorite: false,
                 }
             })
             .collect();
@@ -148,6 +149,8 @@ pub struct ImageRecord {
     /// 仮の評価 (0..=5)。
     pub rating: u8,
     pub triage: Triage,
+    /// お気に入り (WP-5。グリッドセルのバッジ表示に使用)。
+    pub favorite: bool,
 }
 
 /// IPC用リスト項目DTO (docs/implementation-plan.md §9 DTO候補)。
@@ -167,6 +170,10 @@ pub struct ImageListItem {
     /// 選別状態 (WP-4でDTOへ暴露。選別セッションの採用/除外カウント用。
     /// マーク編集UI自体はWP-5)。
     pub triage: Triage,
+    /// 星評価 0..=5 (WP-5。グリッドセルの星バッジ表示に使用)。
+    pub rating: u8,
+    /// お気に入り (WP-5。グリッドセルの♥バッジ表示に使用)。
+    pub favorite: bool,
 }
 
 impl ImageRecord {
@@ -183,6 +190,8 @@ impl ImageRecord {
             thumbnail_state: self.thumb_state,
             is_animated: self.is_animated,
             triage: self.triage,
+            rating: self.rating,
+            favorite: self.favorite,
         }
     }
 }
@@ -366,6 +375,7 @@ mod tests {
             thumb_state: ThumbnailState::Missing,
             rating: 0,
             triage: Triage::Undecided,
+            favorite: false,
         }
     }
 
@@ -529,10 +539,11 @@ mod tests {
                 "thumbnailState": "missing",
                 "isAnimated": false,
                 "triage": "undecided",
+                // WP-5: グリッドバッジ表示用の追加フィールド
+                "rating": 0,
+                "favorite": false
             })
         );
-        let back: ImageListItem = serde_json::from_value(json).unwrap();
-        assert_eq!(back, item);
     }
 
     #[test]

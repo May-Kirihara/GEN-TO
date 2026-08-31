@@ -18,6 +18,8 @@ function item(index: number, overrides: Partial<ImageListItem> = {}): ImageListI
     mtimeMs: 1000,
     mimeType: "image/png",
     dbState: "adhoc",
+    rating: 0,
+    favorite: false,
     triage: "undecided",
     ...overrides,
   };

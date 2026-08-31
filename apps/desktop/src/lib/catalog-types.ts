@@ -42,8 +42,12 @@ export type ImageListItem = {
   /** DB状態 (WP-4)。asset=登録済みAsset確定 / provisional=登録済みハッシュ待ち
    *  / adhoc=未登録 (一時走査・仮想)。 */
   dbState: ItemDbState;
-  /** 選別状態 (WP-4。セッションの採用/除外カウント用。編集UIはWP-5)。 */
+  /** 選別状態 (WP-4。セッションの採用/除外カウント用。WP-5で編集接続)。 */
   triage: "undecided" | "keep" | "reject";
+  /** 星評価 0..=5 (WP-5。グリッドセルの星バッジ表示)。 */
+  rating: number;
+  /** お気に入り (WP-5。グリッドセルの♥バッジ表示)。 */
+  favorite: boolean;
 };
 
 /** get_catalog_page の戻り値 (Rust: gento_core::catalog::PageResult)。 */

@@ -41,8 +41,37 @@ export type DevBridgeStores = {
   getSession: () => SessionLike | null;
   /** QA-WP4: セッション通知文言 (再開中止警告の検証用)。 */
   getSessionNotice: () => string;
+  /** WP-5: メタデータ編集状態 (InfoPanel詳細・undo・高速選別)。 */
+  getMeta: () => MetaLike | null;
   /** WP-7: invoke (エラー注入など)。App.svelteのcore invokeを流用。 */
   invoke: <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
+};
+
+/** WP-5: メタデータ編集状態の読み出し口 (E2E検証用)。 */
+export type MetaLike = {
+  /** フォーカス項目のasset_detail応答 (未取得・編集不可はnull)。 */
+  detail: {
+    id: string;
+    rating: number;
+    triage: string;
+    favorite: boolean;
+    tags: Array<{ name: string; manually_edited: boolean }>;
+    captions: Array<{ kind: string; body: string; manually_edited: boolean }>;
+  } | null;
+  /** 高速選別モード (ビューア)。 */
+  triageMode: boolean;
+  /** Undoスタック残数。 */
+  undoDepth: number;
+  /** フォーカス項目が編集可能 (Library + Asset確定)。 */
+  canEdit: boolean;
+  /** フォーカス項目のグリッド表示値 (rating/triage/favorite)。 */
+  focusItem: {
+    id: string;
+    rating: number;
+    triage: string;
+    favorite: boolean;
+    dbState: string;
+  } | null;
 };
 
 type GridLike = {
@@ -56,9 +85,19 @@ type GridLike = {
     cancelled: number;
     cancelBatches: number;
   };
-  pager: { stats: { fetched: number; errors: number }; generation: number | null };
+  pager: {
+    stats: { fetched: number; errors: number };
+    generation: number | null;
+    findIndicesByIds(ids: ReadonlySet<string>): Map<string, number>;
+  };
   thumbUrlFor(id: string): string | null;
-  getItem(index: number): { id: string; displayName: string } | null;
+  getItem(index: number): {
+    id: string;
+    displayName: string;
+    triage?: string;
+    rating?: number;
+    favorite?: boolean;
+  } | null;
 };
 
 type SessionLike = {
@@ -175,6 +214,13 @@ function findButton(prefix: string): HTMLButtonElement | null {
 
 function clickButton(prefix: string): void {
   findButton(prefix)?.click();
+}
+
+/** 高速選別キー相当のkeydownをwindowへ合成 (ビューアのsvelte:windowリスナ経由)。 */
+function pressTriageKey(key: string): void {
+  window.dispatchEvent(
+    new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }),
+  );
 }
 
 function cellAt(index: number): HTMLElement | null {
@@ -390,6 +436,55 @@ export function installDevBridge(stores: DevBridgeStores): void {
     },
     // QA-WP4: 走査キャンセルボタン (走査中のみ出現)
     cancelScan: () => clickButton("走査をキャンセル"),
+    // WP-5: メタデータ編集 (InfoPanelの本物のボタン/DOMイベントで駆動)
+    metaRate5: () => {
+      document.querySelector<HTMLButtonElement>('[data-meta="rating"] button[aria-label="評価 5"]')
+        ?.click();
+    },
+    metaReject: () => {
+      const buttons = Array.from(
+        document.querySelectorAll<HTMLButtonElement>('[data-meta="cull"] button'),
+      );
+      buttons.find((b) => (b.textContent ?? "").startsWith("除外"))?.click();
+    },
+    metaPick: () => {
+      const buttons = Array.from(
+        document.querySelectorAll<HTMLButtonElement>('[data-meta="cull"] button'),
+      );
+      buttons.find((b) => (b.textContent ?? "").startsWith("採用"))?.click();
+    },
+    metaUndo: () => {
+      document.querySelector<HTMLButtonElement>('[data-meta="undo"] button')?.click();
+    },
+    metaBulkConfirm: () => {
+      document.querySelector<HTMLButtonElement>(".bulk-confirm button.primary")?.click();
+    },
+    metaToggleTriage: () => clickButton("高速選別"),
+    /** 高速選別キー相当のkeydownをwindowへ合成 (ビューアのsvelte:windowリスナ経由)。 */
+    pressKey0: () => pressTriageKey("0"),
+    pressKey3: () => pressTriageKey("3"),
+    pressKey5: () => pressTriageKey("5"),
+    pressKeyX: () => pressTriageKey("x"),
+    pressKeyP: () => pressTriageKey("p"),
+    // WP-5 E2E: 実キー入力 (xdotool type) の着地ポイントへフォーカス
+    focusLibraryPathInput: () => {
+      document.querySelector<HTMLInputElement>(".roots-add input")?.focus();
+    },
+    focusTagInput: () => {
+      document.querySelector<HTMLInputElement>('[data-meta="tags"] input')?.focus();
+    },
+    focusNoteCaption: () => {
+      document.querySelector<HTMLTextAreaElement>('[data-meta="caption-user_note"] textarea')
+        ?.focus();
+    },
+    metaSaveCaption: () => {
+      document
+        .querySelector<HTMLButtonElement>('[data-meta="caption-user_note"] .caption-controls button')
+        ?.click();
+    },
+    focusCell0: () => clickCell(0),
+    focusCell1: () => clickCell(1),
+    focusCell2: () => clickCell(2),
     // QA-WP4: ツリー行クリック (xdotoolポインタが環境により不安定なため
     // 本物のtree-labelボタンをDOM clickで駆動。selectFolder→open_folder
     // の生産経路を通る)
@@ -459,11 +554,58 @@ export function installDevBridge(stores: DevBridgeStores): void {
     const grid = stores.getGrid();
     const focusItem =
       sel !== null && sel.focusIndex !== null ? grid?.getItem(sel.focusIndex) : null;
+    // WP-5: 採用/除外/保留の実集計 (DB triage → pagerキャッシュ)
+    let keep = -1;
+    let reject = -1;
+    let undecided = -1;
+    if (grid !== null && session.session !== null) {
+      keep = 0;
+      reject = 0;
+      undecided = 0;
+      const wanted = new Set(session.session.ids);
+      const resolved = grid.pager.findIndicesByIds(wanted);
+      for (const id of session.session.ids) {
+        const index = resolved.get(id);
+        const triage = index !== undefined ? grid.getItem(index)?.triage : undefined;
+        if (triage === "keep") {
+          keep++;
+        } else if (triage === "reject") {
+          reject++;
+        } else {
+          undecided++;
+        }
+      }
+    }
     return [
       `S act=${session.active ? 1 : 0} pos=${session.session?.position ?? -1}` +
         ` tot=${session.session?.ids.length ?? 0} cur=${session.currentId() ?? "-"}` +
         ` foc=${sel?.focusIndex ?? -1} fn=${focusItem?.displayName ?? "-"}` +
+        ` k=${keep} r=${reject} u=${undecided}` +
         ` note=${stores.getSessionNotice().slice(0, 48)}`,
+    ];
+  }
+
+  /** WP-5: メタデータ編集状態行 (E2Eの機械検証用)。 */
+  function metaLines(): string[] {
+    const meta = stores.getMeta();
+    if (meta === null) {
+      return [];
+    }
+    const d = meta.detail;
+    const f = meta.focusItem;
+    const tri = (value: string | undefined): string =>
+      value === "keep" || value === "picked" ? "k" : value === "reject" || value === "rejected" ? "r" : "u";
+    // グリッドDOM上のバッジ数 (星・♥・採用/除外) とタグ候補数
+    const badges = document.querySelectorAll("[data-grid-cell] .badge").length;
+    const suggests = document.querySelectorAll("[data-meta='tag-suggest'] .tag-suggest-item").length;
+    return [
+      `M edit=${meta.canEdit ? 1 : 0} rat=${d?.rating ?? f?.rating ?? -1}` +
+        ` frat=${f?.rating ?? -1} ftri=${tri(f?.triage)} fid=${f?.id ?? "-"} fdb=${f?.dbState ?? "-"}` +
+        ` tri=${tri(d?.triage ?? f?.triage)}` +
+        ` fav=${(d?.favorite ?? f?.favorite ?? false) ? 1 : 0}` +
+        ` tags=${d?.tags.length ?? -1} caps=${d?.captions.length ?? -1}` +
+        ` undo=${meta.undoDepth} tmode=${meta.triageMode ? 1 : 0}` +
+        ` badge=${badges} sug=${suggests}`,
     ];
   }
 
@@ -555,7 +697,7 @@ export function installDevBridge(stores: DevBridgeStores): void {
           ` sw=${c.stats.swaps} creq=${c.stats.requests}`,
       );
     }
-    lines.push(...gridLines(), ...thumbLines(), ...perfLines(), ...uiLines(), ...sessionLines());
+    lines.push(...gridLines(), ...thumbLines(), ...perfLines(), ...uiLines(), ...sessionLines(), ...metaLines());
     if (!lines.some((line) => line.startsWith("V ") || line.startsWith("C "))) {
       lines.push("idle (viewer closed)");
     }
@@ -587,6 +729,41 @@ export function installDevBridge(stores: DevBridgeStores): void {
       }
       const key = event.key;
       let handled = true;
+      // WP-5 E2E: ctrl+shift+F2..F8 はメタデータ編集の着地フォーカス等。
+      // 未割り当てなら通常割り当て (F9..F12のctrl+shift) へ落とす
+      if (event.ctrlKey && event.shiftKey && key >= "F2" && key <= "F8") {
+        switch (key) {
+          case "F2":
+            actions.focusLibraryPathInput();
+            break;
+          case "F3":
+            actions.focusTagInput();
+            break;
+          case "F4":
+            actions.focusCell0();
+            break;
+          case "F5":
+            actions.focusCell1();
+            break;
+          case "F6":
+            actions.focusCell2();
+            break;
+          case "F7":
+            actions.focusNoteCaption();
+            break;
+          case "F8":
+            actions.metaSaveCaption();
+            break;
+          default:
+            handled = false;
+        }
+        if (handled) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          setTimeout(dump, 600);
+        }
+        return;
+      }
       switch (key) {
         case "F1":
           if (event.ctrlKey) {
@@ -614,6 +791,10 @@ export function installDevBridge(stores: DevBridgeStores): void {
           }
           break;
         case "F4": {
+          if (event.ctrlKey) {
+            actions.metaRate5();
+            break;
+          }
           if (event.shiftKey) {
             actions.sessionNext();
             break;
@@ -625,6 +806,10 @@ export function installDevBridge(stores: DevBridgeStores): void {
           break;
         }
         case "F5": {
+          if (event.ctrlKey) {
+            actions.metaUndo();
+            break;
+          }
           if (event.shiftKey) {
             actions.cycleSort();
             break;
@@ -663,28 +848,44 @@ export function installDevBridge(stores: DevBridgeStores): void {
           }
           break;
         case "F9":
-          if (event.ctrlKey) {
+          if (event.ctrlKey && event.shiftKey) {
+            actions.pressKey3();
+          } else if (event.shiftKey) {
+            actions.metaPick();
+          } else if (event.ctrlKey) {
             actions.clearCache();
           } else {
             actions.virtualMode();
           }
           break;
         case "F10":
-          if (event.ctrlKey) {
+          if (event.ctrlKey && event.shiftKey) {
+            actions.pressKey5();
+          } else if (event.shiftKey) {
+            actions.metaReject();
+          } else if (event.ctrlKey) {
             actions.jumpStart();
           } else {
             actions.realMode();
           }
           break;
         case "F11":
-          if (event.ctrlKey) {
+          if (event.ctrlKey && event.shiftKey) {
+            actions.pressKeyX();
+          } else if (event.shiftKey) {
+            actions.metaBulkConfirm();
+          } else if (event.ctrlKey) {
             actions.jumpMiddle();
           } else {
             actions.cycleInjection();
           }
           break;
         case "F12":
-          if (event.ctrlKey) {
+          if (event.ctrlKey && event.shiftKey) {
+            actions.pressKeyP();
+          } else if (event.shiftKey) {
+            actions.metaToggleTriage();
+          } else if (event.ctrlKey) {
             actions.jumpEnd();
           } else {
             handled = false;
