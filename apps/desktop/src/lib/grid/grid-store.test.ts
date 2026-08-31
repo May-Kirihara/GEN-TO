@@ -433,7 +433,7 @@ describe("GridStore — 世代ガード", () => {
       sort: "name",
     });
     expect(grid.thumbUrlFor("3")).toBeNull();
-    // デバウンス後に可視範囲の需要が再計画される (修复: onResetが
+    // デバウンス後に可視範囲の需要が再計画される (修正: onResetが
     // scheduleDemandを呼ぶ)
     await vi.advanceTimersByTimeAsync(200);
     const after = requestCalls(calls).length;

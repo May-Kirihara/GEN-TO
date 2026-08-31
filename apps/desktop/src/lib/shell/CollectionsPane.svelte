@@ -14,8 +14,8 @@
   import {
     buildQueryJson,
     CONDITION_TYPES,
+    describeQueryJson,
     MIME_CHOICES,
-    parseQueryJson,
     type CollectionDto,
     type ConditionDraft,
     type CollectionsStore,
@@ -166,29 +166,13 @@
   }
 
   function conditionsSummary(collection: CollectionDto): string {
-    const drafts = parseQueryJson(collection.query_json);
-    if (drafts === null) {
+    // v2 (検索バー保存・条件ビルダー) と旧形式の両方を概要表示
+    // (QA-WP8。「(条件表示不可)」は未解析JSONの場合のみ)。
+    const summary = describeQueryJson(collection.query_json);
+    if (summary === null) {
       return collection.kind === "smart" ? "(条件表示不可)" : "";
     }
-    if (drafts.length === 0) {
-      return "すべて";
-    }
-    return drafts
-      .map((draft) => {
-        switch (draft.type) {
-          case "rating_ge":
-            return `★≥${draft.value}`;
-          case "cull_state":
-            return draft.value === "picked" ? "採用" : draft.value === "rejected" ? "除外" : "未選別";
-          case "favorite":
-            return draft.value === "true" ? "お気に入り" : "非お気に入り";
-          case "has_tag":
-            return `タグ:${draft.value}`;
-          case "mime_type":
-            return draft.value.replace("image/", "");
-        }
-      })
-      .join(" かつ ");
+    return summary;
   }
 
   // 条件ビルダーの値入力候補 (選択式。タグは自由入力+候補は省略 — WP-8で接続)

@@ -95,10 +95,17 @@ describe("canEditMetadata", () => {
   });
 
   it("WP-8回帰: 検索結果表示はlibrary系 — 直前がtemp走査でも編集可", () => {
-    // 検索実行でカタログソースはlibrary系へ遷移する (api-contract §42:
-    // 検索結果はmode=Library系・安定AssetId)。temp由来だからといって
-    // 編集不可に戻してはならない。
+    // App.svelteの検索3遷移 (runSearch/refreshSearch/exitSearch) は
+    // catalogSourceを"library"へ遷移させ (api-contract §42。backendも
+    // CatalogMode::Library)、InfoPanelには canEditMetadata(
+    // catalogSource === "library", item) が渡る。遷移後の評価は直前
+    // ソースの履歴に依存しないため、temp走査から検索しても asset確定
+    // 項目は編集可のまま:
     expect(canEditMetadata(true, { dbState: "asset" })).toBe(true);
+    // 遷移が壊れてlibraryBacked=falseのまま渡った場合の症状 (同一項目が
+    // 編集不可に落ちる)。catalogSource遷移の実装自体はE2E wp8_e2e.sh
+    // step3 (M edit=1)・step5bが検証する。
+    expect(canEditMetadata(false, { dbState: "asset" })).toBe(false);
   });
 
   it("一時走査表示 (未登録フォルダ) はdbStateに関係なく編集不可 — 仕様§4.1", () => {

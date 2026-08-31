@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   buildQueryJson,
   CollectionsStore,
+  describeQueryJson,
   parseQueryJson,
   planReorder,
   type CollectionDto,
@@ -44,7 +45,7 @@ const dto = (id: string, kind: "manual" | "smart", itemCount = 0): CollectionDto
 // ===== buildQueryJson =====
 
 describe("buildQueryJson", () => {
-  it("全条件型をAND結合の正規形JSONへ構築する", () => {
+  it("全条件型をAND結合のv2 (AST保存形式) 正規形JSONへ構築する", () => {
     const json = buildQueryJson([
       { type: "rating_ge", value: "4" },
       { type: "cull_state", value: "picked" },
@@ -53,17 +54,18 @@ describe("buildQueryJson", () => {
       { type: "mime_type", value: "image/png" },
     ]);
     expect(json).toBe(
-      '{"conditions":[' +
-        '{"type":"rating_ge","value":4},' +
-        '{"type":"cull_state","value":"picked"},' +
-        '{"type":"favorite","value":true},' +
-        '{"type":"has_tag","name":"Sky"},' +
-        '{"type":"mime_type","value":"image/png"}]}',
+      '{"version":2,"query":{"terms":[' +
+        '{"type":"field","key":"rating","op":"ge","value":{"number":4}},' +
+        '{"type":"field","key":"cull","op":"eq","value":{"text":"picked"}},' +
+        '{"type":"field","key":"fav","op":"eq","value":{"bool":true}},' +
+        '{"type":"field","key":"tag","op":"eq","value":{"text":"Sky"}},' +
+        '{"type":"field","key":"type","op":"eq","value":{"text":"image/png"}}' +
+        "]}}",
     );
   });
 
-  it("空条件は全件一致 (空配列)", () => {
-    expect(buildQueryJson([])).toBe('{"conditions":[]}');
+  it("空条件は全件一致 (空termsのv2)", () => {
+    expect(buildQueryJson([])).toBe('{"version":2,"query":{"terms":[]}}');
   });
 
   it("不正値はnull (rating範囲外・未知cull・空タグ)", () => {
@@ -91,12 +93,69 @@ describe("parseQueryJson", () => {
     ]);
   });
 
+  it("旧形式 (WP-6 conditions) もドラフトへ戻せる (読み取り互換)", () => {
+    expect(
+      parseQueryJson(
+        '{"conditions":[' +
+          '{"type":"rating_ge","value":4},' +
+          '{"type":"has_tag","name":"sky"}]}',
+      ),
+    ).toEqual([
+      { type: "rating_ge", value: "4" },
+      { type: "has_tag", value: "sky" },
+    ]);
+  });
+
+  it("ビルダーで表現できないv2 term (テキスト・未対応キー) はnull", () => {
+    expect(parseQueryJson('{"version":2,"query":{"terms":[{"type":"text","value":"夜景"}]}}')).toBeNull();
+    expect(
+      parseQueryJson('{"version":2,"query":{"terms":[{"type":"field","key":"path","op":"eq","value":{"text":"a"}}]}}'),
+    ).toBeNull();
+  });
+
   it("不正JSON・未知条件型はnull", () => {
     expect(parseQueryJson(null)).toBeNull();
     expect(parseQueryJson("not json")).toBeNull();
     expect(parseQueryJson("{}")).toBeNull();
     expect(parseQueryJson('{"conditions":[{"type":"unknown","value":1}]}')).toBeNull();
     expect(parseQueryJson('{"conditions":"x"}')).toBeNull();
+    expect(parseQueryJson('{"version":3,"query":{"terms":[]}}')).toBeNull();
+  });
+});
+
+// ===== describeQueryJson (左ペインの条件概要表示) =====
+
+describe("describeQueryJson", () => {
+  it("旧形式・ビルダー表現可能なv2は条件ラベルで表示 (丸括題の解消)", () => {
+    expect(describeQueryJson('{"conditions":[{"type":"rating_ge","value":4}]}')).toBe("★≥4");
+    expect(
+      describeQueryJson(
+        '{"version":2,"query":{"terms":[' +
+          '{"type":"field","key":"rating","op":"ge","value":{"number":4}},' +
+          '{"type":"field","key":"tag","op":"eq","value":{"text":"night"}}' +
+          "]}}",
+      ),
+    ).toBe("★≥4 かつ タグ:night");
+  });
+
+  it("ビルダー表現外のv2 termも一般形式で概要表示", () => {
+    expect(
+      describeQueryJson(
+        '{"version":2,"query":{"terms":[' +
+          '{"type":"text","value":"sunset"},' +
+          '{"type":"field","key":"type","op":"eq","value":{"text":"image/png"}},' +
+          '{"type":"field","key":"added","op":"eq","value":{"date_range":' +
+          '{"from":{"year":2026,"month":1,"day":1},"to":{"year":2026,"month":6,"day":30}}}}' +
+          "]}}",
+      ),
+    ).toBe("「sunset」 かつ png かつ 追加日:2026-01-01〜2026-06-30");
+  });
+
+  it("空条件は「すべて」・未解析はnull", () => {
+    expect(describeQueryJson('{"version":2,"query":{"terms":[]}}')).toBe("すべて");
+    expect(describeQueryJson('{"conditions":[]}')).toBe("すべて");
+    expect(describeQueryJson(null)).toBeNull();
+    expect(describeQueryJson("not json")).toBeNull();
   });
 });
 
@@ -243,6 +302,15 @@ describe("CollectionsStore", () => {
     const store = new CollectionsStore(ipc);
     await expect(store.createManual("x")).rejects.toThrow("受け付けられません");
     expect(store.lastError).toContain("受け付けられません");
+  });
+
+  it("createSmart: v2 ASTをsearchJson引数 (正本) で送る", async () => {
+    const { ipc, invokes } = mockIpc();
+    const store = new CollectionsStore(ipc);
+    const v2 = '{"version":2,"query":{"terms":[]}}';
+    await store.createSmart("夜景", v2);
+    expect(invokes[0].command).toBe("smart_collection_create");
+    expect(invokes[0].args).toEqual({ name: "夜景", queryJson: "{}", searchJson: v2 });
   });
 
   it("collections:changedイベントで一覧再取得とリスナー呼出が走る", async () => {

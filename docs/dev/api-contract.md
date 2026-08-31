@@ -1679,21 +1679,22 @@ gento-search `SearchQuery` の直列化と同一形状:
 
 ### Commands
 
-- `search_run(query, filters?, scopeRootId?, scopeCollectionId?)` →
+- `search_run(query, filters?, scopeRootId?, scopeCollectionId?)` (async) →
   `{summary, total, shown, elapsedMs, warnings, queryJson}`。
   検索を実行し結果を**カタログの検索ソース**として表示する
   (mode=Library系・安定AssetId。`catalog:changed` reason=`search_switch`)。
-  `set_catalog_source("search")` で最後の検索結果へ再切替できる
-- `search_refresh()` → 表示中検索を新しいDB状態で再実行 (メタデータ編集後の
-  反映用。同じ応答形状)
+  全件収集はspawn_blocking (UI非ブロッキング)。`set_catalog_source("search")`
+  で最後の検索結果へ再切替できる
+- `search_refresh()` (async) → 表示中検索を新しいDB状態で再実行
+  (メタデータ編集後の反映用。同じ応答形状)
 - `search_evidence(assetIds: string[])` → `[{assetId, matches:
   [{field, snippet}]}]`。一致フィールド (filename|path|tags|captions|note)
   と `[一致語]` 形式の前後文。InfoPanel・セルツールチップが使用
-- `fts_integrity()` → `{expectedDocs, actualDocs, missingDocs, orphanDocs,
+- `fts_integrity()` (async) → `{expectedDocs, actualDocs, missingDocs, orphanDocs,
   duplicateDocs, staleContents, consistent}`
 - `fts_rebuild()` (async) → `{rebuilt, removed, elapsedMs}`。
   進捗は `fts:rebuild_progress` イベント `{done, total}`
-- `fts_repair()` → 不整合のみ修復 (欠落・内容不一致の再構築 + 孤立・重複削除)
+- `fts_repair()` (async) → 不整合のみ修復 (欠落・内容不一致の再構築 + 孤立・重複削除)
 
 ### スマートコレクション = 保存済み検索 (設計判断)
 
@@ -1704,8 +1705,11 @@ gento-search `SearchQuery` の直列化と同一形状:
   `{"version":2,"query":{"terms":[...]}}`。
   `smart_collection_create` は `searchJson` 引数 (version 2形式) を取り、
   指定時はそちらを正本とする (旧`queryJson`引数は互換用)
-- 旧形式 (WP-6最小条件 `{"conditions":[...]}`) は**読み取り互換のみ**:
-  評価時にASTへ変換 (`legacy_to_query`)。新規書き込みは拒否
+- 旧形式 (WP-6最小条件 `{"conditions":[...]}`) は**読み取り互換**:
+  評価時にASTへ変換 (`legacy_to_query`)。UIからの新規書き込みは
+  version 2のみ (QA-WP8よりCollectionsPaneの条件ビルダーもv2を書く。
+  旧`queryJson`引数での旧形式作成は既存呼び出し側 (E2E等) の互換用に
+  受け付ける — `searchJson`指定が優先)
 - **スマートコレクション評価はWP-6のSQL直クエリからAST検索経路へ移行**
   (`smart_collection_refresh` / `collection_show` / 件数表示はすべて
   `search_asset_ids` で評価。WP-6互換のためpresentファイル制約は掛けない)
@@ -1727,7 +1731,10 @@ docs/dev/measurements/ とhandoff参照。
 ### 制約・保証
 
 - 検索結果はpresentなFileを持つassetに限定 (グリッド表示可能集合と同一)
-- 検索実行はreader接続 (UIをブロックしない。結果到着後に表示)
+- 検索実行はreader接続かつUIスレッド外: `search_run` / `search_refresh` /
+  `fts_integrity` / `fts_repair` はasync commandで、全件収集・索引保守を
+  `tauri::async_runtime::spawn_blocking` で実行する (QA-WP8。5万件級の
+  広域クエリでもUIをブロックしない。結果到着後に表示)
 - 検索結果表示中はlibraryスナップショットの自動反映をしない (コレクション
   表示と同じ方針。「再実行」で明示更新。`asset:updated` のin-placeパッチは
   適用される)

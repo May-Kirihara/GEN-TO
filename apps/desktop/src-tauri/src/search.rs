@@ -129,8 +129,12 @@ pub struct FtsProgressPayload {
 /// - `filters`: GUIフィルタ (AST term JSON列。クエリとAND合成)
 /// - `scope_root_id` / `scope_collection_id`: 検索範囲
 ///   (両方None = ライブラリ全体)
+///
+/// async command: 一致全件の収集 (5万件級の広域クエリで数百ms) は
+/// `spawn_blocking` でUIスレッド外で実行する (QA-WP8。WP-7
+/// `file_ops_execute`・`fts_rebuild`と同じ方式)。
 #[tauri::command]
-pub fn search_run(
+pub async fn search_run(
     app: AppHandle,
     state: State<'_, AppState>,
     query: String,
@@ -162,17 +166,22 @@ pub fn search_run(
         collection_id: scope_collection,
         require_present_files: true,
     };
-    let (asset_ids, total) = collect_search_ids(&db, &ast, &scope)?;
-    let records = crate::collections::build_collection_records(&db, &asset_ids)
-        .map_err(|e| format!("検索結果の表示構築に失敗しました: {e}"))?;
+    let (records, total) = tauri::async_runtime::spawn_blocking(move || {
+        let (asset_ids, total) = collect_search_ids(&db, &ast, &scope)?;
+        let records = crate::collections::build_collection_records(&db, &asset_ids)
+            .map_err(|e| format!("検索結果の表示構築に失敗しました: {e}"))?;
+        Ok::<_, String>((records, total))
+    })
+    .await
+    .map_err(|e| format!("検索の実行に失敗しました: {e}"))??;
     let shown = records.len() as u64;
 
     let (summary, generation) = {
         let mut inner = crate::catalog::lock(&state.catalog);
         let generation = inner.set_search_display(SearchDisplay {
             query_json: query_json.clone(),
-            scope_root_id: scope.root_id,
-            scope_collection_id: scope.collection_id,
+            scope_root_id: scope_root,
+            scope_collection_id: scope_collection,
             records,
         });
         (crate::catalog::summary_of_pub(&inner), generation)
@@ -273,12 +282,16 @@ pub fn search_evidence(
 }
 
 /// FTS索引とDB正本の整合性を検査する。
+/// async command: 全文書の内容比較をUIスレッド外で実行する (QA-WP8)。
 #[tauri::command]
-pub fn fts_integrity(state: State<'_, AppState>) -> Result<FtsIntegrityDto, String> {
+pub async fn fts_integrity(state: State<'_, AppState>) -> Result<FtsIntegrityDto, String> {
     let db = db_of(&state)?;
-    let report = db
-        .with_reader(|repos| gento_db::fts_integrity(repos.conn()))
-        .map_err(|e| format!("索引診断に失敗しました: {e}"))?;
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        db.with_reader(|repos| gento_db::fts_integrity(repos.conn()))
+    })
+    .await
+    .map_err(|e| format!("索引診断に失敗しました: {e}"))?
+    .map_err(|e| format!("索引診断に失敗しました: {e}"))?;
     Ok(report.into())
 }
 
@@ -310,13 +323,17 @@ pub async fn fts_rebuild(
 }
 
 /// FTS索引の不整合のみを修復する (欠落・内容不一致の再構築、孤立・重複の削除)。
+/// async command: 修復の書き込みをUIスレッド外で実行する (QA-WP8)。
 #[tauri::command]
-pub fn fts_repair(state: State<'_, AppState>) -> Result<FtsMaintenanceDto, String> {
+pub async fn fts_repair(state: State<'_, AppState>) -> Result<FtsMaintenanceDto, String> {
     let db = db_of(&state)?;
     let started = Instant::now();
-    let (rebuilt, removed) = db
-        .with_writer(|repos| gento_db::fts_repair(repos.conn()))
-        .map_err(|e| format!("索引修復に失敗しました: {e}"))?;
+    let (rebuilt, removed) = tauri::async_runtime::spawn_blocking(move || {
+        db.with_writer(|repos| gento_db::fts_repair(repos.conn()))
+    })
+    .await
+    .map_err(|e| format!("索引修復に失敗しました: {e}"))?
+    .map_err(|e| format!("索引修復に失敗しました: {e}"))?;
     Ok(FtsMaintenanceDto {
         rebuilt,
         removed,
@@ -325,8 +342,12 @@ pub fn fts_repair(state: State<'_, AppState>) -> Result<FtsMaintenanceDto, Strin
 }
 
 /// 現在の検索表示を新しいDB状態で再実行する (表示中の明示refresh)。
+/// async command: `search_run` と同じく全件収集をUIスレッド外で実行 (QA-WP8)。
 #[tauri::command]
-pub fn search_refresh(app: AppHandle, state: State<'_, AppState>) -> Result<SearchRunDto, String> {
+pub async fn search_refresh(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<SearchRunDto, String> {
     let display = {
         let inner = crate::catalog::lock(&state.catalog);
         inner.search_display().cloned()
@@ -348,9 +369,14 @@ pub fn search_refresh(app: AppHandle, state: State<'_, AppState>) -> Result<Sear
         collection_id: display.scope_collection_id,
         require_present_files: true,
     };
-    let (asset_ids, total) = collect_search_ids(&db, &query, &scope)?;
-    let records = crate::collections::build_collection_records(&db, &asset_ids)
-        .map_err(|e| format!("検索結果の表示構築に失敗しました: {e}"))?;
+    let (records, total) = tauri::async_runtime::spawn_blocking(move || {
+        let (asset_ids, total) = collect_search_ids(&db, &query, &scope)?;
+        let records = crate::collections::build_collection_records(&db, &asset_ids)
+            .map_err(|e| format!("検索結果の表示構築に失敗しました: {e}"))?;
+        Ok::<_, String>((records, total))
+    })
+    .await
+    .map_err(|e| format!("検索の実行に失敗しました: {e}"))??;
     let shown = records.len() as u64;
     let (summary, generation) = {
         let mut inner = crate::catalog::lock(&state.catalog);

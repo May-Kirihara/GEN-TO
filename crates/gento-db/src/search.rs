@@ -735,7 +735,9 @@ pub fn search_asset_ids(
         .map_err(map_err)?;
     let total = match (rows.last(), offset) {
         // 窓関数のtotalは行が無いと取れないため、offset>0で空ページの
-        // 場合はcountへフォールバックする (ページ末尾超過の判定用)
+        // 場合はcountへフォールバックする (ページ末尾超過の判定用)。
+        // 失敗は伝播する (unwrap_or(0)だと実在する一致があるのに
+        // total=0の虚偽表示になる — QA-WP8)。
         (None, 0) => 0,
         (None, _) => conn
             .query_row(
@@ -743,7 +745,7 @@ pub fn search_asset_ids(
                 params_from_iter(sql_parts.values.iter()),
                 |r| r.get(0),
             )
-            .unwrap_or(0),
+            .map_err(map_err)?,
         (Some((_, total)), _) => *total,
     };
     Ok((
@@ -1510,6 +1512,43 @@ mod tests {
                 assert!(
                     p95 < 100.0,
                     "5万件規模のクエリp95が100ms超: {p95:.2}ms (release測定)"
+                );
+            }
+
+            // 実経路計測 (search_run相当 — QA-WP8): 一致全件を5000件/ページ
+            // で全収集する (apps/desktopのcollect_search_idsと同じ呼び方)。
+            // 広域クエリ「画像」= 5万一致のフル収集。
+            let wide = parse("画像").unwrap().query;
+            let started = std::time::Instant::now();
+            let mut collected: u64 = 0;
+            let mut offset: u32 = 0;
+            let total_hits = loop {
+                let (page, total) =
+                    search_asset_ids(conn, &wide, &SearchScope::default(), offset, 5_000).unwrap();
+                let page_empty = page.is_empty();
+                collected += page.len() as u64;
+                if collected >= total.min(100_000) || page_empty {
+                    break total;
+                }
+                offset += 5_000;
+            };
+            let collect_ms = started.elapsed().as_secs_f64() * 1000.0;
+            println!(
+                "50k full collect (search_run相当): total={total_hits} collected={collected} pages={} {collect_ms:.0}ms",
+                offset / 5_000 + 1
+            );
+            assert_eq!(total_hits, 50_000, "広域クエリは全件一致が前提");
+            assert_eq!(collected, 50_000);
+            // 健全性の上限のみ (release実測値は measurements/wp8-search-50k.md)。
+            if cfg!(debug_assertions) {
+                assert!(
+                    collect_ms < 20_000.0,
+                    "5万件の全収集が遅すぎ (debug): {collect_ms:.0}ms"
+                );
+            } else {
+                assert!(
+                    collect_ms < 5_000.0,
+                    "5万件の全収集が遅すぎ (release): {collect_ms:.0}ms"
                 );
             }
         });

@@ -2534,13 +2534,13 @@
         <select
           class="search-scope"
           aria-label="検索範囲"
-          title="検索範囲"
+          title="検索範囲。「現在のフォルダ」は選択フォルダを含む登録ルート全体 (サブフォルダ単位の絞り込みはなし)"
           value={searchScopeMode}
           onchange={(event) =>
             (searchScopeMode = event.currentTarget.value as typeof searchScopeMode)}
         >
           <option value="library">ライブラリ全体</option>
-          <option value="folder">現在のフォルダ</option>
+          <option value="folder">現在のフォルダ（登録ルート全体）</option>
           <option value="collection">表示中コレクション</option>
         </select>
         <button
