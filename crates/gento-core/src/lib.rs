@@ -9,6 +9,7 @@ pub mod file_ops;
 pub mod jobs;
 pub mod library;
 pub mod metadata;
+pub mod path_safety;
 pub mod repo;
 
 pub use assetmeta::{
@@ -33,6 +34,7 @@ pub use library::{
     ScanOptions, ScanPhase, ScanProgress, ScanSummary, WalkOutcome, WatchBuffer,
     DEFAULT_SCAN_BATCH_SIZE, PROVISIONAL_FILE_FLAG,
 };
+pub use path_safety::open_regular_beneath;
 pub use repo::{
     AssetRecord, AssetRepo, FileRecord, FileRepo, FileUpsert, HashState, LibraryRootRecord,
     LibraryRootRepo, NewAsset, OsFileId, ParseScanStateError, RepoError, RootSettings, ScanState,

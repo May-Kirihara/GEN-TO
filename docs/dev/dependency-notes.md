@@ -592,3 +592,22 @@
     `vite.config.ts` に `process.env.VITEST` 条件でのみ
     `resolve.conditions: ["browser"]` を追加した (dev/build無関係)。
   - 入手元: npm (capricorn86/happy-dom)。ライセンス: MIT。
+
+## FG-WP13-2 レビュー対応 (2026-09-03)
+
+- **`libc` 0.2系 (既存pin帯)** (gento-core、通常依存。`libc = "0.2"`)
+  - 用途: 復元実体ハッシュ計算前の**全コンポーネントsymlink不追従オープン**
+    (`open_regular_beneath`)。Linuxでは `openat2(2)` +
+    `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS` の単一原子呼び出しを試行し
+    (ENOSYS/EINVALは不対応扱いでフォールバック)、全unixでは
+    `openat(2)` + `O_DIRECTORY|O_NOFOLLOW` のfd歩行にフォールバック
+    (中間コンポーネントのsymlink脱出を構造的に遮断 — WP-13レビュー
+    blocker対応)。`open`/`openat`/`syscall`/`fcntl`/フラグ定数のみ使用。
+  - 入手元: crates.io (rust-lang/libc)。ライセンス: MIT OR Apache-2.0。
+    native libraryなし (pure Rust束縛)。
+  - gento-tauri / gento-platform / gento-embeddingが利用中の同一crate
+    (0.2.189がlock内) の直付け拡大のため、新規外部依存ではない。
+  - 呼び出しは新module `gento-core/src/path_safety.rs` に隔離
+    (WP-11 ort / WP-12 usearchと同じ「1ファイル隔離」規約)。
+    非unix (Windows) は字句的symlink検査のフォールバックで、構造的
+    (race-free) 保証はunix実装のみ (WP-17で再検討)。

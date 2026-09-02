@@ -1,7 +1,7 @@
 # GEN-TO IPC API契約 (Phase 2 / WP-2時点)
 
 - 作成日: 2026-08-28 (WP-2)
-- 最終更新: 2026-09-03 (**FG-WP13-1: §47 改訂 — トークン束縛された確定plan適用・rel_pathパス検証規約・digest manifest完全性・フルDB原子公開** / WP-13 (MVP): §47 バックアップと復元のcommand群・`.gento`バックアップ形式追加 / 2026-09-02 WP-12 §46 / WP-11 §45 / WP-10 §44 / WP-9 §43 / WP-8 §42 / WP-7 §39-41 / WP-6 §34-38 / WP-5 §31-33 / WP-4 §26-33 / WP-3 §22-24 / WP-2 §17-21 / WP-1 §1/§16 / WP-0 §0/§1/§14/§15)
+- 最終更新: 2026-09-03 (**FG-WP13-2: §47 改訂 — rel_path symlink規約を全コンポーネント歩行へ強化・列挙fail-closed・durability境界明記** / FG-WP13-1: §47 改訂 — トークン束縛された確定plan適用・rel_pathパス検証規約・digest manifest完全性・フルDB原子公開 / WP-13 (MVP): §47 バックアップと復元のcommand群・`.gento`バックアップ形式追加 / 2026-09-02 WP-12 §46 / WP-11 §45 / WP-10 §44 / WP-9 §43 / WP-8 §42 / WP-7 §39-41 / WP-6 §34-38 / WP-5 §31-33 / WP-4 §26-33 / WP-3 §22-24 / WP-2 §17-21 / WP-1 §1/§16 / WP-0 §0/§1/§14/§15)
 - 目的: Tauri command・イベント・ローカル画像プロトコルの形状をWP-3〜6の契約基準として固定する。
 - 整合性情報: 本書の型は `crates/gento-core/src/catalog.rs`、`apps/desktop/src-tauri/src/catalog.rs`
   (ページDTOのversion拡張もここ)、
@@ -2189,9 +2189,11 @@ score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
      で公開する (クラッシュや中断が最終名の世代を汚さない。一時名は
      retention・復元対象外 — `list_full_backups` は `.tmp-` を含む名を
      除外)。検証・同期・リネームの失敗はいずれも一時名を掃除する。
-     **原子rename と durable publication の区別**: renameは可視性の
-     原子性のみを保証するため、公開前にファイル内容の`sync_all`、公開後に
-     親ディレクトリのsync (best-effort) を行う。出力先は既定
+      **原子rename と durable publication の区別**: renameは可視性の
+      原子性のみを保証するため、公開前にファイル内容の`sync_all`、公開後に
+      親ディレクトリのsync (best-effort) を行う。**クラッシュ後の永続性は
+      FS/プラットフォーム依存** (親dir syncがno-op・エラーになるFSがあり
+      得るため — rename原子性の保証とは区別される)。出力先は既定
      `db-backups/` (`BACKUP_DIR_NAME`)。ファイル名
      `library-full-{YYYYMMDDTHHMMSSmmmZ}.sqlite3` (タイムスタンプ先行・
      固定幅 = 辞書順が時系列。migration用 `library-pre-*` とは接頭辞で
@@ -2217,8 +2219,9 @@ score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
     `collections.json`) の**過不足なし一意** (欠落・重複・未知名は
     `DigestMismatch` で拒否 — 部分集合では認証されない要素が復元経路に
     混入するため)。
-  - バックアップディレクトリの**実ファイルが期待集合 (上記2つ +
-    `backup-info.json`) と完全一致** (manifestに無い実ファイル = 改竄)。
+   - バックアップディレクトリの**実ファイルが期待集合 (上記2つ +
+     `backup-info.json`) と完全一致** (manifestに無い実ファイル = 改竄)。
+     列挙エラーは1件でも即失敗 (fail-closed)。
   - `backup-info.json` の件数 (asset/file/collection) が実解析行数と一致。
   - asset/file/collection UUIDの重複拒否。
 - **rel_pathパス検証規約**: 復元側はすべてのrel_pathを単一の検証関数
@@ -2227,11 +2230,15 @@ score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
   (drive letter `C:` / UNC `\\` — 現行linux開発でも拒否)、`..` 親
   コンポーネント (percent-encoded `..` も復号後に同一判定)、空・`.`のみ。
   `.` は正規化して除去し `Component::Normal` のみで再構成した相対パスを
-  ルートへjoinする。**symlinkはフォローしない**: `symlink_metadata` で
-  link種別を確認し、symlinkは「行方不明」として報告する (fileopsの3分類
-  規約に同じ)。実体ハッシュ計算はopen前にlink種別を確認し、open後はfd上
-  のfstatで通常ファイル性と (unix) (dev, ino) 一致を検証する — 検査後の
-  パス差し替え (symlink escape含む) を検出して登録しない。
+  ルートへjoinする。**symlinkはフォローしない (中間コンポーネント含む
+  全経路 — FG-WP13-2)**: symlinkは「行方不明」として報告する (fileopsの
+  3分類規約に同じ)。実体ハッシュ計算は `gento_core::open_regular_beneath`
+  によるルートdir fdからの全コンポーネント歩行で開く (Linux:
+  `openat2` + `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS`。非対応時と非Linux
+  unix: `openat` + `O_DIRECTORY|O_NOFOLLOW` のfd歩行) — 中間symlink
+  脱出 (`root/linked-dir/image.png` 型) を構造的に遮断し、開いたfdの
+  fstatが正本になる (経路は一度だけ解決)。検証不能・非通常ファイルは
+  登録しない。
 - **復元は2フェーズ + トークン束縛された確定plan**:
   (a) `backup_restore_plan` = dry-run。マッチング優先度は
   **UUID完全一致 → content_hash一致 → rel_path一致**。差分

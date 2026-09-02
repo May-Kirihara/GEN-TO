@@ -54,8 +54,11 @@
 //! - asset/file/collection UUIDの重複拒否。
 //! - シンボリックリンクは「行方不明」として報告 (フォローしない —
 //!   fileopsの `symlink_metadata` 3分類規約に合わせる)。実体ハッシュは
-//!   open前にlink種別を確認し、fd上のfstatで (dev, ino) を突き合わせる
-//!   (検査後の差し替え・symlink escapeを検出)。
+//!   [`gento_core::open_regular_beneath`] による**全コンポーネント歩行**
+//!   (Linux: openat2 `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS`、非対応時と
+//!   非Linux unix: `openat`+`O_NOFOLLOW` fd歩行) で開く — 中間
+//!   コンポーネントのsymlink脱出を構造的に遮断し、開いたfdのfstatが
+//!   正本になる (FG-WP13-2)。
 //!
 //! 埋め込みベクトル・サムネイル・FTS・USearch索引はバックアップ対象外
 //! (派生データ)。復元後に再構築できることをテストで保証する
@@ -1223,29 +1226,28 @@ fn publish_dir(tmp_dir: &Path, final_path: &Path) -> Result<(), BackupError> {
 /// 検証付きでファイル実体を開いて内容ハッシュを計算する
 /// (`blake3:<hex>`。gento-imageと同一形式)。
 ///
-/// symlink不追従方針: open前に `symlink_metadata` でlink種別を確認し
-/// (symlink・ディレクトリ等は `None` = 行方不明扱い)、open後はfd上の
-/// fstatで改めて通常ファイルであることと、unixでは検査時の (dev, ino)
-/// との一致を要求する — 検査後にパスが差し替えられた場合 (symlink
-/// escape含む) は `None`。戻り値のMetadataはfdピン留めされた実体のもの
-/// (mtime・os_file_idの取得元として使う — パスを再解決しない)。
-fn open_and_hash_regular_file(abs: &Path) -> Option<(String, std::fs::Metadata)> {
-    let link_md = std::fs::symlink_metadata(abs).ok()?;
-    if !link_md.is_file() {
-        return None;
-    }
-    let mut file = std::fs::File::open(abs).ok()?;
-    let fd_md = file.metadata().ok()?;
-    if !fd_md.is_file() {
-        return None;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if (fd_md.dev(), fd_md.ino()) != (link_md.dev(), link_md.ino()) {
-            return None;
+/// 全コンポーネントsymlink不追従 (FG-WP13-2): `root` と
+/// `decode_rel_checked` 済みの `rel` を受け、
+/// [`gento_core::open_regular_beneath`] がルートdir fdからcomponentsを
+/// 歩行して開く — 中間コンポーネントのsymlink脱出
+/// (`root/linked-dir/image.png` 等) を構造的に遮断する (Linuxはopenat2の
+/// `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS`、非対応時と非Linux unixは
+/// `openat` + `O_DIRECTORY|O_NOFOLLOW` のfd歩行)。経路は一度だけ解決
+/// されるため、開いたfdとそのfstat metadataが正本である (旧実装のような
+/// 検査時statとの (dev, ino) 突き合わせは不要 — 二重解決が無くなった)。
+/// 失敗 (行方不明・symlink・非通常ファイル・読み取り不能) は `None`。
+/// 戻り値のMetadataはfdピン留めされた実体のもの (mtime・os_file_idの
+/// 取得元として使う — パスを再解決しない)。
+fn open_and_hash_regular_file(root: &Path, rel: &Path) -> Option<(String, std::fs::Metadata)> {
+    let mut components: Vec<std::ffi::OsString> = Vec::new();
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(part) => components.push(part.to_os_string()),
+            // decode_rel_checked済みのrelには来ない (防御的に拒否)
+            _ => return None,
         }
     }
+    let (mut file, md) = gento_core::open_regular_beneath(root, &components).ok()?;
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; 128 * 1024];
     loop {
@@ -1255,7 +1257,7 @@ fn open_and_hash_regular_file(abs: &Path) -> Option<(String, std::fs::Metadata)>
         }
         hasher.update(&buf[..n]);
     }
-    Some((format!("blake3:{}", hasher.finalize().to_hex()), fd_md))
+    Some((format!("blake3:{}", hasher.finalize().to_hex()), md))
 }
 
 /// パスの在不在3分類 (Path::existsは権限エラーでもfalseになるため使わない)。
@@ -1365,12 +1367,17 @@ pub fn open_portable_backup(dir: &Path) -> Result<PortableBackup, BackupError> {
     }
     // ディレクトリ実ファイルとの一致: manifestに無い実ファイル = 改竄。
     // (サブディレクトリがあればそれ自体が不一致として拒否される。)
+    // 列挙エラーは1件でも即エラー (fail-closed — 黙って除外すると
+    // 検証されていない実体が混入し得るため)。
     {
-        let actual: std::collections::HashSet<String> = std::fs::read_dir(dir)
+        let mut actual: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for entry in std::fs::read_dir(dir)
             .map_err(|e| BackupError::Io(format!("read dir {}: {e}", dir.display())))?
-            .filter_map(|e| e.ok())
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .collect();
+        {
+            let entry =
+                entry.map_err(|e| BackupError::Io(format!("read dir {}: {e}", dir.display())))?;
+            actual.insert(entry.file_name().to_string_lossy().into_owned());
+        }
         let expected: std::collections::HashSet<String> =
             expected_files.iter().map(|s| s.to_string()).collect();
         if actual != expected {
@@ -1865,9 +1872,10 @@ fn plan_entries(
                 } else {
                     match disk_status(&abs) {
                         DiskStatus::File => {
-                            // open_and_hash_regular_file: symlink不追従・fd照合。
-                            // Noneは検査後の差し替えや読み取り失敗。
-                            match open_and_hash_regular_file(&abs) {
+                            // open_and_hash_regular_file: 全コンポーネント
+                            // symlink不追従のfd歩行。Noneは行方不明・
+                            // symlink経路・検証後の差し替え・読み取り失敗。
+                            match open_and_hash_regular_file(&target.path, &rel) {
                                 Some((hash, _)) if hash == asset.content_hash => {
                                     add_candidates.push(f.rel_path.clone());
                                 }
@@ -2363,7 +2371,6 @@ fn apply_restore_tx(
                     .unwrap_or_default()
                 {
                     let rel = decode_rel_checked(&f.rel_path).map_err(|e| e.to_string())?;
-                    let abs = target.path.join(&rel);
                     // 既存行 (同パス) は作らない
                     let exists: bool = tx
                         .query_row(
@@ -2377,9 +2384,9 @@ fn apply_restore_tx(
                     if exists {
                         continue;
                     }
-                    // symlink不追従 + fd上の (dev, ino) 照合で実体を確定して
+                    // 全コンポーネントsymlink不追従のfd歩行で実体を確定して
                     // からhash検証 (検証不能・検査後差し替えは登録しない)。
-                    let Some((hash, md)) = open_and_hash_regular_file(&abs) else {
+                    let Some((hash, md)) = open_and_hash_regular_file(&target.path, &rel) else {
                         continue;
                     };
                     if hash != asset.content_hash {
@@ -4139,6 +4146,111 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn intermediate_symlink_directory_escape_is_refused_at_plan_and_execute() {
+        // FG-WP13-2 blocker回帰: rel_pathの**中間**コンポーネントがルート外への
+        // symlinkでもリンク先を実体として読み取らない。ルート外にバックアップ
+        // と同一内容の実体を置く (hash不一致では弾けず、読めてしまえば登録が
+        // 成功する構成) し、ルート内にも同一内容の正常ファイルを置いて
+        // 「hashが登録可能なものではないため弾いた」場合と区別できる形にする。
+        let fx = Fixture::new("symdirescape");
+        let (root_id, _hash) = seed_library(&fx.src_db, &fx.root_dir, "linked-dir/image.png", 1);
+        let backup = open_portable_backup(&fx.backup(root_id)).unwrap();
+        let cur_root = fx.register_target_root();
+        // 攻撃構成: linked-dir をルート外ディレクトリ (同一内容image.png格納)
+        // へのsymlinkへ差し替える。
+        std::fs::remove_dir_all(fx.root_dir.join("linked-dir")).unwrap();
+        let outside_dir = fx.tmp().join("outside-store");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::fs::write(outside_dir.join("image.png"), vec![1u8; 64]).unwrap();
+        std::os::unix::fs::symlink(&outside_dir, fx.root_dir.join("linked-dir")).unwrap();
+        // 区別用: ルート内の安全なパスに同一内容の正常ファイルを置く。
+        write_image(&fx.root_dir, "legit.png", 1);
+
+        // plan: 行方不明 (PathAddにしない — 外の実体を検証・採用しない)
+        let plan = build_restore_plan(&fx.cur_db, &backup, None).unwrap();
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(
+            plan.entries[0].matched,
+            RestoreMatch::Missing,
+            "中間symlink経由のパスは行方不明扱い: {}",
+            plan.entries[0].reason
+        );
+        assert_eq!(plan.summary.missing, 1);
+
+        // 実行: 登録0件 + スキップ報告 (結果で検証 — 外の実体を読まない)
+        let result = plan_digest_execute(&fx.cur_db, &backup, Some(cur_root)).unwrap();
+        assert!(result.applied.is_empty(), "{:?}", result.applied);
+        assert_eq!(result.skipped.len(), 1);
+        let file_rows: i64 = fx
+            .cur_db
+            .with_reader(|repos| {
+                repos
+                    .conn()
+                    .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
+                    .map_err(|e| RepoError::Db(e.to_string()))
+            })
+            .unwrap();
+        assert_eq!(file_rows, 0, "中間symlink経由のルート外実体は登録しない");
+
+        // 正对照: symlinkを実ディレクトリ (同一内容のimage.png) に戻すと
+        // 同じバックアップがPathAddで登録される — 拒否がhash不一致ではなく
+        // 経路検証によることの区別。
+        std::fs::remove_file(fx.root_dir.join("linked-dir")).unwrap();
+        write_image(&fx.root_dir, "linked-dir/image.png", 1);
+        let result_ok = plan_digest_execute(&fx.cur_db, &backup, Some(cur_root)).unwrap();
+        assert_eq!(result_ok.applied.len(), 1, "{:?}", result_ok.skipped);
+        let file_rows_ok: i64 = fx
+            .cur_db
+            .with_reader(|repos| {
+                repos
+                    .conn()
+                    .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
+                    .map_err(|e| RepoError::Db(e.to_string()))
+            })
+            .unwrap();
+        assert_eq!(file_rows_ok, 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn intermediate_symlink_escape_multi_level_path_is_refused() {
+        // 中間が複数階層 (a/b/link/c.png) でも同じく拒否する。
+        let fx = Fixture::new("symdirmulti");
+        let (root_id, _hash) = seed_library(&fx.src_db, &fx.root_dir, "a/b/link/c.png", 1);
+        let backup = open_portable_backup(&fx.backup(root_id)).unwrap();
+        let cur_root = fx.register_target_root();
+        std::fs::remove_dir_all(fx.root_dir.join("a/b/link")).unwrap();
+        let outside_dir = fx.tmp().join("outside-multi");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::fs::write(outside_dir.join("c.png"), vec![1u8; 64]).unwrap();
+        std::os::unix::fs::symlink(&outside_dir, fx.root_dir.join("a/b/link")).unwrap();
+        write_image(&fx.root_dir, "legit.png", 1);
+
+        let plan = build_restore_plan(&fx.cur_db, &backup, None).unwrap();
+        assert_eq!(
+            plan.entries[0].matched,
+            RestoreMatch::Missing,
+            "{}",
+            plan.entries[0].reason
+        );
+        assert_eq!(plan.summary.missing, 1);
+        let result = plan_digest_execute(&fx.cur_db, &backup, Some(cur_root)).unwrap();
+        assert!(result.applied.is_empty(), "{:?}", result.applied);
+        assert_eq!(result.skipped.len(), 1);
+        let file_rows: i64 = fx
+            .cur_db
+            .with_reader(|repos| {
+                repos
+                    .conn()
+                    .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
+                    .map_err(|e| RepoError::Db(e.to_string()))
+            })
+            .unwrap();
+        assert_eq!(file_rows, 0, "多段中間symlink経由も登録しない");
+    }
+
+    #[test]
     fn execute_rejects_when_db_changes_after_confirmation() {
         // (a) match種別・actionの変化: 確認後に同一内容を複製 → ambiguousへ
         {
@@ -4550,6 +4662,22 @@ mod tests {
             hostile.collections.push(dup);
             hostile.info.collection_count = hostile.collections.len() as u64;
             let dir = tmp.path().join("dup-collection-uuid.gento");
+            let _ = std::fs::remove_dir_all(&dir);
+            write_self_redigested(&dir, &hostile);
+            let err = open_portable_backup(&dir).unwrap_err();
+            assert!(
+                matches!(err, BackupError::Format(_)) && err.to_string().contains("duplicate"),
+                "{err}"
+            );
+        }
+        // (g) file UUID重複 (FG-WP13-2 N2 — 実装は拒否するが未テストだった)
+        {
+            let valid = open_portable_backup(&path).unwrap();
+            let mut hostile = valid.clone();
+            let dup = hostile.files[0].clone();
+            hostile.files.push(dup);
+            hostile.info.file_count = hostile.files.len() as u64;
+            let dir = tmp.path().join("dup-file-uuid.gento");
             let _ = std::fs::remove_dir_all(&dir);
             write_self_redigested(&dir, &hostile);
             let err = open_portable_backup(&dir).unwrap_err();

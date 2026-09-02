@@ -18,6 +18,9 @@ serde_json = { workspace = true }
 # タグ正規化名のNFC正規化 (WP-5。docs/dev/dependency-notes.md参照)。
 # workspace共有ではなく単一crate依存として直付け。
 unicode-normalization = "=0.1.25"
+# 全コンポーネントsymlink不追従オープン (openat2/openat歩行。
+# FG-WP13-2。docs/dev/dependency-notes.md参照)。他crateと同一0.2系の直付け。
+libc = "0.2"
 
 [dev-dependencies]
 serde_json = { workspace = true }
