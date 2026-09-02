@@ -454,8 +454,8 @@
               GPS座標をプロンプトへ含める (独立したopt-in)
             </label>
             <label class="field">
-              送信画像の最大辺 (px。0=縮小なし)
-              <input type="number" min="0" max="8192" step="128" bind:value={editing.extra.max_image_edge} />
+              送信画像の最大辺 (px。64〜2048 — 送信は最大2048pxまで)
+              <input type="number" min="64" max="2048" step="64" bind:value={editing.extra.max_image_edge} />
             </label>
             <label class="check">
               <input type="checkbox" bind:checked={editing.extra.send_response_format} />

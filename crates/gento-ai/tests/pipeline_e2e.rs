@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use gento_ai::apikey::{ApiKey, SecretStore};
 use gento_ai::client::{
-    test_connection, test_structured, test_text, test_vision, AiClient, AiEndpoint,
+    test_connection, test_structured, test_text, test_vision, AiClient, AiEndpoint, AiError,
 };
 use gento_ai::pipeline::{run_caption_tags_job, AiRunOutcome, PipelineOptions};
 use gento_ai::prompt::ProfileExtra;
@@ -178,6 +178,8 @@ fn job_of(db: &Db, job_id: i64) -> JobRecord {
 }
 
 /// ワーカーと同じ遷移で1ジョブを確定まで進める (claim→実行→完了/失敗)。
+/// 失敗はretryable分類に従い、worker (tauri ai.rs) と同じ遷移を辿る:
+/// permanent → 即failed / retryable → backoff付きretry_waiting。
 fn drive(db: &Db, job: &JobRecord, profile: &AiProfileRecord) -> AiRunOutcome {
     let claimed = db
         .with_writer(|repos| repos.claim_job_by_id(job.id, &gento_db::rfc3339_after_now(0)))
@@ -189,9 +191,15 @@ fn drive(db: &Db, job: &JobRecord, profile: &AiProfileRecord) -> AiRunOutcome {
             db.with_writer(|repos| repos.complete_job(claimed.id))
                 .unwrap();
         }
-        AiRunOutcome::Failed { error, .. } => {
-            let retry_at = gento_db::rfc3339_after_now(0);
-            let _ = db.with_writer(|repos| repos.fail_job(claimed.id, error, &retry_at));
+        AiRunOutcome::Failed {
+            error, retryable, ..
+        } => {
+            if *retryable {
+                let retry_at = gento_db::rfc3339_after_now(30_000);
+                let _ = db.with_writer(|repos| repos.fail_job(claimed.id, error, &retry_at));
+            } else {
+                let _ = db.with_writer(|repos| repos.fail_job_permanent(claimed.id, error));
+            }
         }
     }
     outcome
@@ -397,7 +405,9 @@ fn e2e_privacy_gates_exif_and_gps_in_request_body() {
         "両方ONならGPS座標が含まれる: {body2}"
     );
 
-    // プロファイルexif=OFFならEXIFも送られない (AND)
+    // プロファイルexif=OFFならEXIFは送られない (AND)。GPSはEXIFとは
+    // 独立したopt-inのため、この構成 (ルートgps=ON×プロファイルgps=ON)
+    // では座標のみ含まれる (FG-WP10: GPS独立性)。
     let server3 = MockServer::start(MockBehavior::default());
     let (_tmp3, db3, _r3, asset3) = fixture("privacy3", false, true, true);
     let profile3 = profile_for(
@@ -418,8 +428,12 @@ fn e2e_privacy_gates_exif_and_gps_in_request_body() {
         "プロファイル拒否でEXIF無し: {body3}"
     );
     assert!(
-        !body3.contains("35.68"),
-        "EXIFがOFFならGPS節ごと無い: {body3}"
+        !body3.contains("50mm") && !body3.contains("2026-08-01"),
+        "EXIF撮影情報は含まれない: {body3}"
+    );
+    assert!(
+        body3.contains("35.681236"),
+        "EXIFがOFFでもGPS許可なら座標は含まれる: {body3}"
     );
 }
 
@@ -592,7 +606,7 @@ fn e2e_connection_failure_is_retryable_and_local_reads_unaffected() {
     assert_eq!(count, 1);
 }
 
-// ===== 画像縮小 (acceptance: 送信前の最大辺) =====
+// ===== acceptance: 送信前の最大辺 =====
 
 #[test]
 fn e2e_large_image_is_downscaled_before_send() {
@@ -649,4 +663,243 @@ fn e2e_large_image_is_downscaled_before_send() {
     assert_eq!(summary["image_width"], 1024, "長辺1024へ縮小: {summary}");
     let height = summary["image_height"].as_i64().unwrap();
     assert!((555..=565).contains(&height), "アスペクト保持: {summary}");
+}
+
+// ===== FG-WP10 blocker 1: プロファイル保存値 (8192等) も実行時に強制 =====
+
+#[test]
+fn e2e_saved_out_of_range_edge_is_enforced_at_execution() {
+    let server = MockServer::start(MockBehavior::default());
+    let tmp = TempDir::new("edge8192");
+    use image::{Rgb, RgbImage};
+    // 4000x2000 — 旧「0=縮小なし」や8192設定では原寸/4000pxが出る寸法
+    let img = RgbImage::from_fn(4000, 2000, |x, _| Rgb([(x % 256) as u8, 0x80, 0x40]));
+    img.write_with_encoder(image::codecs::png::PngEncoder::new(
+        std::fs::File::create(tmp.0.join("huge.png")).unwrap(),
+    ))
+    .unwrap();
+    let db = Arc::new(Db::open(tmp.0.join("db.sqlite3")).unwrap());
+    let asset_id = db
+        .with_writer(|repos| {
+            let root = repos.add_root(&tmp.0)?;
+            let file = repos.upsert_file(FileUpsert {
+                root_id: root.id,
+                rel_path: PathBuf::from("huge.png"),
+                display_name: "huge.png".to_string(),
+                byte_size: 10,
+                mtime_ms: 1,
+                mtime_ns: 1_000,
+                scan_state: ScanState::Present,
+                os_file_id: None,
+                detach_asset: false,
+            })?;
+            let asset = repos.create_asset(NewAsset {
+                content_hash: "blake3:huge".to_string(),
+                hash_algorithm: "blake3".to_string(),
+                byte_size: 10,
+                mime_type: None,
+                width: None,
+                height: None,
+                has_alpha: None,
+                is_animated: None,
+                frame_count: None,
+            })?;
+            repos.link_file(file.id, asset.id)?;
+            Ok(asset.id)
+        })
+        .unwrap();
+    // 保存済みextraに8192 (範囲外) を直接埋め込む (IPCでは拒否される値の
+    // 旧プロファイル残留を模倣)
+    let profile = profile_for(
+        &db,
+        &server.base_url,
+        ProfileExtra {
+            max_image_edge: 8192,
+            ..ProfileExtra::default()
+        },
+    );
+    let job = enqueue(&db, asset_id, profile.id);
+    let outcome = drive(&db, &job, &profile);
+    assert!(matches!(outcome, AiRunOutcome::Succeeded { .. }));
+    let runs = db
+        .with_reader(|repos| repos.list_ai_runs_for_asset(asset_id, 5))
+        .unwrap();
+    let summary: serde_json::Value =
+        serde_json::from_str(&runs[0].request_summary.clone().unwrap()).unwrap();
+    assert_eq!(
+        summary["image_width"], 2048,
+        "8192設定でも送信は最大辺2048へ強制: {summary}"
+    );
+    assert_eq!(summary["image_height"], 1024);
+}
+
+// ===== FG-WP10 blocker 4: HTTP応答の境界とリダイレクト =====
+
+fn plain_client(base_url: &str) -> AiClient {
+    AiClient::new(
+        AiEndpoint {
+            base_url: base_url.to_string(),
+            model: "mock-vision-model".to_string(),
+            timeout: Duration::from_secs(10),
+        },
+        None,
+        false,
+    )
+}
+
+#[test]
+fn client_rejects_huge_response_with_content_length() {
+    let server = MockServer::start(MockBehavior {
+        huge_body: Some(gento_ai::testserver::HugeBodyMode::ContentLength),
+        ..MockBehavior::default()
+    });
+    let client = plain_client(&server.base_url);
+    let started = std::time::Instant::now();
+    let err = client
+        .chat(&[gento_ai::client::text_message("hi")], None)
+        .unwrap_err();
+    assert!(
+        matches!(err, AiError::Oversized { .. }),
+        "巨大応答はエラー: {err}"
+    );
+    assert!(!err.is_retryable(), "応答過大は非リトライ: {err}");
+    // Content-Length検査で即座に拒否 (3MiB読み切らない)
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "即時拒否: {:?}",
+        started.elapsed()
+    );
+    // エラーで完了 (タイムアウト・パニックせず)。巨大応答はchat経路のみで
+    // models (通常サイズ) は引き続き正常 — 障害の隔離
+    let report = test_connection(&client);
+    assert!(report.ok, "models応答は通常どおり: {report:?}");
+}
+
+#[test]
+fn client_rejects_huge_chunked_response_via_streaming_cap() {
+    let server = MockServer::start(MockBehavior {
+        huge_body: Some(gento_ai::testserver::HugeBodyMode::Chunked),
+        ..MockBehavior::default()
+    });
+    let client = plain_client(&server.base_url);
+    // Content-Lengthが無いためストリーミング読み取り上限で抑える
+    let err = client
+        .chat(&[gento_ai::client::text_message("hi")], None)
+        .unwrap_err();
+    assert!(
+        matches!(err, AiError::Oversized { .. }),
+        "chunked巨大応答もエラー: {err}"
+    );
+    assert!(!err.is_retryable());
+}
+
+#[test]
+fn client_does_not_follow_redirects() {
+    // リダイレクト先 (本来の応答を返す正常なmock)
+    let target = MockServer::start(MockBehavior::default());
+    let redirector = MockServer::start(MockBehavior {
+        redirect_to: Some(format!("{}/chat/completions", target.base_url)),
+        ..MockBehavior::default()
+    });
+    let client = plain_client(&redirector.base_url);
+    let err = client
+        .chat(&[gento_ai::client::text_message("hi")], None)
+        .unwrap_err();
+    match &err {
+        AiError::Api { status, .. } => assert_eq!(*status, 302, "3xxはそのまま返る: {err}"),
+        other => panic!("expected Api(302), got {other:?}"),
+    }
+    assert!(!err.is_retryable());
+    // リダイレクト先へは転送されない (リクエストが届かない)
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(target.chat_calls(), 0, "転送先へのリクエスト無し");
+    assert_eq!(redirector.chat_calls(), 1);
+}
+
+// ===== FG-WP10 blocker 2 (pipeline層): 4xxは非リトライ・5xxはリトライ =====
+
+#[test]
+fn e2e_http_401_is_permanent_and_500_is_retryable() {
+    // 401 (認証失敗): 画像を再送しても同じ結果 — permanent
+    let server_401 = MockServer::start(MockBehavior {
+        chat_status: 401,
+        ..MockBehavior::default()
+    });
+    let (_tmp, db, _root, asset_id) = fixture("auth401", false, false, false);
+    let profile = profile_for(&db, &server_401.base_url, ProfileExtra::default());
+    let job = enqueue(&db, asset_id, profile.id);
+    let outcome = drive(&db, &job, &profile);
+    match &outcome {
+        AiRunOutcome::Failed {
+            retryable, error, ..
+        } => {
+            assert!(!retryable, "401は非リトライ: {error}");
+            assert!(error.contains("401"), "エラーにstatus: {error}");
+        }
+        other => panic!("expected failure, got {other:?}"),
+    }
+    assert_eq!(job_of(&db, job.id).status, "failed", "即時failed確定");
+    assert_eq!(server_401.chat_calls(), 1, "1回のみのリクエスト");
+
+    // 500 (サーバー側の一時障害): backoffで再試行し得る — retry_waiting
+    let server_500 = MockServer::start(MockBehavior {
+        chat_status: 500,
+        ..MockBehavior::default()
+    });
+    let (_tmp2, db2, _r2, asset2) = fixture("err500", false, false, false);
+    let profile2 = profile_for(&db2, &server_500.base_url, ProfileExtra::default());
+    let job2 = enqueue(&db2, asset2, profile2.id);
+    let outcome2 = drive(&db2, &job2, &profile2);
+    match &outcome2 {
+        AiRunOutcome::Failed {
+            retryable, error, ..
+        } => {
+            assert!(retryable, "500はリトライ可能: {error}");
+        }
+        other => panic!("expected failure, got {other:?}"),
+    }
+    let after = job_of(&db2, job2.id);
+    assert_eq!(after.status, "retry_waiting", "backoff待機へ");
+    assert!(after.scheduled_at.is_some(), "再試行期限あり");
+}
+
+// ===== FG-WP10 非ブロッカー9: 適用エラーはジョブ/ランを失敗に =====
+
+#[test]
+fn e2e_apply_failure_fails_run_and_job_not_succeeded() {
+    let server = MockServer::start(MockBehavior::default());
+    let (_tmp, db, _root, asset_id) = fixture("applyfail", false, false, false);
+    let profile = profile_for(&db, &server.base_url, ProfileExtra::default());
+    let job = enqueue(&db, asset_id, profile.id);
+
+    // captions INSERTを必ず失敗させるtriggerを注入 (repo書き込み障害の模倣)
+    db.with_writer(|repos| -> Result<(), gento_core::repo::RepoError> {
+        repos
+            .conn()
+            .execute(
+                "CREATE TRIGGER fail_caption_insert BEFORE INSERT ON captions \
+                 BEGIN SELECT RAISE(ABORT, 'injected caption failure'); END",
+                [],
+            )
+            .map_err(|e| gento_core::repo::RepoError::Db(e.to_string()))?;
+        Ok(())
+    })
+    .unwrap();
+
+    let outcome = drive(&db, &job, &profile);
+    match &outcome {
+        AiRunOutcome::Failed {
+            error, retryable, ..
+        } => {
+            assert!(error.contains("キャプションの適用に失敗"), "{error}");
+            assert!(!retryable);
+        }
+        other => panic!("expected failure, got {other:?}"),
+    }
+    let after = job_of(&db, job.id);
+    assert_eq!(after.status, "failed", "ジョブはsucceededにならない");
+    let runs = db
+        .with_reader(|repos| repos.list_ai_runs_for_asset(asset_id, 5))
+        .unwrap();
+    assert_eq!(runs[0].status, "failed", "ai_runsも失敗確定");
 }

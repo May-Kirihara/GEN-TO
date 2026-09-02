@@ -9,11 +9,20 @@
 //! - エラー種別は接続失敗 (再試行で回復し得る) とAPIエラー (応答あり。
 //!   ステータス+本文抜粋) を区別する。**APIキーをエラー文字列に含む
 //!   経路はない** (Authorizationヘッダの値を整形しないため。
+//! - 応答境界: ボディは2 MiB上限 (超過は [`AiError::Oversized`]。
+//!   Content-Length検査+ストリーミング読み取りの二段構え)。リダイレクト
+//!   は不追従 (3xxはそのままAPIエラー — 外向き送信の意図しない転送防止)。
 
+use std::io::Read;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+/// 応答ボディの読み取り上限 (2 MiB)。超過は即エラー — 不正・悪意のある
+/// endpointによる無制限送出でファイラーのメモリを枯渇させない
+/// (Content-Length検査 + ストリーミング読み取り上限の二段構え)。
+const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
 /// 接続設定 (ai_profiles行の実行時形)。
 #[derive(Debug, Clone)]
@@ -57,10 +66,13 @@ pub fn text_message(text: &str) -> ChatMessage {
 pub enum AiError {
     /// 接続層の失敗 (DNS・TCP・タイムアウト。再試行で回復し得る)。
     Connect(String),
-    /// HTTP応答は返ったが失敗ステータス (4xx/5xx)。
+    /// HTTP応答は返ったが失敗ステータス (4xx/5xx/3xx — リダイレクト不追従)。
     Api { status: u16, body_excerpt: String },
     /// 成功応答だが内容が期待形でない (choices無し・空本文等)。
     Parse(String),
+    /// 応答ボディが上限を超えた (faulty/malicious endpoint。
+    /// 再試行しても同じ結果になる可能性が高いため非リトライ)。
+    Oversized { status: u16, limit_bytes: usize },
 }
 
 impl std::fmt::Display for AiError {
@@ -74,6 +86,13 @@ impl std::fmt::Display for AiError {
                 write!(f, "endpoint returned {status}: {body_excerpt}")
             }
             AiError::Parse(msg) => write!(f, "unexpected response shape: {msg}"),
+            AiError::Oversized {
+                status,
+                limit_bytes,
+            } => write!(
+                f,
+                "endpoint response exceeded {limit_bytes} bytes (status {status})"
+            ),
         }
     }
 }
@@ -82,13 +101,14 @@ impl std::error::Error for AiError {}
 
 impl AiError {
     /// 再試行で回復し得る失敗か (ジョブのbackoff判定)。
-    /// 接続失敗と5xx系は回復見込みあり。4xx (認証・不正リクエスト) は
-    /// 繰り返しても同じ結果のため再試行しない。
+    /// 接続失敗と5xx系は回復見込みあり。4xx (認証・不正リクエスト)・
+    /// パース失敗・応答過大は繰り返しても同じ結果のため再試行しない。
     pub fn is_retryable(&self) -> bool {
         match self {
             AiError::Connect(_) => true,
             AiError::Api { status, .. } => *status >= 500,
             AiError::Parse(_) => false,
+            AiError::Oversized { .. } => false,
         }
     }
 }
@@ -117,10 +137,15 @@ impl AiClient {
         send_response_format: bool,
     ) -> Self {
         let timeout = endpoint.timeout;
+        // フォールバックを置かない: Client::new()は失敗時panicのため従来の
+        // 代替経路は実際には機能せず、かつredirect=noneの保証を破る。
         let client = reqwest::blocking::Client::builder()
             .timeout(timeout)
+            // 外向き送信の意図しない転送防止: リダイレクトは明示的に不追従
+            // (3xx応答はそのままApiエラーとして扱う)。
+            .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+            .expect("blocking reqwest client (timeout + redirect=none)");
         AiClient {
             endpoint,
             api_key,
@@ -157,11 +182,30 @@ impl AiClient {
         })
     }
 
+    /// 応答ボディを上限付きで読み取る (Content-Length検査 + ストリーミング
+    /// 読み取り上限 — chunked応答も上限に到達した時点でエラー)。
     fn read_body_checked(&self, response: reqwest::blocking::Response) -> Result<String, AiError> {
         let status = response.status().as_u16();
-        let body = response
-            .text()
+        if let Some(length) = response.content_length() {
+            if length as usize > MAX_RESPONSE_BYTES {
+                return Err(AiError::Oversized {
+                    status,
+                    limit_bytes: MAX_RESPONSE_BYTES,
+                });
+            }
+        }
+        let mut body: Vec<u8> = Vec::new();
+        let mut limited = response.take((MAX_RESPONSE_BYTES + 1) as u64);
+        limited
+            .read_to_end(&mut body)
             .map_err(|e| AiError::Connect(e.to_string()))?;
+        if body.len() > MAX_RESPONSE_BYTES {
+            return Err(AiError::Oversized {
+                status,
+                limit_bytes: MAX_RESPONSE_BYTES,
+            });
+        }
+        let body = String::from_utf8_lossy(&body).into_owned();
         if !(200..300).contains(&status) {
             let excerpt: String = body.chars().take(300).collect();
             return Err(AiError::Api {

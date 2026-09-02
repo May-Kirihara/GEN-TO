@@ -227,6 +227,12 @@ CREATE VIRTUAL TABLE asset_docs USING fts5(
 ///   バックオフ期限は既存 `scheduled_at` 列を流用 (queuedは即時)。
 ///   pending中の同一 (job_type, target_id) 重複投入を防ぐ部分UNIQUE
 ///   indexを追加 (自動処理の多重エンキュー抑止)。
+///   コピー時の正規化: v7以前のjobs表にはjob_type CHECKが無かったため、
+///   移行失敗 (rollback) を防ぐため (a) 実行器の存在しないjob_typeの行と
+///   (b) pending重複の2行目以降 (部分UNIQUE indexと衝突) はコピーから
+///   除外する。除外対象はWP-10以前の投入経路が存在しない行であり、
+///   実行也不能・重複実行のまま残す意味が無いため破棄を正当化する
+///   (履歴の正本はai_runs/file_operationsでありjobsはキューである)。
 const MIGRATION_V8_SQL: &str = r#"
 CREATE TABLE ai_profiles (
     id INTEGER PRIMARY KEY,
@@ -297,10 +303,19 @@ CREATE TABLE jobs_v8 (
 INSERT INTO jobs_v8 (id, uuid, job_type, target_type, target_id, status, priority,
                      attempts, max_attempts, payload, error, scheduled_at, started_at,
                      finished_at, created_at, updated_at)
-    SELECT id, uuid, job_type, target_type, target_id, status, priority,
-           attempts, max_attempts, payload, error, scheduled_at, started_at,
-           finished_at, created_at, updated_at
-      FROM jobs;
+    SELECT j.id, j.uuid, j.job_type, j.target_type, j.target_id, j.status, j.priority,
+           j.attempts, j.max_attempts, j.payload, j.error, j.scheduled_at, j.started_at,
+           j.finished_at, j.created_at, j.updated_at
+      FROM jobs j
+     WHERE j.job_type IN ('ai_caption_tags', 'ai_reparse')
+       AND NOT (
+           j.status IN ('queued', 'running', 'retry_waiting')
+           AND EXISTS (SELECT 1 FROM jobs k
+                       WHERE k.job_type = j.job_type
+                         AND k.target_id = j.target_id
+                         AND k.status IN ('queued', 'running', 'retry_waiting')
+                         AND k.id < j.id)
+       );
 DROP TABLE jobs;
 ALTER TABLE jobs_v8 RENAME TO jobs;
 CREATE INDEX idx_jobs_status_priority ON jobs(status, priority);

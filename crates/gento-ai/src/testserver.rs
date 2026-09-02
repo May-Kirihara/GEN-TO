@@ -3,7 +3,8 @@
 //! stdのみでHTTP/1.1を最小実装したin-processサーバー:
 //! - `GET /v1/models` → モデル一覧JSON
 //! - `POST /v1/chat/completions` → 固定/注入応答。Bearer検証・遅延・
-//!   ステータス注入 (500等)・structured応答 (response_format検出) が可能
+//!   ステータス注入 (500等)・structured応答 (response_format検出)・
+//!   巨大ボディ (Content-Length/chunked)・リダイレクト注入が可能
 //!
 //! cargo test・debug build・devtools featureビルドでのみコンパイルされる
 //! (release通常ビルドからは除去 — WP-0のdevtools境界規約と同一)。
@@ -12,9 +13,19 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// 巨大ボディ応答の形式 (応答上限試験: FG-WP10 blocker 4)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HugeBodyMode {
+    /// Content-Length付き (検査はヘッダ段階で拒絶できる形)。
+    ContentLength,
+    /// Transfer-Encoding: chunked (Content-Length無し — ストリーミング
+    /// 読み取り上限の検証用)。
+    Chunked,
+}
 
 /// mockの動作注入。
 #[derive(Debug, Clone)]
@@ -30,6 +41,12 @@ pub struct MockBehavior {
     /// request_format: json_object を含むリクエストへの応答を
     /// JSON文字列に切り替える (test_structured模倣)。
     pub honor_response_format: bool,
+    /// 設定時: chat/completionsの代わりに3 MiBの巨大ボディを返す
+    /// (応答読み取り上限の試験)。
+    pub huge_body: Option<HugeBodyMode>,
+    /// 設定時: chat/completionsは302 + Locationで応答 (リダイレクト
+    /// 不追従の試験。Locationは絶対URLを指定すること)。
+    pub redirect_to: Option<String>,
 }
 
 impl Default for MockBehavior {
@@ -41,6 +58,8 @@ impl Default for MockBehavior {
             chat_status: 200,
             delay: Duration::from_millis(0),
             honor_response_format: true,
+            huge_body: None,
+            redirect_to: None,
         }
     }
 }
@@ -53,6 +72,10 @@ pub struct RequestLog {
     pub unauthorized: AtomicU64,
     /// 最後のchatリクエスト本文 (GPS/EXIF混入検証に使う)。
     pub last_body: std::sync::Mutex<String>,
+    /// 処理中リクエスト数 (同時実行検出)。
+    in_flight: AtomicI64,
+    /// 同時処理数の最大観測値 (concurrency制限の実証に使う)。
+    pub concurrent_max: AtomicU64,
 }
 
 /// 起動済みmockサーバー (dropで停止)。
@@ -158,8 +181,30 @@ fn handle(
     behavior: &Arc<std::sync::Mutex<MockBehavior>>,
     log: &RequestLog,
 ) -> std::io::Result<()> {
-    let peer = stream.peer_addr().ok();
-    let _ = peer;
+    // 同時処理数の追跡 (concurrency制限の実証 — 遅延を含む全処理時間)
+    let now_in_flight = log.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+    let mut observed_max = log.concurrent_max.load(Ordering::SeqCst) as i64;
+    while now_in_flight > observed_max {
+        match log.concurrent_max.compare_exchange(
+            observed_max as u64,
+            now_in_flight as u64,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => break,
+            Err(actual) => observed_max = actual as i64,
+        }
+    }
+    let result = handle_inner(&mut stream, behavior, log);
+    log.in_flight.fetch_sub(1, Ordering::SeqCst);
+    result
+}
+
+fn handle_inner(
+    stream: &mut TcpStream,
+    behavior: &Arc<std::sync::Mutex<MockBehavior>>,
+    log: &RequestLog,
+) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     // acceptループの停止判定は接続内では行わない (単発リクエストのため)
     let mut request_line = String::new();
@@ -213,11 +258,7 @@ fn handle(
             .is_some_and(|value| value == format!("Bearer {expected}"));
         if !ok {
             log.unauthorized.fetch_add(1, Ordering::SeqCst);
-            return respond(
-                &mut stream,
-                401,
-                r#"{"error":{"message":"invalid api key"}}"#,
-            );
+            return respond(stream, 401, r#"{"error":{"message":"invalid api key"}}"#);
         }
     }
 
@@ -225,14 +266,20 @@ fn handle(
         ("GET", "/v1/models") => {
             log.models_calls.fetch_add(1, Ordering::SeqCst);
             let payload = r#"{"object":"list","data":[{"id":"mock-vision-model"}]}"#;
-            respond(&mut stream, 200, payload)
+            respond(stream, 200, payload)
         }
         ("POST", "/v1/chat/completions") => {
             log.chat_calls.fetch_add(1, Ordering::SeqCst);
             *log.last_body.lock().unwrap() = body.clone();
+            if let Some(location) = &behavior.redirect_to {
+                return respond_redirect(stream, location);
+            }
+            if let Some(mode) = behavior.huge_body {
+                return respond_huge(stream, mode);
+            }
             if behavior.chat_status != 200 {
                 return respond(
-                    &mut stream,
+                    stream,
                     behavior.chat_status,
                     r#"{"error":{"message":"injected failure"}}"#,
                 );
@@ -251,9 +298,9 @@ fn handle(
                 serde_json::to_string(&content).unwrap_or_default()
             );
             let payload = format!("{payload}}}");
-            respond(&mut stream, 200, &payload)
+            respond(stream, 200, &payload)
         }
-        _ => respond(&mut stream, 404, r#"{"error":{"message":"not found"}}"#),
+        _ => respond(stream, 404, r#"{"error":{"message":"not found"}}"#),
     }
 }
 
@@ -271,5 +318,52 @@ fn respond(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<(
     );
     stream.write_all(header.as_bytes())?;
     stream.write_all(body.as_bytes())?;
+    stream.flush()
+}
+
+/// 302 + Location (リダイレクト不追従の試験用)。
+fn respond_redirect(stream: &mut TcpStream, location: &str) -> std::io::Result<()> {
+    let header = format!(
+        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(header.as_bytes())?;
+    stream.flush()
+}
+
+/// 3 MiBの巨大ボディ (応答読み取り上限の試験用)。
+const HUGE_BODY_BYTES: usize = 3 * 1024 * 1024;
+
+fn respond_huge(stream: &mut TcpStream, mode: HugeBodyMode) -> std::io::Result<()> {
+    match mode {
+        HugeBodyMode::ContentLength => {
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {HUGE_BODY_BYTES}\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(header.as_bytes())?;
+            let chunk = [b'x'; 64 * 1024];
+            let mut remaining = HUGE_BODY_BYTES;
+            while remaining > 0 {
+                let n = remaining.min(chunk.len());
+                stream.write_all(&chunk[..n])?;
+                remaining -= n;
+            }
+        }
+        HugeBodyMode::Chunked => {
+            // Transfer-Encoding: chunked — Content-Lengthを示さない
+            // (ストリーミング読み取り上限の検証用)
+            let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+            stream.write_all(header.as_bytes())?;
+            let chunk = [b'x'; 64 * 1024];
+            let mut remaining = HUGE_BODY_BYTES;
+            while remaining > 0 {
+                let n = remaining.min(chunk.len());
+                stream.write_all(format!("{n:x}\r\n").as_bytes())?;
+                stream.write_all(&chunk[..n])?;
+                stream.write_all(b"\r\n")?;
+                remaining -= n;
+            }
+            stream.write_all(b"0\r\n\r\n")?;
+        }
+    }
     stream.flush()
 }

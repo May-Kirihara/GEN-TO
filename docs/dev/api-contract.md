@@ -1857,33 +1857,57 @@ docs/dev/measurements/ とhandoff参照。
   (#1計画どおり。NULL既定のADD COLUMNならFK参照を付与可能)。
 - `jobs` 表再構築: status CHECKへ `retry_waiting` を追加。バックオフ期限は
   既存 `scheduled_at` を流用。pending中の同一 (job_type, target_id) 重複を
-  防ぐ部分UNIQUE index `idx_jobs_pending_dedupe`。
+  防ぐ部分UNIQUE index `idx_jobs_pending_dedupe`。コピー時の正規化:
+  実行器の存在しないjob_typeの行とpending重複の2行目以降は除外
+  (v7以前のjobs表にCHECKが無かったことへの移行防衛 — populated v7
+  移行テストで検証)。
 
 ### ジョブ状態機械 (spec §11.2)
 
 ```text
 queued ──claim──▶ running ──成功──▶ succeeded
-  ▲                 │失敗 (attempts<max)──▶ retry_waiting (scheduled_at=期限)
-  │                 │失敗 (attempts>=max)──▶ failed ──retry_failed(手動)──▶ queued
+  ▲                 │失敗・retryable (attempts<max)──▶ retry_waiting (scheduled_at=期限)
+  │                 │失敗・permanent (4xx/認証/パース/応答過大/鍵取得失敗)──▶ failed
+  │                 │失敗・retryable (attempts>=max)──▶ failed ──retry_failed(手動)──▶ queued
   │                 └(起動回復: running→queued)
   └──cancel──▶ cancelled (queued/retry_waitingのみ。runningは中断不可)
 ```
 
 - バックオフ: `gento_core::jobs::backoff_delay_ms` (純粋関数)。
   基準 30s→2m→8m (×4) + ジッター [0.5, 1.5)倍 + 上限1h。
+- エラー分類: network/5xx/timeout = **retryable** (backoffで再試行)、
+  4xx/認証/パース失敗/プロンプト過大/応答過大/鍵取得失敗 =
+  **permanent** (`fail_job_permanent` で即座にterminal failed。
+  retry_waitingに入れない — 画像再開示の反復を構造的に防止)。
 - worker: gento-tauri `ai::AiService` (std::thread ×2。library.rsの
   ワーカー規約に同じ)。起床 = エンキュー/resume通知 or 500msポーリング。
-  プロファイル毎のconcurrencyは実行中カウントのセマフォで強制。
+  プロファイル毎のconcurrencyは「容量チェック・claim・スロット予約を
+  同一ロック内」で強制 (チェック〜予約間の競合を構造的に排除)。
 - キュー一時停止はメモリフラグ (永続化しない — 再起動で再開が既定)。
+  claim直前にも再検査する (pause境界はbest-effort)。
+
+### HTTPクライアント境界 (FG-WP10)
+
+- 応答ボディは2 MiB上限 (Content-Length検査 + ストリーミング読み取り
+  上限の二段構え。chunked対応)。超過は非リトライの `AiError::Oversized`。
+- リダイレクトは不追従 (`redirect::Policy::none()`) — 3xxはそのまま
+  APIエラー (permanen失敗) として扱う。
+- プロファイルに鍵参照があるが取得に失敗した場合 (keyring/fileエラー) は
+  **フェイルクローズ**: ジョブをpermanent失敗 (「資格情報の取得に失敗」)
+  とし、未認証での送信は行わない (4種テスト機能も同じ)。
 
 ### 送信プライバシー (spec §16)
 
 - EXIF/GPS送信 = `library_roots.send_exif/send_gps` ∧
   プロファイル追加設定 (`extra_json` の `send_exif/send_gps`)。
   GPSはsend_exifとは**独立した**opt-in (EXIF許可でもGPS拒否なら座標は
-  送らない)。実効判定は `gento_ai::prompt::effective_privacy`。
+  送らない。逆にEXIF拒否でもGPS許可なら座標のみ送る)。
+  実効判定は `gento_ai::prompt::effective_privacy`。
 - 送信画像は必ず再エンコード (長辺 `max_image_edge` 既定1024px・JPEG q85
   ・EXIF等メタデータは再エンコードで除去)。
+  `max_image_edge` は**64〜2048に強制** (3層: IPC保存は範囲外を拒否 /
+  保存済み値の読み込みはクランプ / 実行時もクランプ)。旧「0=縮小なし」
+  は廃止 — 原寸が外部へ出る経路は存在しない。
 - プロンプト: `PROMPT_VERSION = 1` (ai_runs.prompt_versionに記録。
   変更時は必ず版を上げる — 自動処理の重複抑止が版ベース)。
 
@@ -1892,9 +1916,13 @@ queued ──claim──▶ running ──成功──▶ succeeded
 1. keyring crate (Linux=Secret Service via zbus / macOS=Keychain /
    Windows=Credential Manager) を試行
 2. 利用不能 (ヘッドレス等) の場合、`{data_dir}/ai-secrets/<uuid>.key`
-   (0600・平文・README警告同梱) へフォールバック。
+   (0600・平文・README警告同梱) へフォールバック。ディレクトリは0700。
+   **symlink (鍵ファイル・ディレクトリ両方) は保存も読み出しも拒否**
+   (差し替え攻撃の防衛。フェイルクローズ)。
    簡易難読化は意図的にしない (同一マシンに鍵を置く疑似安全を避ける)。
 3. `ApiKey` newtypeのDebug/Displayは `****` (ログ混入の構造的防止)。
+4. 鍵削除は「DB参照クリア → 成功後secret削除」の順 (DB失敗時は
+   credentialが失われない)。
 
 ### Commands (camelCase引数)
 
@@ -1902,7 +1930,8 @@ queued ──claim──▶ running ──成功──▶ succeeded
   visionCapable, enabled, timeoutMs, concurrency, extra, hasApiKey,
   apiKeyStore}]` (鍵本体は返さない)
 - `ai_profile_save(profile, apiKey?)` — apiKey: 省略=変更なし / `""`=削除 /
-  値=保存。`extra` はProfileExtra (省略時は既存値引継ぎ)
+  値=保存。`extra` はProfileExtra (省略時は既存値引継ぎ)。
+  `max_image_edge` は範囲外 (64未満・2048超) を日本語エラーで拒否
 - `ai_profile_delete(profileId)` — 待機中ジョブをキャンセルし鍵も削除
 - `ai_profile_test_connection|test_text|test_vision|test_structured(profileId)`
   → `{ok, detail, elapsedMs, status}` (保存済みプロファイルに対して実行)

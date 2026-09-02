@@ -115,6 +115,20 @@ const README_TEXT: &str = "\
 - 資格情報ストアが利用できる環境では再保存することで移行できます
 ";
 
+/// パスが存在する場合、symlinkでないことを保証する (差し替え攻撃の
+/// 防衛 — 既存symlinkは失敗扱い。リンクを辿らないようsymlink_metadata)。
+fn ensure_not_symlink(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(std::io::Error::other(format!(
+            "refusing symlinked secret path: {}",
+            path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// 鍵の保存・読み出し。
 pub struct SecretStore {
     /// フォールバックファイルの置き場所 (app data_dir直下のai-secrets)。
@@ -205,15 +219,25 @@ impl SecretStore {
         key: &ApiKey,
     ) -> Result<StoredSecretRef, SecretStoreError> {
         let save = || -> std::io::Result<()> {
+            // ディレクトリ自体がsymlink (差し替え攻撃) は保存失敗扱い
+            if self.secret_dir.symlink_metadata().is_ok() {
+                ensure_not_symlink(&self.secret_dir)?;
+            }
             std::fs::create_dir_all(&self.secret_dir)?;
             #[cfg(unix)]
             {
-                use std::os::unix::fs::OpenOptionsExt;
+                use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+                // 平文置き場のため所有者限定 (0700)。既存ディレクトリの
+                // モードも保存のたびに矯正する。
+                let meta = std::fs::metadata(&self.secret_dir)?;
+                let mut perms = meta.permissions();
+                perms.set_mode(0o700);
+                std::fs::set_permissions(&self.secret_dir, perms)?;
                 // 平文であるため所有者限定 (0600)。既存ファイルのモードも
                 // 書き直し時に併せて落とす (create_newではなくtruncateで上書き)。
                 let file_name = self.file_name_of(profile_uuid);
-                if file_name.exists() {
-                    use std::os::unix::fs::PermissionsExt;
+                if file_name.symlink_metadata().is_ok() {
+                    ensure_not_symlink(&file_name)?;
                     let meta = std::fs::metadata(&file_name)?;
                     let mut perms = meta.permissions();
                     perms.set_mode(0o600);
@@ -231,7 +255,11 @@ impl SecretStore {
             {
                 // Windows/macOS: keyringが実質常に利用可能なため、
                 // フォールバックは到達しにくい。最小限のACL無し書き込み。
+                // (ACL付与はWP-17で検証する — handoff参照)
                 let file_name = self.file_name_of(profile_uuid);
+                if file_name.symlink_metadata().is_ok() {
+                    ensure_not_symlink(&file_name)?;
+                }
                 std::fs::write(&file_name, key.secret().as_bytes())?;
             }
             let readme = self.secret_dir.join(README_NAME);
@@ -254,6 +282,8 @@ impl SecretStore {
 
     /// 参照IDから鍵を読む。未登録・読み取り失敗はNone
     /// (APIキー無しendpoint = ローカルllama.cpp等は正当な状態)。
+    /// **鍵ファイル/ディレクトリがsymlinkの場合もNone** — リンク先の
+    /// 内容を鍵として読み上げない (フェイルクローズ)。
     pub fn load(&self, api_key_ref: &str) -> Option<ApiKey> {
         let secret_ref = StoredSecretRef::parse(api_key_ref)?;
         match secret_ref.kind {
@@ -262,7 +292,14 @@ impl SecretStore {
                 entry.get_password().ok().map(ApiKey::new)
             }
             SecretStoreKind::PlainFile => {
-                std::fs::read_to_string(self.file_name_of(&secret_ref.id))
+                if ensure_not_symlink(&self.secret_dir).is_err() {
+                    return None;
+                }
+                let path = self.file_name_of(&secret_ref.id);
+                if ensure_not_symlink(&path).is_err() {
+                    return None;
+                }
+                std::fs::read_to_string(path)
                     .ok()
                     .map(|s| ApiKey::new(s.trim_end_matches(['\n', '\r']).to_string()))
             }
@@ -388,6 +425,89 @@ mod tests {
             let mode = std::fs::metadata(&file).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_fallback_dir_is_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new("dirmode");
+        let store = SecretStore::file_only(tmp.0.as_path());
+        let uuid = "019abcde-f012-7abc-8000-000000000020";
+        store
+            .save(uuid, &ApiKey::new("sk-dir-mode".to_string()))
+            .unwrap();
+        let mode = std::fs::metadata(store.secret_dir())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "ai-secretsは所有者のみアクセス可");
+        // 緩められた既存ディレクトリも保存時に矯正される
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(store.secret_dir()).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(store.secret_dir(), perms).unwrap();
+        }
+        store
+            .save(uuid, &ApiKey::new("sk-again".to_string()))
+            .unwrap();
+        let mode = std::fs::metadata(store.secret_dir())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "既存dirのモードも矯正");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_key_file_is_rejected_on_save_and_load() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new("symlink");
+        let store = SecretStore::file_only(tmp.0.as_path());
+        let uuid = "019abcde-f012-7abc-8000-000000000021";
+        // 一度正当に保存
+        let stored = store
+            .save(uuid, &ApiKey::new("sk-real".to_string()))
+            .unwrap();
+        // 鍵ファイルを外部ファイルへのsymlinkへ差し替え
+        let outside = tmp.0.join("outside.txt");
+        std::fs::write(&outside, "sk-attacker").unwrap();
+        let key_file = store.secret_dir().join(format!("{uuid}.key"));
+        std::fs::remove_file(&key_file).unwrap();
+        symlink(&outside, &key_file).unwrap();
+        // 上書き保存は失敗 (symlinkを経由した書き込みを拒否)
+        assert!(store
+            .save(uuid, &ApiKey::new("sk-new".to_string()))
+            .is_err());
+        // 読み出しも失敗 (リンク先の内容を読み上げない)
+        assert!(store.load(&stored.as_ref_string()).is_none());
+        // 攻撃者ファイルは無傷 (書き込まれていない)
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "sk-attacker",
+            "symlink先へ書き込んでいない"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_secret_dir_is_rejected() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new("symdir");
+        // ai-secrets自体を別ディレクトリへのsymlinkにする
+        let real_dir = tmp.0.join("elsewhere");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        symlink(&real_dir, tmp.0.join(SECRET_DIR_NAME)).unwrap();
+        let store = SecretStore::file_only(tmp.0.as_path());
+        let uuid = "019abcde-f012-7abc-8000-000000000022";
+        let result = store.save(uuid, &ApiKey::new("sk-dir-link".to_string()));
+        assert!(result.is_err(), "symlinkディレクトリへの保存は失敗");
+        // リンク先へファイルが書かれていない
+        assert!(
+            std::fs::read_dir(&real_dir).unwrap().count() == 0,
+            "リンク先は空のまま"
+        );
     }
 
     #[test]

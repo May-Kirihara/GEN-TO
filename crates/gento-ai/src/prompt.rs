@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::client::{image_url_message, text_message, ChatMessage};
+use crate::imaging::{MAX_IMAGE_EDGE, MIN_IMAGE_EDGE};
 
 /// プロンプトの版。本文を変えたら必ず上げる (ai_runsに記録)。
 pub const PROMPT_VERSION: i64 = 1;
@@ -52,7 +53,8 @@ pub struct ProfileExtra {
     pub send_exif: bool,
     /// GPS座標をプロンプトへ含める (ルート設定とのAND。send_exifとは独立)。
     pub send_gps: bool,
-    /// 送信画像の最大辺 (px)。0 = 縮小なし。
+    /// 送信画像の最大辺 (px)。64〜2048の範囲にクランプされる
+    /// (0 = 縮小なしは廃止 — 原寸の外部送信を構造的に防ぐ)。
     pub max_image_edge: u32,
     /// response_format: json_object を送る (対応確認済みのendpointのみ)。
     pub send_response_format: bool,
@@ -71,11 +73,16 @@ impl Default for ProfileExtra {
 
 impl ProfileExtra {
     /// extra_json文字列をパース (NULL・不正JSONは既定値)。
+    /// `max_image_edge` は保存済み値の範囲外 (旧「0=縮小なし」・過大値) を
+    /// 読み込み時に [MIN_IMAGE_EDGE, MAX_IMAGE_EDGE] へクランプする
+    /// (IPCでの保存は範囲検査で拒否 — 二重の防御)。
     pub fn parse(extra_json: Option<&str>) -> Self {
-        match extra_json {
+        let mut parsed = match extra_json {
             Some(text) => serde_json::from_str(text).unwrap_or_default(),
             None => ProfileExtra::default(),
-        }
+        };
+        parsed.max_image_edge = parsed.max_image_edge.clamp(MIN_IMAGE_EDGE, MAX_IMAGE_EDGE);
+        parsed
     }
 
     pub fn to_json_string(&self) -> String {
@@ -102,26 +109,26 @@ pub fn effective_privacy(
     }
 }
 
-/// 撮影情報のテキスト節 (send_exif時のみ。GPSはさらにsend_gps時)。
+/// 撮影情報のテキスト節。EXIF節 (send_exif) とGPS座標 (send_gps) は
+/// それぞれ独立したopt-in — EXIF拒否でもGPS許可なら座標のみ含める。
 fn exif_section(hints: &AiMetadataHints, privacy: EffectivePrivacy) -> String {
-    if !privacy.send_exif {
-        return String::new();
-    }
     let mut lines: Vec<String> = Vec::new();
-    if let Some(taken) = &hints.taken_at {
-        lines.push(format!("- 撮影日時: {taken}"));
-    }
-    let camera = match (&hints.camera_make, &hints.camera_model) {
-        (Some(make), Some(model)) => Some(format!("{make} {model}")),
-        (Some(make), None) => Some(make.clone()),
-        (None, Some(model)) => Some(model.clone()),
-        (None, None) => None,
-    };
-    if let Some(camera) = camera {
-        lines.push(format!("- カメラ: {camera}"));
-    }
-    if let Some(lens) = &hints.lens {
-        lines.push(format!("- レンズ: {lens}"));
+    if privacy.send_exif {
+        if let Some(taken) = &hints.taken_at {
+            lines.push(format!("- 撮影日時: {taken}"));
+        }
+        let camera = match (&hints.camera_make, &hints.camera_model) {
+            (Some(make), Some(model)) => Some(format!("{make} {model}")),
+            (Some(make), None) => Some(make.clone()),
+            (None, Some(model)) => Some(model.clone()),
+            (None, None) => None,
+        };
+        if let Some(camera) = camera {
+            lines.push(format!("- カメラ: {camera}"));
+        }
+        if let Some(lens) = &hints.lens {
+            lines.push(format!("- レンズ: {lens}"));
+        }
     }
     // GPSはEXIF節とは独立したopt-in (座標は機密性が高いため)
     if privacy.send_gps {
@@ -285,7 +292,21 @@ mod tests {
         let json = serde_json::to_string(&messages).unwrap();
         assert!(json.contains("35.681236"), "GPS座標が含まれる: {json}");
 
-        // ルートがEXIF拒否: EXIFもGPSも含まれない
+        // GPSはEXIFと独立: EXIF拒否・GPS許可なら座標のみ含まれる
+        let gps_only = effective_privacy(false, true, &profile_both);
+        let messages = build_caption_tags_messages("data:image/jpeg;base64,xx", &h, gps_only);
+        let json = serde_json::to_string(&messages).unwrap();
+        assert!(
+            json.contains("35.681236"),
+            "EXIF拒否でもGPS許可なら座標は含まれる: {json}"
+        );
+        assert!(!json.contains("TestCam"), "EXIF機種名は含まれない: {json}");
+        assert!(
+            !json.contains("50mm") && !json.contains("2026-08-01"),
+            "EXIF節なし: {json}"
+        );
+
+        // 両方拒否: 何も含まれない
         let none = effective_privacy(false, false, &profile_both);
         let messages = build_caption_tags_messages("data:image/jpeg;base64,xx", &h, none);
         let json = serde_json::to_string(&messages).unwrap();
@@ -353,6 +374,21 @@ mod tests {
         // 往復
         let s = parsed.to_json_string();
         assert_eq!(ProfileExtra::parse(Some(&s)), parsed);
+        // 保存済み値の範囲外 (旧「0=縮小なし」・過大値) は読み込み時に
+        // クランプされる (IPC保存側は拒否 — tauri ai.rsのテスト参照)
+        assert_eq!(
+            ProfileExtra::parse(Some(r#"{"max_image_edge":0}"#)).max_image_edge,
+            MIN_IMAGE_EDGE
+        );
+        assert_eq!(
+            ProfileExtra::parse(Some(r#"{"max_image_edge":8192}"#)).max_image_edge,
+            MAX_IMAGE_EDGE
+        );
+        assert_eq!(
+            ProfileExtra::parse(Some(r#"{"max_image_edge":100}"#)).max_image_edge,
+            100,
+            "範囲内は不変"
+        );
     }
 
     #[test]

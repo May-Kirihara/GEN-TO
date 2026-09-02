@@ -314,6 +314,27 @@ impl SqliteRepos<'_> {
         Ok(status.to_string())
     }
 
+    /// 再試行不能な失敗。attempts上限とは無関係に即座 `failed` へ確定する
+    /// (認証失敗・不正リクエスト等、反復しても同じ結果になる失敗の再送を
+    /// 構造的に防ぐ — retry_waitingへ入らない)。
+    pub fn fail_job_permanent(&self, id: i64, error: &str) -> Result<String, RepoError> {
+        let now = now_utc_rfc3339();
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE jobs SET status = 'failed', error = ?2, scheduled_at = NULL, \
+                 finished_at = ?3, updated_at = ?3 WHERE id = ?1 AND status = 'running'",
+                params![id, error, now],
+            )
+            .map_err(map_err)?;
+        if changed == 0 {
+            return Err(RepoError::Constraint(format!(
+                "job {id} is not running; cannot fail permanently"
+            )));
+        }
+        Ok("failed".to_string())
+    }
+
     /// queued/retry_waitingのジョブをキャンセルする。
     /// 実行中 (running) はHTTP呼び出しを中断できないため拒否する。
     pub fn cancel_job(&self, id: i64) -> Result<JobRecord, RepoError> {
@@ -587,6 +608,38 @@ mod tests {
                 .claim_next_job("2026-09-02T09:00:00.000Z")
                 .unwrap()
                 .is_none());
+        });
+    }
+
+    #[test]
+    fn permanent_fail_terminates_immediately_regardless_of_attempts() {
+        with_repos("permfail", |repos| {
+            let job = enqueue(repos, 1).unwrap();
+            let claimed = repos.claim_next_job(NOW).unwrap().unwrap();
+            assert_eq!(claimed.attempts, 1);
+            // 1回目の失敗でpermanent → retry_waitingを経由せず即failed
+            assert_eq!(
+                repos
+                    .fail_job_permanent(job.id, "認証に失敗しました (401)")
+                    .unwrap(),
+                "failed"
+            );
+            let j = repos.list_jobs(10).unwrap().remove(0);
+            assert_eq!(j.status, "failed");
+            assert_eq!(j.attempts, 1, "attemptsはclaim分のみ");
+            assert!(j.scheduled_at.is_none(), "backoff期限は設定されない");
+            assert!(j.finished_at.is_some());
+            assert_eq!(j.error.as_deref(), Some("認証に失敗しました (401)"));
+            // failedはclaimされない (自動再試行なし)
+            assert!(repos
+                .claim_next_job("2026-09-02T09:00:00.000Z")
+                .unwrap()
+                .is_none());
+            // running以外への適用は拒否
+            assert!(matches!(
+                repos.fail_job_permanent(job.id, "again"),
+                Err(RepoError::Constraint(_))
+            ));
         });
     }
 

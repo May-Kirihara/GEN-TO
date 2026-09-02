@@ -814,6 +814,97 @@ mod tests {
     }
 
     #[test]
+    fn v7_populated_jobs_migrate_to_v8_with_legacy_and_duplicate_rows() {
+        // レガシー (v7以前) のjobs表にはjob_type CHECKが無く、pending重複も
+        // 成立し得る。#8のjob_type CHECK・部分UNIQUE indexがこれらの行で
+        // 移行をrollbackさせないこと (Codexレビュー: populated v7移行)。
+        let tmp = TempDir::new("v7jobs");
+        let mut conn = Connection::open(tmp.path().join("db.sqlite3")).unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run_migrations(&mut conn, &MIGRATIONS[..7], &MigrationOpts::default()).unwrap();
+
+        let insert_job = |id: i64, uuid_suffix: i64, job_type: &str, target: i64, status: &str| {
+            conn.execute(
+                "INSERT INTO jobs (id, uuid, job_type, target_type, target_id, status, \
+                     priority, attempts, max_attempts, payload, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'asset', ?4, ?5, 5, 0, 3, '{}',
+                         '2026-09-01T00:00:00.000Z', '2026-09-01T00:00:00.000Z')",
+                rusqlite::params![
+                    id,
+                    format!("00000000-0000-7000-8000-{uuid_suffix:012}"),
+                    job_type,
+                    target,
+                    status
+                ],
+            )
+            .unwrap();
+        };
+        // (a) pending重複 (同一job_type+target_id): id 1,2 — 最古のみ残る
+        insert_job(1, 1, "ai_caption_tags", 10, "queued");
+        insert_job(2, 2, "ai_caption_tags", 10, "queued");
+        // (b) レガシーjob_type (実行器なし): 除去される
+        insert_job(3, 3, "hash_scan", 11, "queued");
+        // (c) 正常行: pending・terminal混在 (同一keyのsucceeded+queuedは共存可)
+        insert_job(4, 4, "ai_reparse", 12, "queued");
+        insert_job(5, 5, "ai_reparse", 12, "succeeded");
+        // (d) pending→terminalの順で並ぶ同一key (id 6がpendingの最古)。
+        // v7のCHECKにretry_waitingはまだ無いため重複はqueuedで作る
+        insert_job(6, 6, "ai_caption_tags", 13, "running");
+        insert_job(7, 7, "ai_caption_tags", 13, "queued");
+        // (e) レガシー型のpending重複 — 両方とも除去される
+        insert_job(8, 8, "legacy_embed", 14, "queued");
+        insert_job(9, 9, "legacy_embed", 14, "queued");
+
+        run_migrations(&mut conn, MIGRATIONS, &MigrationOpts::default()).unwrap();
+        assert_eq!(read_user_version(&conn).unwrap(), LATEST_VERSION);
+
+        let rows: Vec<(i64, String, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT id, job_type, status FROM jobs ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        // 残る行: id 1 (重複の最古), 4, 5, 6 (runningのままコピー — 起動回復で
+        // queuedへ戻る)。id 2 (重複2行目), 3/8/9 (未対応型), 7 (id 6とpending重複)
+        // は除外。
+        let ids: Vec<i64> = rows.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(ids, vec![1, 4, 5, 6], "rows: {rows:?}");
+        // 部分UNIQUE indexが作成済みであること (重複なしで移行が完結した証)
+        let idx: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master \
+                 WHERE type='index' AND name='idx_jobs_pending_dedupe'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1);
+        // 移行後のキュー操作が正常に機能すること
+        conn.execute(
+            "INSERT INTO jobs (uuid, job_type, target_type, target_id, status, \
+             created_at, updated_at) VALUES \
+             ('00000000-0000-7000-8000-0000000000bb', 'ai_caption_tags', 'asset', 99, \
+              'queued', '2026-09-02T00:00:00.000Z', '2026-09-02T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        // レガシー型は新規投入時にCHECKへ拒否される
+        let err = conn
+            .execute(
+                "INSERT INTO jobs (uuid, job_type, target_type, target_id, status, \
+                 created_at, updated_at) VALUES \
+                 ('00000000-0000-7000-8000-0000000000cc', 'hash_scan', 'asset', 99, \
+                  'queued', '2026-09-02T00:00:00.000Z', '2026-09-02T00:00:00.000Z')",
+                [],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("CHECK"), "{err}");
+    }
+
+    #[test]
     fn newer_schema_db_is_rejected() {
         let tmp = TempDir::new("future");
         let mut conn = Connection::open(tmp.path().join("db.sqlite3")).unwrap();

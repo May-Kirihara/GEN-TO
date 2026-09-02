@@ -198,18 +198,40 @@ pub fn run_caption_tags_job(
     );
     match client.chat(&messages, None) {
         Ok(response) => {
-            // ④ パース → 適用 (手動保護はrepo側で強制)
+            // ④ パース → 適用 (手動保護はrepo側で強制)。
+            //     適用 (repo書き込み) の失敗はジョブ/ランを失敗にする
+            //     (結果が失われたままsucceededにしない)。
             match parse_caption_tags_response(&response.content) {
                 Ok(result) => {
-                    let applied_tags = db
+                    let applied_tags = match db
                         .with_writer(|repos| repos.add_ai_tags(asset_id, &result.tags, run.id))
-                        .unwrap_or(0);
-                    let caption_became_current = result.caption.as_ref().is_some_and(|body| {
-                        db.with_writer(|repos| {
+                    {
+                        Ok(applied) => applied,
+                        Err(err) => {
+                            return finish_failed(
+                                db,
+                                run.id,
+                                &format!("タグの適用に失敗しました: {err}"),
+                                false,
+                            );
+                        }
+                    };
+                    let caption_became_current = match result.caption.as_ref() {
+                        Some(body) => match db.with_writer(|repos| {
                             repos.apply_ai_caption(asset_id, CaptionKind::Description, body, run.id)
-                        })
-                        .unwrap_or(false)
-                    });
+                        }) {
+                            Ok(became) => became,
+                            Err(err) => {
+                                return finish_failed(
+                                    db,
+                                    run.id,
+                                    &format!("キャプションの適用に失敗しました: {err}"),
+                                    false,
+                                );
+                            }
+                        },
+                        None => false,
+                    };
                     let _ = db.with_writer(|repos| {
                         repos.finish_ai_run(run.id, "succeeded", Some(&response.content), None)
                     });

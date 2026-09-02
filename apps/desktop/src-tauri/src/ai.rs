@@ -294,7 +294,7 @@ fn worker_loop(
             let _ = wake_rx.recv_timeout(Duration::from_millis(1000));
             continue;
         }
-        let ran = run_one_job(db, data_dir, in_flight, change_tx);
+        let ran = run_one_job(db, data_dir, paused, in_flight, change_tx);
         if !ran {
             // ジョブが無い: 起床通知 or ポーリング間隔まで待つ
             let _ = wake_rx.recv_timeout(POLL_INTERVAL);
@@ -305,9 +305,13 @@ fn worker_loop(
 /// 1ジョブを実行する (候補選択→claim→実行→確定)。
 /// 戻り値 = ジョブを実行したか (false = 対象なし)。
 /// テストから直接呼んで決定的にドライブできる。
+/// `paused` はclaim直前にも再検査する (worker_loopの検査通過後にpauseが
+/// 設定された場合も新規claimを避ける — pauseは協調的フラグのため境界は
+/// best-effortだが窓を最小化する)。
 fn run_one_job(
     db: &Arc<Db>,
     data_dir: &std::path::Path,
+    paused: &AtomicBool,
     in_flight: &Mutex<HashMap<i64, usize>>,
     change_tx: &SyncSender<AiJobDto>,
 ) -> bool {
@@ -318,41 +322,48 @@ fn run_one_job(
     if candidates.is_empty() {
         return false;
     }
-    // プロファイル飽和を考慮して最初に実行可能な候補を選ぶ
-    let target = {
-        let saturated = in_flight.lock().unwrap_or_else(|p| p.into_inner());
-        candidates
-            .iter()
-            .find(|job| {
-                let profile = profile_of_job(db, job);
-                match profile {
-                    Some(profile) => {
-                        let running = saturated.get(&profile.id).copied().unwrap_or(0);
-                        running < profile.concurrency.max(1) as usize
-                    }
-                    // プロファイル未解決のジョブは飽和計算外 (即failするため)
-                    None => true,
+    // プロファイル飽和チェック・claim・スロット予約を同一ロック内で行う
+    // (FG-WP10 blocker 3: チェックと予約の間に別workerが同じプロファイルの
+    // ジョブをclaimする競合を構造的に排除する)。
+    let claimed_job: Option<(JobRecord, Option<AiProfileRecord>)> = {
+        let mut saturated = in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        // 候補読み取り後にpauseされた場合は新規claimしない
+        if paused.load(Ordering::SeqCst) {
+            return false;
+        }
+        let chosen = candidates.iter().find_map(|job| {
+            let profile = profile_of_job(db, job);
+            let has_capacity = match &profile {
+                Some(profile) => {
+                    let running = saturated.get(&profile.id).copied().unwrap_or(0);
+                    running < profile.concurrency.max(1) as usize
                 }
-            })
-            .cloned()
+                // プロファイル未解決のジョブは飽和計算外 (即failするため)
+                None => true,
+            };
+            has_capacity.then(|| (job.clone(), profile))
+        });
+        let Some((job, profile)) = chosen else {
+            return false; // 全候補が飽和 — 次のポーリングで再評価
+        };
+        let claimed = db
+            .with_writer(|repos| repos.claim_job_by_id(job.id, &now))
+            .unwrap_or(None);
+        match claimed {
+            Some(claimed) => {
+                // 予約成功でのみスロットを確保 (claim敗退時は何もしない)
+                if let Some(profile) = &profile {
+                    *saturated.entry(profile.id).or_insert(0) += 1;
+                }
+                Some((claimed, profile))
+            }
+            // 他ワーカーに取られた → ロック解放後に即再ループ
+            None => return true,
+        }
     };
-    let Some(job) = target else {
-        return false; // 全候補が飽和 — 次のポーリングで再評価
-    };
-    let claimed = db
-        .with_writer(|repos| repos.claim_job_by_id(job.id, &now))
-        .unwrap_or(None);
-    let Some(claimed) = claimed else {
-        return true; // 他ワーカーに取られた → 即再ループ
-    };
+    let (claimed, profile) = claimed_job.expect("matched arm always sets");
     let _ = change_tx.try_send(job_dto(&claimed));
 
-    let profile = profile_of_job(db, &claimed);
-    // プロファイル別実行中カウント (concurrencyセマフォ)
-    if let Some(profile) = &profile {
-        let mut counts = in_flight.lock().unwrap_or_else(|p| p.into_inner());
-        *counts.entry(profile.id).or_insert(0) += 1;
-    }
     let outcome_result = execute_claimed_job(db, data_dir, &claimed, profile.as_ref());
     if let Some(profile) = &profile {
         let mut counts = in_flight.lock().unwrap_or_else(|p| p.into_inner());
@@ -360,25 +371,27 @@ fn run_one_job(
             *count = count.saturating_sub(1);
         }
     }
-    let outcome = outcome_result;
-    match outcome {
+    match outcome_result {
         Ok(_) => {
             let _ = db.with_writer(|repos| repos.complete_job(claimed.id));
         }
         Err((retryable, error)) => {
-            let delay = if retryable {
+            if retryable {
+                // network/5xx/timeout: backoff付きで再試行待機へ
                 let jitter = pseudo_jitter();
-                backoff_delay_ms(
+                let delay = backoff_delay_ms(
                     claimed.attempts,
                     DEFAULT_BACKOFF_BASE_MS,
                     DEFAULT_BACKOFF_FACTOR,
                     jitter,
-                )
+                );
+                let retry_at = rfc3339_after_now(delay);
+                let _ = db.with_writer(|repos| repos.fail_job(claimed.id, &error, &retry_at));
             } else {
-                0
-            };
-            let retry_at = rfc3339_after_now(delay);
-            let _ = db.with_writer(|repos| repos.fail_job(claimed.id, &error, &retry_at));
+                // 4xx/認証/パース失敗等: 再送しても同じ結果 — 即座にterminal
+                // failed (retry_waitingに入れない。画像再開示の反復を防止)
+                let _ = db.with_writer(|repos| repos.fail_job_permanent(claimed.id, &error));
+            }
         }
     }
     let after = db
@@ -404,7 +417,22 @@ fn execute_claimed_job(
     let secrets = SecretStore::new(data_dir);
     match (claimed.job_type.as_str(), profile) {
         (JOB_TYPE_AI_CAPTION_TAGS, Some(profile)) => {
-            let api_key = profile.api_key_ref.as_deref().and_then(|r| secrets.load(r));
+            // 鍵参照があるのに取得失敗 (keyring/fileエラー・ファイル消失) は
+            // フェイルクローズ: 未認証での送信はしない (FG-WP10 blocker 5)
+            let api_key = match profile.api_key_ref.as_deref() {
+                None => None,
+                Some(key_ref) => match secrets.load(key_ref) {
+                    Some(key) => Some(key),
+                    None => {
+                        return Err((
+                            false,
+                            "資格情報の取得に失敗しました (プロファイルのAPIキーが\
+                             読み取れません。保存し直してください)"
+                                .to_string(),
+                        ));
+                    }
+                },
+            };
             let result =
                 run_caption_tags_job(db, claimed, profile, api_key, &PipelineOptions::default());
             match result {
@@ -597,9 +625,20 @@ fn save_profile_impl(
     }
     let mut extra = match input.get("extra") {
         Some(value) if value.is_object() => {
-            let mut parsed: ProfileExtra = serde_json::from_value(value.clone())
+            let parsed: ProfileExtra = serde_json::from_value(value.clone())
                 .map_err(|e| format!("追加設定が不正です: {e}"))?;
-            parsed.max_image_edge = parsed.max_image_edge.min(8192);
+            // 送信画像サイズは範囲外をIPCで拒否 (旧「0=縮小なし」・2048超は
+            // 保存させない。保存済み値の読み込み側クランプはProfileExtra::parse)
+            if !(gento_ai::imaging::MIN_IMAGE_EDGE..=gento_ai::imaging::MAX_IMAGE_EDGE)
+                .contains(&parsed.max_image_edge)
+            {
+                return Err(format!(
+                    "送信画像の最大辺は{}〜{}pxの範囲で指定してください (送信は最大{}pxまで)",
+                    gento_ai::imaging::MIN_IMAGE_EDGE,
+                    gento_ai::imaging::MAX_IMAGE_EDGE,
+                    gento_ai::imaging::MAX_IMAGE_EDGE
+                ));
+            }
             parsed
         }
         _ => ProfileExtra::default(),
@@ -671,11 +710,13 @@ fn save_profile_impl(
     match api_key.as_deref() {
         None => {}
         Some("") => {
+            // DB参照を先にクリアし、成功後のみsecretを削除する
+            // (逆順だとDB失敗時 credential が失われる — FG-WP10 非ブロッカー8)
             if let Some(old_ref) = record.api_key_ref.as_deref() {
+                db.with_writer(|repos| repos.set_ai_profile_api_key_ref(record.id, None))
+                    .map_err(|e| e.to_string())?;
                 service.secret_store().delete(old_ref);
             }
-            db.with_writer(|repos| repos.set_ai_profile_api_key_ref(record.id, None))
-                .map_err(|e| e.to_string())?;
         }
         Some(value) => {
             if value.trim().is_empty() {
@@ -752,10 +793,17 @@ macro_rules! run_test {
                 .with_reader(|repos| repos.get_ai_profile(id))
                 .map_err(|e| e.to_string())?
                 .ok_or("プロファイルが見つかりません")?;
-            let api_key = profile
-                .api_key_ref
-                .as_deref()
-                .and_then(|r| service.secret_store().load(r));
+            // 鍵参照があるのに取得失敗なら送信しない (フェイルクローズ)
+            let api_key = match profile.api_key_ref.as_deref() {
+                None => None,
+                Some(key_ref) => service.secret_store().load(key_ref),
+            };
+            if profile.api_key_ref.is_some() && api_key.is_none() {
+                return Err(
+                    "資格情報の取得に失敗しました (プロファイルのAPIキーが読み取れません)"
+                        .to_string(),
+                );
+            }
             let extra = ProfileExtra::parse(profile.extra_json.as_deref());
             let client = AiClient::new(
                 AiEndpoint {
@@ -1537,6 +1585,9 @@ mod tests {
         let service = AiService::start(Arc::clone(&db), tmp.0.clone(), sink);
         service.set_paused(true);
         assert!(service.is_paused());
+        // ポーリング周期 (500ms) を超えて待ち、全workerがpauseを観測済みの
+        // 状態で投入する (pause検査通過直後の反復がenqueueを跨ぐ競合を避ける)
+        std::thread::sleep(Duration::from_millis(700));
 
         let payload = json!({"asset_id": asset_id}).to_string();
         db.with_writer(|repos| {
@@ -1595,8 +1646,9 @@ mod tests {
         let (_log, sink) = recorder();
         drop(sink);
         let in_flight = std::sync::Mutex::new(HashMap::new());
+        let not_paused = AtomicBool::new(false);
         let (tx, _rx) = std::sync::mpsc::sync_channel(16);
-        assert!(run_one_job(&db, &tmp.0, &in_flight, &tx));
+        assert!(run_one_job(&db, &tmp.0, &not_paused, &in_flight, &tx));
 
         // 再トリガー → 成功済みのため再投入しない
         on_asset_linked(&db, file_id_of(&db, asset_id), asset_id);
@@ -1619,6 +1671,392 @@ mod tests {
                 .unwrap())
         })
         .unwrap()
+    }
+
+    /// fixtureに2つ目のasset+代表ファイルを追加する (同時実行試験用)。
+    fn add_asset(db: &Arc<Db>, root_id: i64, tag: &str, file_name: &str) -> i64 {
+        db.with_writer(|repos| {
+            use gento_core::repo::{FileRepo, FileUpsert};
+            let root = repos.get_root(root_id)?.unwrap();
+            let path = root.path.join(file_name);
+            test_png(&path);
+            let file = repos.upsert_file(FileUpsert {
+                root_id,
+                rel_path: PathBuf::from(file_name),
+                display_name: file_name.to_string(),
+                byte_size: 10,
+                mtime_ms: 1,
+                mtime_ns: 1_000,
+                scan_state: ScanState::Present,
+                os_file_id: None,
+                detach_asset: false,
+            })?;
+            let asset = repos.create_asset(NewAsset {
+                content_hash: format!("blake3:{tag}"),
+                hash_algorithm: "blake3".to_string(),
+                byte_size: 10,
+                mime_type: Some("image/png".to_string()),
+                width: Some(64),
+                height: Some(48),
+                has_alpha: Some(false),
+                is_animated: Some(false),
+                frame_count: None,
+            })?;
+            repos.link_file(file.id, asset.id)?;
+            Ok(asset.id)
+        })
+        .unwrap()
+    }
+
+    /// FG-WP10 blocker 1: IPC (save_profile_impl) は範囲外max_image_edgeを拒否。
+    #[test]
+    fn ipc_rejects_out_of_range_max_image_edge() {
+        let (tmp, db, _root, _asset) = fixture("edge-ipc");
+        let (_log, sink) = recorder();
+        let service = AiService::start(db, tmp.0.clone(), sink);
+        let base = json!({
+            "displayName": "edge",
+            "baseUrl": "http://127.0.0.1:9/v1",
+            "model": "m",
+        });
+        for bad in [0u32, 63, 2049, 8192, u32::MAX] {
+            let input = json!({
+                "displayName": "edge",
+                "baseUrl": "http://127.0.0.1:9/v1",
+                "model": "m",
+                "extra": { "max_image_edge": bad },
+            });
+            let err = save_profile_impl(&service, &input, None).unwrap_err();
+            assert!(
+                err.contains("64〜2048"),
+                "拒否される ({bad}): {err} / input={input}"
+            );
+        }
+        // 境界値・範囲内・既定は受理
+        for ok in [64u32, 1024, 2048] {
+            let input = json!({
+                "displayName": "edge-ok",
+                "baseUrl": "http://127.0.0.1:9/v1",
+                "model": "m",
+                "extra": { "max_image_edge": ok },
+            });
+            let dto = save_profile_impl(&service, &input, None).unwrap();
+            assert_eq!(dto.extra["max_image_edge"].as_u64(), Some(ok as u64));
+        }
+        // extra省略 (UI互換) は既定1024
+        let dto = save_profile_impl(&service, &base, None).unwrap();
+        assert_eq!(dto.extra["max_image_edge"].as_u64(), Some(1024));
+        service.shutdown();
+    }
+
+    /// FG-WP10 blocker 1: 既存プロファイル保存値 (0/8192) は読み込み時に
+    /// クランプされてDTOへ出る (ProfileExtra::parse経路)。
+    #[test]
+    fn legacy_saved_out_of_range_edge_is_clamped_in_dto() {
+        let (_tmp, db, _root, _asset) = fixture("edge-legacy");
+        let profile_id = add_profile(&db, "http://127.0.0.1:9/v1");
+        for (saved, clamped) in [(0u32, 64u32), (8192, 2048), (100, 100)] {
+            db.with_writer(|repos| -> Result<(), gento_core::repo::RepoError> {
+                // savedはu32のためSQL注入なし (値の直埋め)
+                repos
+                    .conn()
+                    .execute(
+                        &format!(
+                            "UPDATE ai_profiles SET extra_json = '{{\"max_image_edge\":{saved}}}' \
+                             WHERE id = {profile_id}"
+                        ),
+                        [],
+                    )
+                    .map_err(|e| gento_core::repo::RepoError::Db(e.to_string()))?;
+                Ok(())
+            })
+            .unwrap();
+            let record = db
+                .with_reader(|repos| repos.get_ai_profile(profile_id))
+                .unwrap()
+                .unwrap();
+            let dto = profile_dto(&record, None);
+            assert_eq!(
+                dto.extra["max_image_edge"].as_u64(),
+                Some(clamped as u64),
+                "保存値{saved} → クランプ{clamped}"
+            );
+        }
+    }
+
+    /// FG-WP10 blocker 2: 4xx (認証失敗) は1回で確定failed — 再送しない。
+    #[test]
+    fn service_permanent_4xx_fails_once_without_retry() {
+        let server = MockServer::start(MockBehavior {
+            chat_status: 401,
+            ..MockBehavior::default()
+        });
+        let (tmp, db, _root, asset_id) = fixture("auth-fail");
+        let profile_id = add_profile(&db, &server.base_url);
+        let (_log, sink) = recorder();
+        let service = AiService::start(Arc::clone(&db), tmp.0.clone(), sink);
+        let payload = json!({"profile_id": profile_id, "asset_id": asset_id}).to_string();
+        db.with_writer(|repos| {
+            repos.enqueue_job(JOB_TYPE_AI_CAPTION_TAGS, "asset", asset_id, 5, &payload)
+        })
+        .unwrap()
+        .expect("enqueue");
+
+        assert!(
+            wait_until(20_000, || job_status(&db)
+                .iter()
+                .any(|(_, s)| s == "failed")),
+            "401は即時failed: {:?}",
+            job_status(&db)
+        );
+        let job = db
+            .with_reader(|repos| Ok(repos.list_jobs(10)?.into_iter().next().unwrap()))
+            .unwrap();
+        assert_eq!(job.attempts, 1, "1回の試行のみ");
+        assert!(
+            job.scheduled_at.is_none(),
+            "retry_waitingに入らない (=再試行予定なし)"
+        );
+        assert!(job.error.as_deref().unwrap_or("").contains("401"));
+        // 一定時間経過しても再送されない (画像再開示の反復を防止)
+        std::thread::sleep(Duration::from_millis(2_000));
+        assert_eq!(server.chat_calls(), 1, "リクエストは1回のみ");
+        assert!(
+            job_status(&db).iter().all(|(_, s)| s != "retry_waiting"),
+            "retry_waitingへ遷移しない: {:?}",
+            job_status(&db)
+        );
+        service.shutdown();
+    }
+
+    /// FG-WP10 blocker 2: 5xxはbackoff付きretry_waitingへ (接続拒否と対比)。
+    #[test]
+    fn service_5xx_goes_to_retry_waiting_with_backoff() {
+        let server = MockServer::start(MockBehavior {
+            chat_status: 500,
+            ..MockBehavior::default()
+        });
+        let (tmp, db, _root, asset_id) = fixture("err5xx");
+        let profile_id = add_profile(&db, &server.base_url);
+        let (_log, sink) = recorder();
+        let service = AiService::start(Arc::clone(&db), tmp.0.clone(), sink);
+        let payload = json!({"profile_id": profile_id, "asset_id": asset_id}).to_string();
+        db.with_writer(|repos| {
+            repos.enqueue_job(JOB_TYPE_AI_CAPTION_TAGS, "asset", asset_id, 5, &payload)
+        })
+        .unwrap()
+        .expect("enqueue");
+
+        assert!(
+            wait_until(20_000, || job_status(&db)
+                .iter()
+                .any(|(_, s)| s == "retry_waiting")),
+            "500はretry_waiting: {:?}",
+            job_status(&db)
+        );
+        let job = db
+            .with_reader(|repos| Ok(repos.list_jobs(10)?.into_iter().next().unwrap()))
+            .unwrap();
+        assert!(job.attempts >= 1);
+        assert!(
+            job.scheduled_at.is_some(),
+            "backoff期限が設定される: {:?}",
+            job.scheduled_at
+        );
+        service.shutdown();
+    }
+
+    /// FG-WP10 blocker 3: concurrency=1のプロファイルで2worker同時ドライブ
+    /// しても同時実行は起きない (遅延注入mockの同時処理数で決定的に検出)。
+    #[test]
+    fn concurrency_one_is_enforced_across_two_workers() {
+        let server = MockServer::start(MockBehavior {
+            delay: Duration::from_millis(400),
+            ..MockBehavior::default()
+        });
+        let (tmp, db, root, asset_a) = fixture("conc1");
+        let asset_b = add_asset(&db, root, "conc1-b", "b.png");
+        // concurrency=1のプロファイル
+        let profile_id = db
+            .with_writer(|repos| {
+                repos.insert_ai_profile(&NewAiProfile {
+                    display_name: "serial".to_string(),
+                    base_url: server.base_url.clone(),
+                    model: "mock-vision-model".to_string(),
+                    vision_capable: true,
+                    enabled: true,
+                    timeout_ms: 8_000,
+                    concurrency: 1,
+                    extra_json: None,
+                })
+            })
+            .unwrap()
+            .id;
+        for asset in [asset_a, asset_b] {
+            let payload = json!({"profile_id": profile_id, "asset_id": asset}).to_string();
+            db.with_writer(|repos| {
+                repos.enqueue_job(JOB_TYPE_AI_CAPTION_TAGS, "asset", asset, 5, &payload)
+            })
+            .unwrap()
+            .expect("enqueue");
+        }
+
+        let in_flight = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<AiJobDto>(16);
+        let all_terminal = |db: &Arc<Db>| {
+            job_status(db)
+                .iter()
+                .all(|(_, s)| s == "succeeded" || s == "failed" || s == "cancelled")
+        };
+        let not_paused = Arc::new(AtomicBool::new(false));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let db = Arc::clone(&db);
+            let data_dir = tmp.0.clone();
+            let in_flight = Arc::clone(&in_flight);
+            let not_paused = Arc::clone(&not_paused);
+            let tx = tx.clone();
+            workers.push(
+                std::thread::Builder::new()
+                    .spawn(move || {
+                        while !all_terminal(&db) {
+                            let ran = run_one_job(&db, &data_dir, &not_paused, &in_flight, &tx);
+                            if !ran {
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                        }
+                    })
+                    .unwrap(),
+            );
+        }
+        for handle in workers {
+            handle.join().unwrap();
+        }
+
+        let statuses = job_status(&db);
+        assert!(
+            statuses.iter().all(|(_, s)| s == "succeeded"),
+            "両ジョブ完了: {statuses:?}"
+        );
+        assert_eq!(
+            server
+                .log
+                .concurrent_max
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "mock同時処理数の最大は1 (=直列化されている)"
+        );
+        assert_eq!(server.chat_calls(), 2);
+    }
+
+    /// FG-WP10 blocker 5: 鍵参照があるが取得失敗 (ストア破損) → 送信なしの
+    /// permanent失敗 (mockのBearer検証にリクエスト自体が届かない)。
+    #[test]
+    fn key_lookup_failure_fails_closed_without_sending() {
+        let server = MockServer::start(MockBehavior {
+            expected_bearer: Some("sk-must-not-be-sent".to_string()),
+            ..MockBehavior::default()
+        });
+        let (tmp, db, _root, asset_id) = fixture("keyfail");
+        let profile_id = add_profile(&db, &server.base_url);
+        // 鍵をfileストアへ保存して参照を設定
+        let secrets = SecretStore::file_only(&tmp.0);
+        let record = db
+            .with_reader(|repos| repos.get_ai_profile(profile_id))
+            .unwrap()
+            .unwrap();
+        let stored = secrets
+            .save(
+                &record.uuid,
+                &ApiKey::new("sk-must-not-be-sent".to_string()),
+            )
+            .unwrap();
+        db.with_writer(|repos| {
+            repos.set_ai_profile_api_key_ref(profile_id, Some(&stored.as_ref_string()))
+        })
+        .unwrap();
+        // 「ストア破損」: 鍵ファイルを消失させる
+        std::fs::remove_file(secrets.secret_dir().join(format!("{}.key", stored.id))).unwrap();
+
+        let (_log, sink) = recorder();
+        let service = AiService::start(Arc::clone(&db), tmp.0.clone(), sink);
+        let payload = json!({"profile_id": profile_id, "asset_id": asset_id}).to_string();
+        db.with_writer(|repos| {
+            repos.enqueue_job(JOB_TYPE_AI_CAPTION_TAGS, "asset", asset_id, 5, &payload)
+        })
+        .unwrap()
+        .expect("enqueue");
+
+        assert!(
+            wait_until(20_000, || job_status(&db)
+                .iter()
+                .any(|(_, s)| s == "failed")),
+            "鍵取得失敗はpermanent失敗: {:?}",
+            job_status(&db)
+        );
+        let job = db
+            .with_reader(|repos| Ok(repos.list_jobs(10)?.into_iter().next().unwrap()))
+            .unwrap();
+        assert!(
+            job.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("資格情報の取得に失敗"),
+            "日本語エラー: {:?}",
+            job.error
+        );
+        assert_eq!(job.attempts, 1, "再試行しない");
+        // リクエスト自体が来ないこと (未認証送信の禁止の実証)
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(server.chat_calls(), 0, "chatへのリクエスト無し");
+        assert_eq!(
+            server
+                .log
+                .unauthorized
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "認証失敗リクエストも無し (送信していない)"
+        );
+        service.shutdown();
+    }
+
+    /// FG-WP10 非ブロッカー8: 鍵クリアはDB参照クリア→成功後secret削除の順
+    /// (成功時は両方の効果が観測される。保存先がkeyringでもfileでも成立)。
+    #[test]
+    fn key_clear_removes_db_ref_then_secret() {
+        let (tmp, db, _root, _asset) = fixture("keyclear");
+        let (_log, sink) = recorder();
+        let service = AiService::start(Arc::clone(&db), tmp.0.clone(), sink);
+        let input = json!({
+            "displayName": "クリア",
+            "baseUrl": "http://127.0.0.1:9/v1",
+            "model": "m",
+        });
+        let dto = save_profile_impl(&service, &input, Some("sk-clear-me".to_string())).unwrap();
+        assert!(dto.has_api_key);
+        // 鍵が読み取れる (保存先がkeyring/fileのどちらでも同じAPIで検証)
+        let store = SecretStore::new(&tmp.0);
+        let record = db
+            .with_reader(|repos| repos.get_ai_profile(dto.id.parse().unwrap()))
+            .unwrap()
+            .unwrap();
+        let key_ref = record.api_key_ref.clone().unwrap();
+        assert!(store.load(&key_ref).is_some(), "保存直後は読み取れる");
+
+        // 空文字列で削除 (同一プロファイルのidを渡す) → 参照と実体の両方が消える
+        let clear_input = json!({
+            "id": dto.id,
+            "displayName": "クリア",
+            "baseUrl": "http://127.0.0.1:9/v1",
+            "model": "m",
+        });
+        let cleared = save_profile_impl(&service, &clear_input, Some(String::new())).unwrap();
+        assert!(!cleared.has_api_key);
+        assert!(
+            store.load(&key_ref).is_none(),
+            "secret実体も削除されている (DB参照クリア後)"
+        );
+        service.shutdown();
     }
 
     /// save_profile_implのAPIキー保存: keyring不可環境ではfileフォールバック

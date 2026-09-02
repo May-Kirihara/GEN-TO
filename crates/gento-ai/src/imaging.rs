@@ -7,10 +7,17 @@
 //!
 //! デコード制限はサムネイル経路 (gento-image) と同じ値
 //! (寸法20000・割り当て256MiB) を適用する。
+//!
+//! `max_edge` は呼び出し値に関わらず [MIN_IMAGE_EDGE, MAX_IMAGE_EDGE]
+//! へクランプされる — 外部へ出る画像の最大辺は構造的に2048pxまで。
 
 use base64::Engine;
 use image::{DynamicImage, ImageReader, Limits};
 
+/// 送信画像の最大辺の下限 (px)。
+pub const MIN_IMAGE_EDGE: u32 = 64;
+/// 送信画像の最大辺の上限 (px)。原寸送信を構造的に防止する境界。
+pub const MAX_IMAGE_EDGE: u32 = 2048;
 pub const DEFAULT_MAX_EDGE: u32 = 1024;
 pub const JPEG_QUALITY: u8 = 85;
 
@@ -28,10 +35,11 @@ pub struct EncodedImage {
 
 /// 画像バイト列を (必要なら) 縮小しJPEG data URLへ変換する。
 ///
-/// - `max_edge` = 0は縮小なし (ただし再エンコードは行う —
-///   メタデータ除去のため)。
+/// - `max_edge` は [MIN_IMAGE_EDGE, MAX_IMAGE_EDGE] へクランプされる
+///   (実行経路の最終防衛。0や2048超が伝わっていても原寸は出ない)。
 ///- 既に長辺が `max_edge` 以下なら拡大しない。
 pub fn encode_for_send(bytes: &[u8], max_edge: u32) -> Result<EncodedImage, String> {
+    let max_edge = clamp_image_edge(max_edge);
     let mut limits = Limits::default();
     limits.max_image_width = Some(20_000);
     limits.max_image_height = Some(20_000);
@@ -43,7 +51,7 @@ pub fn encode_for_send(bytes: &[u8], max_edge: u32) -> Result<EncodedImage, Stri
     let decoded = reader.decode().map_err(|e| format!("decode failed: {e}"))?;
     let (orig_w, orig_h) = (decoded.width(), decoded.height());
 
-    let resized = if max_edge > 0 && orig_w.max(orig_h) > max_edge {
+    let resized = if orig_w.max(orig_h) > max_edge {
         resize_long_edge(&decoded, max_edge)
     } else {
         decoded
@@ -71,6 +79,12 @@ pub fn encode_for_send(bytes: &[u8], max_edge: u32) -> Result<EncodedImage, Stri
 /// `thumbnail` = 高速な整数box平均。拡大はしない)。
 fn resize_long_edge(image: &DynamicImage, edge: u32) -> DynamicImage {
     image.thumbnail(edge, edge)
+}
+
+/// 送信画像の最大辺を実効範囲 [MIN_IMAGE_EDGE, MAX_IMAGE_EDGE] へ
+/// クランプする (全実行経路の最終防衛)。
+pub fn clamp_image_edge(edge: u32) -> u32 {
+    edge.clamp(MIN_IMAGE_EDGE, MAX_IMAGE_EDGE)
 }
 
 /// 透過を持つ形式のRGBA→白背景合成。JPEGは透過を表現できないため
@@ -138,10 +152,19 @@ mod tests {
     }
 
     #[test]
-    fn max_edge_zero_means_no_resize() {
-        let bytes = png_bytes(2048, 1024);
-        let encoded = encode_for_send(&bytes, 0).unwrap();
-        assert_eq!((encoded.width, encoded.height), (2048, 1024));
+    fn max_edge_out_of_range_is_clamped_never_full_resolution() {
+        // 0 (旧「縮小なし」) は下限64へ、2048超は上限2048へクランプ —
+        // 原寸が外部へ出る経路を構造的に塞ぐ (FG-WP10 blocker 1)。
+        let zero = encode_for_send(&png_bytes(4000, 2000), 0).unwrap();
+        assert_eq!((zero.width, zero.height), (64, 32), "0は下限64へ");
+        let huge = encode_for_send(&png_bytes(4000, 2000), 8192).unwrap();
+        assert_eq!(huge.width, MAX_IMAGE_EDGE, "8192は上限2048へ");
+        assert_eq!(huge.height, 1024);
+        // 範囲内はそのまま (拡大しない)
+        let small = encode_for_send(&png_bytes(64, 32), 2048).unwrap();
+        assert_eq!((small.width, small.height), (64, 32));
+        assert_eq!(clamp_image_edge(u32::MAX), MAX_IMAGE_EDGE);
+        assert_eq!(clamp_image_edge(1), MIN_IMAGE_EDGE);
     }
 
     #[test]

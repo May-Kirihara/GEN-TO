@@ -32,6 +32,7 @@ export type AiProfile = {
 export type AiProfileExtra = {
   send_exif: boolean;
   send_gps: boolean;
+  /** 送信画像の最大辺 (px)。backendが64〜2048へ強制 (IPCは範囲外を拒否)。 */
   max_image_edge: number;
   send_response_format: boolean;
 };
