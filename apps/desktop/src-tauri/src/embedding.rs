@@ -33,6 +33,8 @@ use tauri::State;
 type NoticeSink = Arc<dyn Fn(&str, &str) + Send + Sync>;
 /// ワーカーspawn境界 (テストで差し替え)。
 type WorkerCommandFactory = Box<dyn Fn(&PathBuf) -> Command + Send + Sync>;
+/// 埋め込みupsertのフック (WP-12: USearch索引への増分追加)。
+pub type VectorSink = Arc<dyn Fn(&str, &str, i64, &[f32]) + Send + Sync>;
 
 use crate::catalog::AppState;
 
@@ -173,6 +175,10 @@ pub struct EmbeddingService {
     emit: NoticeSink,
     /// クラッシュ停止通知済みフラグ (重複通知防止)。
     crash_notified: AtomicBool,
+    /// モデルロードの直列化 (ハイブリッド検索からの同時ensure防止。WP-12)。
+    load_gate: Mutex<()>,
+    /// 埋め込みupsertフック (WP-12: USearch索引増分追加。setup後に接続)。
+    vector_sink: Mutex<Option<VectorSink>>,
 }
 
 impl EmbeddingService {
@@ -233,6 +239,8 @@ impl EmbeddingService {
             worker_command,
             emit: Arc::clone(&emit),
             crash_notified: AtomicBool::new(false),
+            load_gate: Mutex::new(()),
+            vector_sink: Mutex::new(None),
         });
         // ジョブ実行スレッド (enabled時のみ仕事をする)
         {
@@ -513,8 +521,27 @@ impl EmbeddingService {
         }
     }
 
+    /// 埋め込みupsertフックを接続する (lib.rs setupでVectorIndexService
+    /// 生成後に呼ぶ)。
+    pub fn set_vector_sink(&self, sink: VectorSink) {
+        *self.vector_sink.lock().unwrap_or_else(|p| p.into_inner()) = Some(sink);
+    }
+
+    fn notify_vector_sink(&self, model: &str, revision: &str, asset_id: i64, vector: &[f32]) {
+        let sink = self
+            .vector_sink
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(sink) = sink {
+            sink(model, revision, asset_id, vector);
+        }
+    }
+
     /// モデルを検証してロードする。成功時セルフチェックを実施する。
     pub fn ensure_loaded(&self) -> Result<gento_embedding::ProtoModelInfo, String> {
+        // 直列化: ハイブリッド検索とジョブログが同時にロードを競合させない
+        let _gate = self.load_gate.lock().unwrap_or_else(|p| p.into_inner());
         let model = self.selected_model();
         let already = self
             .loaded
@@ -803,6 +830,7 @@ impl EmbeddingService {
     }
 
     /// モデル削除 (ベクトル + パッケージ)。モデル削除後も通常検索は動作。
+    /// USearch索引の破棄はcommand層がVectorIndexServiceへ依頼する (WP-12)。
     pub fn delete_model(&self, model: &str) -> Result<EmbeddingStatusDto, String> {
         let removed = self
             .db
@@ -1012,6 +1040,15 @@ pub fn model_revision_of(model_id: &str) -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
+/// app_settingsから選択モデルを直接読む (サービスを介さない経路 —
+/// WP-12の類似画像検索等)。
+pub fn selected_model_of(db: &Arc<Db>) -> String {
+    db.with_reader(|repos| repos.setting_get(SETTING_EMBEDDING_MODEL))
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| gento_embedding::MODEL_RURI_V3_70M.to_string())
+}
+
 fn with_request_id(
     request: gento_embedding::WorkerRequest,
     id: u64,
@@ -1213,6 +1250,8 @@ fn run_one_batch(service: &Arc<EmbeddingService>, emit: &NoticeSink) -> bool {
                     match result {
                         Ok(_) => {
                             let _ = service.db.with_writer(|repos| repos.complete_job(job.id));
+                            // WP-12: 索引への増分反映 (索引稼働時のみ効果あり)
+                            service.notify_vector_sink(&model, &revision, job.target_id, &vector);
                         }
                         Err(error) => {
                             let retry_at = rfc3339_after_now(backoff_delay_ms(
@@ -1286,9 +1325,17 @@ pub async fn embedding_enable(
     model: Option<String>,
 ) -> Result<EmbeddingStatusDto, String> {
     let service = service_of(&state)?;
-    tauri::async_runtime::spawn_blocking(move || service.enable(model.as_deref()))
-        .await
-        .map_err(|e| e.to_string())?
+    // WP-12: 有効化後に索引のロード/構築を予約 (バックグラウンド)
+    let vector_index = state.vector_index.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let status = service.enable(model.as_deref())?;
+        if let Some(vector_index) = vector_index {
+            vector_index.ensure_ready();
+        }
+        Ok(status)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1305,6 +1352,15 @@ pub async fn embedding_model_delete(
     model: String,
 ) -> Result<EmbeddingStatusDto, String> {
     let service = service_of(&state)?;
+    // WP-12: モデルのUSearch索引も破棄する (ベクトル正本と同時に)
+    if let Some(vector_index) = state.vector_index.clone() {
+        let model_for_index = model.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            vector_index.delete_index_for_model(&model_for_index)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
     tauri::async_runtime::spawn_blocking(move || service.delete_model(&model))
         .await
         .map_err(|e| e.to_string())?

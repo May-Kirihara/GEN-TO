@@ -85,3 +85,9 @@ tokenizers = { version = "=0.23.1", default-features = false, features = [
 ndarray = { version = "=0.17", default-features = false }
 # WP-11: モデルパッケージsha256検証 (lock既存0.10.9の直依存化)
 sha2 = "=0.10.9"
+# WP-12: HNSW近傍探索索引 (Apache-2.0。cxx-buildでC++17をその場コンパイル
+# + numkong静的リンク — ビルド要件はdependency-notes参照)
+usearch = "=2.26.2"
+# WP-12: usearchのRust束縛が返すcxx::Exceptionの直依存化 (lock既存1.0.199。
+# エラー型変換のみに使用 — 新規実体なし)
+cxx = "=1.0.199"

@@ -815,7 +815,26 @@ fn compile_query(query: &SearchQuery, scope: &SearchScope) -> QuerySql {
         fragments.push(field_fragment(condition, &mut values));
     }
 
-    // スコープ
+    fragments.extend(scope_fragments(scope, &mut values));
+
+    if fragments.is_empty() {
+        QuerySql {
+            where_clause: String::new(),
+            values,
+        }
+    } else {
+        QuerySql {
+            where_clause: format!(" WHERE {}", fragments.join(" AND ")),
+            values,
+        }
+    }
+}
+
+/// スコープ (root / collection) のWHERE断片 (WP-12でranked側と共用化)。
+/// `a.` をassetsの別名として参照する。present制約はcompile_query側が
+/// 先頭に置くためここでは扱わない。
+fn scope_fragments(scope: &SearchScope, values: &mut Vec<SqlValue>) -> Vec<String> {
+    let mut fragments = Vec::new();
     if let Some(root_id) = scope.root_id {
         values.push(SqlValue::Integer(root_id));
         fragments.push(
@@ -830,18 +849,7 @@ fn compile_query(query: &SearchQuery, scope: &SearchScope) -> QuerySql {
             "a.id IN (SELECT asset_id FROM collection_items WHERE collection_id = ?)".to_string(),
         );
     }
-
-    if fragments.is_empty() {
-        QuerySql {
-            where_clause: String::new(),
-            values,
-        }
-    } else {
-        QuerySql {
-            where_clause: format!(" WHERE {}", fragments.join(" AND ")),
-            values,
-        }
-    }
+    fragments
 }
 
 /// AST検索を実行してasset id一覧 (id昇順・ページング) を返す。
@@ -890,6 +898,66 @@ pub fn search_asset_ids(
         rows.into_iter().map(|(id, _)| id).collect(),
         total.max(0) as u64,
     ))
+}
+
+/// FTS一致をbm25スコア順 (上位=最良) で返す (WP-12ハイブリッド検索の
+/// キーワード側ランキング)。MATCH語を含むクエリ専用 — LIKEフォールバック
+/// や構造条件のみのクエリでは呼び出し側がid昇順 (search_asset_ids) を
+/// ランキング代わりに使う。
+///
+/// 検索語・構造条件・スコープの意味論は [`search_asset_ids`] と同一
+/// (FTSテーブルをFROMに直接置き、`ORDER BY bm25`で並べ替えた形)。
+pub fn keyword_ranked_asset_ids(
+    conn: &Connection,
+    query: &SearchQuery,
+    scope: &SearchScope,
+    limit: u32,
+) -> Result<Vec<i64>, RepoError> {
+    let text_terms = query.text_terms();
+    let plan = TextPlan::compile(&text_terms);
+    let Some(match_expr) = plan.match_expr.clone() else {
+        return Ok(Vec::new());
+    };
+    let mut fragments: Vec<String> = Vec::new();
+    let mut values: Vec<SqlValue> = Vec::new();
+    fragments.push("asset_docs MATCH ?".to_string());
+    values.push(SqlValue::Text(match_expr));
+    // LIKEフォールバック語はFTS列へ直接 (意味論はcompile_queryの
+    // サブクエリ版と同一: 全列OR×語のAND)
+    for term in &plan.like_terms {
+        let pattern = format!("%{}%", escape_like(term));
+        for _ in 0..5 {
+            values.push(SqlValue::Text(pattern.clone()));
+        }
+        fragments.push(
+            "(filename LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\' \
+               OR tags LIKE ? ESCAPE '\\' OR captions LIKE ? ESCAPE '\\' \
+               OR note LIKE ? ESCAPE '\\')"
+                .to_string(),
+        );
+    }
+    for condition in query.field_conditions() {
+        fragments.push(field_fragment(condition, &mut values));
+    }
+    fragments.extend(scope_fragments(scope, &mut values));
+    let where_clause = if fragments.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", fragments.join(" AND "))
+    };
+    values.push(SqlValue::Integer(limit as i64));
+    let sql = format!(
+        "SELECT asset_docs.asset_id FROM asset_docs \
+         JOIN assets a ON a.id = asset_docs.asset_id{where_clause} \
+         ORDER BY bm25(asset_docs) LIMIT ?"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+    let rows = stmt
+        .query_map(params_from_iter(values.iter()), |row| row.get::<_, i64>(0))
+        .map_err(map_err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(map_err)?;
+    Ok(rows)
 }
 
 /// 検索結果の一致根拠を組み立てる (表示中ページ分)。
@@ -1121,6 +1189,86 @@ mod tests {
         search_asset_ids(repos.conn(), &query, &SearchScope::default(), 0, 1000)
             .unwrap()
             .0
+    }
+
+    // ===== WP-12: bm25キーワードランキング =====
+
+    #[test]
+    fn keyword_ranked_orders_by_relevance_and_respects_filters() {
+        with_repos("bmrank", |repos| {
+            let root = repos.add_root(Path::new("/data/kw")).unwrap();
+            // captionsへ "sunset" をN回含める → 出現頻度でbm25差を作る
+            let mut expected_order: Vec<i64> = Vec::new();
+            for (i, hits) in [(0, 3), (1, 2), (2, 1)] {
+                let asset = make_asset(repos, &format!("bmr{i}"));
+                link_file(repos, root.id, &format!("bmr{i}.png"), asset);
+                repos
+                    .set_caption(
+                        asset,
+                        gento_core::metadata::CaptionKind::Description,
+                        &vec!["sunset"; hits].join(" "),
+                    )
+                    .unwrap();
+                repos.set_rating(asset, 2).unwrap();
+                rebuild_docs_for_assets(repos.conn(), &[asset]).unwrap();
+                expected_order.push(asset);
+            }
+            // フィルタ除外対象 (sunset最多だがrating未設定 = NULL)
+            let excluded = make_asset(repos, "bmr-x");
+            link_file(repos, root.id, "bmr-x.png", excluded);
+            repos
+                .set_caption(
+                    excluded,
+                    gento_core::metadata::CaptionKind::Description,
+                    "sunset sunset sunset sunset",
+                )
+                .unwrap();
+            rebuild_docs_for_assets(repos.conn(), &[excluded]).unwrap();
+
+            // 構造フィルタなし: 頻度最大の除外assetが最上位
+            let query = parse("sunset").unwrap().query;
+            let ranked =
+                keyword_ranked_asset_ids(repos.conn(), &query, &SearchScope::default(), 10)
+                    .unwrap();
+            assert_eq!(ranked.first(), Some(&excluded), "頻度最大: {ranked:?}");
+            assert_eq!(ranked.len(), 4);
+
+            // 構造フィルタ適用: 除外assetが外れ、残りは頻度順
+            let query = parse("sunset rating:>=1").unwrap().query;
+            let ranked =
+                keyword_ranked_asset_ids(repos.conn(), &query, &SearchScope::default(), 10)
+                    .unwrap();
+            assert!(!ranked.contains(&excluded));
+            assert_eq!(ranked, expected_order, "頻度降順: {ranked:?}");
+
+            // LIMIT
+            let ranked =
+                keyword_ranked_asset_ids(repos.conn(), &query, &SearchScope::default(), 2).unwrap();
+            assert_eq!(ranked.len(), 2);
+        });
+    }
+
+    #[test]
+    fn keyword_ranked_without_match_terms_returns_empty() {
+        with_repos("bmnomat", |repos| {
+            let root = repos.add_root(Path::new("/data/kw2")).unwrap();
+            let asset = make_asset(repos, "nm1");
+            link_file(repos, root.id, "nm1.png", asset);
+            rebuild_docs_for_assets(repos.conn(), &[asset]).unwrap();
+            // 純構造クエリ・LIKEのみクエリはランキング対象外 (空)
+            let query = parse("tag:x").unwrap().query;
+            assert!(
+                keyword_ranked_asset_ids(repos.conn(), &query, &SearchScope::default(), 10)
+                    .unwrap()
+                    .is_empty()
+            );
+            let query = parse("ab").unwrap().query;
+            assert!(
+                keyword_ranked_asset_ids(repos.conn(), &query, &SearchScope::default(), 10)
+                    .unwrap()
+                    .is_empty()
+            );
+        });
     }
 
     // ===== WP-9: 埋め込み画像メタデータ (asset_metadata) の検索 =====

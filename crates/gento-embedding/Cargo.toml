@@ -23,6 +23,11 @@ ort = { workspace = true }
 tokenizers = { workspace = true }
 ndarray = { workspace = true }
 sha2 = { workspace = true }
+# WP-12: USearch HNSW索引 (vector_index moduleのみで使用。nativeビルド要件は
+# dependency-notes参照)
+usearch = { workspace = true }
+# WP-12: usearch束縛のcxx::Exception変換用 (lock既存の直依存化)
+cxx = { workspace = true }
 tracing = { workspace = true }
 # モデルDL (進捗・キャンセル・Range再開・プロキシ環境変数尊重)。
 # gento-aiと分離したClientインスタンスとして使用 (dependency-notes参照)。
@@ -35,6 +40,9 @@ libc = "0.2"
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+# WP-12ハイブリッド評価テスト: RRF融合 (通常依存はなし — devのみ。
+# 依存方向 search→core で循環なし)
+gento-search = { workspace = true }
 
 [features]
 # WP-0規約: 計測・検証専用機能のコンパイル隔離 (予約。現在使用なし)。

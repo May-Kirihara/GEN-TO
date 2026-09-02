@@ -62,9 +62,19 @@
     EMPTY_FILTERS,
     SearchStore,
     filtersActive,
+    weightLabel,
     type GuiFilters,
     type SearchFieldMatch,
   } from "./lib/search";
+  import {
+    VectorIndexStore,
+    indexProgressText,
+    semanticSearchAvailable,
+    semanticUnavailableReason,
+    type VectorIndexProgress,
+    type VectorIndexStatus,
+  } from "./lib/vector-index";
+  import { EmbeddingStore } from "./lib/embedding";
   import {
     applyConflictChoice,
     cancelFileOps,
@@ -602,6 +612,9 @@
   let collectionPositionInput = $state("");
   let disposeCollections: (() => void) | null = null;
   let stopCollectionsChanged: (() => void) | null = null;
+  /** WP-12: 索引イベント購読の解除関数。 */
+  let disposeVectorIndexReady: (() => void) | null = null;
+  let disposeVectorIndexProgress: (() => void) | null = null;
 
   /**
    * collections:changed → 表示追従。backendは表示中コレクションの内容変化で
@@ -794,6 +807,42 @@
   let searchNotice = $state("");
   /** evidence写像の変化通知 (InfoPanel・ツールチップ再評価用)。 */
   let searchEvidenceTick = $state(0);
+  // ===== 意味検索 (WP-12) =====
+  const vectorIndex = new VectorIndexStore({ invoke, listen });
+  const embeddingProbe = new EmbeddingStore({ invoke, listen });
+  /** 意味重みスライダー値 (0..100%。0 = 純キーワード)。 */
+  let semanticWeightPercent = $state(0);
+  let vectorIndexStatus = $state<VectorIndexStatus | null>(null);
+  let embeddingEnabled = $state(false);
+  let indexProgress = $state<VectorIndexProgress | null>(null);
+  /** 索引状態の変化通知 (スライダーdisabled判定の再評価用)。 */
+  let semanticStateTick = $state(0);
+
+  /** 意味検索が現在使えるか (スライダー・類似検索の可用性)。 */
+  function semanticAvailable(): boolean {
+    void semanticStateTick;
+    return semanticSearchAvailable(embeddingEnabled, vectorIndexStatus);
+  }
+
+  function semanticReason(): string {
+    void semanticStateTick;
+    return semanticUnavailableReason(embeddingEnabled, vectorIndexStatus);
+  }
+
+  /** 埋め込み有効化・索引状態の再取得 (起動時・索引readyイベント後)。 */
+  async function refreshSemanticState(): Promise<void> {
+    try {
+      const [status, embedding] = await Promise.all([
+        vectorIndex.status(),
+        embeddingProbe.status(),
+      ]);
+      vectorIndexStatus = status;
+      embeddingEnabled = embedding.enabled;
+    } catch {
+      // 状態取得失敗はスライダーdisabled側へ吸収される
+    }
+    semanticStateTick++;
+  }
 
   searchStore.onChange(() => {
     searchEvidenceTick++;
@@ -834,7 +883,8 @@
       return;
     }
     searchNotice = "";
-    const ok = await searchStore.run(searchInput, searchFilters, scope);
+    const weight = semanticAvailable() ? semanticWeightPercent / 100 : 0;
+    const ok = await searchStore.run(searchInput, searchFilters, scope, weight);
     if (!ok) {
       searchNotice = searchStore.lastError ?? "検索に失敗しました";
       return;
@@ -843,6 +893,23 @@
     // 検索結果は安定AssetIdのLibrary系表示 (api-contract §42。backendも
     // CatalogMode::Library)。コレクション表示 (showCollection) と同じ扱いに
     // して、一時走査ビューから検索しても編集・詳細取得を無効化しない。
+    catalogSource = "library";
+    activeCollection = null;
+    collectionNotes = {};
+    gridSelection = { ids: [], focusIndex: null };
+    await catalog.refreshSummary();
+    await catalog.loadPage(0);
+  }
+
+  /** 類似画像検索 (WP-12): 対象assetの意味近傍を検索表示する。 */
+  async function runSimilarSearch(assetId: string): Promise<void> {
+    searchNotice = "";
+    const ok = await searchStore.runSimilar(assetId);
+    if (!ok) {
+      searchNotice = searchStore.lastError ?? "類似画像検索に失敗しました";
+      return;
+    }
+    searchActive = true;
     catalogSource = "library";
     activeCollection = null;
     collectionNotes = {};
@@ -927,6 +994,16 @@
     }
     void searchEvidenceTick;
     return searchStore.evidence[id] ?? null;
+  }
+
+  /** 意味スコア (ハイブリッド/類似表示中のみ。WP-12)。 */
+  function semanticScoreOf(id: string): number | null {
+    if (!searchActive || id === "") {
+      return null;
+    }
+    void searchEvidenceTick;
+    const score = searchStore.semantic[id];
+    return score === undefined ? null : score;
   }
 
   /** セルツールチップ文言 (表示名 + 検索一致根拠)。 */
@@ -1817,6 +1894,19 @@
         },
       });
     }
+    // 類似画像検索 (WP-12。単一assetのdocベクトル近傍 — 常にfocus対象)
+    if (canCollection) {
+      const similarOk = semanticAvailable();
+      actions.push({
+        id: "similar-search",
+        label: "類似画像を検索",
+        disabled: !similarOk,
+        title: similarOk ? "この画像に意味的に近い画像を検索します" : semanticReason(),
+        run: async () => {
+          await runSimilarSearch(focus.id);
+        },
+      });
+    }
     if (canCollection) {
       actions.push({
         id: "add-to-collection",
@@ -2111,6 +2201,17 @@
     });
 
     void refreshHealth();
+    // WP-12: 意味検索の状態 (埋め込み有効化・索引構築) 追跡
+    void refreshSemanticState().then(async () => {
+      disposeVectorIndexReady = await vectorIndex.subscribeReady(() => {
+        indexProgress = null;
+        void refreshSemanticState();
+      });
+      disposeVectorIndexProgress = await vectorIndex.subscribeProgress((progress) => {
+        indexProgress = progress;
+        semanticStateTick++;
+      });
+    });
     void catalog.init().then(async (dispose) => {
       disposeCatalog = dispose;
       // 起動時は --dataset (決定論的) を一時走査する。前回フォルダは
@@ -2242,6 +2343,8 @@
   });
 
   onDestroy(() => {
+    disposeVectorIndexReady?.();
+    disposeVectorIndexProgress?.();
     disposeFileOpsProgress?.();
     stopChangeNotification();
     stopGridNotifyForPerf();
@@ -2346,6 +2449,15 @@
         ハッシュ待ち {library.status.pending_hash.toLocaleString()}
       </span>
     {/if}
+    {#if indexProgress !== null}
+      <span
+        class="scan-indicator"
+        title="USearch索引のバックグラウンド構築進捗 (検索・閲覧は引き続き利用できます)"
+        data-testid="vector-index-progress"
+      >
+        {indexProgressText(indexProgress)}
+      </span>
+    {/if}
     {#if library.status.watch_degraded}
       <span class="warn-indicator" title="フォルダ監視が未確立の登録ルートがあります (ポーリング再スキャンで運用中)">
         ⚠ 監視劣化
@@ -2428,8 +2540,10 @@
         <nav class="breadcrumb" aria-label="現在場所">
           {#if searchActive}
             <span class="coll-current">
-              <span class="coll-current-kind" aria-hidden="true">⌕</span>
-              検索結果
+              <span class="coll-current-kind" aria-hidden="true">
+                {searchStore.lastKind === "similar" ? "◈" : "⌕"}
+              </span>
+              {searchStore.lastKind === "similar" ? "類似画像" : "検索結果"}
               <span class="coll-current-count" data-testid="search-status">
                 ({(searchStore.lastResult?.total ?? 0).toLocaleString()}件・
                 {(searchStore.lastResult?.elapsedMs ?? 0).toLocaleString()}ms)
@@ -2631,6 +2745,32 @@
           <option value="folder">現在のフォルダ（登録ルート全体）</option>
           <option value="collection">表示中コレクション</option>
         </select>
+        <label
+          class="search-semantic"
+          data-testid="search-semantic"
+          title={semanticAvailable()
+            ? "キーワード検索と意味検索 (自然言語) の重み。左=キーワードのみ / 右=意味のみ"
+            : semanticReason()}
+        >
+          <span class="semantic-end">キーワード</span>
+          <input
+            type="range"
+            min="0"
+            max="100"
+            step="5"
+            value={semanticWeightPercent}
+            disabled={!semanticAvailable()}
+            aria-label="意味検索の重み"
+            data-testid="search-semantic-weight"
+            oninput={(event) => (semanticWeightPercent = Number(event.currentTarget.value))}
+          />
+          <span class="semantic-end">意味</span>
+          <span class="semantic-value" data-testid="search-semantic-value">
+            {semanticWeightPercent > 0
+              ? `${weightLabel(semanticWeightPercent / 100)} ${semanticWeightPercent}%`
+              : "キーワード"}
+          </span>
+        </label>
         <button
           class:active={searchFiltersOpen || searchFiltersActive}
           onclick={() => (searchFiltersOpen = !searchFiltersOpen)}
@@ -2855,6 +2995,15 @@
           selectionCount={gridSelection.ids.length}
           libraryMode={catalogSource === "library"}
           searchEvidence={searchEvidenceOf(focusInfo?.id ?? "")}
+          semanticScore={semanticScoreOf(focusInfo?.id ?? "")}
+          semanticLabel={searchStore.lastKind === "similar" ? "類似度" : "意味"}
+          canSimilarSearch={focusInfo !== null && focusInfo.dbState === "asset" && semanticAvailable()}
+          onSimilarSearch={() => {
+            const item = focusInfo;
+            if (item !== null) {
+              void runSimilarSearch(item.id);
+            }
+          }}
           assetMetadata={focusInfo !== null && metaAssetMetadata?.id === focusInfo.id
             ? metaAssetMetadata
             : null}
@@ -3112,6 +3261,30 @@
 
   .search-scope {
     flex: none;
+  }
+
+  /* WP-12: キーワード⇔意味の重みスライダー */
+  .search-semantic {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.75rem;
+    white-space: nowrap;
+  }
+
+  .search-semantic input[type="range"] {
+    width: 7rem;
+  }
+
+  .search-semantic:has(input:disabled) {
+    opacity: 0.55;
+  }
+
+  .semantic-value {
+    min-width: 6.5rem;
+    font-variant-numeric: tabular-nums;
+    text-align: left;
   }
 
   .search-warn {

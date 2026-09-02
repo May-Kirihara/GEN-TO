@@ -159,6 +159,56 @@ impl SqliteRepos<'_> {
             .collect()
     }
 
+    /// モデルのベクトルをasset_id昇順にページ取得する (WP-12索引構築用 —
+    /// 全件一括読み込みのメモリ峰值を避ける)。
+    pub fn embedding_vectors_page(
+        &self,
+        model_name: &str,
+        model_revision: &str,
+        after_asset_id: i64,
+        limit: u32,
+    ) -> Result<Vec<(i64, Vec<f32>)>, RepoError> {
+        let mut stmt = self
+            .conn()
+            .prepare(
+                "SELECT asset_id, vector FROM embeddings \
+                 WHERE purpose = 'doc' AND model_name = ?1 AND model_revision = ?2 \
+                 AND asset_id > ?3 ORDER BY asset_id LIMIT ?4",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(
+                params![model_name, model_revision, after_asset_id, limit],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .map_err(map_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_err)?;
+        rows.into_iter()
+            .map(|(asset_id, blob)| decode_vector_f32(&blob).map(|v| (asset_id, v)))
+            .collect()
+    }
+
+    /// 1 assetのdocベクトルを取得する (類似画像検索のクエリ側)。
+    pub fn embedding_vector_of_asset(
+        &self,
+        asset_id: i64,
+        model_name: &str,
+        model_revision: &str,
+    ) -> Result<Option<Vec<f32>>, RepoError> {
+        let blob: Option<Vec<u8>> = self
+            .conn()
+            .query_row(
+                "SELECT vector FROM embeddings \
+                 WHERE asset_id = ?1 AND purpose = 'doc' AND model_name = ?2 AND model_revision = ?3",
+                params![asset_id, model_name, model_revision],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_err)?;
+        blob.map(|bytes| decode_vector_f32(&bytes)).transpose()
+    }
+
     /// モデルの既存ベクトルをすべて削除 (`embedding_model_delete`。
     /// モデル削除後も通常検索は動作する — acceptance)。
     pub fn embedding_delete_for_model(&self, model_name: &str) -> Result<u64, RepoError> {
@@ -460,6 +510,46 @@ mod tests {
                     .unwrap()
                     .as_deref(),
                 Some("0")
+            );
+        });
+    }
+
+    #[test]
+    fn vectors_page_paginates_and_single_asset_fetch() {
+        with_repos("page", |repos| {
+            let a1 = seed_present_asset(repos, "p1");
+            let a2 = seed_present_asset(repos, "p2");
+            let a3 = seed_present_asset(repos, "p3");
+            repos
+                .embedding_upsert(a1, "m", "r1", 4, "f32", "h1", &[0.1; 4])
+                .unwrap();
+            repos
+                .embedding_upsert(a2, "m", "r1", 4, "f32", "h2", &[0.2; 4])
+                .unwrap();
+            repos
+                .embedding_upsert(a3, "m", "r2", 4, "f32", "h3", &[0.3; 4])
+                .unwrap();
+            // ページング (model+revision分離)
+            let page1 = repos.embedding_vectors_page("m", "r1", 0, 2).unwrap();
+            assert_eq!(page1.len(), 2);
+            let last = page1.last().unwrap().0;
+            let page2 = repos.embedding_vectors_page("m", "r1", last, 10).unwrap();
+            assert_eq!(page2.len(), 0, "r1は2件のみ");
+            let all = repos.embedding_vectors_page("m", "r2", 0, 10).unwrap();
+            assert_eq!(all.len(), 1);
+            assert_eq!(all[0].0, a3);
+            // 1件取得 (類似検索クエリ側)
+            assert_eq!(
+                repos.embedding_vector_of_asset(a2, "m", "r1").unwrap(),
+                Some(vec![0.2; 4])
+            );
+            assert_eq!(
+                repos.embedding_vector_of_asset(a2, "m", "r2").unwrap(),
+                None
+            );
+            assert_eq!(
+                repos.embedding_vector_of_asset(999999, "m", "r1").unwrap(),
+                None
             );
         });
     }

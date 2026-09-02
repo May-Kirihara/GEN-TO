@@ -21,6 +21,7 @@ pub mod metadata;
 pub mod protocol;
 pub mod search;
 pub mod thumbnails;
+pub mod vectorindex;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -237,7 +238,10 @@ pub fn run() {
         embedding::embedding_enable,
         embedding::embedding_disable,
         embedding::embedding_model_delete,
-        embedding::embedding_similar_debug
+        embedding::embedding_similar_debug,
+        search::similar_search_run,
+        vectorindex::vector_index_status,
+        vectorindex::vector_index_rebuild
     ]);
     #[cfg(not(any(debug_assertions, feature = "devtools")))]
     let builder = builder.invoke_handler(tauri::generate_handler![
@@ -329,7 +333,10 @@ pub fn run() {
         embedding::embedding_enable,
         embedding::embedding_disable,
         embedding::embedding_model_delete,
-        embedding::embedding_similar_debug
+        embedding::embedding_similar_debug,
+        search::similar_search_run,
+        vectorindex::vector_index_status,
+        vectorindex::vector_index_rebuild
     ]);
     builder
         .setup(move |app| {
@@ -436,7 +443,26 @@ pub fn run() {
                             models_dir,
                             crate::embedding::tauri_notice_sink(app.handle().clone()),
                         );
+                        // WP-12: USearch索引サービス (起動時ロード/背景再構築は
+                        // サービス内のメンテナンススレッドが担当)。
+                        // 埋め込みジョブ完了 → 索引増分追加のフックを接続。
+                        let vector_index_service = crate::vectorindex::VectorIndexService::start(
+                            std::sync::Arc::clone(&db),
+                            app_dirs.data_dir.clone(),
+                            crate::vectorindex::tauri_notice_sink(app.handle().clone()),
+                        );
+                        embedding_service.set_vector_sink({
+                            let vector_index = std::sync::Arc::clone(&vector_index_service);
+                            std::sync::Arc::new(
+                                move |model: &str, revision: &str, asset_id: i64, vector: &[f32]| {
+                                    vector_index.on_embedding_upserted(
+                                        model, revision, asset_id, vector,
+                                    );
+                                },
+                            )
+                        });
                         state.embedding = Some(embedding_service);
+                        state.vector_index = Some(vector_index_service);
                         controller.enqueue_scan_all();
                         state.library = Some(controller);
                     }
@@ -469,6 +495,9 @@ pub fn run() {
                     }
                     if let Some(embedding) = &state.embedding {
                         embedding.shutdown();
+                    }
+                    if let Some(vector_index) = &state.vector_index {
+                        vector_index.shutdown();
                     }
                 }
             }

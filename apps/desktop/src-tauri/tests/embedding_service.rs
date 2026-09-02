@@ -107,8 +107,13 @@ fn real_models_dir() -> Option<PathBuf> {
     let path = if path.is_absolute() {
         path
     } else {
+        // src-tauriのmanifest dirから3親上がworkspace root。2親だとapps/ に
+        // なり、相対指定 (.local-models) でテストが無音スキップする
+        // (WP-12で発見・修正 — 2親のままではWP-11の文書化コマンドが
+        // 実際にはスキップしていた)
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
+            .and_then(|p| p.parent())
             .and_then(|p| p.parent())
             .expect("workspace root")
             .join(path)

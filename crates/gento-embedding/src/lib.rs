@@ -10,6 +10,7 @@
 //! - `worker_proto`: 独立ワーカー (`gento-embedding-worker` bin) との
 //!   stdio長さ前置JSONプロトコル
 //! - `download`: HF配布repoからのモデルDL (進捗・キャンセル・再開)
+//! - `vector_index`: USearch HNSW索引ラッパ (WP-12。モデルidentity分離)
 //!
 //! # 依存方向
 //!
@@ -21,6 +22,7 @@ pub mod download;
 pub mod manifest;
 pub mod model_store;
 pub mod provider;
+pub mod vector_index;
 pub mod worker_proto;
 
 pub use manifest::{
@@ -34,6 +36,10 @@ pub use model_store::{
 };
 pub use provider::{
     is_known_model, mean_pool_l2, EmbeddingProvider, ModelInfo, ProviderError, RuriOnnxProvider,
+};
+pub use vector_index::{
+    index_files_exist, remove_index_files, IndexIdentity, Neighbor, VectorIndex, VectorIndexError,
+    DEFAULT_CONNECTIVITY, DEFAULT_EXPANSION_ADD, DEFAULT_EXPANSION_SEARCH,
 };
 pub use worker_proto::{
     read_frame, write_frame, ModelInfo as ProtoModelInfo, WorkerRequest, WorkerResponse,

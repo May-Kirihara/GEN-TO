@@ -2067,3 +2067,103 @@ queued ──claim──▶ running ──成功──▶ succeeded
 - Recall@3 = 0.8333 (閾値0.80。公式ST同一接頭辞と完全一致)。
 - 参照実装とのベクトル一致 cos ≥ 0.9999993。
 - embed_query avg 9.6ms・docバッチ 11.5ms/件 (release・70m)。
+
+## 46. WP-12: USearch索引・ハイブリッド検索・類似画像検索
+
+### USearch索引 (gento-embedding `vector_index`)
+
+- **依存**: `usearch` =2.26.2 (Apache-2.0。cxx-buildによるC++17その場
+  コンパイル + numkong静的リンク — dependency-notes参照)。
+- **索引単位・保存先**: モデルidentity (model_name + model_revision +
+  dimensions) ごと。`{data_dir}/indexes/{model-id}/` 配下に
+  `index.usearch` (HNSW本体) と `identity.json` (sidecar = identity +
+  count + version) を保存。**sidecarと索引ヘッダの両方でidentityを検証**
+  — 不一致は「混在」エラーとして拒否 (§10: 異なるモデル/revision/次元の
+  混在禁止)。
+- **metric**: Cos (ベクトルはL2正規化済み → similarity = 1 - distance)。
+  スカラーF32 (量子化なし)。HNSWパラメータ: connectivity=16 /
+  expansion_add=96 / **expansion_search=64** (5万件計測でrecall@10 0.995。
+  24では0.92 — measurements参照)。
+- **永続化**: tmp書き込み → rename のアトミック切替。鍵 = asset id
+  (u64 key。正数前提)。
+- **資源**: 5万×384次元で索引144.4MiB (約3.0KiB/ベクトル)。
+
+### 索引管理 (gento-tauri `vectorindex::VectorIndexService`)
+
+- **起動・有効化時に再読込** (`ensure_ready`): ファイルがあればロード
+  (identity照合) → 即検索可能。件数がSQLite embeddingsと不整合なら
+  旧索引で検索させつつバックグラウンド全再構築 (§10: 完了後に切替)。
+- **破損時**: ロード失敗 → ファイル破棄 → SQLiteからバックグラウンド
+  再構築 (進捗イベント)。**索引は派生データ** — 正本はSQLite embeddings。
+- **増分**: 埋め込みジョブ完了フック (`EmbeddingService.set_vector_sink`)
+  で稼働索引へ即追加。ディスク反映は30秒毎の定期保存とgraceful
+  shutdown時のflush (crash時は次回起動の件数照合→再構築が拾う)。
+- **モデル切替**: identity照合で旧索引は自動無効化 (検索不可)。新モデル
+  のベクトルが溜まれば新規構築。`embedding_model_delete` は索引ファイル
+  も破棄。
+- **手動再構築**: `vector_index_rebuild` command (バックグラウンド即復帰)。
+
+### ハイブリッド検索 (重み付きRRF — 数式固定)
+
+```text
+score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
+  k = 60 (RRF標準値・固定)
+  w ∈ [0,1] (意味重み。w=0 純キーワード / w=1 意味のみ)
+  rank_* = 各リスト内の1開始順位。不在 = 項0
+並び: score降順・同点はasset id昇順 (決定性)
+```
+
+- 意味側: 検索フリーテキスト → worker `embed_query` (query接頭辞。
+  モデル未ロード時はレイジーロード、上限45秒で諦め) → USearch top-K。
+- キーワード側: FTS MATCH語があれば **bm25順** top-K
+  (`keyword_ranked_asset_ids` — FTSをFROMに直接置き`ORDER BY bm25`)、
+  なければ一致id昇順。
+- **K = 200/側** (固定)。w>0の結果は融合上位 (最大400件) のみ表示。
+  w=0は旧キーワード経路 (id昇順・完全互換)。
+- **構造フィルタ (tag:/rating:等) は意味側にも適用**: フィールド条件+
+  スコープのみのASTで事前SQL収集した対象asset集合をUSearchの
+  filtered_search (labels述語) へ渡す。5万規模実測0.55ms
+  (measurements参照 — 取得後フィルタではなく前置述語を採用)。
+- **フォールバック** (警告付きでキーワード検索へ): 埋め込み無効・索引
+  未構築・モデルロード失敗/タイムアウト。§8: キーワード検索は常時機能。
+
+### Commands (すべてasync + spawn_blocking。DTOはcamelCase)
+
+- `search_run(query, filters?, scopeRootId?, scopeCollectionId?,
+  semanticWeight?)` → `SearchRunDto` に `kind:"query"` と
+  `semanticScores: Record<assetId, number>` (cosine類似度・上位分) 追加。
+  `semanticWeight` は0..1にclamp (省略=0=旧挙動)。
+- `similar_search_run(assetId, k?)` → 類似画像検索 (対象assetのdocベクトル
+  近傍・自己除外・類似度順)。k既定50・上限200。埋め込み不在/索引未構築は
+  Err (日本語メッセージ)。表示種別 `kind:"similar"`。
+- `search_refresh` → 表示中検索を再実行。**類似画像表示は同assetで再検索**、
+  ハイブリッド表示は保存済み意味重みで再実行 (SearchDisplayにkindと重みを
+  保持)。
+- `vector_index_status` → `{model, ready, indexedCount, sqliteCount,
+  building, lastError}`。
+- `vector_index_rebuild` → 全再構築を予約 (即時status復帰)。
+
+### Events (payloadはJSON文字列)
+
+- `vector-index:progress` `{"done":N,"total":M}` — 構築進捗 (4ページ毎)。
+- `vector-index:ready` `{"model":"...","count":N}` — 構築/ロード完了。
+- `vector-index:notice` (string) — 構築失敗等。
+
+### UI統合
+
+- 検索バー: 意味重みスライダー (0..100%・5%刻み。「キーワード⇔意味」)。
+  埋め込み無効・索引未構築時はdisabled + 理由title。
+- InfoPanel: `semanticScores` に「意味 xx%」(類似画像表示では「類似度 xx%」)、
+  「類似画像を検索」ボタン。グリッドコンテキストメニューにも同項目。
+- ヘッダー: 索引構築進捗表示 (`索引構築中 x / y`)。
+- 一致根拠 (検索一致セクション) はハイブリッド表示でもキーワード側の
+  FTS根拠を表示。
+
+### 実測 (docs/dev/measurements/wp12-usearch-50k.md に詳細)
+
+- 5万×384: 検索 p50=0.35ms / p95=0.45ms / max=0.45ms (acceptance
+  <0.5秒を3桁余裕でクリア)。構築16.4s (単一バックグラウンドスレッド)。
+  メモリ144.4MiB。保存0.05s・ロード0.06s。
+- 実モデル (ruri-v3-70m・WP-11評価セット): 索引top-3 == 総当たりtop-3
+  が100%一致、Recall@3 = 0.8333 (総当たりと同一 — 索引化で品質低下なし)。
+- 構築中もstatus応答最大4.2ms (96回サンプリング) — UI非ブロック実証。

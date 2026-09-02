@@ -13,6 +13,8 @@
     label: string;
     run: () => void | Promise<void>;
     disabled?: boolean;
+    /** ホバー時に出す補足 (無効理由等)。 */
+    title?: string;
   };
 
   let {
@@ -93,6 +95,7 @@
     <button
       role="menuitem"
       disabled={action.disabled}
+      title={action.title ?? ""}
       onclick={() => void runAction(action)}
     >
       {action.label}

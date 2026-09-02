@@ -1,24 +1,37 @@
-//! 検索command群 (MVP WP-8)。FTS5検索の実行・一致根拠・索引保守。
+//! 検索command群 (MVP WP-8 + WP-12ハイブリッド拡張)。FTS5検索の実行・
+//! 一致根拠・索引保守。
 //!
 //! thin adapter: AST parser (gento-search) と検索実行 (gento-db search) を
 //! 組み合わせ、結果をカタログの検索ソースとして表示する。
+//! WP-12: `semantic_weight` (0..=1) によりキーワード×意味の重み付きRRF
+//! ハイブリッド検索 (api-contract §46) と類似画像検索
+//! (`similar_search_run`) を提供する。
 
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use gento_search::{parse as parse_query, SearchQuery, SearchTerm};
+use gento_search::{parse as parse_query, weighted_rrf, SearchQuery, SearchTerm, TextPlan};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::catalog::{CatalogChangeReason, CatalogChangedPayload, CatalogSummary, SearchDisplay};
+use crate::catalog::{
+    CatalogChangeReason, CatalogChangedPayload, CatalogSummary, SearchDisplay, SearchDisplayKind,
+};
 use crate::AppState;
 
 /// 検索結果表示に載せる上限 (5万件規模 + 余裕。それ超過は打ち切り)。
 const SEARCH_VIEW_LIMIT: u64 = 100_000;
 /// asset id一覧の取得チャンク。
 const SEARCH_PAGE: u32 = 5_000;
+/// ハイブリッド検索で各側から取得する上位件数 (api-contract §46)。
+const HYBRID_TOP_K: usize = 200;
+/// 意味側クエリ埋め込み (モデル初回ロード込み) の待ち上限。
+const EMBED_QUERY_WAIT: Duration = Duration::from_secs(45);
+/// 類似画像検索の既定表示件数。
+const SIMILAR_DEFAULT_K: usize = 50;
 
 fn db_of(state: &AppState) -> Result<Arc<gento_db::Db>, String> {
     state
@@ -26,6 +39,15 @@ fn db_of(state: &AppState) -> Result<Arc<gento_db::Db>, String> {
         .as_ref()
         .and_then(|d| d.db.clone())
         .ok_or_else(|| "データベースが利用できないため検索できません".to_string())
+}
+
+fn vector_index_of(
+    state: &AppState,
+) -> Result<Arc<crate::vectorindex::VectorIndexService>, String> {
+    state
+        .vector_index
+        .clone()
+        .ok_or_else(|| "ベクトル索引が利用できないため意味検索できません".to_string())
 }
 
 /// GUIフィルタ (AST termのJSON列) を検証してAST termへ変換する。
@@ -43,8 +65,8 @@ fn filter_terms(filters: Option<Vec<JsonValue>>) -> Result<Vec<SearchTerm>, Stri
     Ok(terms)
 }
 
-/// `search_run` の応答。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// `search_run` / `similar_search_run` の応答。
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchRunDto {
     pub summary: CatalogSummary,
@@ -58,6 +80,11 @@ pub struct SearchRunDto {
     pub warnings: Vec<String>,
     /// 保存済み検索 (スマートコレクション) 作成用のAST JSON (version 2)。
     pub query_json: String,
+    /// 表示種別: "query" (構文検索) | "similar" (類似画像。WP-12)。
+    pub kind: String,
+    /// 意味側スコア (assetId → cosine類似度。ハイブリッド/類似表示の
+    /// 上位分のみ。InfoPanel「意味 xx%」表示用。WP-12)。
+    pub semantic_scores: HashMap<String, f32>,
 }
 
 /// `search_evidence` の応答項目。
@@ -123,12 +150,16 @@ pub struct FtsProgressPayload {
     pub total: u64,
 }
 
-/// 検索を実行して結果をカタログの検索ソースとして表示する (WP-8)。
+/// 検索を実行して結果をカタログの検索ソースとして表示する (WP-8 + WP-12)。
 ///
 /// - `query`: 検索構文文字列 (api-contract §42)
 /// - `filters`: GUIフィルタ (AST term JSON列。クエリとAND合成)
 /// - `scope_root_id` / `scope_collection_id`: 検索範囲
 ///   (両方None = ライブラリ全体)
+/// - `semantic_weight`: 意味重み w ∈ [0,1] (WP-12)。0/None = 純キーワード
+///   (旧経路・完全互換)。0 < w で意味側 (USearch) と重み付きRRF融合。
+///   埋め込み無効・索引未構築・モデルロード失敗時は警告付きで
+///   キーワード検索へフォールバック (§8: キーワード検索は常時機能)。
 ///
 /// async command: 一致全件の収集 (5万件級の広域クエリで数百ms) は
 /// `spawn_blocking` でUIスレッド外で実行する (QA-WP8。WP-7
@@ -141,6 +172,7 @@ pub async fn search_run(
     filters: Option<Vec<JsonValue>>,
     scope_root_id: Option<String>,
     scope_collection_id: Option<String>,
+    semantic_weight: Option<f64>,
 ) -> Result<SearchRunDto, String> {
     let db = db_of(&state)?;
     let started = Instant::now();
@@ -166,14 +198,24 @@ pub async fn search_run(
         collection_id: scope_collection,
         require_present_files: true,
     };
-    let (records, total) = tauri::async_runtime::spawn_blocking(move || {
-        let (asset_ids, total) = collect_search_ids(&db, &ast, &scope)?;
-        let records = crate::collections::build_collection_records(&db, &asset_ids)
-            .map_err(|e| format!("検索結果の表示構築に失敗しました: {e}"))?;
-        Ok::<_, String>((records, total))
-    })
-    .await
-    .map_err(|e| format!("検索の実行に失敗しました: {e}"))??;
+    let weight = gento_search::clamp_weight(semantic_weight.unwrap_or(0.0) as f32);
+    let embedding = state.embedding.clone();
+    let vector_index = state.vector_index.clone();
+    let initial_warnings = outcome.warnings;
+    let (records, total, warnings, semantic_scores) =
+        tauri::async_runtime::spawn_blocking(move || {
+            execute_search(
+                &db,
+                &ast,
+                &scope,
+                weight,
+                embedding,
+                vector_index,
+                initial_warnings,
+            )
+        })
+        .await
+        .map_err(|e| format!("検索の実行に失敗しました: {e}"))??;
     let shown = records.len() as u64;
 
     let (summary, generation) = {
@@ -182,6 +224,9 @@ pub async fn search_run(
             query_json: query_json.clone(),
             scope_root_id: scope_root,
             scope_collection_id: scope_collection,
+            kind: SearchDisplayKind::Query {
+                semantic_weight: weight,
+            },
             records,
         });
         (crate::catalog::summary_of_pub(&inner), generation)
@@ -198,9 +243,196 @@ pub async fn search_run(
         total,
         shown,
         elapsed_ms: started.elapsed().as_millis() as u64,
-        warnings: outcome.warnings,
+        warnings,
         query_json,
+        kind: "query".to_string(),
+        semantic_scores,
     })
+}
+
+/// 検索実行の本体 (キーワード = 旧経路。ハイブリッド = WP-12)。
+/// 戻り値: (表示レコード, 一致総数, 警告, 意味スコア)。
+#[allow(clippy::type_complexity)]
+pub fn execute_search(
+    db: &Arc<gento_db::Db>,
+    ast: &SearchQuery,
+    scope: &gento_db::SearchScope,
+    weight: f32,
+    embedding: Option<Arc<crate::embedding::EmbeddingService>>,
+    vector_index: Option<Arc<crate::vectorindex::VectorIndexService>>,
+    initial_warnings: Vec<String>,
+) -> Result<
+    (
+        Vec<gento_core::catalog::ImageRecord>,
+        u64,
+        Vec<String>,
+        HashMap<String, f32>,
+    ),
+    String,
+> {
+    let mut warnings = initial_warnings;
+    let semantic_scores: HashMap<String, f32> = HashMap::new();
+    let has_text = !ast.text_terms().is_empty();
+    if weight > 0.0 && has_text {
+        match (embedding, vector_index) {
+            (Some(embedding), Some(vector_index)) => {
+                if let Some((ordered_ids, scores)) = run_hybrid(
+                    db,
+                    embedding,
+                    vector_index,
+                    ast,
+                    scope,
+                    weight,
+                    &mut warnings,
+                ) {
+                    let records = crate::collections::build_collection_records(db, &ordered_ids)
+                        .map_err(|e| format!("検索結果の表示構築に失敗しました: {e}"))?;
+                    let total = ordered_ids.len() as u64;
+                    return Ok((records, total, warnings, scores));
+                }
+                // None = 警告付きフォールバック (警告はrun_hybrid内で付与済み)
+            }
+            _ => {
+                warnings
+                    .push("埋め込みサービスが利用できないため意味検索を省略しました".to_string());
+            }
+        }
+    } else if weight > 0.0 && !has_text {
+        warnings.push("検索語 (フリーテキスト) がないため意味検索を省略しました".to_string());
+    }
+    // 純キーワード経路 (旧WP-8動作)
+    let (asset_ids, total) = collect_search_ids(db, ast, scope)?;
+    let records = crate::collections::build_collection_records(db, &asset_ids)
+        .map_err(|e| format!("検索結果の表示構築に失敗しました: {e}"))?;
+    Ok((records, total, warnings, semantic_scores))
+}
+
+/// ハイブリッド検索 (WP-12)。意味側を実行できなかった場合はNone
+/// (警告付き — 呼び出し側はキーワード経路へフォールバック)。
+#[allow(clippy::type_complexity)]
+fn run_hybrid(
+    db: &Arc<gento_db::Db>,
+    embedding: Arc<crate::embedding::EmbeddingService>,
+    vector_index: Arc<crate::vectorindex::VectorIndexService>,
+    ast: &SearchQuery,
+    scope: &gento_db::SearchScope,
+    weight: f32,
+    warnings: &mut Vec<String>,
+) -> Option<(Vec<i64>, HashMap<String, f32>)> {
+    if !embedding.is_enabled() {
+        warnings.push(
+            "自然言語検索が無効のため意味検索を省略しました (AIパネルから有効化できます)"
+                .to_string(),
+        );
+        return None;
+    }
+    if !vector_index.is_ready() {
+        warnings.push(
+            "ベクトル索引が未構築のため意味検索を省略しました (埋め込み完了後に自動構築されます)"
+                .to_string(),
+        );
+        return None;
+    }
+    let query_text = ast.text_terms().join(" ");
+    let query_vector = match embed_query_bounded(&embedding, &query_text, EMBED_QUERY_WAIT) {
+        Ok(vector) => vector,
+        Err(error) => {
+            warnings.push(format!(
+                "意味検索クエリの生成に失敗したため省略しました: {error}"
+            ));
+            return None;
+        }
+    };
+    // 構造フィルタ (tag:/rating:等) は意味側にも適用: 対象asset集合を事前SQL
+    // で絞り、USearchのlabelsフィルタ (filtered_search) で検索する
+    let allowed = structural_allowed_set(db, ast, scope);
+    let Some(neighbors) = vector_index.search(&query_vector, HYBRID_TOP_K, allowed.as_ref()) else {
+        warnings.push(
+            "索引検索に失敗したため意味検索を省略しました (索引の再構築が進行中の可能性があります)"
+                .to_string(),
+        );
+        return None;
+    };
+    let semantic_pairs: Vec<(i64, f32)> = neighbors
+        .iter()
+        .map(|neighbor| (neighbor.key, neighbor.similarity))
+        .collect();
+    // キーワード側ランキング: MATCH語があればbm25順、なければ一致id昇順
+    let has_match = TextPlan::compile(&ast.text_terms()).match_expr.is_some();
+    let keyword_ranked: Vec<i64> = if has_match {
+        db.with_reader(|repos| {
+            gento_db::keyword_ranked_asset_ids(repos.conn(), ast, scope, HYBRID_TOP_K as u32)
+        })
+        .unwrap_or_default()
+    } else {
+        match collect_search_ids(db, ast, scope) {
+            Ok((matched, _)) => matched.into_iter().take(HYBRID_TOP_K).collect(),
+            Err(error) => {
+                warnings.push(format!("キーワード側の収集に失敗しました: {error}"));
+                return None;
+            }
+        }
+    };
+    let fused = weighted_rrf(&keyword_ranked, &semantic_pairs, weight);
+    let ordered_ids: Vec<i64> = fused.iter().map(|item| item.asset_id).collect();
+    let semantic_scores: HashMap<String, f32> = fused
+        .iter()
+        .filter_map(|item| {
+            item.semantic_similarity
+                .map(|similarity| (item.asset_id.to_string(), similarity))
+        })
+        .collect();
+    Some((ordered_ids, semantic_scores))
+}
+
+/// モデルロード込みのクエリ埋め込み (上限待ち)。タイムアウト時もロードは
+/// 続行するため、次回の検索は速くなる (§8: 準備完了後に意味検索が乗る)。
+fn embed_query_bounded(
+    embedding: &Arc<crate::embedding::EmbeddingService>,
+    text: &str,
+    timeout: Duration,
+) -> Result<Vec<f32>, String> {
+    let service = Arc::clone(embedding);
+    let text = text.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("hybrid-embed".into())
+        .spawn(move || {
+            let _ = tx.send(service.embed_query(&text));
+        })
+        .map_err(|e| e.to_string())?;
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => Err("モデルの読み込みに時間がかかっています".to_string()),
+    }
+}
+
+/// 意味側に適用する構造フィルタの対象集合 (フィールド条件+スコープのみの
+/// ASTで全件収集)。条件が無い (全件対象) 場合はNone (フィルタ不要)。
+fn structural_allowed_set(
+    db: &Arc<gento_db::Db>,
+    ast: &SearchQuery,
+    scope: &gento_db::SearchScope,
+) -> Option<HashSet<i64>> {
+    if ast.field_conditions().is_empty() && scope.root_id.is_none() && scope.collection_id.is_none()
+    {
+        return None;
+    }
+    let structural = strip_to_structural(ast);
+    let (ids, _) = collect_search_ids(db, &structural, scope).ok()?;
+    Some(ids.into_iter().collect())
+}
+
+/// ASTから構造条件 (フィールドterm) のみを残す (意味側フィルタ用)。
+fn strip_to_structural(ast: &SearchQuery) -> SearchQuery {
+    SearchQuery {
+        terms: ast
+            .terms
+            .iter()
+            .filter(|term| matches!(term, SearchTerm::Field(_)))
+            .cloned()
+            .collect(),
+    }
 }
 
 /// 検索一致全件のasset idをページングしながら集める (上限SEARCH_VIEW_LIMIT)。
@@ -342,6 +574,8 @@ pub async fn fts_repair(state: State<'_, AppState>) -> Result<FtsMaintenanceDto,
 }
 
 /// 現在の検索表示を新しいDB状態で再実行する (表示中の明示refresh)。
+/// WP-12: 類似画像表示は同assetで再検索、ハイブリッド表示は保存済み
+/// 意味重みで再実行する。
 /// async command: `search_run` と同じく全件収集をUIスレッド外で実行 (QA-WP8)。
 #[tauri::command]
 pub async fn search_refresh(
@@ -355,28 +589,14 @@ pub async fn search_refresh(
     let Some(display) = display else {
         return Err("再実行できる検索がありません".to_string());
     };
-    let query = match gento_search::stored::parse_stored(&display.query_json) {
-        Ok(gento_search::stored::StoredSearch::Ast(query)) => query,
-        Ok(gento_search::stored::StoredSearch::Legacy(legacy)) => {
-            gento_search::stored::legacy_to_query(&legacy)
-        }
-        Err(e) => return Err(format!("保存済み検索条件が読み込めません: {e}")),
-    };
-    let db = db_of(&state)?;
     let started = Instant::now();
-    let scope = gento_db::SearchScope {
-        root_id: display.scope_root_id,
-        collection_id: display.scope_collection_id,
-        require_present_files: true,
+    let result = match display.kind {
+        SearchDisplayKind::Query { semantic_weight } => {
+            refresh_query(&state, &display, semantic_weight).await?
+        }
+        SearchDisplayKind::SimilarImage { asset_id } => refresh_similar(&state, asset_id).await?,
     };
-    let (records, total) = tauri::async_runtime::spawn_blocking(move || {
-        let (asset_ids, total) = collect_search_ids(&db, &query, &scope)?;
-        let records = crate::collections::build_collection_records(&db, &asset_ids)
-            .map_err(|e| format!("検索結果の表示構築に失敗しました: {e}"))?;
-        Ok::<_, String>((records, total))
-    })
-    .await
-    .map_err(|e| format!("検索の実行に失敗しました: {e}"))??;
+    let (records, total, warnings, semantic_scores, kind) = result;
     let shown = records.len() as u64;
     let (summary, generation) = {
         let mut inner = crate::catalog::lock(&state.catalog);
@@ -384,6 +604,173 @@ pub async fn search_refresh(
             query_json: display.query_json.clone(),
             scope_root_id: display.scope_root_id,
             scope_collection_id: display.scope_collection_id,
+            kind: display.kind,
+            records,
+        });
+        (crate::catalog::summary_of_pub(&inner), generation)
+    };
+    let _ = app.emit(
+        "catalog:changed",
+        CatalogChangedPayload {
+            generation,
+            reason: CatalogChangeReason::SearchSwitch,
+        },
+    );
+    Ok(SearchRunDto {
+        summary,
+        total,
+        shown,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        warnings,
+        query_json: display.query_json,
+        kind,
+        semantic_scores,
+    })
+}
+
+/// 再実行の結果搬送 (search_refresh内部)。
+type RefreshOutcome = (
+    Vec<gento_core::catalog::ImageRecord>,
+    u64,
+    Vec<String>,
+    HashMap<String, f32>,
+    String,
+);
+
+async fn refresh_query(
+    state: &State<'_, AppState>,
+    display: &SearchDisplay,
+    semantic_weight: f32,
+) -> Result<RefreshOutcome, String> {
+    let query = match gento_search::stored::parse_stored(&display.query_json) {
+        Ok(gento_search::stored::StoredSearch::Ast(query)) => query,
+        Ok(gento_search::stored::StoredSearch::Legacy(legacy)) => {
+            gento_search::stored::legacy_to_query(&legacy)
+        }
+        Err(e) => return Err(format!("保存済み検索条件が読み込めません: {e}")),
+    };
+    let db = db_of(state)?;
+    let scope = gento_db::SearchScope {
+        root_id: display.scope_root_id,
+        collection_id: display.scope_collection_id,
+        require_present_files: true,
+    };
+    let embedding = state.embedding.clone();
+    let vector_index = state.vector_index.clone();
+    let (records, total, warnings, semantic_scores) =
+        tauri::async_runtime::spawn_blocking(move || {
+            execute_search(
+                &db,
+                &query,
+                &scope,
+                semantic_weight,
+                embedding,
+                vector_index,
+                vec![],
+            )
+        })
+        .await
+        .map_err(|e| format!("検索の実行に失敗しました: {e}"))??;
+    Ok((
+        records,
+        total,
+        warnings,
+        semantic_scores,
+        "query".to_string(),
+    ))
+}
+
+async fn refresh_similar(
+    state: &State<'_, AppState>,
+    asset_id: i64,
+) -> Result<RefreshOutcome, String> {
+    let db = db_of(state)?;
+    let vector_index = vector_index_of(state)?;
+    let (records, semantic_scores) = tauri::async_runtime::spawn_blocking(move || {
+        execute_similar(&db, &vector_index, asset_id, SIMILAR_DEFAULT_K)
+    })
+    .await
+    .map_err(|e| format!("類似画像検索に失敗しました: {e}"))??;
+    let total = records.len() as u64;
+    Ok((
+        records,
+        total,
+        Vec::new(),
+        semantic_scores,
+        "similar".to_string(),
+    ))
+}
+
+/// 類似画像検索の実行本体: 対象assetのdocベクトルで索引から近傍
+/// (自己除外) を取得し、類似度順の表示レコードを組む。
+pub fn execute_similar(
+    db: &Arc<gento_db::Db>,
+    vector_index: &Arc<crate::vectorindex::VectorIndexService>,
+    asset_id: i64,
+    k: usize,
+) -> Result<(Vec<gento_core::catalog::ImageRecord>, HashMap<String, f32>), String> {
+    let model = crate::embedding::selected_model_of(db);
+    let revision = crate::embedding::model_revision_of(&model);
+    let vector = db
+        .with_reader(|repos| repos.embedding_vector_of_asset(asset_id, &model, &revision))
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| {
+            "この画像には埋め込みがありません (自然言語検索の処理完了後に利用できます)".to_string()
+        })?;
+    if !vector_index.is_ready() {
+        return Err("ベクトル索引が準備中です (埋め込み完了後に自動構築されます)".to_string());
+    }
+    let Some(neighbors) = vector_index.search(&vector, k + 1, None) else {
+        return Err("ベクトル索引が準備中です".to_string());
+    };
+    let mut semantic_scores: HashMap<String, f32> = HashMap::new();
+    let mut ordered_ids: Vec<i64> = Vec::with_capacity(neighbors.len());
+    for neighbor in neighbors {
+        if neighbor.key == asset_id {
+            continue;
+        }
+        ordered_ids.push(neighbor.key);
+        semantic_scores.insert(neighbor.key.to_string(), neighbor.similarity);
+    }
+    ordered_ids.truncate(k);
+    let records = crate::collections::build_collection_records(db, &ordered_ids)
+        .map_err(|e| format!("類似画像の表示構築に失敗しました: {e}"))?;
+    Ok((records, semantic_scores))
+}
+
+/// 類似画像検索 (WP-12): 対象assetのdocベクトルで近傍を検索し、
+/// カタログの検索ソースとして表示する (類似度順)。
+#[tauri::command]
+pub async fn similar_search_run(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    asset_id: String,
+    k: Option<u32>,
+) -> Result<SearchRunDto, String> {
+    let asset = asset_id
+        .parse::<i64>()
+        .map_err(|_| "画像IDが整数として解析できません".to_string())?;
+    let db = db_of(&state)?;
+    let vector_index = vector_index_of(&state)?;
+    let started = Instant::now();
+    let k = k
+        .map(|value| value.clamp(1, 200) as usize)
+        .unwrap_or(SIMILAR_DEFAULT_K);
+    let (records, semantic_scores) =
+        tauri::async_runtime::spawn_blocking(move || execute_similar(&db, &vector_index, asset, k))
+            .await
+            .map_err(|e| format!("類似画像検索に失敗しました: {e}"))??;
+    let total = records.len() as u64;
+    let shown = total;
+    let (summary, generation) = {
+        let mut inner = crate::catalog::lock(&state.catalog);
+        // 類似画像表示のquery_jsonは空AST (一致根拠は無く、保存対象外)
+        let empty_json = gento_search::SearchQuery::default().to_stored_json();
+        let generation = inner.set_search_display(SearchDisplay {
+            query_json: empty_json,
+            scope_root_id: None,
+            scope_collection_id: None,
+            kind: SearchDisplayKind::SimilarImage { asset_id: asset },
             records,
         });
         (crate::catalog::summary_of_pub(&inner), generation)
@@ -401,7 +788,9 @@ pub async fn search_refresh(
         shown,
         elapsed_ms: started.elapsed().as_millis() as u64,
         warnings: Vec::new(),
-        query_json: display.query_json,
+        query_json: String::new(),
+        kind: "similar".to_string(),
+        semantic_scores,
     })
 }
 
@@ -464,6 +853,46 @@ mod tests {
                 value: "夜景".to_string()
             }
         );
+    }
+
+    #[test]
+    fn strip_to_structural_removes_text_terms() {
+        let outcome = parse_query("夜景 tag:sky rating:>=3").unwrap();
+        let structural = strip_to_structural(&outcome.query);
+        assert!(structural.text_terms().is_empty());
+        assert_eq!(structural.field_conditions().len(), 2);
+        // 構造条件ゼロのクエリは空になる
+        let outcome = parse_query("ただの検索語").unwrap();
+        assert!(strip_to_structural(&outcome.query).terms.is_empty());
+    }
+
+    #[test]
+    fn search_run_dto_serializes_camel_case_with_new_fields() {
+        let dto = SearchRunDto {
+            summary: CatalogSummary {
+                generation: 1,
+                mode: gento_core::catalog::CatalogMode::Library,
+                total: 0,
+                scanning: false,
+                scanned_count: 0,
+                error_count: 0,
+                last_scan_elapsed_ms: None,
+                sort: gento_core::catalog::CatalogSort::Name,
+            },
+            total: 3,
+            shown: 3,
+            elapsed_ms: 12,
+            warnings: vec![],
+            query_json: "{}".to_string(),
+            kind: "similar".to_string(),
+            semantic_scores: HashMap::from([("42".to_string(), 0.87f32)]),
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["kind"], "similar");
+        let similarity = json["semanticScores"]["42"].as_f64().unwrap();
+        assert!((similarity - 0.87).abs() < 1e-6, "{similarity}");
+        assert!(json.get("semantic_scores").is_none(), "snake_case混入");
+        assert!(json.get("kind_").is_none());
     }
 
     #[test]

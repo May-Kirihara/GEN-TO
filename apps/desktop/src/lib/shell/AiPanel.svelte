@@ -42,6 +42,7 @@
     workerPhaseLabel,
     type EmbeddingStatus,
   } from "../embedding";
+  import { VectorIndexStore, type VectorIndexStatus } from "../vector-index";
 
   let {
     store,
@@ -99,12 +100,26 @@
   // ===== 自然言語検索 (WP-11) =====
   let embeddingStore: EmbeddingStore | null = $state(null);
   let embeddingStatus: EmbeddingStatus | null = $state(null);
+  /** WP-12: USearch索引状態 (自然言語検索タブの進捗表示)。 */
+  let vectorIndexStore: VectorIndexStore | null = $state(null);
+  let vectorIndexStatus: VectorIndexStatus | null = $state(null);
   let embeddingBusy = $state(false);
   let embeddingError = $state<string | null>(null);
   let embeddingNotice = $state("");
   let confirmEnable = $state(false);
   let confirmDeleteModel: string | null = $state(null);
   let pollStop: (() => void) | null = null;
+
+  async function refreshVectorIndex(): Promise<void> {
+    if (vectorIndexStore === null) {
+      return;
+    }
+    try {
+      vectorIndexStatus = await vectorIndexStore.status();
+    } catch {
+      // 状態取得失敗は表示を前回値のままにする
+    }
+  }
 
   async function refreshEmbedding(): Promise<void> {
     if (embeddingStore === null) {
@@ -445,8 +460,16 @@
       return;
     }
     embeddingStore ??= new EmbeddingStore({ invoke: ipc.invoke, listen: () => Promise.resolve(() => {}) });
+    vectorIndexStore ??= new VectorIndexStore({
+      invoke: ipc.invoke,
+      listen: () => Promise.resolve(() => {}),
+    });
     void refreshEmbedding();
-    const timer = setInterval(() => void refreshEmbedding(), 2000);
+    void refreshVectorIndex();
+    const timer = setInterval(() => {
+      void refreshEmbedding();
+      void refreshVectorIndex();
+    }, 2000);
     void embeddingStore.subscribe((payload) => {
       embeddingNotice = payload;
       void refreshEmbedding();
@@ -757,7 +780,8 @@
         <p class="hint">
           画像のキャプション・タグ・プロンプトから意味の近さで検索するための
           ローカル埋め込みモデル (ruri-v3) です。外部へは送信されません。
-          検索バーへの統合は次期で提供されます。
+          検索バーの重みスライダー (キーワード⇔意味) と「類似画像を検索」
+          から利用できます。
         </p>
         {#if embeddingNotice}
           <p class="notice">{embeddingNotice}</p>
@@ -795,6 +819,20 @@
             {progressText(embeddingStatus)}
             ({Math.round(progressRatio(embeddingStatus) * 100)}%)
           </p>
+          {#if vectorIndexStatus !== null}
+            <p class="counts" data-testid="vector-index-status">
+              索引: {vectorIndexStatus.building
+                ? `構築中 (${vectorIndexStatus.indexedCount.toLocaleString()} / ${vectorIndexStatus.sqliteCount.toLocaleString()})`
+                : vectorIndexStatus.ready
+                  ? `準備完了 (${vectorIndexStatus.indexedCount.toLocaleString()}件)`
+                  : vectorIndexStatus.sqliteCount === 0
+                    ? "未構築 (埋め込み待ち)"
+                    : "準備中"}
+              {#if vectorIndexStatus.lastError !== null}
+                · エラーあり
+              {/if}
+            </p>
+          {/if}
           {#if embeddingStatus.enabled && progressRatio(embeddingStatus) < 1}
             <progress max="1" value={progressRatio(embeddingStatus)}></progress>
           {/if}

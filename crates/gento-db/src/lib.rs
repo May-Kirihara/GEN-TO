@@ -78,8 +78,8 @@ pub use schema::LATEST_VERSION;
 /// FTS5検索 (WP-8): 文書構築・整合性診断・AST検索実行・一致根拠。
 pub use search::{
     build_asset_doc, build_search_doc_input, fts_counts, fts_integrity, fts_rebuild, fts_repair,
-    prune_orphan_docs, rebuild_docs_for_assets, search_asset_ids, search_evidence, AssetDoc,
-    DocField, FieldEvidence, FtsIntegrityReport, SearchScope,
+    keyword_ranked_asset_ids, prune_orphan_docs, rebuild_docs_for_assets, search_asset_ids,
+    search_evidence, AssetDoc, DocField, FieldEvidence, FtsIntegrityReport, SearchScope,
 };
 
 /// 既定のbusy_timeout (ms)。PM計画§6-2。

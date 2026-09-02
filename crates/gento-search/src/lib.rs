@@ -10,6 +10,7 @@
 //!   LIKEフォールバックへの割り振り。
 //! - `stored`: スマートコレクション保存形式 (query_json version 2) の
 //!   読み書きと、WP-6旧形式 (最小条件) からの変換。
+//! - `hybrid`: キーワード×意味の重み付きRRF融合 (WP-12。純Rust)。
 //!
 //! # 依存方向
 //!
@@ -35,8 +36,12 @@
 
 use serde::{Deserialize, Serialize};
 
+/// ハイブリッド検索 (重み付きRRF) のモジュール (WP-12)。
+pub mod hybrid;
 /// スマートコレクション保存形式 (version 2) のモジュール。
 pub mod stored;
+
+pub use hybrid::{clamp_weight, weighted_rrf, FusedRank, RRF_K};
 
 /// パース失敗。メッセージは日本語 (UIへそのまま表示)。`position` は
 /// 入力文字列の文字オフセット (0開始)。

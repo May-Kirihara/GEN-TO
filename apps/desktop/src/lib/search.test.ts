@@ -6,6 +6,7 @@ import {
   filtersActive,
   type GuiFilters,
 } from "./search";
+import { semanticPercent, weightLabel } from "./search";
 import type { SearchEvidenceItem, SearchRunResult } from "./search";
 
 function okSummary() {
@@ -94,6 +95,20 @@ describe("SearchStore — 実行・根拠・保存", () => {
               elapsedMs: 5,
               warnings: [],
               queryJson: '{"version":2,"query":{"terms":[]}}',
+              kind: "query",
+              semanticScores: { 7: 0.9 },
+            } as SearchRunResult as T;
+          }
+          if (command === "similar_search_run") {
+            return {
+              summary: okSummary(),
+              total: 3,
+              shown: 3,
+              elapsedMs: 8,
+              warnings: [],
+              queryJson: "",
+              kind: "similar",
+              semanticScores: { 7: 0.95, 8: 0.8 },
             } as SearchRunResult as T;
           }
           if (command === "search_evidence") {
@@ -167,6 +182,51 @@ describe("SearchStore — 実行・根拠・保存", () => {
     expect(call?.args?.searchJson).toBe('{"version":2,"query":{"terms":[]}}');
   });
 
+  it("run: semanticWeightを0..1に拘束して渡す (WP-12)", async () => {
+    const { ipc, calls } = makeIpc();
+    const store = new SearchStore(ipc);
+    await store.run("猫", EMPTY_FILTERS, {}, 0.65);
+    const run = calls.find((c) => c.command === "search_run");
+    expect(run?.args?.semanticWeight).toBeCloseTo(0.65);
+    expect(store.lastSemanticWeight).toBe(0.65);
+    // 範囲外はclamp
+    await store.run("猫", EMPTY_FILTERS, {}, 7);
+    const calls2 = calls.filter((c) => c.command === "search_run");
+    expect(calls2[calls2.length - 1]?.args?.semanticWeight).toBe(1);
+    await store.run("猫", EMPTY_FILTERS, {}, -2);
+    const calls3 = calls.filter((c) => c.command === "search_run");
+    expect(calls3[calls3.length - 1]?.args?.semanticWeight).toBe(0);
+  });
+
+  it("run: 意味スコア写像を保持する (WP-12)", async () => {
+    const { ipc } = makeIpc();
+    const store = new SearchStore(ipc);
+    await store.run("猫", EMPTY_FILTERS, {}, 0.5);
+    expect(store.semantic["7"]).toBeCloseTo(0.9);
+    expect(store.lastKind).toBe("query");
+  });
+
+  it("runSimilar: 類似画像検索を実行しkind/スコアを保持 (WP-12)", async () => {
+    const { ipc, calls } = makeIpc();
+    const store = new SearchStore(ipc);
+    const ok = await store.runSimilar("42");
+    expect(ok).toBe(true);
+    const call = calls.find((c) => c.command === "similar_search_run");
+    expect(call?.args?.assetId).toBe("42");
+    expect(store.lastKind).toBe("similar");
+    expect(store.semantic["7"]).toBeCloseTo(0.95);
+    // 失敗はlastErrorへ
+    const failIpc = {
+      invoke: async () => {
+        throw new Error("この画像には埋め込みがありません");
+      },
+    };
+    const failStore = new SearchStore(failIpc);
+    const failOk = await failStore.runSimilar("42");
+    expect(failOk).toBe(false);
+    expect(failStore.lastError).toContain("埋め込みがありません");
+  });
+
   it("onChange: 実行状態の変化を通知する", async () => {
     const { ipc } = makeIpc();
     const store = new SearchStore(ipc);
@@ -174,5 +234,25 @@ describe("SearchStore — 実行・根拠・保存", () => {
     store.onChange(listener);
     await store.run("sunset", EMPTY_FILTERS);
     expect(listener.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe("semanticPercent / weightLabel — 表示ヘルパー (WP-12)", () => {
+  it("semanticPercent: 0..1を%表示へ (負・過大は拘束)", () => {
+    expect(semanticPercent(0.87)).toBe("87%");
+    expect(semanticPercent(0)).toBe("0%");
+    expect(semanticPercent(1)).toBe("100%");
+    expect(semanticPercent(-0.2)).toBe("0%");
+    expect(semanticPercent(1.7)).toBe("100%");
+    expect(semanticPercent(Number.NaN)).toBe("0%");
+    expect(semanticPercent(0.871)).toBe("87%");
+  });
+
+  it("weightLabel: 重みの段階ラベル", () => {
+    expect(weightLabel(0)).toBe("キーワード");
+    expect(weightLabel(0.2)).toBe("キーワード寄り");
+    expect(weightLabel(0.5)).toBe("バランス");
+    expect(weightLabel(0.8)).toBe("意味寄り");
+    expect(weightLabel(1)).toBe("意味");
   });
 });

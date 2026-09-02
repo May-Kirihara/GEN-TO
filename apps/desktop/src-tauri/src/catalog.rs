@@ -48,6 +48,8 @@ pub struct AppState {
     pub ai: Option<Arc<crate::ai::AiService>>,
     /// 埋め込みサービス (WP-11)。DBが開けている場合のみ生成。
     pub embedding: Option<Arc<crate::embedding::EmbeddingService>>,
+    /// USearch索引サービス (WP-12)。DBが開けている場合のみ生成。
+    pub vector_index: Option<Arc<crate::vectorindex::VectorIndexService>>,
     /// 計測ブリッジ (devtest) の有効フラグ (FG-1)。devtoolsビルドのみ存在
     /// (WP-0)。起動時に環境変数 `GENTO_DEV_BRIDGE` (値は厳密に "1") から
     /// 確定し以後不変。危険コマンド (set_failure_injection / devtest_report /
@@ -93,12 +95,44 @@ pub struct CollectionView {
 
 /// 検索結果表示の状態 (WP-8)。query_jsonはgento-search保存形式 (v2)。
 /// `records` は検索結果の表示レコード (再選択時に復元するため保持)。
+/// WP-12: 表示種別 (通常クエリ / 類似画像) と意味重みを保持し、
+/// `search_refresh` が同じ条件で再実行できる。
 #[derive(Debug, Clone)]
 pub struct SearchDisplay {
     pub query_json: String,
     pub scope_root_id: Option<i64>,
     pub scope_collection_id: Option<i64>,
+    pub kind: SearchDisplayKind,
     pub records: Vec<ImageRecord>,
+}
+
+/// 検索表示の種別 (WP-12)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SearchDisplayKind {
+    /// 検索構文による表示。意味重み (0 = 純キーワード)。
+    Query { semantic_weight: f32 },
+    /// 類似画像検索の表示 (対象assetのdocベクトル近傍)。
+    SimilarImage { asset_id: i64 },
+}
+
+impl SearchDisplay {
+    /// 従来形式のコンストラクタ (純キーワード検索)。
+    pub fn query(
+        query_json: String,
+        scope_root_id: Option<i64>,
+        scope_collection_id: Option<i64>,
+        records: Vec<ImageRecord>,
+    ) -> Self {
+        Self {
+            query_json,
+            scope_root_id,
+            scope_collection_id,
+            kind: SearchDisplayKind::Query {
+                semantic_weight: 0.0,
+            },
+            records,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -165,6 +199,7 @@ impl AppState {
             file_ops: None,
             ai: None,
             embedding: None,
+            vector_index: None,
             #[cfg(any(debug_assertions, feature = "devtools"))]
             dev_bridge: AtomicBool::new(crate::devtools::dev_bridge_enabled_strict()),
         }

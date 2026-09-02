@@ -534,3 +534,34 @@
   環境の考慮」— gento-ai側はsystem-proxy無効化しているのに対し、
   DL側は`Proxy::system`/環境変数既定を尊重する)。同一crate・同一version
   のため新規依存ではない。
+
+## WP-12 USearch索引・ハイブリッド検索 (2026-09-02)
+
+- **`usearch` =2.26.2 (default features = `numkong`のみ)** (gento-embedding,
+  通常依存)
+  - 用途: 埋め込みベクトル (ruri-v3・L2正規化済み) のHNSW近傍探索索引。
+    cosine metric・f32スカラーで使用 (設計 docs/embedding-runtime.md §6-7)。
+  - 入手元: crates.io (unum-cloud/USearch。Rust束縛は同repo `lang/rust`)。
+  - **配布license: Apache-2.0** (usearch本体・Rust束縛とも)。静的リンクに
+    再配布義務は表示保持のみ。
+  - **native依存のビルド要件 (重要)**: crateにC++ヘッダ群 (usearch本体は
+    header-only) が同梱され、`build.rs`が **cxx-build でC++17としてその場
+    コンパイル**する。加えてSIMDカーネルは `numkong` crate (>=7.5,<8) が
+    同様にネイティブソースからコンパイルし静的リンク (`links` metadata経由
+    のinclude path連携)。**ビルド時に C++17対応コンパイラ (g++/clang++/MSVC)
+    とcmake不要 (cc系のみ)** を要求する。Linux g++ 13.3で確認済み。
+    クリーンビルド時間が+1〜2分程度増える。
+  - features: `openmp`は**無効のまま** (§7「CPU使用率は控えめ既定」—
+    OpenMPリンク (libomp動的リンク) が配布を複雑化するため不使用。
+    並列構築はホスト側からインデックスを分割しない本設計では単一
+    バックグラウンドスレッドで行う)。`simsimd`はエイリアス (numkongと
+    同一) のため不使用。
+  - 依存方向: gento-embedding内の新module `vector_index` のみで使用
+    (1ファイルに隔離 — version更新影響を最小化するWP-11のortと同じ
+    規約)。gento-searchはusearchに依存させない (RRF融合は純Rust)。
+  - 対応プラットフォーム: Linux/macOS/Windows (C++17があれば動作。
+    WP-17でWindows/macOS実機確認)。
+  - 版の保守状況: unum-cloud/USearchは活発開発中 (2.26系。2026-08-31
+    リリース)。Rust APIはcxx bridge経由で安定だが、minor更新で
+    `IndexOptions`等のフィールドが増える可能性あり — 更新時は
+    `vector_index.rs` のみ追従すればよい構造にしてある。

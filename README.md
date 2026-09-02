@@ -52,6 +52,24 @@ OpenAI互換endpoint (llama.cpp等) への接続プロファイルを登録す�
   (30s→2m→8m) で再試行。アプリ再起動後にジョブを再開
 - 詳細な契約は [docs/dev/api-contract.md](docs/dev/api-contract.md) §44
 
+## 自然言語検索・ハイブリッド検索 (WP-11/WP-12)
+
+ローカルruri-v3埋め込みモデル (ONNX Runtime・独立ワーカープロセス) で
+画像ごとの検索文書ベクトルを生成し、USearch HNSW索引で近傍検索する。
+
+- ヘッダー「AI」→「自然言語検索」タブで有効化 (モデル選択・進捗・索引状態)
+- 検索バーの重みスライダー「キーワード⇔意味」で、FTS5 bm25キーワード
+  検索と意味検索の重み付きRRF融合 (w=0..1) を指定できる
+- グリッドのコンテキストメニューや情報パネルの「類似画像を検索」で
+  対象画像に意味的に近い画像を表示できる
+- 埋め込み無効・索引未構築時もキーワード検索は常時機能し、意味検索は
+  警告付きで省略される
+- 索引は派生データ (`~/.local/share/gento-spike/indexes/`): 破損時は
+  SQLiteのベクトル正本から自動再構築する
+- 実測: 5万ベクトルで検索0.45ms・構築16.4s・索引144MiB
+  ([docs/dev/measurements/wp12-usearch-50k.md](docs/dev/measurements/wp12-usearch-50k.md))
+- 詳細な契約は [docs/dev/api-contract.md](docs/dev/api-contract.md) §45-46
+
 キーボード: Space=クイックプレビュー、Enter/ダブルクリック=ビューア、
 Esc=閉じる、F2=リネーム/WP-7、Delete=ゴミ箱/WP-7。右クリックで
 コンテキストメニュー (OSのファイルマネージャーで表示 / 外部アプリで開く /

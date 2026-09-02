@@ -35,6 +35,7 @@
     type MetaRow,
   } from "../asset-metadata";
   import { copyText } from "../ui/clipboard";
+  import { semanticPercent } from "../search";
   import type { AiRun } from "../ai";
 
   let {
@@ -61,6 +62,10 @@
     collectionMemoNote = null,
     onSaveCollectionMemo = undefined,
     searchEvidence = null,
+    semanticScore = null,
+    semanticLabel = "意味",
+    canSimilarSearch = false,
+    onSimilarSearch = undefined,
     assetMetadata = null,
     aiRuns = [],
     onEnqueueAi = undefined,
@@ -105,6 +110,14 @@
     onSaveCollectionMemo?: (note: string) => void;
     /** WP-8: 検索一致根拠 (検索結果表示中のみ。null=非表示)。 */
     searchEvidence?: SearchFieldMatch[] | null;
+    /** WP-12: 意味スコア (cosine類似度。null=非表示)。 */
+    semanticScore?: number | null;
+    /** WP-12: スコアの表示ラベル (「意味」/「類似度」)。 */
+    semanticLabel?: string;
+    /** WP-12: 類似画像検索が実行可能か。 */
+    canSimilarSearch?: boolean;
+    /** WP-12: 類似画像検索の実行 (Appが構築)。 */
+    onSimilarSearch?: () => void;
     /** WP-9: 埋め込み画像メタデータ (asset_metadata_get。null=未取得/なし)。 */
     assetMetadata?: AssetMetadataDto | null;
     /** WP-10: フォーカス項目のAI実行履歴 (空=非表示)。 */
@@ -489,6 +502,25 @@
             {/each}
           </ul>
         </div>
+      {/if}
+      {#if semanticScore !== null}
+        <div class="semantic-score" data-testid="semantic-score">
+          <h4>{semanticLabel}</h4>
+          <p>{semanticLabel} {semanticPercent(semanticScore)}</p>
+        </div>
+      {/if}
+      {#if item !== null && item.dbState === "asset"}
+        <button
+          class="similar-button"
+          disabled={!canSimilarSearch}
+          title={canSimilarSearch
+            ? "この画像に意味的に近い画像を検索します"
+            : "自然言語検索 (埋め込み+索引) が利用可能になると実行できます"}
+          onclick={() => onSimilarSearch?.()}
+          data-testid="similar-search-button"
+        >
+          類似画像を検索
+        </button>
       {/if}
     {/if}
   </section>
@@ -942,6 +974,21 @@
 
   .search-evidence {
     margin-top: 0.5rem;
+  }
+
+  /* WP-12: 意味スコア・類似画像検索 */
+  .semantic-score {
+    margin-top: 0.5rem;
+  }
+
+  .semantic-score p {
+    margin: 0.25rem 0 0;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .similar-button {
+    margin-top: 0.6rem;
+    width: 100%;
   }
 
   /* WP-9: 埋め込みメタデータの折りたたみブロック */

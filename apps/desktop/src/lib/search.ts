@@ -15,7 +15,7 @@ export type SearchIpc = {
   invoke: <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
 };
 
-/** `search_run` の応答。 */
+/** `search_run` / `similar_search_run` の応答。 */
 export type SearchRunResult = {
   summary: CatalogSummary;
   total: number;
@@ -23,6 +23,10 @@ export type SearchRunResult = {
   elapsedMs: number;
   warnings: string[];
   queryJson: string;
+  /** "query" (構文検索) | "similar" (類似画像)。WP-12。 */
+  kind: string;
+  /** assetId → cosine類似度 (上位分。WP-12)。 */
+  semanticScores: Record<string, number>;
 };
 
 /** `search_evidence` の応答項目。 */
@@ -130,6 +134,29 @@ function toMessage(value: unknown): string {
   return value instanceof Error ? value.message : String(value);
 }
 
+/** cosine類似度 → 表示用パーセント文字列 (0..100に拘束。負は0扱い)。 */
+export function semanticPercent(score: number): string {
+  const clamped = Number.isFinite(score) ? Math.min(1, Math.max(0, score)) : 0;
+  return `${Math.round(clamped * 100)}%`;
+}
+
+/** 意味重みスライダー値 (0..1) の隣ラベル。 */
+export function weightLabel(weight: number): string {
+  if (weight <= 0) {
+    return "キーワード";
+  }
+  if (weight >= 1) {
+    return "意味";
+  }
+  if (weight >= 0.65) {
+    return "意味寄り";
+  }
+  if (weight <= 0.35) {
+    return "キーワード寄り";
+  }
+  return "バランス";
+}
+
 export class SearchStore {
   running = false;
   lastResult: SearchRunResult | null = null;
@@ -137,8 +164,14 @@ export class SearchStore {
   /** 現在の検索構文 (再実行・保存の既定値)。 */
   lastQuery = "";
   lastFilters: GuiFilters = { ...EMPTY_FILTERS };
+  /** 最終実行の意味重み (0 = 純キーワード)。 */
+  lastSemanticWeight = 0;
+  /** 表示種別 ("query" | "similar")。 */
+  lastKind: "query" | "similar" = "query";
   /** assetId → 一致根拠列。 */
   evidence: Record<string, SearchFieldMatch[]> = {};
+  /** assetId → cosine類似度 (ハイブリッド/類似表示の上位分。WP-12)。 */
+  semantic: Record<string, number> = {};
 
   private readonly changeListeners = new Set<() => void>();
 
@@ -157,11 +190,13 @@ export class SearchStore {
     }
   }
 
-  /** 検索を実行し、結果をカタログのsearchソースへ表示する。 */
+  /** 検索を実行し、結果をカタログのsearchソースへ表示する。
+   * semanticWeight (0..1) が0超ならハイブリッド検索 (WP-12)。 */
   async run(
     query: string,
     filters: GuiFilters,
     scope: { rootId?: string; collectionId?: string } = {},
+    semanticWeight = 0,
   ): Promise<boolean> {
     this.running = true;
     this.lastError = null;
@@ -175,7 +210,11 @@ export class SearchStore {
       this.notify();
       return false;
     }
-    const args: Record<string, unknown> = { query, filters: terms };
+    const args: Record<string, unknown> = {
+      query,
+      filters: terms,
+      semanticWeight: Math.min(1, Math.max(0, semanticWeight)),
+    };
     if (scope.rootId !== undefined) {
       args.scopeRootId = scope.rootId;
     }
@@ -187,7 +226,10 @@ export class SearchStore {
       this.lastResult = result;
       this.lastQuery = query;
       this.lastFilters = { ...filters };
+      this.lastSemanticWeight = semanticWeight;
+      this.lastKind = "query";
       this.evidence = {};
+      this.semantic = { ...result.semanticScores };
       return true;
     } catch (error) {
       this.lastError = toMessage(error);
@@ -198,7 +240,32 @@ export class SearchStore {
     }
   }
 
-  /** 表示中検索を新しいDB状態で再実行する (メタデータ編集後のrefresh用)。 */
+  /** 類似画像検索 (WP-12): 対象assetのdocベクトル近傍を検索表示する。 */
+  async runSimilar(assetId: string, k?: number): Promise<boolean> {
+    this.running = true;
+    this.lastError = null;
+    this.notify();
+    try {
+      const result = await this.ipc.invoke<SearchRunResult>("similar_search_run", {
+        assetId,
+        k: k ?? null,
+      });
+      this.lastResult = result;
+      this.lastKind = "similar";
+      this.evidence = {};
+      this.semantic = { ...result.semanticScores };
+      return true;
+    } catch (error) {
+      this.lastError = toMessage(error);
+      return false;
+    } finally {
+      this.running = false;
+      this.notify();
+    }
+  }
+
+  /** 表示中検索を新しいDB状態で再実行する (メタデータ編集後のrefresh用)。
+   * 類似画像表示は同assetで再検索される (WP-12)。 */
   async refresh(): Promise<boolean> {
     this.running = true;
     this.lastError = null;
@@ -207,6 +274,10 @@ export class SearchStore {
       const result = await this.ipc.invoke<SearchRunResult>("search_refresh", {});
       this.lastResult = result;
       this.evidence = {};
+      this.semantic = { ...result.semanticScores };
+      if (result.kind === "similar") {
+        this.lastKind = "similar";
+      }
       return true;
     } catch (error) {
       this.lastError = toMessage(error);

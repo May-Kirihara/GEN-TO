@@ -83,6 +83,7 @@
 | cipher | 0.5.2 | MIT OR Apache-2.0 | https://github.com/RustCrypto/traits |
 | cmake | 0.1.58 | MIT OR Apache-2.0 | https://github.com/rust-lang/cmake-rs |
 | cmov | 0.5.4 | Apache-2.0 OR MIT | https://github.com/RustCrypto/utils |
+| codespan-reporting | 0.13.1 | Apache-2.0 | https://github.com/brendanzab/codespan |
 | color_quant | 1.1.0 | MIT | https://github.com/image-rs/color_quant.git |
 | combine | 4.6.8 | MIT | https://github.com/Marwes/combine |
 | compact_str | 0.9.1 | MIT | https://github.com/ParkMyCar/compact_str |
@@ -110,6 +111,10 @@
 | ctor | 0.8.0 | Apache-2.0 OR MIT | https://github.com/mmastrac/rust-ctor |
 | ctor-proc-macro | 0.0.7 | Apache-2.0 OR MIT | https://github.com/mmastrac/rust-ctor |
 | ctutils | 0.4.2 | Apache-2.0 OR MIT | https://github.com/RustCrypto/utils |
+| cxx | 1.0.199 | MIT OR Apache-2.0 | https://github.com/dtolnay/cxx |
+| cxx-build | 1.0.199 | MIT OR Apache-2.0 | https://github.com/dtolnay/cxx |
+| cxxbridge-flags | 1.0.199 | MIT OR Apache-2.0 | https://github.com/dtolnay/cxx |
+| cxxbridge-macro | 1.0.199 | MIT OR Apache-2.0 | https://github.com/dtolnay/cxx |
 | daachorse | 1.0.1 | MIT OR Apache-2.0 | https://github.com/daac-tools/daachorse |
 | darling | 0.20.11 | MIT | https://github.com/TedDriggs/darling |
 | darling | 0.23.0 | MIT | https://github.com/TedDriggs/darling |
@@ -295,6 +300,7 @@
 | libredox | 0.1.21 | MIT | https://gitlab.redox-os.org/redox-os/libredox.git |
 | libsqlite3-sys | 0.28.0 | MIT | https://github.com/rusqlite/rusqlite |
 | libwebp-sys | 0.9.6 | MIT | https://github.com/NoXF/libwebp-sys |
+| link-cplusplus | 1.0.12 | MIT OR Apache-2.0 | https://github.com/dtolnay/link-cplusplus |
 | linux-raw-sys | 0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://github.com/sunfishcode/linux-raw-sys |
 | litemap | 0.8.3 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | lock_api | 0.4.14 | MIT OR Apache-2.0 | https://github.com/Amanieu/parking_lot |
@@ -338,6 +344,7 @@
 | num-traits | 0.2.19 | MIT OR Apache-2.0 | https://github.com/rust-num/num-traits |
 | num_enum | 0.7.6 | BSD-3-Clause OR MIT OR Apache-2.0 | https://github.com/illicitonion/num_enum |
 | num_enum_derive | 0.7.6 | BSD-3-Clause OR MIT OR Apache-2.0 | https://github.com/illicitonion/num_enum |
+| numkong | 7.8.2 | Apache-2.0 | https://github.com/ashvardanian/NumKong |
 | objc2 | 0.6.4 | MIT | https://github.com/madsmtm/objc2 |
 | objc2-app-kit | 0.3.2 | Zlib OR Apache-2.0 OR MIT | https://github.com/madsmtm/objc2 |
 | objc2-cloud-kit | 0.3.2 | Zlib OR Apache-2.0 OR MIT | https://github.com/madsmtm/objc2 |
@@ -442,6 +449,7 @@
 | schemars | 1.2.2 | MIT | https://github.com/GREsau/schemars |
 | schemars_derive | 0.8.22 | MIT | https://github.com/GREsau/schemars |
 | scopeguard | 1.2.0 | MIT OR Apache-2.0 | https://github.com/bluss/scopeguard |
+| scratch | 1.0.9 | MIT OR Apache-2.0 | https://github.com/dtolnay/scratch |
 | secret-service | 5.2.0 | MIT OR Apache-2.0 | https://github.com/hwchen/secret-service-rs.git |
 | security-framework | 3.7.0 | MIT OR Apache-2.0 | https://github.com/kornelski/rust-security-framework |
 | security-framework-sys | 2.17.0 | MIT OR Apache-2.0 | https://github.com/kornelski/rust-security-framework |
@@ -508,6 +516,7 @@
 | tauri-winres | 0.3.6 | MIT | https://github.com/tauri-apps/winres |
 | tempfile | 3.27.0 | MIT OR Apache-2.0 | https://github.com/Stebalien/tempfile |
 | tendril | 0.5.1 | MIT OR Apache-2.0 | https://github.com/servo/html5ever |
+| termcolor | 1.4.1 | Unlicense OR MIT | https://github.com/BurntSushi/termcolor |
 | thiserror | 1.0.69 | MIT OR Apache-2.0 | https://github.com/dtolnay/thiserror |
 | thiserror | 2.0.20 | MIT OR Apache-2.0 | https://github.com/dtolnay/thiserror |
 | thiserror-impl | 1.0.69 | MIT OR Apache-2.0 | https://github.com/dtolnay/thiserror |
@@ -560,6 +569,7 @@
 | unicode-normalization | 0.1.25 | MIT OR Apache-2.0 | https://github.com/unicode-rs/unicode-normalization |
 | unicode-normalization-alignments | 0.1.12 | MIT/Apache-2.0 | https://github.com/n1t0/unicode-normalization |
 | unicode-segmentation | 1.13.3 | MIT OR Apache-2.0 | https://github.com/unicode-rs/unicode-segmentation |
+| unicode-width | 0.2.2 | MIT OR Apache-2.0 | https://github.com/unicode-rs/unicode-width |
 | unicode_categories | 0.1.1 | MIT OR Apache-2.0 | https://github.com/swgillespie/unicode-categories |
 | untrusted | 0.9.0 | ISC | https://github.com/briansmith/untrusted |
 | ureq | 3.4.0 | MIT OR Apache-2.0 | https://github.com/algesten/ureq |
@@ -567,6 +577,7 @@
 | url | 2.5.8 | MIT OR Apache-2.0 | https://github.com/servo/rust-url |
 | urlencoding | 2.1.3 | MIT | https://github.com/kornelski/rust_urlencoding |
 | urlpattern | 0.3.0 | MIT | https://github.com/denoland/rust-urlpattern |
+| usearch | 2.26.2 | Apache-2.0 | https://github.com/unum-cloud/USearch |
 | utf8-zero | 0.8.1 | MIT OR Apache-2.0 | https://github.com/algesten/utf8-zero |
 | utf8_iter | 1.0.4 | Apache-2.0 OR MIT | https://github.com/hsivonen/utf8_iter |
 | uuid | 1.26.0 | Apache-2.0 OR MIT | https://github.com/uuid-rs/uuid |
