@@ -2737,6 +2737,80 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_sweep_neither_double_counts_inflight_nor_rehashes_linked() {
+        // FIXLIB-1副次: メンテナンス周期の未リンクpresentファイル再提出は
+        // (a) プール内in-flightジョブと重複しても会計を乱さない
+        //     (同一キーでMergedExisting統合 — hash_pendingは増えない)
+        // (b) リンク済みファイルを再ハッシュしない (SQLがasset_id IS NULLで除外)
+        let (db_path, _dir) = temp_db("maintenance-sweep");
+        let data = TestDir::new("maintenance-sweep-data");
+        const FILES: usize = 12;
+        let mut paths = Vec::new();
+        for i in 0..FILES {
+            paths.push(data.write(&format!("f{i:02}.png"), PNG_A));
+        }
+
+        let db = Arc::new(gento_db::Db::open(&db_path).unwrap());
+        let host = TestHost::new();
+        // 遅延ハッシュ (1件150ms × 12件 / 2ワーカー ≈ 900ms) の間に
+        // メンテナンス (200ms周期) が複数回走る。
+        let fs = Arc::new(RiggedHashFs::new(Box::new(|_path, _calls| None)).with_delay(150));
+        let controller = LibraryController::with_fs_maintenance(
+            db,
+            host.clone(),
+            fs.clone(),
+            Duration::from_millis(200),
+            8_192,
+        )
+        .unwrap();
+        let (root, _) = controller.add_root(data.path()).unwrap();
+        let _ = root;
+
+        // (a) in-flight中の会計: hash_pending は発行済み件数 (FILES) を超えない
+        //     (再提出が二重計上すれば超える)。
+        let mut pending_ok = true;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let pending = controller.shared.hash_pending.load(Ordering::SeqCst);
+            if pending > FILES as u64 {
+                pending_ok = false;
+                break;
+            }
+            if linked_count(&controller) == FILES as u64 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            pending_ok,
+            "メンテナンス再提出がin-flightジョブを二重計上した: pending={}",
+            controller.shared.hash_pending.load(Ordering::SeqCst)
+        );
+        assert!(
+            wait_until(20, || linked_count(&controller) == FILES as u64),
+            "全ファイルリンク: status={:?}",
+            controller.status_dto()
+        );
+
+        // (b) リンク済みファイルは再ハッシュしない: メンテナンス周期を
+        //     3周以上待っても呼び出し回数が1回/ファイルのまま。
+        let settled: Vec<u64> = paths.iter().map(|p| fs.hash_calls_of(p)).collect();
+        assert!(
+            settled.iter().all(|&calls| calls == 1),
+            "各ファイル1回のハッシュでリンク済み: {settled:?}"
+        );
+        std::thread::sleep(Duration::from_millis(700));
+        let after: Vec<u64> = paths.iter().map(|p| fs.hash_calls_of(p)).collect();
+        assert_eq!(after, settled, "リンク済みの再ハッシュ無し");
+        assert_eq!(
+            controller.shared.hash_pending.load(Ordering::SeqCst),
+            0,
+            "静定時に会計0"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
     fn maintenance_resolves_immutable_unlinked_file_without_watch_events() {
         // FG-WP2-2: 監視健全な通常ルートでも「不変な未リンクファイル」が
         // 永続未解決にならない。スキャン・監視イベントなしで、メンテナンス

@@ -405,7 +405,9 @@
         {/if}
         {#if thumbEventLog.length > 0}
           <div class="dev-log">
-            {#each thumbEventLog.slice(0, 8) as line (line)}
+            <!-- キーは行位置: ログ行は同一内容になり得る (同一秒・同件数の
+                 ready等) ため内容キーだとeach_key_duplicateで効果が落ちる -->
+            {#each thumbEventLog.slice(0, 8) as line, logIndex (logIndex)}
               <div class="dev-log-line">{line}</div>
             {/each}
           </div>

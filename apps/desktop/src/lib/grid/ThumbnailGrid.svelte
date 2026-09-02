@@ -449,7 +449,12 @@
         break;
       }
       const item = grid.getItem(index);
-      cells.push({ index, key: item ? item.id : `pending-${index}` });
+      // キーは位置とidの合成: libraryスナップショットはBLAKE3重複ファイルが
+      // 同一Assetを共有するため item.id 単独では行内で重複し得る
+      // (1615ファイル→974アセット等)。keyed eachのキー重複はSvelte 5が
+      // each_key_duplicateでレンダリング効果を落とし、以後その行が
+      // 永久に更新されなくなる (FIXLIB-1)。
+      cells.push({ index, key: item ? `${item.id}@${index}` : `pending-${index}` });
     }
     return cells;
   }

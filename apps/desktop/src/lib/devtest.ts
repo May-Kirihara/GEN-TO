@@ -260,6 +260,10 @@ function n(value: number | null | undefined, digits = 2): string {
   return typeof value === "number" ? value.toFixed(digits) : "-1";
 }
 
+function toBridgeMessage(value: unknown): string {
+  return value instanceof Error ? `${value.message}` : String(value);
+}
+
 function scheme(url: string | null): string {
   if (url === null) {
     return "none";
@@ -406,6 +410,22 @@ export function installDevBridge(stores: DevBridgeStores): void {
   if (typeof window === "undefined" || "__gentoTest" in window) {
     return;
   }
+
+  // FIXLIB-1: WebView内の未捕捉JS例外をdevtestチャネルへ露出する
+  // (レンダリング効果のクラッシュはUI側で静かに呑まれるため)。
+  let jsErrorCount = 0;
+  let jsErrorLast = "";
+  const noteJsError = (message: string): void => {
+    jsErrorCount++;
+    jsErrorLast = message.slice(0, 200);
+  };
+  window.addEventListener("error", (event) => {
+    const top = event.error instanceof Error ? ` @ ${event.error.stack?.split("\n")[1]?.trim() ?? ""}` : "";
+    noteJsError(`${event.message}${top}`);
+  });
+  window.addEventListener("unhandledrejection", (event) => {
+    noteJsError(`unhandled: ${toBridgeMessage(event.reason)}`);
+  });
 
   const readout = document.createElement("pre");
   readout.id = "devtest-readout";
@@ -924,13 +944,53 @@ export function installDevBridge(stores: DevBridgeStores): void {
     if (grid === null) {
       return [];
     }
-    const dom = document.querySelectorAll("[data-grid-cell]").length;
+    const cells = Array.from(document.querySelectorAll<HTMLElement>("[data-grid-cell]"));
+    const dom = cells.length;
     const ready0 = grid.summary !== null && grid.summary.total > 0 && grid.thumbUrlFor("0") !== null ? 1 : 0;
+    // FIXLIB-1: セル単位の<img>描画統計。「要求/ready受理は進むのに描画されない」
+    // 系の欠陥で、統計値 (req/rdy) が正常に見える偽陽性をDOM実測で切り分ける。
+    // フィールド名は既存ドライバのdevtest_value先頭一致 (CL n= 等) を
+    // 奪わないよう命名済み (n→img, err→bad)。rdy=はG行より後ろにあるため
+    // G行の値が先頭一致する (従来通り)。
+    // img=セル内img総数 / ok=デコード成功 / bad=ロード完了だが破損
+    // / pend=ロード中 / none=imgを持たないセル / rdy=ストアがURLを保持するセル
+    // / it=itemを解決できるセル / t0=先頭セルのtitle文字数 (0=item未描画)
+    let imgTotal = 0;
+    let imgOk = 0;
+    let imgErr = 0;
+    let imgPend = 0;
+    let cellNoImg = 0;
+    let cellUrlReady = 0;
+    let cellItem = 0;
+    const firstTitle = cells[0]?.getAttribute("title") ?? "";
+    for (const cell of cells) {
+      const img = cell.querySelector("img");
+      if (img === null) {
+        cellNoImg++;
+      } else {
+        imgTotal++;
+        if (img.complete && img.naturalWidth > 0) {
+          imgOk++;
+        } else if (img.complete) {
+          imgErr++;
+        } else {
+          imgPend++;
+        }
+      }
+      const index = Number(cell.dataset.index);
+      const item = Number.isInteger(index) ? grid.getItem(index) : null;
+      if (item !== null) {
+        cellItem++;
+      }
+      if (item !== null && grid.thumbUrlFor(item.id) !== null) {
+        cellUrlReady++;
+      }
+    }
     const scrollEl = document.querySelector<HTMLElement>(".grid-scroll");
     const ae = document.activeElement;
     const sel = stores.getSelection();
     const s = grid.stats;
-    return [
+    const gridLinesOut = [
       `G tot=${grid.summary?.total ?? 0} mode=${grid.summary?.mode ?? "-"}` +
         ` srt=${grid.summary?.sort ?? "-"}` +
         ` req=${s.requested} bat=${s.batches} rej=${s.rejectedFull}` +
@@ -940,7 +1000,14 @@ export function installDevBridge(stores: DevBridgeStores): void {
         ` st=${Math.round(scrollEl?.scrollTop ?? -1)}` +
         ` ae=${ae === null ? "-" : `${ae.tagName}.${String(ae.className).split(" ")[0]}`}` +
         ` selN=${sel?.ids.length ?? -1} foc=${sel?.focusIndex ?? -1}`,
+      `IM img=${imgTotal} ok=${imgOk} bad=${imgErr} pend=${imgPend}` +
+        ` none=${cellNoImg} rdy=${cellUrlReady} it=${cellItem} t0=${firstTitle.length}` +
+        ` jse=${jsErrorCount}`,
     ];
+    if (jsErrorLast !== "") {
+      gridLinesOut.push(`JSE last="${jsErrorLast.replaceAll('"', "'")}"`);
+    }
+    return gridLinesOut;
   }
 
   /** QA-WP4: 選別セッション状態行 (再開シナリオの実機E2E用)。 */
