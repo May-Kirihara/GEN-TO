@@ -29,8 +29,9 @@
 //! - `key:値` = 等価、`key:>=値` `key:<=値` `key:>値` `key:<値` = 比較、
 //!   `key:"句"` = 引用値。
 //! - keys: `tag` `rating` `cull` `fav` `type` `path` `name` `note` `added`。
-//! - `model` / `steps` / `has:workflow` はWP-9で画像メタデータが入るまで
-//!   **未対応キー** (エラーではなく警告。WP-9接続時に有効化)。
+//! - WP-9で画像メタデータキーを追加: `model` `sampler` `vae` `lora`
+//!   (部分一致) / `steps` (数値比較) / `has:workflow`
+//!   (ComfyUI workflow保持。asset_metadata列へクエリ)。
 
 use serde::{Deserialize, Serialize};
 
@@ -97,6 +98,18 @@ pub enum FieldKey {
     Name,
     Note,
     Added,
+    /// 生成モデル名 (asset_metadata.generation_model。WP-9)。
+    Model,
+    /// 生成ステップ数 (asset_metadata.steps。WP-9)。
+    Steps,
+    /// 特殊保持確認 (`has:workflow`。WP-9)。
+    Has,
+    /// サンプラー名 (asset_metadata.sampler。WP-9)。
+    Sampler,
+    /// VAE名 (asset_metadata.vae。WP-9)。
+    Vae,
+    /// LoRA名 (asset_metadata.generation_extra JSON内。WP-9)。
+    Lora,
 }
 
 impl FieldKey {
@@ -112,6 +125,12 @@ impl FieldKey {
             FieldKey::Name => "name",
             FieldKey::Note => "note",
             FieldKey::Added => "added",
+            FieldKey::Model => "model",
+            FieldKey::Steps => "steps",
+            FieldKey::Has => "has",
+            FieldKey::Sampler => "sampler",
+            FieldKey::Vae => "vae",
+            FieldKey::Lora => "lora",
         }
     }
 
@@ -126,6 +145,12 @@ impl FieldKey {
             "name" => FieldKey::Name,
             "note" => FieldKey::Note,
             "added" => FieldKey::Added,
+            "model" => FieldKey::Model,
+            "steps" => FieldKey::Steps,
+            "has" => FieldKey::Has,
+            "sampler" => FieldKey::Sampler,
+            "vae" => FieldKey::Vae,
+            "lora" => FieldKey::Lora,
             _ => return None,
         })
     }
@@ -245,12 +270,9 @@ impl IsoDate {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParseOutcome {
     pub query: SearchQuery,
-    /// 未対応キー (WP-9接続待ち) の警告。クエリとしては無視される。
+    /// 付帯警告 (クエリとしては無視される項目についての注記)。
     pub warnings: Vec<String>,
 }
-
-/// 未対応キー (WP-9で有効化予定)。エラーにせず警告へ流す。
-const FUTURE_KEYS: [&str; 3] = ["model", "steps", "has"];
 
 /// 検索構文をパースする。空文字列・空白のみ = 空クエリ (全件)。
 pub fn parse(input: &str) -> Result<ParseOutcome, ParseError> {
@@ -273,12 +295,6 @@ pub fn parse(input: &str) -> Result<ParseOutcome, ParseError> {
                 }
             }
             Token::Field { key, op, value } => {
-                if FUTURE_KEYS.contains(&key.as_str()) {
-                    outcome.warnings.push(format!(
-                        "キー「{key}」はまだ検索対象に入っていません (画像メタデータ対応後に有効化されます)"
-                    ));
-                    continue;
-                }
                 let field_key = FieldKey::from_str_opt(&key)
                     .ok_or_else(|| err(position, format!("不明な検索キーです: {key}")))?;
                 let condition = build_condition(position, field_key, op, value)?;
@@ -469,6 +485,50 @@ fn build_condition(
                 key,
                 op: CmpOp::Eq,
                 value: FieldValue::DateRange { from, to },
+            })
+        }
+        // WP-9: 埋め込み画像メタデータの正規化列 (asset_metadata) への条件。
+        FieldKey::Model | FieldKey::Sampler | FieldKey::Vae | FieldKey::Lora => {
+            text_condition(key, op, position, value)
+        }
+        FieldKey::Steps => {
+            let op = require_cmp_or_eq(op, position, "steps")?;
+            let number: i64 = value
+                .parse()
+                .map_err(|_| err(position, "steps の値は整数で指定してください"))?;
+            Ok(FieldCondition {
+                key,
+                op,
+                value: FieldValue::Number(number),
+            })
+        }
+        FieldKey::Has => {
+            // 比較演算子は意味を成さない (テキスト系キーと同様の拒否)。
+            let op = match op {
+                FieldOp::Eq => CmpOp::Eq,
+                FieldOp::Cmp(cmp) => {
+                    return Err(err(
+                        position,
+                        format!(
+                            "キー「has」に比較演算子 ({}) は使えません",
+                            cmp_to_syntax(cmp)
+                        ),
+                    ))
+                }
+            };
+            let parsed = match value.as_str() {
+                "workflow" => "workflow",
+                other => {
+                    return Err(err(
+                        position,
+                        format!("has の値が不正です: {other} (現在は workflow のみ対応)"),
+                    ))
+                }
+            };
+            Ok(FieldCondition {
+                key,
+                op,
+                value: FieldValue::Text(parsed.to_string()),
             })
         }
     }
@@ -782,11 +842,81 @@ mod tests {
 
     #[test]
     fn future_keys_warn_but_do_not_error() {
-        let outcome = parse_ok("model:\"model-name\" steps:>=30 has:workflow");
-        assert!(outcome.query.terms.is_empty(), "未対応キーは無視される");
-        assert_eq!(outcome.warnings.len(), 3);
-        assert!(outcome.warnings[0].contains("model"));
-        assert!(outcome.warnings[2].contains("has"));
+        // WP-9で model/steps/has は有効化済み。まだ未対応のキーが警告に
+        // 流れる経路の検証として、存在しない将来キー相当を直接流し込む。
+        // (FUTURE_KEYS機構はWP-9で有効化完了に伴い廃止 — 未知キーは
+        // 「不明な検索キー」エラーになる。api-contract §43参照)
+        let error = parse("quantum:x").unwrap_err();
+        assert!(error.message.contains("不明な検索キー"), "{error}");
+    }
+
+    #[test]
+    fn wp9_metadata_keys_parse_as_fields() {
+        // model/steps/has はWP-9で正式キー化 (embedded画像メタデータ検索)。
+        let outcome = parse_ok("model:\"animagine xl\" steps:>=30 has:workflow");
+        assert!(
+            outcome.warnings.is_empty(),
+            "警告は出ない: {warnings:?}",
+            warnings = outcome.warnings
+        );
+        let conditions = outcome.query.field_conditions();
+        assert_eq!(conditions.len(), 3);
+        assert_eq!(
+            conditions[0],
+            &FieldCondition {
+                key: FieldKey::Model,
+                op: CmpOp::Eq,
+                value: FieldValue::Text("animagine xl".to_string()),
+            }
+        );
+        assert_eq!(
+            conditions[1],
+            &FieldCondition {
+                key: FieldKey::Steps,
+                op: CmpOp::Ge,
+                value: FieldValue::Number(30),
+            }
+        );
+        assert_eq!(
+            conditions[2],
+            &FieldCondition {
+                key: FieldKey::Has,
+                op: CmpOp::Eq,
+                value: FieldValue::Text("workflow".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn wp9_sampler_vae_lora_keys() {
+        let outcome = parse_ok("sampler:\"euler a\" vae:sdxl lora:\"add detail\"");
+        let conditions = outcome.query.field_conditions();
+        assert_eq!(conditions[0].key, FieldKey::Sampler);
+        assert_eq!(conditions[0].value, FieldValue::Text("euler a".to_string()));
+        assert_eq!(conditions[1].key, FieldKey::Vae);
+        assert_eq!(conditions[2].key, FieldKey::Lora);
+        assert_eq!(
+            conditions[2].value,
+            FieldValue::Text("add detail".to_string())
+        );
+        // テキスト系キーと同じく比較演算子は不可
+        assert!(parse("model:>=x").is_err());
+        assert!(parse("sampler:>=x").is_err());
+    }
+
+    #[test]
+    fn wp9_steps_and_has_validation() {
+        assert!(parse("steps:20").is_ok());
+        assert!(parse("steps:<50").is_ok());
+        let error = parse("steps:abc").unwrap_err();
+        assert!(error.message.contains("整数"), "{error}");
+        let error = parse("steps:>=x").unwrap_err();
+        assert!(error.message.contains("整数"), "{error}");
+        // has は workflow のみ (Eq専用)
+        let error = parse("has:foo").unwrap_err();
+        assert!(error.message.contains("has の値が不正"), "{error}");
+        let error = parse("has:>=workflow").unwrap_err();
+        assert!(error.message.contains("比較演算子"), "{error}");
     }
 
     #[test]

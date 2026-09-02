@@ -1745,3 +1745,98 @@ docs/dev/measurements/ とhandoff参照。
   asset_detail取得が有効。メタデータ編集可否の規則正本は
   `lib/metadata.ts canEditMetadata`)
 - `GENTO_API_VERSION` 据え置き (1): 追加のみ
+
+## 43. WP-9: 埋め込み画像メタデータ (EXIF / IPTC / PNG生成メタデータ)
+
+### 基本方針 (spec-draft §12)
+
+- **読み取り専用**: 元画像のバイト列は一切変更しない (BLAKE3前後一致を
+  cargoテスト `metadata_extraction_does_not_modify_file_bytes` で保証)
+- 2層構造: 正規化列 (`asset_metadata` 既存列) + 生データ
+  (`raw_exif` / `raw_iptc` / `raw_png_metadata` / `raw_workflow` のJSON)
+- 未知メタデータも破棄せずRaw表示・コピー可能 (未知チャンクはpng-text行の
+  raw JSONへ。上限超過チャンクは `__warnings` 配列でスキップ記録)
+- **migrationなし**: 必要列はすべてmigration #1に存在
+  (`UNIQUE(asset_id, parser_name)` で1 asset = 複数parser行の縦持ち)
+
+### parser一覧 (parser_name@version)
+
+| parser | 対象 | 主な正規化先 |
+|---|---|---|
+| `exif@1` | JPEG APP1 / TIFF / PNG eXIf / WebP EXIF (kamadak-exif) | taken_at (RFC3339), camera_make/model, lens, gps_lat/lon (十進度・S/W負), orientation + `raw_exif` (全フィールドJSON) |
+| `iptc@1` | JPEG APP13 8BIM内IIM (最小自作) | 正規化列なし。keywords/caption/byline/copyright/title等を `raw_iptc` JSONへ (未知datasetは `r:d` 生キー) |
+| `png-text@1` | tEXt / iTXt / zTXt 全収集 (自前走査) | 正規化列なし。全チャンクを `raw_png_metadata` JSONへ |
+| `sd-params@1` | `parameters` チャンク (SD WebUI/Forge形式) | generator="Stable Diffusion WebUI", positive/negative_prompt, steps, cfg_scale, seed(文字列), sampler, scheduler(Schedule type), generation_model(Model), vae + `generation_extra` JSON (size/model_hash/clip_skip/loras等) |
+| `comfy@1` | `prompt` チャンク (API JSON) + `workflow` チャンク | generator="ComfyUI"。KSampler/KSamplerAdvancedのpositive/negative入力を接続追跡 (CLIPTextEncode・ConditioningCombine等、ベストエフォート)。steps/cfg/seed/sampler/scheduler。CheckpointLoader→generation_model, VAELoader→vae, LoraLoader→loras。`workflow` チャンクは `raw_workflow` へverbatim (解析しない) |
+| `nai@1` | `Comment` (JSON) + Title/Description/Software/Source | generator="NovelAI"。Description(またはComment.prompt)→positive, Comment.uc→negative, steps/scale/seed/sampler, Source→generation_model |
+
+- 読み取り上限: PNGテキストチャンク **1チャンク4MiB / 合計16MiB**
+  (超過は警告付きスキップ)、EXIFコンテナ抽出 (TIFF/WebP) の読み取り総量
+  **64MiB**、チャンク/セグメント/フィールド数上限 (異常ファイルへの安全弁)
+- Seedは表現差とu64超過のため**文字列**保持 (data-model §6)
+
+### 世代トークン規律 (WP-2パターン踏襲)
+
+- 解析はハッシュと**同一fd**で束ねる: `ScanFs::hash_and_probe_and_metadata`
+  (gento-image `hash_probe_metadata_file`)。fdトークン照合→BLAKE3→
+  プローブ→メタデータ抽出→fdトークン再照合。Stale時は解析結果ごと破棄
+- 保存はリンクと同一書き込みクロージャ内 (`hash_and_link_file`):
+  DB行の現在トークンと突合後に `save_asset_metadata`。同version行の
+  再保存は冪等スキップ (内容はcontent hashから決定的)
+- **positive_promptは `embedded_prompt` キャプション** (kind=
+  embedded_prompt, source=embedded_metadata) としても保存し、FTS文書の
+  captions列へ接続 (WP-8の申し送り実装)。手動編集済み現行行は上書きしない
+
+### FTS文書構成の変更 (§42からの差分)
+
+- captions列: description + sd_tags + **embedded_prompt (positive)**。
+  **negative prompt・workflow全体は含めない** (data-model §9)
+- 検索ASTキー有効化 (旧FUTURE_KEYSの警告を削除し正式キーへ):
+  - `model:"…"` / `sampler:…` / `vae:…` / `lora:"…"` — asset_metadata列
+    (generation_model/sampler/vae) またはgeneration_extra JSONのloras配列
+    への部分一致 (EXISTS。NeはGUIフィルタのASTのみ)
+  - `steps:>=30` 等の数値比較
+  - `has:workflow` — raw_workflow IS NOT NULL (Ne = workflow非保持)
+
+### Commands
+
+- `asset_metadata_get(assetId)` (async) → `{id, parsers:
+  [{parserName, parserVersion, rawExif?, rawIptc?, rawPng?, rawWorkflow?,
+  updatedAt}], normalized: {takenAt, cameraMake, …, positivePrompt,
+  negativePrompt, generationExtra}}`。normalizedは複数parser行のマージ
+  (優先順位: 写真系=exif、生成系= sd-params > comfy > nai)。rawを含む
+  全行読み取りのためspawn_blocking (QA-WP8方式)
+- `metadata_reparse()` (async) → `{targeted, reparsed, changed, skipped,
+  elapsedMs}`。現行parser集合 (`gento_image::metadata::CURRENT_PARSERS`) に
+  対し (a) 行が1つもない (b) 既存行のversionが古い (c) 廃止parser名の行
+  を持つ asset を代表presentファイルのfdからトークン照合付きで再解析
+  (1回最大500 asset。バッチ実行)。進捗は `metadata:reparse_progress`
+  イベント `{done, total}`。Stale (ファイル変化) はスキップ扱い
+  (次回スキャンで再ハッシュされる)。**parser集合の変更 (追加・削除) は
+  全parser version繰り上げの運用** — 形式ごとの行構成差を「行の欠落」で
+  判定できないため
+
+### フロントエンド (InfoPanel)
+
+- 「写真メタデータ」節: 撮影日時・カメラ・レンズ・GPS座標 (十進度+方位)・
+  向き。GPSのAI送信設定は登録ルート単位である旨を注記 (設定接続はWP-10)
+- 「生成メタデータ」節: ツール/モデル/VAE/Sampler/Steps/CFG/Seed +
+  **positive/negative promptは折りたたみ** (展開時にのみレンダリング。
+  プレビューは先頭4096文字、コピーは全文) + **workflow JSON折りたたみ+
+  コピー** (raw_workflowをverbatim — ComfyUIへそのまま読み込ませ可能)
+- 「Raw metadata」節: parser行ごとの折りたたみ+コピー
+- ロジック正本は `lib/asset-metadata.ts` (純関数。vitestで検証)
+- dev bridge (E2E): `X` 行 `photo= gen= raw= pos=<文字数> neg= wf=<文字数>
+  wfx=<展開> rawn=<Raw折りたたみ数> cpy=<最後のコピー>`。アクションは
+  foCmdMode (`ctrl+shift+F12`) の `p`=折りたたみ全展開 / `i`=workflowコピー
+
+### 既知の制限
+
+- A1111のJPEG出力 (EXIF UserCommentへのparameters格納) は非対応
+  (PNGテキストチャンクのみ)
+- AVIFのEXIF (メタデータボックス内) は未対応 (EXIF対象はJPEG/TIFF/PNG/WebP)
+- GIF/BMPは埋め込みメタデータ対象外 (該当parserなし)
+- ComfyUIの条件ノード解決は既知クラスのみ (未知ノードはunknown扱い=
+  プロンプト抽出なし。rawのprompt JSONで確認可能)
+- 1ファイルに複数生成形式が混在する敵対的ケースは正規化優先順位
+  (sd-params > comfy > nai) で決定論化

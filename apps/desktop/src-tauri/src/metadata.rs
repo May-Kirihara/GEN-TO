@@ -593,6 +593,270 @@ pub fn asset_detail(
     asset_detail_impl(&state, asset_id)
 }
 
+// ===== WP-9: 埋め込み画像メタデータ (表示・Raw・再解析) =====
+
+/// parser行DTO (`asset_metadata_get` の `parsers` 要素)。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetMetadataParserDto {
+    pub parser_name: String,
+    pub parser_version: String,
+    pub raw_exif: Option<String>,
+    pub raw_iptc: Option<String>,
+    pub raw_png_metadata: Option<String>,
+    pub raw_workflow: Option<String>,
+    pub updated_at: String,
+}
+
+/// 正規化列の統合DTO (複数parser行のマージ結果。優先順位は
+/// `merge_normalized` 参照)。
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetMetadataNormalizedDto {
+    pub taken_at: Option<String>,
+    pub camera_make: Option<String>,
+    pub camera_model: Option<String>,
+    pub lens: Option<String>,
+    pub gps_latitude: Option<f64>,
+    pub gps_longitude: Option<f64>,
+    pub orientation: Option<i64>,
+    pub generator: Option<String>,
+    pub generation_model: Option<String>,
+    pub vae: Option<String>,
+    pub sampler: Option<String>,
+    pub scheduler: Option<String>,
+    pub steps: Option<i64>,
+    pub cfg_scale: Option<f64>,
+    pub seed: Option<String>,
+    pub positive_prompt: Option<String>,
+    pub negative_prompt: Option<String>,
+    pub generation_extra: Option<String>,
+}
+
+/// `asset_metadata_get` 応答。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetMetadataDto {
+    pub id: String,
+    pub parsers: Vec<AssetMetadataParserDto>,
+    pub normalized: AssetMetadataNormalizedDto,
+}
+
+/// 複数parser行の正規化列を優先順位付きでマージする。
+/// 写真系 (EXIF) はexif行、生成系は sd-params > comfy > nai >
+/// (その他アルファベット順) を優先 (1ファイル複数形式混入の決定論化)。
+pub(crate) fn merge_normalized(
+    rows: &[gento_core::assetmeta::AssetMetadataRecord],
+) -> AssetMetadataNormalizedDto {
+    use gento_core::assetmeta::AssetMetadataRecord as Row;
+    let priority = |name: &str| -> i32 {
+        match name {
+            "exif" => 0,
+            "sd-params" => 1,
+            "comfy" => 2,
+            "nai" => 3,
+            other => 10 + (other.chars().next().map_or(0, |c| c as i32)),
+        }
+    };
+    let mut order: Vec<&Row> = rows.iter().collect();
+    order.sort_by_key(|r| priority(&r.parsed.parser_name));
+    let mut out = AssetMetadataNormalizedDto::default();
+    for row in order {
+        let c = &row.parsed.columns;
+        let take_str = |slot: &mut Option<String>, v: &Option<String>| {
+            if slot.is_none() {
+                *slot = v.clone();
+            }
+        };
+        take_str(&mut out.taken_at, &c.taken_at);
+        take_str(&mut out.camera_make, &c.camera_make);
+        take_str(&mut out.camera_model, &c.camera_model);
+        take_str(&mut out.lens, &c.lens);
+        if out.gps_latitude.is_none() {
+            out.gps_latitude = c.gps_latitude;
+        }
+        if out.gps_longitude.is_none() {
+            out.gps_longitude = c.gps_longitude;
+        }
+        if out.orientation.is_none() {
+            out.orientation = c.orientation;
+        }
+        take_str(&mut out.generator, &c.generator);
+        take_str(&mut out.generation_model, &c.generation_model);
+        take_str(&mut out.vae, &c.vae);
+        take_str(&mut out.sampler, &c.sampler);
+        take_str(&mut out.scheduler, &c.scheduler);
+        if out.steps.is_none() {
+            out.steps = c.steps;
+        }
+        if out.cfg_scale.is_none() {
+            out.cfg_scale = c.cfg_scale;
+        }
+        take_str(&mut out.seed, &c.seed);
+        take_str(&mut out.positive_prompt, &c.positive_prompt);
+        take_str(&mut out.negative_prompt, &c.negative_prompt);
+        take_str(&mut out.generation_extra, &c.generation_extra);
+    }
+    out
+}
+
+/// `metadata:reparse_progress` イベントのペイロード。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReparseProgressPayload {
+    pub done: u64,
+    pub total: u64,
+}
+
+/// `metadata_reparse` 応答。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReparseResultDto {
+    pub targeted: u64,
+    pub reparsed: u64,
+    pub changed: u64,
+    pub skipped: u64,
+    pub elapsed_ms: u64,
+}
+
+/// parser更新後の再解析 (WP-9。本格ジョブ基盤はWP-10): 現行parser集合に
+/// 対して行が欠落/古いversionのassetを、代表presentファイルのfdから
+/// トークン照合付きで再解析する。async command + `spawn_blocking`
+/// (QA-WP8方式。UIスレッドをブロックしない)。進捗は
+/// `metadata:reparse_progress` イベント。
+#[tauri::command]
+pub async fn metadata_reparse(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ReparseResultDto, String> {
+    let db = db_of(&state)?;
+    let app_for_job = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        run_metadata_reparse(&db, &|payload: ReparseProgressPayload| {
+            let _ = app_for_job.emit("metadata:reparse_progress", payload);
+        })
+        .map(|mut result| {
+            result.elapsed_ms = started.elapsed().as_millis() as u64;
+            result
+        })
+    })
+    .await
+    .map_err(|e| format!("メタデータ再解析が失敗しました: {e}"))?
+}
+
+/// 再解析の実体 (テスト可能な分離。emitterは進捗イベント送出)。
+pub(crate) fn run_metadata_reparse(
+    db: &Arc<gento_db::Db>,
+    emit_progress: &dyn Fn(ReparseProgressPayload),
+) -> Result<ReparseResultDto, String> {
+    use gento_core::assetmeta::AssetMetadataRepo as _;
+    use gento_core::library::GenerationToken;
+    use gento_core::repo::LibraryRootRepo as _;
+    // バッチ: 1回のコマンドで処理する最大asset数 (大量再解析は複数回実行)。
+    const BATCH: u64 = 500;
+    let started = std::time::Instant::now();
+    let current: Vec<(String, String)> = gento_image::metadata::CURRENT_PARSERS
+        .iter()
+        .map(|(name, version)| (name.to_string(), version.to_string()))
+        .collect();
+    let targets = db
+        .with_reader(|repos| repos.assets_needing_reparse(&current, BATCH))
+        .map_err(repo_error_message)?;
+    let total = targets.len() as u64;
+    let mut reparsed = 0u64;
+    let mut changed = 0u64;
+    let mut skipped = 0u64;
+    let roots = db
+        .with_reader(|repos| repos.list_roots())
+        .map_err(repo_error_message)?;
+    for (index, target) in targets.iter().enumerate() {
+        let Some(root) = roots.iter().find(|r| r.id == target.root_id) else {
+            skipped += 1;
+            continue;
+        };
+        let path = root.path.join(&target.file.rel_path);
+        let token = GenerationToken::from_record(&target.file);
+        match gento_image::metadata::reparse_metadata_file(&path, &token) {
+            Ok(parsed) => {
+                reparsed += 1;
+                let wrote = db
+                    .with_writer(|repos| repos.save_asset_metadata(target.asset_id, &parsed))
+                    .map_err(repo_error_message)?;
+                if wrote {
+                    changed += 1;
+                }
+            }
+            Err(_) => {
+                // Stale (ファイルが変わった)・読み取り失敗: スキップ。
+                // 次回スキャンで再ハッシュ→再解析される。
+                skipped += 1;
+            }
+        }
+        emit_progress(ReparseProgressPayload {
+            done: index as u64 + 1,
+            total,
+        });
+    }
+    Ok(ReparseResultDto {
+        targeted: total,
+        reparsed,
+        changed,
+        skipped,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
+/// 埋め込みメタデータの取得 (WP-9)。async command: rawを含む全行の読み取り
+/// (巨大workflow付き) をUIスレッド外で実行する (QA-WP8方式)。
+#[tauri::command]
+pub async fn asset_metadata_get(
+    state: State<'_, AppState>,
+    asset_id: String,
+) -> Result<AssetMetadataDto, String> {
+    let state_db: Arc<gento_db::Db> = {
+        let mode = current_mode(&state);
+        let ids = parse_stable_asset_ids(mode, std::slice::from_ref(&asset_id))?;
+        let _ = ids;
+        db_of(&state)?
+    };
+    tauri::async_runtime::spawn_blocking(move || asset_metadata_get_blocking(&state_db, asset_id))
+        .await
+        .map_err(|e| format!("メタデータ取得が失敗しました: {e}"))?
+}
+
+/// spawn_blocking側の実体 (mode検証は済み)。
+fn asset_metadata_get_blocking(
+    db: &Arc<gento_db::Db>,
+    asset_id: String,
+) -> Result<AssetMetadataDto, String> {
+    use gento_core::assetmeta::AssetMetadataRepo as _;
+    let numeric: i64 = asset_id
+        .parse()
+        .map_err(|_| format!("無効なAssetIdです: {asset_id}"))?;
+    db.with_reader(|repos| {
+        repos.get_asset(numeric)?.ok_or(RepoError::NotFound)?;
+        let rows = repos.list_asset_metadata(numeric)?;
+        Ok(AssetMetadataDto {
+            id: asset_id.clone(),
+            normalized: merge_normalized(&rows),
+            parsers: rows
+                .into_iter()
+                .map(|r| AssetMetadataParserDto {
+                    parser_name: r.parsed.parser_name,
+                    parser_version: r.parsed.parser_version,
+                    raw_exif: r.parsed.raw_exif,
+                    raw_iptc: r.parsed.raw_iptc,
+                    raw_png_metadata: r.parsed.raw_png_metadata,
+                    raw_workflow: r.parsed.raw_workflow,
+                    updated_at: r.updated_at,
+                })
+                .collect(),
+        })
+    })
+    .map_err(repo_error_message)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -732,6 +996,184 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("未登録フォルダ"), "{err}");
+    }
+
+    // ===== WP-9: メタデータDTO・再解析 =====
+
+    #[test]
+    fn wp9_merge_normalized_priority_order() {
+        use gento_core::assetmeta::{AssetMetadataParsed, AssetMetadataRecord, MetadataColumns};
+        let row = |parser: &str, model: Option<&str>, prompt: Option<&str>| AssetMetadataRecord {
+            id: 0,
+            uuid: "00000000-0000-7000-8000-000000000000".to_string(),
+            asset_id: 1,
+            parsed: AssetMetadataParsed {
+                parser_name: parser.to_string(),
+                parser_version: "1".to_string(),
+                columns: MetadataColumns {
+                    generation_model: model.map(str::to_string),
+                    positive_prompt: prompt.map(str::to_string),
+                    ..MetadataColumns::default()
+                },
+                ..AssetMetadataParsed::default()
+            },
+            created_at: "t".to_string(),
+            updated_at: "t".to_string(),
+        };
+        // list順 (parser名昇順) に関係なく優先順位 sd-params > comfy > nai で決まる
+        let merged = merge_normalized(&[
+            row("nai", Some("nai-model"), Some("nai prompt")),
+            row("comfy", Some("comfy-model"), Some("comfy prompt")),
+            row("sd-params", Some("sd-model"), Some("sd prompt")),
+        ]);
+        assert_eq!(merged.generation_model.as_deref(), Some("sd-model"));
+        assert_eq!(merged.positive_prompt.as_deref(), Some("sd prompt"));
+        // sd-params不在ならcomfyが浮上
+        let merged = merge_normalized(&[
+            row("nai", Some("nai-model"), None),
+            row("comfy", Some("comfy-model"), None),
+        ]);
+        assert_eq!(merged.generation_model.as_deref(), Some("comfy-model"));
+        assert!(merged.positive_prompt.is_none());
+        // 空は空
+        assert_eq!(merge_normalized(&[]), AssetMetadataNormalizedDto::default());
+    }
+
+    #[test]
+    fn wp9_asset_metadata_get_blocking_and_reparse() {
+        with_library_app("wp9meta", |app| {
+            let asset = app.seed_asset("wp9meta");
+            app.seed_library_record(asset);
+            let db = app.db();
+            // 実ファイル (SD parameters PNG) を用意して登録ルート経由でリンク
+            let dir = std::env::temp_dir().join(format!(
+                "gento-tauri-wp9-{}-{}",
+                std::process::id(),
+                asset
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let png_path = dir.join("gen.png");
+            std::fs::write(&png_path, sd_params_png_bytes()).unwrap();
+            // 行トークン = 実ファイルの実stat観測 (fd束ね再解析の前提)
+            let stat = std::fs::metadata(&png_path).unwrap();
+            let mtime_ns = stat
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64;
+            let file = db
+                .with_writer(|repos| {
+                    use gento_core::repo::{FileRepo, FileUpsert, LibraryRootRepo};
+                    let root = repos.add_root(&dir)?;
+                    repos.upsert_file(FileUpsert {
+                        root_id: root.id,
+                        rel_path: std::path::PathBuf::from("gen.png"),
+                        display_name: "gen.png".to_string(),
+                        byte_size: stat.len(),
+                        mtime_ms: mtime_ns / 1_000_000,
+                        mtime_ns,
+                        scan_state: gento_core::repo::ScanState::Present,
+                        os_file_id: {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::MetadataExt;
+                                Some(gento_core::repo::OsFileId::new(stat.dev(), stat.ino()))
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                None
+                            }
+                        },
+                        detach_asset: false,
+                    })
+                })
+                .unwrap();
+            {
+                use gento_core::repo::AssetRepo;
+                db.with_writer(|repos| repos.link_file(file.id, asset))
+                    .unwrap();
+            }
+            // 再解析: 対象=行なしasset → 解析して保存される
+            let progress: std::sync::Mutex<Vec<ReparseProgressPayload>> =
+                std::sync::Mutex::new(Vec::new());
+            let result =
+                run_metadata_reparse(&app.state.db.as_ref().unwrap().db.clone().unwrap(), &|p| {
+                    progress.lock().unwrap().push(p);
+                })
+                .unwrap();
+            assert_eq!(result.targeted, 1, "行なしassetが対象: {result:?}");
+            assert_eq!(result.reparsed, 1);
+            assert_eq!(result.changed, 1);
+            assert_eq!(progress.lock().unwrap().len(), 1, "進捗イベント1件");
+
+            // 取得: 統合DTO + parser行
+            let db_arc = app.state.db.as_ref().unwrap().db.clone().unwrap();
+            let dto = asset_metadata_get_blocking(&db_arc, asset.to_string()).unwrap();
+            assert_eq!(dto.id, asset.to_string());
+            assert_eq!(
+                dto.parsers.len(),
+                2,
+                "png-text + sd-params: {:?}",
+                dto.parsers
+                    .iter()
+                    .map(|p| p.parser_name.as_str())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                dto.normalized.generator.as_deref(),
+                Some("Stable Diffusion WebUI")
+            );
+            assert_eq!(
+                dto.normalized.positive_prompt.as_deref(),
+                Some("1girl, sunset")
+            );
+            assert_eq!(dto.normalized.steps, Some(28));
+            // rawが見える
+            assert!(dto.parsers.iter().any(|p| p.raw_png_metadata.is_some()));
+
+            // 2回目の再解析は対象なし (現行version行が揃ったため)
+            let again = run_metadata_reparse(&db_arc, &|_| {}).unwrap();
+            assert_eq!(again.targeted, 0, "{again:?}");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// SD parameters付きテストPNG (gento-imageの生成器に類する最小構成)。
+    fn sd_params_png_bytes() -> Vec<u8> {
+        fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+            fn crc32(data: &[u8]) -> u32 {
+                let mut crc: u32 = 0xFFFF_FFFF;
+                for &b in data {
+                    crc ^= b as u32;
+                    for _ in 0..8 {
+                        let mask = (crc & 1).wrapping_neg();
+                        crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+                    }
+                }
+                !crc
+            }
+            let mut body = Vec::new();
+            body.extend_from_slice(kind);
+            body.extend_from_slice(data);
+            let mut out = Vec::new();
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            out.extend_from_slice(&body);
+            out.extend_from_slice(&crc32(&body).to_be_bytes());
+            out
+        }
+        let text = b"parameters\x001girl, sunset\nNegative prompt: lowres\nSteps: 28, Sampler: Euler a, CFG scale: 5.5, Seed: 42, Model: test-model";
+        let mut png = Vec::new();
+        png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&1u32.to_be_bytes());
+        ihdr.extend_from_slice(&1u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        png.extend_from_slice(&chunk(b"IHDR", &ihdr));
+        png.extend_from_slice(&chunk(b"tEXt", text));
+        png.extend_from_slice(&chunk(b"IEND", &[]));
+        png
     }
 
     #[test]

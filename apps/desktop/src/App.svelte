@@ -48,6 +48,7 @@
     canEditMetadata,
     patchOfEvent,
     type AssetDetailDto,
+    type AssetMetadataDto,
     type CullValue,
   } from "./lib/metadata";
   import {
@@ -191,6 +192,8 @@
   let metaBusy = $state(false);
   let metaError = $state<string | null>(null);
   let undoLabel = $state<string | null>(null);
+  /** WP-9: フォーカス項目の埋め込み画像メタデータ。 */
+  let metaAssetMetadata: AssetMetadataDto | null = $state(null);
   /** フォーカス項目の詳細取得世代 (古い応答の破棄)。 */
   let detailGeneration = 0;
   /** 高速選別モード (ビューア内。アプリ稼働中は引き継ぐ — 設定トグル)。 */
@@ -955,6 +958,7 @@
     } else {
       detailGeneration++;
       metaDetail = null;
+      metaAssetMetadata = null;
       metaBusy = false;
     }
   });
@@ -1586,6 +1590,20 @@
   async function refreshMetaDetail(assetId: string): Promise<void> {
     const generation = ++detailGeneration;
     metaBusy = true;
+    // WP-9: 埋め込みメタデータはdetailと並行取得 (raw含む全行。
+    // 失敗は節を表示しないだけ — 詳細取得の失敗とは分離)。
+    void metadata
+      .assetMetadata(assetId)
+      .then((value) => {
+        if (generation === detailGeneration) {
+          metaAssetMetadata = value;
+        }
+      })
+      .catch(() => {
+        if (generation === detailGeneration) {
+          metaAssetMetadata = null;
+        }
+      });
     try {
       const detail = await metadata.assetDetail(assetId);
       if (generation === detailGeneration) {
@@ -2767,6 +2785,9 @@
           selectionCount={gridSelection.ids.length}
           libraryMode={catalogSource === "library"}
           searchEvidence={searchEvidenceOf(focusInfo?.id ?? "")}
+          assetMetadata={focusInfo !== null && metaAssetMetadata?.id === focusInfo.id
+            ? metaAssetMetadata
+            : null}
           sessionCounts={sessionCounts}
           sessionOrigin={sessionSnapshot.origin}
           resumable={sessionResumable}

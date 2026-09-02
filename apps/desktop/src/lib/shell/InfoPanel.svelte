@@ -22,6 +22,19 @@
     type CullValue,
     type TagDto,
   } from "../metadata";
+  import {
+    generationRows,
+    hasGenerationSection,
+    hasPhotoSection,
+    hasRawSection,
+    parserLabel,
+    photoRows,
+    preview,
+    rawSlots,
+    type AssetMetadataDto,
+    type MetaRow,
+  } from "../asset-metadata";
+  import { copyText } from "../ui/clipboard";
 
   let {
     item,
@@ -47,6 +60,7 @@
     collectionMemoNote = null,
     onSaveCollectionMemo = undefined,
     searchEvidence = null,
+    assetMetadata = null,
   }: {
     item: ImageListItem | null;
     selectionCount: number;
@@ -88,6 +102,8 @@
     onSaveCollectionMemo?: (note: string) => void;
     /** WP-8: 検索一致根拠 (検索結果表示中のみ。null=非表示)。 */
     searchEvidence?: SearchFieldMatch[] | null;
+    /** WP-9: 埋め込み画像メタデータ (asset_metadata_get。null=未取得/なし)。 */
+    assetMetadata?: AssetMetadataDto | null;
   } = $props();
 
   const DB_STATE_LABELS: Record<string, string> = {
@@ -356,6 +372,62 @@
   function collectionMemoDirty(): boolean {
     return collectionMemoDraft !== (collectionMemoNote ?? "");
   }
+
+  // ===== WP-9: 埋め込み画像メタデータ (表示・折りたたみ・コピー) =====
+
+  /** 折りたたみ状態 (既定折りたたみ — 巨大workflowでパネルを止めないため
+   * 展開時にのみ本文をレンダリングする)。フォーカス項目切替で全閉じる。 */
+  let metaExpanded = $state<Record<string, boolean>>({});
+
+  $effect(() => {
+    // itemが変わったら折りたたみをリセット (untrackで無限ループ回避)
+    void item?.id;
+    void untrack(() => {
+      metaExpanded = {};
+    });
+  });
+
+  function metaOpen(key: string): boolean {
+    return metaExpanded[key] === true;
+  }
+
+  function toggleMeta(key: string): void {
+    metaExpanded[key] = !metaOpen(key);
+  }
+
+  /** コピー実行 + 完了通知 (テキストは全文 — プレビュー打ち切りと無関係)。
+   * dev bridge検証用に body[data-gento-copy] へ最後のコピー結果を記録する
+   * (E2Eはコピー発火と成功をX行で観察できる)。 */
+  let copiedKey = $state<string | null>(null);
+
+  async function copyMetaText(key: string, text: string): Promise<void> {
+    const ok = await copyText(text);
+    copiedKey = ok ? key : null;
+    document.body.dataset.gentoCopy = `${key}:${ok ? "1" : "0"}:${text.length}`;
+    if (ok) {
+      setTimeout(() => {
+        if (copiedKey === key) {
+          copiedKey = null;
+        }
+      }, 2000);
+    }
+  }
+
+  const photoMetaRows = $derived(
+    assetMetadata === null ? [] : photoRows(assetMetadata.normalized),
+  );
+  const generationMetaRows = $derived(
+    assetMetadata === null ? [] : generationRows(assetMetadata.normalized),
+  );
+
+  /** workflow JSON (コピー用全文。ComfyUIのraw_workflowが正本)。 */
+  const workflowText = $derived(
+    assetMetadata?.parsers.find((p) => p.rawWorkflow)?.rawWorkflow ?? null,
+  );
+
+  function rowList(rows: MetaRow[]): string {
+    return rows.map((r) => r.value).join("\n");
+  }
 </script>
 
 <div class="info-pane">
@@ -405,6 +477,122 @@
       {/if}
     {/if}
   </section>
+
+  {#if item !== null && hasPhotoSection(assetMetadata)}
+    <!-- WP-9: 写真メタデータ (EXIF系。読み取り専用) -->
+    <section class="info-section" data-meta-section="photo">
+      <h3>写真メタデータ</h3>
+      <dl class="info-list">
+        {#each photoMetaRows as row (row.label)}
+          <dt>{row.label}</dt>
+          <dd title={row.title ?? row.value}>{row.value}</dd>
+        {/each}
+      </dl>
+      {#if photoMetaRows.some((r) => r.label === "GPS")}
+        <p class="meta-note" title="GPSの外部AI送信可否は登録ルートごとの設定 (WP-10で接続)">
+          GPSのAI送信設定は登録ルート単位です (現在は表示のみ)
+        </p>
+      {/if}
+    </section>
+  {/if}
+
+  {#if item !== null && hasGenerationSection(assetMetadata)}
+    <!-- WP-9: 生成メタデータ (SD/Comfy/NAI。プロンプトとworkflowは折りたたみ) -->
+    <section class="info-section" data-meta-section="generation">
+      <h3>生成メタデータ</h3>
+      {#if generationMetaRows.length > 0}
+        <dl class="info-list">
+          {#each generationMetaRows as row (row.label)}
+            <dt>{row.label}</dt>
+            <dd title={row.title ?? row.value}>{row.value}</dd>
+          {/each}
+        </dl>
+      {/if}
+
+      {#if assetMetadata?.normalized.positivePrompt}
+        {@const text = assetMetadata.normalized.positivePrompt}
+        <div class="meta-fold" data-meta-fold="positive-prompt">
+          <button class="fold-toggle" onclick={() => toggleMeta("positive")} aria-expanded={metaOpen("positive")}>
+            Positive prompt ({text.length.toLocaleString()}文字) {metaOpen("positive") ? "▾" : "▸"}
+          </button>
+          {#if metaOpen("positive")}
+            <pre class="meta-pre">{preview(text).text}{preview(text).truncated ? "…" : ""}</pre>
+            <div class="fold-controls">
+              <button onclick={() => void copyMetaText("positive", text)}>
+                {copiedKey === "positive" ? "コピーしました" : "コピー"}
+              </button>
+            </div>
+          {/if}
+        </div>
+      {/if}
+
+      {#if assetMetadata?.normalized.negativePrompt}
+        {@const text = assetMetadata.normalized.negativePrompt}
+        <div class="meta-fold" data-meta-fold="negative-prompt">
+          <button class="fold-toggle" onclick={() => toggleMeta("negative")} aria-expanded={metaOpen("negative")}>
+            Negative prompt ({text.length.toLocaleString()}文字) {metaOpen("negative") ? "▾" : "▸"}
+          </button>
+          {#if metaOpen("negative")}
+            <pre class="meta-pre">{preview(text).text}{preview(text).truncated ? "…" : ""}</pre>
+            <div class="fold-controls">
+              <button onclick={() => void copyMetaText("negative", text)}>
+                {copiedKey === "negative" ? "コピーしました" : "コピー"}
+              </button>
+            </div>
+          {/if}
+        </div>
+      {/if}
+
+      {#if workflowText !== null}
+        <div class="meta-fold" data-meta-fold="workflow">
+          <button class="fold-toggle" onclick={() => toggleMeta("workflow")} aria-expanded={metaOpen("workflow")}>
+            ComfyUI workflow JSON ({workflowText.length.toLocaleString()}文字) {metaOpen("workflow") ? "▾" : "▸"}
+          </button>
+          {#if metaOpen("workflow")}
+            {@const p = preview(workflowText)}
+            <pre class="meta-pre">{p.text}{p.truncated ? "…" : ""}</pre>
+            <p class="meta-note" data-meta="workflow-note">
+              {p.truncated ? `プレビューは先頭${p.text.length.toLocaleString()}文字 (全体${p.totalLength.toLocaleString()}文字)` : "全文表示中"}
+            </p>
+            <div class="fold-controls">
+              <button data-meta="workflow-copy" onclick={() => void copyMetaText("workflow", workflowText)}>
+                {copiedKey === "workflow" ? "コピーしました" : "JSONをコピー"}
+              </button>
+            </div>
+          {/if}
+        </div>
+      {/if}
+    </section>
+  {/if}
+
+  {#if item !== null && hasRawSection(assetMetadata)}
+    <!-- WP-9: Raw metadata (未知形式も破棄せず表示・コピー) -->
+    <section class="info-section" data-meta-section="raw">
+      <h3>Raw metadata</h3>
+      {#each assetMetadata?.parsers ?? [] as parser (parser.parserName)}
+        {@const slots = rawSlots(parser)}
+        {#if slots.length > 0}
+          <div class="meta-fold" data-meta-fold="raw-{parser.parserName}">
+            <button class="fold-toggle" onclick={() => toggleMeta(`raw-${parser.parserName}`)} aria-expanded={metaOpen(`raw-${parser.parserName}`)}>
+              {parserLabel(parser.parserName)}@{parser.parserVersion} ({slots.length}項目) {metaOpen(`raw-${parser.parserName}`) ? "▾" : "▸"}
+            </button>
+            {#if metaOpen(`raw-${parser.parserName}`)}
+              {#each slots as slot (slot.label)}
+                {@const p = preview(slot.value)}
+                <p class="meta-raw-label">{slot.label}</p>
+                <pre class="meta-pre">{p.text}{p.truncated ? "…" : ""}</pre>
+              {/each}
+              <div class="fold-controls">
+                <button onclick={() => void copyMetaText(`raw-${parser.parserName}`, rowList(slots))}>
+                  {copiedKey === `raw-${parser.parserName}` ? "コピーしました" : "コピー"}
+                </button>
+              </div>
+            {/if}
+          </div>
+        {/if}
+      {/each}
+    </section>
+  {/if}
 
   <section class="info-section">
     <h3>評価・選別・タグ・キャプション</h3>
@@ -705,6 +893,51 @@
 
   .search-evidence {
     margin-top: 0.5rem;
+  }
+
+  /* WP-9: 埋め込みメタデータの折りたたみブロック */
+  .meta-fold {
+    margin-top: 0.4rem;
+  }
+
+  .fold-toggle {
+    background: none;
+    border: none;
+    color: light-dark(#0969da, #58a6ff);
+    cursor: pointer;
+    font-size: 0.8rem;
+    padding: 0.1rem 0;
+    text-align: left;
+  }
+
+  .meta-pre {
+    background: light-dark(#f6f8fa, #161b22);
+    border: 1px solid light-dark(#d0d7de, #30363d);
+    border-radius: 4px;
+    font-size: 0.72rem;
+    margin: 0.25rem 0;
+    max-height: 16rem;
+    overflow: auto;
+    padding: 0.4rem;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .fold-controls {
+    display: flex;
+    gap: 0.4rem;
+  }
+
+  .meta-note {
+    color: light-dark(#57606a, #8b949e);
+    font-size: 0.72rem;
+    margin: 0.2rem 0;
+  }
+
+  .meta-raw-label {
+    color: light-dark(#57606a, #8b949e);
+    font-size: 0.72rem;
+    margin: 0.3rem 0 0;
   }
 
   .search-evidence h4 {

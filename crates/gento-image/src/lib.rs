@@ -8,6 +8,7 @@ pub mod cache;
 pub mod format;
 pub mod fs;
 pub mod hash;
+pub mod metadata;
 pub mod metrics;
 pub mod orientation;
 pub mod pool;

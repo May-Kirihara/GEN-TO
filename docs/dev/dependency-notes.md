@@ -381,3 +381,26 @@
     rowid=asset_idの1:1管理 + rowid経由のDELETE/INSERTで索引更新を
     O(log n) にする (WHERE asset_idでの相関EXISTSは50k行×全走査に
     なる — 計測で顕在化し修正済み)。
+
+## WP-9 画像メタデータ (2026-09-02)
+
+- **`flate2` =1.1.10 (gento-image, 通常依存)**
+  - 用途: PNG zTXt / iTXt (compressed) チャンクのzlib解凍。
+    **Cargo.lockに存在する既存crateの直依存化** (png =0.18.1が
+    IDAT解凍で利用中。推移依存のminiz_oxide 0.9.1 = pure Rust。
+    新規crateの導入ではない)。
+  - 入手元: crates.io (rust-lang/flate2-rs)。
+  - ライセンス: MIT OR Apache-2.0。native libraryなし (rust_backend
+    既定 = miniz_oxide)。
+  - 対応プラットフォーム: 全主要OS。
+  - 安全策: 解凍出力にもチャンク上限 (1チャンク4MiB) を適用 —
+    圧縮bompに対するメモリ保護 (Read側を`take`で打ち切り)。
+- **`serde_json` =1.0.151 (gento-image, 通常依存)**
+  - 用途: メタデータparserの出力 (raw_* 列へ保存するJSON文字列) の
+    構築。workspaceに既にpin (gento-search等が利用中。新規crateではない)。
+  - 入手元・ライセンス: serde同様 (MIT OR Apache-2.0)。
+- **kamadak-exif =0.5.5 (既存・WP-3導入) の利用拡大**:
+  Orientation専用だった`Reader`を写真メタデータ全般 (撮影日時・カメラ・
+  レンズ・GPS) の解析へ拡大利用。コンテナ抽出はcrateの
+  `read_from_container` (JPEG/TIFF/PNG/WebP) に一任し、読み取り総量上限
+  (64MiB) はrepo側のRead wrapperで強制する。

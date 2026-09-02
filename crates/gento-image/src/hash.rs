@@ -27,7 +27,7 @@ use crate::scan::{os_file_id_of, system_time_to_ns};
 const CHUNK_BYTES: usize = 1024 * 1024;
 
 /// 開いたfdのfstatから世代トークンを観測する。
-fn fd_token(file: &File) -> Result<GenerationToken, HashFileError> {
+pub(crate) fn fd_token(file: &File) -> Result<GenerationToken, HashFileError> {
     let md = file
         .metadata()
         .map_err(|e| HashFileError::Io(e.to_string()))?;

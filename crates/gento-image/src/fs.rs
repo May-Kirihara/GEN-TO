@@ -95,6 +95,16 @@ impl ScanFs for PlatformFs {
         let _ = Ordering::Relaxed;
         hash_and_probe_file(path, expect, cancel)
     }
+
+    fn hash_and_probe_and_metadata(
+        &self,
+        path: &Path,
+        expect: &GenerationToken,
+        cancel: &AtomicBool,
+    ) -> Result<gento_core::library::HashedWithMetadata, HashFileError> {
+        // WP-9: ハッシュ+プローブ+埋め込みメタデータ解析を同一fdで束ねる。
+        crate::metadata::hash_probe_metadata_file(path, expect, cancel)
+    }
 }
 
 /// プローブ単体の便宜ラッパ (既存の probe_dims 相当)。内部でfd束ねAPIを

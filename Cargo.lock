@@ -1441,11 +1441,13 @@ name = "gento-image"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "flate2",
  "gento-core",
  "gento-platform",
  "image",
  "kamadak-exif",
  "png 0.18.1",
+ "serde_json",
  "tracing",
  "twox-hash",
  "walkdir",

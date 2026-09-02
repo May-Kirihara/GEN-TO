@@ -45,6 +45,8 @@ image = { version = "=0.25.10", default-features = false, features = [
 ] }
 webp = { version = "=0.3.1", default-features = false }
 kamadak-exif = "=0.5.5"
+# WP-9: PNG zTXt/iTXt解凍 (png crate経由で既にlock内。直依存化のみ)。
+flate2 = "=1.1.10"
 twox-hash = "=2.1.4"
 dirs = "=6.0.0"
 rusqlite = { version = "=0.31.0", features = ["bundled", "backup"] }

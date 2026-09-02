@@ -1,5 +1,5 @@
 /**
- * アセットメタデータ編集のストア (MVP WP-5)。
+ * アセットメタデータ編集のストア (MVP WP-5 / WP-9読み取り)。
  *
  * - 評価・選別・お気に入り・タグ・キャプションの編集をIPCへ渡す。
  *   永続化の正本はDB (backend)。書き込み成功は `asset:updated` イベントで
@@ -7,9 +7,14 @@
  * - adhoc (未登録フォルダ表示) ではbackendが編集を拒否するため、
  *   呼び出し側 (InfoPanel等) は編集可否を `item.dbState === "asset"` で
  *   判定してUIを無効化する。
+ * - WP-9: 埋め込み画像メタデータの読み取り (assetMetadata) と再解析
+ *   (metadataReparse) も担う。
  * - Undoは本ストアと対になる `lib/undo.ts` のスタックが担う
  *   (before値の捕捉→逆適用)。ファイル操作のUndoはWP-7で統合。
  */
+import type { AssetMetadataDto } from "./asset-metadata";
+
+export type { AssetMetadataDto };
 
 export type MetadataIpc = {
   invoke: <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
@@ -59,6 +64,15 @@ export type AssetDetailDto = {
   favorite: boolean;
   tags: TagDto[];
   captions: CaptionDto[];
+};
+
+/** WP-9: `metadata_reparse` の応答。 */
+export type ReparseResultDto = {
+  targeted: number;
+  reparsed: number;
+  changed: number;
+  skipped: number;
+  elapsedMs: number;
 };
 
 /** 編集可能なキャプション種別 (表示ラベル付き)。 */
@@ -251,5 +265,24 @@ export class MetadataStore {
 
   assetDetail(assetId: string): Promise<AssetDetailDto> {
     return this.call<AssetDetailDto>("asset_detail", { assetId });
+  }
+
+  /** WP-9: 埋め込み画像メタデータ (正規化+parser行raw) の取得。 */
+  assetMetadata(assetId: string): Promise<AssetMetadataDto | null> {
+    return this.call<AssetMetadataDto | null>("asset_metadata_get", { assetId }).catch(
+      (error) => {
+        // asset未確定・メタデータなしはnull扱い (UIは節を表示しない)。
+        const message = error instanceof Error ? error.message : String(error);
+        if (message.includes("見つかりません") || message.includes("not found")) {
+          return null;
+        }
+        throw error;
+      },
+    );
+  }
+
+  /** WP-9: parser更新後の再解析 (進捗は metadata:reparse_progress イベント)。 */
+  metadataReparse(): Promise<ReparseResultDto> {
+    return this.call<ReparseResultDto>("metadata_reparse");
   }
 }

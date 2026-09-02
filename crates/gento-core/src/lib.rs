@@ -1,6 +1,7 @@
 //! GEN-TO コアドメイン型。Tauriに依存してはならない
 //! (docs/implementation-plan.md §5.1)。
 
+pub mod assetmeta;
 pub mod catalog;
 pub mod collections;
 pub mod file_ops;
@@ -8,6 +9,10 @@ pub mod jobs;
 pub mod library;
 pub mod metadata;
 pub mod repo;
+
+pub use assetmeta::{
+    AssetMetadataParsed, AssetMetadataRecord, AssetMetadataRepo, MetadataColumns, ReparseTarget,
+};
 
 pub use file_ops::{
     execute_file_op, execute_mkdir, execute_undo, plan_file_op, undo_candidate_of,

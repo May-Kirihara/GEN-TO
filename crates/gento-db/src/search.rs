@@ -6,8 +6,9 @@
 //!   書き込むrepo操作と同一トランザクションで対象assetのみ
 //!   DELETE+INSERT再構築する (トリガー不使用)。
 //! - 文書構成: ファイル名 (全File。重複排除) / パス (同) / タグ (正規化名) /
-//!   キャプション (description + sd_tags。**embedded_promptはWP-9で接続**) /
-//!   user_note。negative prompt・workflow全体は含めない (data-model §9)。
+//!   キャプション (description + sd_tags + **embedded_prompt (positive
+//!   prompt。WP-9接続)** ) / user_note。negative prompt・workflow全体は
+//!   含めない (data-model §9)。
 //! - 検索実行はAST ([`gento_search::SearchQuery`]) から**固定SQL断片 +
 //!   パラメータバインドのみ**を構成する (ユーザー入力のSQL連結禁止 —
 //!   WP-6 smart_whereと同じ規約)。
@@ -170,9 +171,10 @@ pub fn build_asset_doc(conn: &Connection, asset_id: i64) -> Result<Option<AssetD
             tags.push(row.get(0).map_err(map_err)?);
         }
     }
-    // キャプション: description + sd_tags (現行のみ)。
-    // embedded_promptはWP-9で接続、embedded_negative_promptは意味文書に
-    // 含めない (data-model §9)。
+    // キャプション: description + sd_tags + embedded_prompt (現行のみ)。
+    // WP-9でembedded_prompt (positive prompt) を接続 — 検索対象はpositiveのみ。
+    // embedded_negative_prompt・workflow全体は意味文書に含めない
+    // (data-model §9。明示的全文検索は将来課題)。
     let mut captions: Vec<String> = Vec::new();
     let mut note = String::new();
     {
@@ -180,7 +182,8 @@ pub fn build_asset_doc(conn: &Connection, asset_id: i64) -> Result<Option<AssetD
             .prepare(
                 "SELECT kind, body FROM captions \
                  WHERE asset_id = ?1 AND current = 1 \
-                   AND kind IN ('description', 'sd_tags', 'user_note') ORDER BY kind",
+                   AND kind IN ('description', 'sd_tags', 'user_note', 'embedded_prompt') \
+                 ORDER BY kind",
             )
             .map_err(map_err)?;
         let mut rows = stmt.query([asset_id]).map_err(map_err)?;
@@ -608,6 +611,78 @@ fn field_fragment(condition: &FieldCondition, values: &mut Vec<SqlValue>) -> Str
             }
             fragments.join(" AND ")
         }
+        // WP-9: 埋め込み画像メタデータ (asset_metadata)。行はasset複数
+        // (parserごと) のためEXISTSで判定する。
+        FieldKey::Model | FieldKey::Sampler | FieldKey::Vae => {
+            let FieldValue::Text(text) = value else {
+                return "0".to_string();
+            };
+            let column = match key {
+                FieldKey::Model => "generation_model",
+                FieldKey::Sampler => "sampler",
+                _ => "vae",
+            };
+            let pattern = format!("%{}%", escape_like(text));
+            values.push(SqlValue::Text(pattern));
+            // Ne = 「どのparser行にも一致しない」(NOT EXISTS)
+            let exists = if matches!(op, CmpOp::Ne) {
+                "NOT EXISTS"
+            } else {
+                "EXISTS"
+            };
+            format!(
+                "{exists} (SELECT 1 FROM asset_metadata am WHERE am.asset_id = a.id \
+                  AND am.{column} LIKE ? ESCAPE '\\')"
+            )
+        }
+        FieldKey::Steps => {
+            let FieldValue::Number(number) = value else {
+                return "0".to_string();
+            };
+            values.push(SqlValue::Integer(*number));
+            let symbol = match op {
+                CmpOp::Eq => "=",
+                CmpOp::Ne => "<>",
+                CmpOp::Ge => ">=",
+                CmpOp::Le => "<=",
+                CmpOp::Gt => ">",
+                CmpOp::Lt => "<",
+            };
+            format!(
+                "EXISTS (SELECT 1 FROM asset_metadata am \
+                  WHERE am.asset_id = a.id AND am.steps IS NOT NULL AND am.steps {symbol} ?)"
+            )
+        }
+        FieldKey::Has => {
+            let FieldValue::Text(what) = value else {
+                return "0".to_string();
+            };
+            if what != "workflow" {
+                return "0".to_string(); // parserが保証 (防御)
+            }
+            let exists = if matches!(op, CmpOp::Ne) {
+                "NOT EXISTS"
+            } else {
+                "EXISTS"
+            };
+            format!(
+                "{exists} (SELECT 1 FROM asset_metadata am WHERE am.asset_id = a.id \
+                  AND am.raw_workflow IS NOT NULL)"
+            )
+        }
+        FieldKey::Lora => {
+            let FieldValue::Text(text) = value else {
+                return "0".to_string();
+            };
+            // generation_extra JSONの loras 配列 (SD: {name,...} / Comfy: 同形式)
+            // への部分一致。JSON1 (bundled SQLite) のjson_eachで走査。
+            let pattern = format!("%{}%", escape_like(text));
+            values.push(SqlValue::Text(pattern));
+            "EXISTS (SELECT 1 FROM asset_metadata am, \
+                  json_each(json_extract(am.generation_extra, '$.loras')) je \
+                  WHERE am.asset_id = a.id AND je.value LIKE ? ESCAPE '\\')"
+                .to_string()
+        }
     }
 }
 
@@ -983,6 +1058,188 @@ mod tests {
         search_asset_ids(repos.conn(), &query, &SearchScope::default(), 0, 1000)
             .unwrap()
             .0
+    }
+
+    // ===== WP-9: 埋め込み画像メタデータ (asset_metadata) の検索 =====
+
+    /// テスト用の生成系メタデータ行ビルダ。
+    #[derive(Default)]
+    struct SdRow<'a> {
+        model: Option<&'a str>,
+        steps: Option<i64>,
+        sampler: Option<&'a str>,
+        vae: Option<&'a str>,
+        loras_extra: Option<&'a str>,
+        prompt: Option<&'a str>,
+        negative: Option<&'a str>,
+        workflow: Option<&'a str>,
+    }
+
+    impl SdRow<'_> {
+        fn build(&self) -> gento_core::assetmeta::AssetMetadataParsed {
+            use gento_core::assetmeta::{AssetMetadataParsed, MetadataColumns};
+            AssetMetadataParsed {
+                parser_name: if self.workflow.is_some() {
+                    "comfy".to_string()
+                } else {
+                    "sd-params".to_string()
+                },
+                parser_version: "1".to_string(),
+                columns: MetadataColumns {
+                    generation_model: self.model.map(str::to_string),
+                    steps: self.steps,
+                    sampler: self.sampler.map(str::to_string),
+                    vae: self.vae.map(str::to_string),
+                    generation_extra: self.loras_extra.map(str::to_string),
+                    positive_prompt: self.prompt.map(str::to_string),
+                    negative_prompt: self.negative.map(str::to_string),
+                    ..MetadataColumns::default()
+                },
+                raw_workflow: self.workflow.map(str::to_string),
+                ..AssetMetadataParsed::default()
+            }
+        }
+    }
+
+    #[test]
+    fn wp9_embedded_prompt_search_and_negative_exclusion() {
+        with_repos("wp9-prompt", |repos| {
+            let root = repos.add_root(Path::new("/data/wp9p")).unwrap();
+            let sd = make_asset(repos, "sd1");
+            link_file(repos, root.id, "sd.png", sd);
+            // positiveにだけ入る語 (silver) とnegativeにだけ入る語 (watermark)
+            use gento_core::assetmeta::AssetMetadataRepo as _;
+            repos
+                .save_asset_metadata(
+                    sd,
+                    &[SdRow {
+                        model: Some("animagine xl"),
+                        steps: Some(28),
+                        sampler: Some("Euler a"),
+                        prompt: Some("1girl, silver hair, masterpiece"),
+                        negative: Some("watermark, lowres"),
+                        ..SdRow::default()
+                    }
+                    .build()],
+                )
+                .unwrap();
+
+            // positive promptの語でヒット (FTS・LIKE両経路)
+            assert_eq!(search_all(repos, "silver hair"), vec![sd]);
+            assert_eq!(
+                search_all(repos, "ma"),
+                vec![sd],
+                "1-2文字はLIKEフォールバック"
+            );
+            // negative promptの語ではヒットしない (data-model §9)
+            assert!(search_all(repos, "watermark").is_empty());
+            assert!(search_all(repos, "lowres").is_empty());
+        });
+    }
+
+    #[test]
+    fn wp9_metadata_field_keys() {
+        with_repos("wp9-keys", |repos| {
+            use gento_core::assetmeta::AssetMetadataRepo as _;
+            let root = repos.add_root(Path::new("/data/wp9k")).unwrap();
+            let sd = make_asset(repos, "k1");
+            link_file(repos, root.id, "sd.png", sd);
+            repos
+                .save_asset_metadata(
+                    sd,
+                    &[SdRow {
+                        model: Some("animagine xl 3.1"),
+                        steps: Some(28),
+                        sampler: Some("Euler a"),
+                        vae: Some("sdxl_vae.safetensors"),
+                        loras_extra: Some(r#"{"loras":[{"name":"add-detail-xl"}]}"#),
+                        prompt: Some("p"),
+                        ..SdRow::default()
+                    }
+                    .build()],
+                )
+                .unwrap();
+            let comfy = make_asset(repos, "k2");
+            link_file(repos, root.id, "comfy.png", comfy);
+            repos
+                .save_asset_metadata(
+                    comfy,
+                    &[SdRow {
+                        model: Some("flux1-dev"),
+                        steps: Some(30),
+                        sampler: Some("euler"),
+                        prompt: Some("p"),
+                        workflow: Some(r#"{"nodes":[]}"#),
+                        ..SdRow::default()
+                    }
+                    .build()],
+                )
+                .unwrap();
+            let plain = make_asset(repos, "k3");
+            link_file(repos, root.id, "plain.png", plain);
+
+            // model: 部分一致
+            assert_eq!(search_all(repos, "model:animagine"), vec![sd]);
+            assert_eq!(search_all(repos, "model:\"flux1-dev\""), vec![comfy]);
+            assert!(search_all(repos, "model:nonexistent").is_empty());
+            // Ne (構文上は `key:!=` が無いためAST直接構築 — GUIフィルタ経路)
+            {
+                use gento_search::{FieldValue, SearchQuery, SearchTerm};
+                let query = SearchQuery {
+                    terms: vec![SearchTerm::Field(gento_search::FieldCondition {
+                        key: gento_search::FieldKey::Model,
+                        op: gento_search::CmpOp::Ne,
+                        value: FieldValue::Text("animagine".to_string()),
+                    })],
+                };
+                let hits = search_asset_ids(repos.conn(), &query, &SearchScope::default(), 0, 1000)
+                    .unwrap()
+                    .0;
+                assert_eq!(hits, vec![comfy, plain], "Ne = 一致しないasset (id昇順)");
+            }
+
+            // steps: 数値比較
+            assert_eq!(search_all(repos, "steps:>=30"), vec![comfy]);
+            assert_eq!(search_all(repos, "steps:>28"), vec![comfy]);
+            assert_eq!(search_all(repos, "steps:<=28"), vec![sd]);
+            assert_eq!(search_all(repos, "steps:28"), vec![sd]);
+            // メタデータなしassetはsteps条件に掛からない
+            assert!(!search_all(repos, "steps:>=1").contains(&plain));
+
+            // has:workflow (ComfyUIのみ)
+            assert_eq!(search_all(repos, "has:workflow"), vec![comfy]);
+            {
+                use gento_search::{FieldValue, SearchQuery, SearchTerm};
+                let query = SearchQuery {
+                    terms: vec![SearchTerm::Field(gento_search::FieldCondition {
+                        key: gento_search::FieldKey::Has,
+                        op: gento_search::CmpOp::Ne,
+                        value: FieldValue::Text("workflow".to_string()),
+                    })],
+                };
+                let hits = search_asset_ids(repos.conn(), &query, &SearchScope::default(), 0, 1000)
+                    .unwrap()
+                    .0;
+                assert_eq!(hits, vec![sd, plain], "workflow非保持 (AST直接構築)");
+            }
+
+            // sampler / vae
+            assert_eq!(
+                search_all(repos, "sampler:euler"),
+                vec![sd, comfy],
+                "部分一致で両方"
+            );
+            // フリーテキストではvae名はヒットしない (文書化されるのはprompt等のみ)
+            assert!(search_all(repos, "sdxl_vae").is_empty());
+            assert_eq!(search_all(repos, "vae:sdxl"), vec![sd]);
+
+            // lora: JSON配列内の名前照合
+            assert_eq!(search_all(repos, "lora:add-detail"), vec![sd]);
+            assert!(search_all(repos, "lora:unknown-lora").is_empty());
+
+            // 複合
+            assert_eq!(search_all(repos, "has:workflow steps:>=30"), vec![comfy]);
+        });
     }
 
     // ===== 文書構築 (トリガーなきRust駆動・同一tx再構築) =====

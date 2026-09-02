@@ -22,3 +22,8 @@ webp = { workspace = true }
 kamadak-exif = { workspace = true }
 twox-hash = { workspace = true }
 blake3 = { workspace = true }
+# WP-9: PNG zTXt/iTXt (compressed) のzlib解凍。png crateの既存利用により
+# Cargo.lockに存在するcrateの直依存化 (新規crate導入ではない)。
+flate2 = { workspace = true }
+# WP-9: メタデータparser出力のraw JSON構築 (workspace既存pin)。
+serde_json = { workspace = true }

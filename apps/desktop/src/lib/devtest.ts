@@ -541,6 +541,23 @@ export function installDevBridge(stores: DevBridgeStores): void {
       document.querySelector<HTMLButtonElement>(".bulk-confirm button.primary")?.click();
     },
     metaToggleTriage: () => clickButton("高速選別"),
+    /** WP-9 E2E: 埋め込みメタデータの折りたたみを全展開
+     * (巨大workflowのレンダリング検証。展開で本文明示レンダリング)。 */
+    metaExpandAll: () => {
+      document
+        .querySelectorAll<HTMLButtonElement>(".fold-toggle")
+        .forEach((button) => {
+          if (button.getAttribute("aria-expanded") === "false") {
+            button.click();
+          }
+        });
+    },
+    /** WP-9 E2E: workflow JSONのコピーボタンを押下。 */
+    metaCopyWorkflow: () => {
+      document
+        .querySelector<HTMLButtonElement>('[data-meta="workflow-copy"]')
+        ?.click();
+    },
     /** 高速選別キー相当のkeydownをwindowへ合成 (ビューアのsvelte:windowリスナ経由)。 */
     pressKey0: () => pressTriageKey("0"),
     pressKey3: () => pressTriageKey("3"),
@@ -1076,6 +1093,7 @@ export function installDevBridge(stores: DevBridgeStores): void {
       ...uiLines(),
       ...sessionLines(),
       ...metaLines(),
+      ...assetMetaLines(),
       ...collectionLines(),
       ...fileOpsLines(),
     );
@@ -1105,11 +1123,35 @@ export function installDevBridge(stores: DevBridgeStores): void {
     ];
   }
 
+  /** WP-9: 埋め込み画像メタデータ状態行 (E2E検証用。X接頭辞)。
+   * DOM観測ベース (InfoPanelのdata-meta-section属性) — ストアを経由しない
+   * ため表示そのものを検証できる。 */
+  function assetMetaLines(): string[] {
+    const photo = document.querySelector('[data-meta-section="photo"]') !== null ? 1 : 0;
+    const gen = document.querySelector('[data-meta-section="generation"]') !== null ? 1 : 0;
+    const raw = document.querySelector('[data-meta-section="raw"]') !== null ? 1 : 0;
+    const posFold = document.querySelector('[data-meta-fold="positive-prompt"]');
+    const negFold = document.querySelector('[data-meta-fold="negative-prompt"]');
+    const wfFold = document.querySelector('[data-meta-fold="workflow"]');
+    const wfNote = document.querySelector('[data-meta="workflow-note"]');
+    const rawFolds = document.querySelectorAll('[data-meta-section="raw"] .meta-fold').length;
+    const chars = (el: Element | null): string =>
+      el?.textContent?.match(/\(([\d,]+)文字\)/)?.[1] ?? "-";
+    const copy = document.body.dataset.gentoCopy ?? "-";
+    return [
+      `X photo=${photo} gen=${gen} raw=${raw}` +
+        ` pos=${posFold ? chars(posFold) : "-"} neg=${negFold ? chars(negFold) : "-"}` +
+        ` wf=${wfFold ? chars(wfFold) : "-"} wfx=${wfNote ? 1 : 0} rawn=${rawFolds}` +
+        ` cpy=${copy}`,
+    ];
+  }
+
   function reportCompact(): void {
     const single = [
       ...dumpLines(),
       ...gridLines(),
       ...searchLines(),
+      ...assetMetaLines(),
       ...thumbLines(),
       ...perfLines(),
     ]
@@ -1159,6 +1201,9 @@ export function installDevBridge(stores: DevBridgeStores): void {
           j: "srRun",
           l: "srRefresh",
           u: "srSave",
+          // WP-9 E2E: 埋め込みメタデータ (折りたたみ全展開・workflowコピー)
+          p: "metaExpandAll",
+          i: "metaCopyWorkflow",
         };
         const action = foKeys[event.key];
         if (action !== undefined) {

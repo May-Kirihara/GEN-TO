@@ -21,7 +21,8 @@ const ROOT_COLUMNS: &str = "id, uuid, path, path_encoding, display_path, enabled
      watch_enabled, ai_enabled, send_exif, send_gps, created_at, updated_at";
 
 /// files行のSELECT列一覧 (map_fileと共通)。
-const FILE_COLUMNS: &str = "id, uuid, root_id, asset_id, rel_path, path_encoding, display_name, \
+pub(crate) const FILE_COLUMNS: &str =
+    "id, uuid, root_id, asset_id, rel_path, path_encoding, display_name, \
      extension, byte_size, mtime_ms, mtime_ns, os_file_id, scan_state, last_seen_at, created_at, \
      updated_at";
 
@@ -121,7 +122,7 @@ fn map_library_root(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryRootReco
     })
 }
 
-fn map_file(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
+pub(crate) fn map_file(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
     let rel_bytes: Vec<u8> = row.get("rel_path")?;
     let scan_state_str: String = row.get("scan_state")?;
     let scan_state = scan_state_from_db_value(&scan_state_str)?;

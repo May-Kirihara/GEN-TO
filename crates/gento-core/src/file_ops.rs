@@ -2745,6 +2745,31 @@ mod tests {
         }
     }
 
+    /// WP-9: ファイル操作のテストではメタデータ保存を行使しないため
+    /// 空実装 (AllRepos要件を満たすためのスタブ)。
+    impl crate::assetmeta::AssetMetadataRepo for TestStore {
+        fn save_asset_metadata(
+            &self,
+            _asset_id: i64,
+            _parsed: &[crate::assetmeta::AssetMetadataParsed],
+        ) -> Result<bool, RepoError> {
+            Ok(false)
+        }
+        fn list_asset_metadata(
+            &self,
+            _asset_id: i64,
+        ) -> Result<Vec<crate::assetmeta::AssetMetadataRecord>, RepoError> {
+            Ok(Vec::new())
+        }
+        fn assets_needing_reparse(
+            &self,
+            _current: &[(String, String)],
+            _limit: u64,
+        ) -> Result<Vec<crate::assetmeta::ReparseTarget>, RepoError> {
+            Ok(Vec::new())
+        }
+    }
+
     impl LibraryRootRepo for TestStore {
         fn add_root(&self, path: &Path) -> Result<LibraryRootRecord, RepoError> {
             Ok(self.add_root(path))

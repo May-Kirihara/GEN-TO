@@ -255,6 +255,17 @@ pub struct HashedFile {
     pub probe: Option<ProbedImage>,
 }
 
+/// ハッシュ+プローブ+埋め込みメタデータ解析の束ね結果 (WP-9)。
+/// メタデータもハッシュと**同一fd**から読まれているため、`content` の
+/// バイト列と異なる内容が混入することは構造的に不可能。
+#[derive(Debug, Clone, PartialEq)]
+pub struct HashedWithMetadata {
+    pub content: FileContentHash,
+    pub probe: Option<ProbedImage>,
+    /// parserごとの解析結果 (空 = メタデータなし。保存も行わない)。
+    pub metadata: Vec<crate::assetmeta::AssetMetadataParsed>,
+}
+
 /// ファイルシステム操作の抽象 (実装: gento-image)。
 pub trait ScanFs: Send + Sync {
     /// `root` (またはその配下 `scope`) を再帰走査し、画像拡張子のファイルを
@@ -282,11 +293,35 @@ pub trait ScanFs: Send + Sync {
         expect: &GenerationToken,
         cancel: &AtomicBool,
     ) -> Result<HashedFile, HashFileError>;
+
+    /// ハッシュ+プローブ+埋め込みメタデータ解析を1つの開いたfdで束ねる
+    /// (WP-9)。既定実装は [`Self::hash_and_probe`] に委譲しメタデータ空を
+    /// 返す (メタデータ抽出を行わない簡易実装・テストFakeの互換)。
+    /// 実運用の実装 (gento-image) は同一fd上でチャンク走査を行い、
+    /// 読み取り前後のfdトークン不変を検証する。
+    fn hash_and_probe_and_metadata(
+        &self,
+        path: &Path,
+        expect: &GenerationToken,
+        cancel: &AtomicBool,
+    ) -> Result<HashedWithMetadata, HashFileError> {
+        let hashed = self.hash_and_probe(path, expect, cancel)?;
+        Ok(HashedWithMetadata {
+            content: hashed.content,
+            probe: hashed.probe,
+            metadata: Vec::new(),
+        })
+    }
 }
 
-/// 4 repository traitの統合ビュー (dyn運用用)。WP-7でFileOpsRepoを追加。
+/// 5 repository traitの統合ビュー (dyn運用用)。WP-7でFileOpsRepo、
+/// WP-9でAssetMetadataRepoを追加。
 pub trait AllRepos:
-    crate::repo::LibraryRootRepo + FileRepo + crate::repo::AssetRepo + crate::file_ops::FileOpsRepo
+    crate::repo::LibraryRootRepo
+    + FileRepo
+    + crate::repo::AssetRepo
+    + crate::file_ops::FileOpsRepo
+    + crate::assetmeta::AssetMetadataRepo
 {
 }
 
@@ -295,6 +330,7 @@ impl<T> AllRepos for T where
         + FileRepo
         + crate::repo::AssetRepo
         + crate::file_ops::FileOpsRepo
+        + crate::assetmeta::AssetMetadataRepo
 {
 }
 
@@ -838,18 +874,22 @@ impl From<RepoError> for LinkError {
     }
 }
 
-/// 1ファイルのハッシュ計算 + Asset統合 (新規なら作成) + リンク。
-/// ハッシュワーカー (Background優先度) から呼ばれる。
+/// 1ファイルのハッシュ計算 + Asset統合 (新規なら作成) + リンク +
+/// 埋め込みメタデータ保存 (WP-9)。ハッシュワーカー (Background優先度)
+/// から呼ばれる。
 ///
-/// 世代検証 (FG-WP2-2): [`ScanFs::hash_and_probe`] は走査時観測トークン
-/// `expect` と開いたfdのfstatトークンが一致する場合のみ計算を進め、
-/// ハッシュと寸法を同一fdから束ねて返す (計算前後のfdトークン不変も検証)。
+/// 世代検証 (FG-WP2-2): [`ScanFs::hash_and_probe_and_metadata`] は走査時
+/// 観測トークン `expect` と開いたfdのfstatトークンが一致する場合のみ
+/// 計算を進め、ハッシュ・寸法・メタデータ解析を同一fdから束ねて返す
+/// (計算前後のfdトークン不変も検証)。
 /// リンクは書き込みトランザクション内でDBレコードの現在トークンとfdトークン
 /// を突合し、一致する場合のみ実行する。これにより「同パス再利用 (新inode)」
 /// 「同一ms内の置換 (ns差)」「計算中の変更」「新しいスキャン後到着した古い
 /// ジョブ」はいずれも誤リンクされず [`HashFileError::Stale`] として破棄され、
 /// 再提出 (呼び出し側の決定論リトライ) または次回スキャンで再ハッシュされる。
 /// 同一inodeの移動・改名は同一バイトのためトークン一致で正しくリンクされる。
+/// メタデータ保存も同一クロージャ内 (リンク直後) に行うため、Stale破棄時は
+/// 解析結果ごと破棄される (別世代のメタデータが残る経路がない)。
 pub fn hash_and_link_file(
     store: &dyn RepoStore,
     fs: &dyn ScanFs,
@@ -858,9 +898,10 @@ pub fn hash_and_link_file(
     expect: &GenerationToken,
     cancel: &AtomicBool,
 ) -> Result<AssetRecord, HashFileError> {
-    let hashed = fs.hash_and_probe(path, expect, cancel)?;
+    let hashed = fs.hash_and_probe_and_metadata(path, expect, cancel)?;
     let content = hashed.content;
     let probe = hashed.probe;
+    let metadata = hashed.metadata;
     // プローブの形式が正本。非プローブ時のみ拡張子から推測する。
     let mime = probe
         .map(|p| p.format.mime().to_string())
@@ -885,6 +926,12 @@ pub fn hash_and_link_file(
         })?;
         let asset_id = asset.id;
         repos.link_file(file_id, asset_id)?;
+        // メタデータはasset内容 (content hash) から決定的に導かれる。
+        // 同一assetへの再リンクでは現行version行が既にあれば保存側が
+        // 冪等スキップする。Stale (トークン不一致) はここへ到達しない。
+        if !metadata.is_empty() {
+            repos.save_asset_metadata(asset_id, &metadata)?;
+        }
         Ok(asset)
     });
     match link {
@@ -1114,6 +1161,7 @@ pub struct CoalescedChanges {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assetmeta::AssetMetadataRepo;
     use crate::library::{ProbedFormat, ProbedImage};
     use crate::repo::{
         AssetRepo, HashState, LibraryRootRecord, LibraryRootRepo, RepoError, RootSettings,
@@ -1133,6 +1181,8 @@ mod tests {
         write_calls: StdMutex<Vec<&'static str>>,
         /// テスト注入: relocate_fileをこのエラーで失敗させる。
         relocate_failure: StdMutex<Option<RepoError>>,
+        /// WP-9: 保存されたメタデータ行 (asset_id, parsed)。
+        asset_metadata: StdMutex<Vec<(i64, crate::assetmeta::AssetMetadataParsed)>>,
     }
 
     impl FakeRepos {
@@ -1646,6 +1696,8 @@ mod tests {
         probe: StdMutex<Option<ProbedImage>>,
         /// hash_and_probeの呼び出し回数 (fd単一APIの検証用)。
         hash_calls: std::sync::atomic::AtomicU64,
+        /// WP-9: hash_and_probe_and_metadataが返す解析結果。
+        metadata: StdMutex<Vec<crate::assetmeta::AssetMetadataParsed>>,
     }
 
     impl FakeFs {
@@ -1706,6 +1758,109 @@ mod tests {
                 content,
                 probe: *self.probe.lock().unwrap(),
             })
+        }
+
+        fn hash_and_probe_and_metadata(
+            &self,
+            path: &Path,
+            expect: &GenerationToken,
+            cancel: &AtomicBool,
+        ) -> Result<HashedWithMetadata, HashFileError> {
+            let hashed = self.hash_and_probe(path, expect, cancel)?;
+            Ok(HashedWithMetadata {
+                content: hashed.content,
+                probe: hashed.probe,
+                metadata: self.metadata.lock().unwrap().clone(),
+            })
+        }
+    }
+
+    impl crate::assetmeta::AssetMetadataRepo for FakeRepos {
+        fn save_asset_metadata(
+            &self,
+            asset_id: i64,
+            parsed: &[crate::assetmeta::AssetMetadataParsed],
+        ) -> Result<bool, RepoError> {
+            self.write_calls.lock().unwrap().push("save_asset_metadata");
+            let mut rows = self.asset_metadata.lock().unwrap();
+            let mut changed = false;
+            for item in parsed {
+                let existing = rows
+                    .iter()
+                    .find(|(id, p)| *id == asset_id && p.parser_name == item.parser_name);
+                match existing {
+                    // 同一version行は冪等スキップ (内容は内容hashから決定的)
+                    Some((_, p)) if p.parser_version == item.parser_version => {}
+                    _ => {
+                        rows.retain(|(id, p)| {
+                            !(*id == asset_id && p.parser_name == item.parser_name)
+                        });
+                        rows.push((asset_id, item.clone()));
+                        changed = true;
+                    }
+                }
+            }
+            Ok(changed)
+        }
+
+        fn list_asset_metadata(
+            &self,
+            asset_id: i64,
+        ) -> Result<Vec<crate::assetmeta::AssetMetadataRecord>, RepoError> {
+            let rows = self.asset_metadata.lock().unwrap();
+            Ok(rows
+                .iter()
+                .filter(|(id, _)| *id == asset_id)
+                .map(|(id, p)| crate::assetmeta::AssetMetadataRecord {
+                    id: 0,
+                    uuid: format!("00000000-0000-7000-8000-{id:012}"),
+                    asset_id: *id,
+                    parsed: p.clone(),
+                    created_at: "2026-09-02T00:00:00.000Z".to_string(),
+                    updated_at: "2026-09-02T00:00:00.000Z".to_string(),
+                })
+                .collect())
+        }
+
+        fn assets_needing_reparse(
+            &self,
+            current: &[(String, String)],
+            _limit: u64,
+        ) -> Result<Vec<crate::assetmeta::ReparseTarget>, RepoError> {
+            let assets = self.assets.lock().unwrap();
+            let files = self.files.lock().unwrap();
+            let mut out = Vec::new();
+            for asset in assets.iter() {
+                let own: Vec<(String, String)> = self
+                    .asset_metadata
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(id, _)| *id == asset.id)
+                    .map(|(_, p)| (p.parser_name.clone(), p.parser_version.clone()))
+                    .collect();
+                // 行なし or 既存行のversionが現行と異なる (gento-db実装と同じ規則)
+                let needs = own.is_empty()
+                    || own.iter().any(|(n, v)| {
+                        current
+                            .iter()
+                            .any(|(name, version)| n == name && v != version)
+                    });
+                if !needs {
+                    continue;
+                }
+                if let Some(file) = files
+                    .iter()
+                    .find(|f| f.asset_id == Some(asset.id) && f.scan_state == ScanState::Present)
+                {
+                    out.push(crate::assetmeta::ReparseTarget {
+                        asset_id: asset.id,
+                        root_id: file.root_id,
+                        file: file.clone(),
+                    });
+                }
+            }
+            Ok(out)
         }
     }
 
@@ -2518,6 +2673,88 @@ mod tests {
 
         // 2ファイル = 2呼び出しのみ (プローブの独立呼び出し経路なし)
         assert_eq!(fs.hash_calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn wp9_hash_and_link_saves_metadata_and_stale_discards() {
+        // WP-9: hash_and_link_fileはメタデータ解析結果をリンクと同一クロージャで
+        // 保存する。Stale (行トークン不一致) の場合は解析結果ごと破棄される。
+        use crate::assetmeta::{AssetMetadataParsed, MetadataColumns};
+        let (repos, store, fs, root) = setup();
+        fs.entries.lock().unwrap().push(entry("a.png", 10, 5, None));
+        let summary = run_scan(&store, &fs, &root);
+        let cancel = AtomicBool::new(false);
+        let pending = summary.pending_hash[0].clone();
+
+        // メタデータ付きでリンク → save_asset_metadataが呼ばれ行が保存される
+        fs.hash_matches(None, 10, 5_000_000, "blake3:meta1");
+        *fs.metadata.lock().unwrap() = vec![AssetMetadataParsed {
+            parser_name: "sd-params".to_string(),
+            parser_version: "1".to_string(),
+            columns: MetadataColumns {
+                positive_prompt: Some("1girl, sunset".to_string()),
+                steps: Some(28),
+                ..MetadataColumns::default()
+            },
+            raw_png_metadata: Some(r#"{"parameters":"..."}"#.to_string()),
+            ..AssetMetadataParsed::default()
+        }];
+        let asset = hash_and_link_file(
+            &*store,
+            &*fs,
+            pending.file_id,
+            &pending.path,
+            &pending.token,
+            &cancel,
+        )
+        .unwrap();
+        let rows = repos.list_asset_metadata(asset.id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].parsed.parser_name, "sd-params");
+        assert_eq!(
+            rows[0].parsed.columns.positive_prompt.as_deref(),
+            Some("1girl, sunset")
+        );
+
+        // メタデータ空 (Vec::new) では保存呼び出しが走らない
+        *fs.metadata.lock().unwrap() = Vec::new();
+        fs.hash_matches(None, 10, 6_000_000, "blake3:meta2");
+        fs.entries.lock().unwrap().push(entry("b.png", 10, 6, None));
+        let summary_b = run_scan(&store, &fs, &root);
+        let pending_b = summary_b.pending_hash[0].clone();
+        let calls_before = repos.write_calls.lock().unwrap().len();
+        hash_and_link_file(
+            &*store,
+            &*fs,
+            pending_b.file_id,
+            &pending_b.path,
+            &pending_b.token,
+            &cancel,
+        )
+        .unwrap();
+        let calls_after = repos.write_calls.lock().unwrap().len();
+        assert_eq!(calls_before, calls_after, "空メタデータでは保存なし");
+
+        // Stale: 行トークンが変わっていれば解析結果も保存されない
+        *fs.metadata.lock().unwrap() = vec![AssetMetadataParsed {
+            parser_name: "exif".to_string(),
+            parser_version: "1".to_string(),
+            ..AssetMetadataParsed::default()
+        }];
+        let mut stale_token = pending_b.token;
+        stale_token.mtime_ns += 1;
+        fs.hash_matches(None, 10, 6_000_001, "blake3:meta3");
+        let result = hash_and_link_file(
+            &*store,
+            &*fs,
+            pending_b.file_id,
+            &pending_b.path,
+            &stale_token,
+            &cancel,
+        );
+        assert!(matches!(result, Err(HashFileError::Stale(_))), "{result:?}");
+        let rows = repos.list_asset_metadata(asset.id).unwrap();
+        assert_eq!(rows.len(), 1, "Stale時はメタデータ行が増えない");
     }
 
     #[test]
