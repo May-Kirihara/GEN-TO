@@ -199,6 +199,18 @@ describe("AiStore", () => {
     ]);
   });
 
+  // backend (gento-ai TestReport) はcamelCaseで直列化する (Rust側
+  // test_report_serializes_camel_case_matching_frontend で固定)。
+  // AiPanelは report.elapsedMs.toLocaleString() を描画するため、
+  // 応答がsnake_case (elapsed_ms) に戻るとundefinedで描画が落ちる。
+  // この契約 (camelCase応答がそのままAiTestReportになる) を固定する。
+  test("runTestはcamelCase応答をAiTestReportとしてそのまま返す", async () => {
+    const report = { ok: true, detail: "応答: OK", elapsedMs: 1234, status: 200 };
+    const ipc = mockIpc({ ai_profile_test_text: () => ({ ...report }) });
+    const store = new AiStore(ipc);
+    expect(await store.runTest("7", "text")).toEqual(report);
+  });
+
   test("subscribeはai:jobsイベントをハンドラへ渡す", async () => {
     const captured: Array<(event: { payload: AiJobsEvent }) => void> = [];
     const ipc: AiIpc = {

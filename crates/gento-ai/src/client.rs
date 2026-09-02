@@ -260,7 +260,10 @@ impl AiClient {
 // ===== テスト機能 (spec §11.1: 接続・テキスト・Vision・構造化出力) =====
 
 /// テスト1件の結果。
+/// tauri command層がDTO経由せず直接返すため、IPC形状はfrontend型
+/// (lib/ai.ts AiTestReport) と同一のcamelCase — 形状テストで固定。
 #[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct TestReport {
     pub ok: bool,
     /// 応答概要 (応答抜粋・ステータス。長文は切り詰め)。
@@ -384,5 +387,35 @@ pub fn test_structured(client: &AiClient) -> TestReport {
             },
         },
         Err(err) => TestReport::fail(&err, started),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TestReport;
+
+    /// TestReportのIPC直列化形状 (camelCase)。tauri command層
+    /// (ai_profile_test_*) がこの型をDTO経由せず直接返すため、
+    /// フロント (lib/ai.ts AiTestReport) と一对一であることが必須 —
+    /// snake_caseへ戻ると report.elapsedMs がundefinedになり結果表示が
+    /// 落ちる (WP-5のDTO命名不整合と同一の不具合クラス)。
+    #[test]
+    fn test_report_serializes_camel_case_matching_frontend() {
+        let report = TestReport {
+            ok: true,
+            detail: "応答: OK".to_string(),
+            elapsed_ms: 1234,
+            status: Some(200),
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "ok": true,
+                "detail": "応答: OK",
+                "elapsedMs": 1234,
+                "status": 200,
+            })
+        );
     }
 }
