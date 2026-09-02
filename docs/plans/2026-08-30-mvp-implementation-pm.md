@@ -97,6 +97,8 @@ QAレビュー（ユーザー可視面）: WP-4後、WP-8後、WP-18最終。
 - 2026-09-02: **WP-9完了** (`86f2b65`)。EXIF/IPTC/SD-Forge/ComfyUI/NovelAI parser（fd束び・世代トークン規律・元バイト不変）、正規化+Raw保持、embedded_prompt検索接続、FUTURE_KEYS有効化（model/steps/has/sampler/vae/lora）、InfoPanel 3節。cargo 622 / vitest 419。E2E 9/9×3。
 - 2026-09-02: **WP-10完了** (`f2eea9c` + FG-WP10 `f50852e`)。**Codexレビュー**: 1回目reject（5ブロッカー: 縮小上限未強制・非リトライ性失敗の即再送・同時実行レース・応答無制限・鍵欠落未認証送信）→修正→2回目**approve-with-notes**。gento-ai crate（reqwest rustls・mockサーバー）、永続ジョブキュー（backoff・再開・冪等）、keyring+0600ファイルフォールバック、手動編集保護、送信前縮小64-2048強制・GPS独立opt-in・フェイルクローズ。migration #8。cargo 690 / vitest 438。**M5完了**。
 - 2026-09-02: ユーザー実機確認サポート: DEVUX-1 (`d76aba4` dev読み出し既定非表示+トグル)、FIX-AI-DTO (`c8d7056` TestReport camelCase_SERIALIZE—the 4種テスト結果が表示されない不具合、WP-5系統の再犯を契約テストで封じた)。**ユーザーが実llama.cppサーバ（外部、Gemma系26B Q4）で4種テスト合格を報告**——WP-10 acceptance 1実機確定（接続2ms/テキスト25s/Vision 44s「青一色」正答/構造化OK、タイムアウト60s既定内）。cargo 691 / vitest 444。
+- 2026-09-02: **WP-11** はPhase A（モデル配布源確認）で設計どおりblocked→**ユーザーがA案（GEN-TO管理変換）を決定**→CONV-1 (`9efe91a`) で変換パイプライン成立（optimum `library_name="transformers"`必須・Xet CASハッシュ罠・cos誤差max 9.5e-8・バイト再現性・成果物421MBを`.local-models/`へgitignore退避。**配布先（HF/GitHub Releases）はRC段階の決定事項**）。
+- 2026-09-02: **WP-11完了** (`1d98e43`)。gento-embedding lib+worker（stdio長さ前置JSON・アイドル10分・クラッシュループ停止）・manifest include_str!正本・migration #9・jobs型フィルタ・similar_debug総当たりcosine。**実モデル評価Recall@3=0.833≥0.80・公式ST完全一致**、query 9.6ms/doc 11.5ms、worker SIGKILL→自動再起動E2E。cargo 763 / vitest 456。ort 2.0.0-rc.13（RCリスク記録・provider 1ファイルに隔離）。
 
 ## 9. オープンクエスチョン（ユーザー判断不要・PM判断で進行）
 
