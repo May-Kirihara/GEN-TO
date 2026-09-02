@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   EMPTY_SCAN_STATUS,
   LibraryStore,
+  startupCatalogView,
   type LibraryIpc,
   type LibraryRoot,
 } from "./library";
@@ -265,5 +266,54 @@ describe("LibraryStore", () => {
     expect(statusCalls2).toBe(statusCalls1);
     expect(unlisten).toHaveBeenCalled();
     vi.useRealTimers();
+  });
+});
+
+describe("startupCatalogView (UXLIB-1 起動既定表示)", () => {
+  it("--dataset が登録ルート配下なら library 表示で起動 (重複走査・編集不可adhocの解消)", () => {
+    expect(startupCatalogView("/data/photos", true, ["/data/photos"])).toEqual({
+      kind: "library",
+    });
+    expect(startupCatalogView("/data/photos/2026", true, ["/data/photos"])).toEqual({
+      kind: "library",
+    });
+  });
+
+  it("--dataset 未指定 (不在) で登録ルートありなら library 表示 (空adhocではなく)", () => {
+    expect(startupCatalogView("/cwd/sample/dataset", false, ["/data/photos"])).toEqual({
+      kind: "library",
+    });
+    expect(startupCatalogView(null, false, ["/data/photos"])).toEqual({
+      kind: "library",
+    });
+  });
+
+  it("ルート0件 + dataset不在は従来どおり adhoc (空表示)", () => {
+    expect(startupCatalogView("/cwd/sample/dataset", false, [])).toEqual({
+      kind: "adhoc",
+      path: "/cwd/sample/dataset",
+    });
+    expect(startupCatalogView(null, false, [])).toEqual({ kind: "adhoc", path: null });
+  });
+
+  it("存在する未登録 dataset は従来どおり adhoc (計測決定論化の維持)", () => {
+    expect(startupCatalogView("/tmp/e2e/dataset", true, ["/data/photos"])).toEqual({
+      kind: "adhoc",
+      path: "/tmp/e2e/dataset",
+    });
+    expect(startupCatalogView("/tmp/e2e/dataset", true, [])).toEqual({
+      kind: "adhoc",
+      path: "/tmp/e2e/dataset",
+    });
+  });
+
+  it("登録判定は複数ルートのいずれかとの一致/配下で行う (兄弟フォルダは対象外)", () => {
+    expect(startupCatalogView("/data/photos2", true, ["/data/photos"])).toEqual({
+      kind: "adhoc",
+      path: "/data/photos2",
+    });
+    expect(startupCatalogView("/data/other/sub", true, ["/data/photos", "/data/other"])).toEqual({
+      kind: "library",
+    });
   });
 });

@@ -14,7 +14,12 @@
     ThumbnailStore,
     type ThumbnailIpc,
   } from "./lib/thumbnails";
-  import { LibraryStore, type LibraryIpc, type LibraryRoot } from "./lib/library";
+  import {
+    LibraryStore,
+    startupCatalogView,
+    type LibraryIpc,
+    type LibraryRoot,
+  } from "./lib/library";
   import { GridStore, type GridIpc } from "./lib/grid/grid-store";
   import { ScrollPositionStore } from "./lib/grid/scroll-position";
   import type { ThumbCellClass } from "./lib/grid/layout";
@@ -1146,6 +1151,37 @@
   }
 
   /**
+   * ライブラリ表示 (登録ルート全体) へ切替える共通遷移 (UXLIB-1)。
+   * selectFolderの登録済み分岐・LibraryPanel (行クリック/表示ボタン/
+   * addRoot後の自動切替)・起動時既定表示が共有する。`folder` は
+   * currentFolderへ反映するパス (省略=現状維持。selectFolderの
+   * registered分岐と同等の状態遷移)。失敗時はlibraryErrorへ理由を出す。
+   */
+  async function showLibrary(
+    opts: { folder?: string | null; sortOverride?: CatalogSort } = {},
+  ): Promise<boolean> {
+    osNotice = "";
+    collectionNotice = "";
+    const ok = await library.useSource("library");
+    if (!ok) {
+      libraryError = library.lastError ?? "ライブラリ表示へ切替できませんでした";
+      return false;
+    }
+    catalogSource = "library";
+    if (opts.folder !== undefined) {
+      currentFolder = opts.folder;
+    }
+    activeCollection = null;
+    searchActive = false;
+    collectionNotes = {};
+    gridSelection = { ids: [], focusIndex: null };
+    await applySavedSort(LIBRARY_SORT_KEY, opts.sortOverride);
+    await catalog.refreshSummary();
+    await catalog.loadPage(0);
+    return true;
+  }
+
+  /**
    * フォルダ選択: 登録済みならライブラリソース、未登録なら一時走査へ切替。
    * 走査中の切替はbackendが旧走査を世代無効化する (QA-WP4 Major-1)。
    * `sortOverride` はセッション復元等の明示指定 (保存済みソート優先)。
@@ -1156,21 +1192,11 @@
     const registered = registeredStateFor(path, libraryRoots) !== null;
     tree.select(path);
     if (registered) {
-      const ok = await library.useSource("library");
+      const ok = await showLibrary({ folder: path, sortOverride });
       if (ok) {
-        catalogSource = "library";
-        currentFolder = path;
-        activeCollection = null;
-        searchActive = false;
-        collectionNotes = {};
-        gridSelection = { ids: [], focusIndex: null };
-        await applySavedSort(LIBRARY_SORT_KEY, sortOverride);
-        await catalog.refreshSummary();
-        await catalog.loadPage(0);
         saveFolderPrefs();
         return true;
       }
-      libraryError = library.lastError ?? "ライブラリ表示へ切替できませんでした";
       return false;
     }
     // フォルダ別保存ソート (QA-WP4 Major-2)。走査開始時点でbackendへ反映
@@ -2214,12 +2240,25 @@
     });
     void catalog.init().then(async (dispose) => {
       disposeCatalog = dispose;
+      // 起動既定表示の決定には --dataset (health) と登録ルートの両方が要る
+      // (UXLIB-1。onMountで先行発行したrefreshHealthとの二重発行は冪等)。
+      await Promise.all([refreshHealth(), library.refreshRoots()]);
+      const view = startupCatalogView(
+        rawHealth?.dataset_path ?? null,
+        rawHealth?.dataset_exists ?? false,
+        library.roots.map((root) => root.path),
+      );
+      if (view.kind === "library") {
+        // 登録済みデータの見える化: 空adhocや重複走査ではなくライブラリ
+        // 表示で起動する (失敗時はshowLibraryがlibraryErrorへ出す)
+        await showLibrary();
+        return;
+      }
       // 起動時は --dataset (決定論的) を一時走査する。前回フォルダは
       // ツリー選択のハイライトとして復元し、クリックで戻れるようにする
       await catalog.startScan();
-      const healthPath = rawHealth?.dataset_path ?? null;
-      if (healthPath !== null) {
-        currentFolder = healthPath;
+      if (view.path !== null) {
+        currentFolder = view.path;
       }
     });
     void thumbnails.init().then((dispose) => {
@@ -2525,6 +2564,7 @@
           error={libraryError}
           scanBusy={libraryScanBusy}
           onRefresh={() => void library.refreshRoots()}
+          onShowLibrary={() => showLibrary()}
         />
       </aside>
       <div
@@ -2583,7 +2623,15 @@
               閉じる
             </button>
           {:else if catalogSource === "library"}
-            <span class="crumb-current">ライブラリ (登録ルート全体)</span>
+            <span
+              class="crumb-current"
+              title="ライブラリ表示は登録ルート全体を表示します (フォルダーの絞り込みは検索scopeで実行できます)"
+            >
+              ライブラリ (登録ルート全体)
+            </span>
+            <span class="crumb-hint" title="フォルダー単位の絞り込みは検索scope (フォルダ) で実行できます">
+              絞り込みは検索scope
+            </span>
           {:else}
             {#each crumbs as crumb, index (crumb.path)}
               {#if index > 0}<span class="crumb-sep">›</span>{/if}
@@ -3410,6 +3458,12 @@
 
   .crumb-current {
     font-weight: bold;
+  }
+
+  /* UXLIB-1: ライブラリ表示の現仕様 (全体表示・絞り込みなし) の一案内 */
+  .crumb-hint {
+    font-size: 0.7rem;
+    color: light-dark(#57606a, #8b949e);
   }
 
   .coll-current {

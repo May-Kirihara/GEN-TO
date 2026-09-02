@@ -808,6 +808,20 @@ export function installDevBridge(stores: DevBridgeStores): void {
         }, 100);
       })();
     },
+    /** UXLIB-1 E2E: 登録ルート行の切替ボタンclick (ライブラリ表示 = 生産経路)。 */
+    foShowLibraryRow: () => {
+      document.querySelector<HTMLButtonElement>(".roots-list li .roots-open")?.click();
+    },
+    /** UXLIB-1 E2E: 「ライブラリを表示」ボタンclick (生産経路)。 */
+    foShowLibraryBtn: () => {
+      document
+        .querySelectorAll<HTMLButtonElement>(".roots-controls button")
+        .forEach((b) => {
+          if ((b.textContent ?? "").includes("ライブラリを表示")) {
+            b.click();
+          }
+        });
+    },
     /**
      * リネーム入力へ "will-revert.png" を設定して確定 (E2E固定値。
      * input値設定+inputイベント+Enter合成keydown = 生産経路)。
@@ -1017,6 +1031,13 @@ export function installDevBridge(stores: DevBridgeStores): void {
     // グリッドDOM上のバッジ数 (星・♥・採用/除外) とタグ候補数
     const badges = document.querySelectorAll("[data-grid-cell] .badge").length;
     const suggests = document.querySelectorAll("[data-meta='tag-suggest'] .tag-suggest-item").length;
+    // UXLIB-1: InfoPanel編集ロックの理由 (h=ハッシュ待ち / u=未登録フォルダ)
+    const lockText = (document.querySelector(".placeholder-note")?.textContent ?? "").trim();
+    const lock = lockText.includes("ハッシュ計算待ち")
+      ? "h"
+      : lockText.includes("未登録フォルダ")
+        ? "u"
+        : "-";
     return [
       `M edit=${meta.canEdit ? 1 : 0} rat=${d?.rating ?? f?.rating ?? -1}` +
         ` frat=${f?.rating ?? -1} ftri=${tri(f?.triage)} fid=${f?.id ?? "-"} fdb=${f?.dbState ?? "-"}` +
@@ -1024,7 +1045,7 @@ export function installDevBridge(stores: DevBridgeStores): void {
         ` fav=${(d?.favorite ?? f?.favorite ?? false) ? 1 : 0}` +
         ` tags=${d?.tags.length ?? -1} caps=${d?.captions.length ?? -1}` +
         ` undo=${meta.undoDepth} tmode=${meta.triageMode ? 1 : 0}` +
-        ` badge=${badges} sug=${suggests}`,
+        ` badge=${badges} sug=${suggests} lock=${lock}`,
     ];
   }
 
@@ -1208,6 +1229,8 @@ export function installDevBridge(stores: DevBridgeStores): void {
       if (foCmdMode) {
         const foKeys: Record<string, string> = {
           "0": "foAddRootDataset",
+          "1": "foShowLibraryRow",
+          "2": "foShowLibraryBtn",
           "4": "contextMenuCell0",
           "5": "contextMenuFocused",
           "3": "focusCell3",

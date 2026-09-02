@@ -234,7 +234,9 @@ xdotool key Return; sleep 1.2
 wait_value n 3 15 || fail "smart not created (n=$(devtest_value n || echo none))"
 wait_cl_list m2,m1,s1 10 || fail "unexpected list (list=$(cl_list || echo none))"
 qj=$(db_query "SELECT query_json FROM collections WHERE kind='smart'" | head -1)
-echo "$qj" | grep -q 'rating_ge' || fail "query_json missing rating_ge: $qj"
+# QA-WP8以降、smartコレクションのquery_jsonはv2 AST形式
+# (terms[].{key,op,value}。旧トークンrating_geは廃止)
+echo "$qj" | grep -q '"key":"rating","op":"ge"' || fail "query_json missing rating ge term: $qj"
 echo "$qj" | grep -q 'SELECT\|FROM assets' && fail "query_json must not contain SQL"
 pass "smartコレクション作成 (評価≥4。query_jsonのみでSQL不保存)"
 # 表示 (E2E Manual→Second→High Rated の3巡回でsmartへ到達)

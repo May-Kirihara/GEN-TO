@@ -153,6 +153,27 @@ export function canEditMetadata(
   return item !== null && libraryBacked && item.dbState === "asset";
 }
 
+/**
+ * 編集不可の理由文案 (UXLIB-1)。canEditMetadataと同一規則で判定し、
+ * InfoPanelの編集セクションへ表示する。編集可 / 項目未選択は null
+ * (未選択は「画像を選択すると…」の別プレースホルダーで示す)。
+ */
+export function editLockedReason(
+  libraryBacked: boolean,
+  item: { dbState: string } | null,
+): string | null {
+  if (item === null || canEditMetadata(libraryBacked, item)) {
+    return null;
+  }
+  if (!libraryBacked) {
+    return "※未登録フォルダ——ルート登録すると編集できます";
+  }
+  if (item.dbState === "provisional") {
+    return "※ハッシュ計算待ち——確定後に編集できます";
+  }
+  return "※この項目は編集できません";
+}
+
 export class MetadataStore {
   lastError: string | null = null;
   version = 0;

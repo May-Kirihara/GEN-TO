@@ -184,7 +184,9 @@ wait_value tmode 1 10 || fail "triage mode not enabled (tmode=$(devtest_value tm
 # セッション開始でフォーカスは位置0 (セル0=一括除外済み) へ移る。
 # P (採用) → 3 (評価) → X (除外) の順で未処理セルへ当てる
 idx_before=$(devtest_value idx || true)
-xdotool key ctrl+shift+F12; sleep 1.0   # "p" = 採用 (セル0: 除外→採用へ) + 自動次送り
+# pressKeyP相当のctrl+shift+F12はWP-7以降foCmdMode入口に取られたため、
+# 高速選別の実キー "p" を直接送る (実装意図 = triageモードのpキー)
+xdotool key p; sleep 1.0                # "p" = 採用 (セル0: 除外→採用へ) + 自動次送り
 wait_db "SELECT id FROM assets WHERE triage = 'picked'" 1 15 \
   || fail "triage-mode pick failed (picked=$(db_query "SELECT id FROM assets WHERE triage = 'picked'" | wc -l))"
 idx_after=$(devtest_value idx || echo -1)

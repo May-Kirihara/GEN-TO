@@ -7,6 +7,7 @@
  * - カタログ表示ソース切替 (temp=一時走査 / library=DB由来)
  * - 型契約は docs/dev/api-contract.md §17
  */
+import { registeredStateFor } from "./fsview";
 
 /** Tauri IPC境界の注入用アダプター (本物は@tauri-apps/api、試験はモック)。 */
 export type LibraryIpc = {
@@ -79,6 +80,41 @@ export const EMPTY_SCAN_STATUS: LibraryScanStatus = {
   hash_retry_pending: 0,
   hash_retry_exhausted: 0,
 };
+
+/** 起動時の既定カタログ表示 (UXLIB-1)。 */
+export type StartupCatalogView =
+  | { kind: "library" }
+  | { kind: "adhoc"; path: string | null };
+
+/**
+ * 起動時の既定カタログ表示を決める純粋関数 (UXLIB-1)。
+ *
+ * - `--dataset` (health の dataset_path。未指定時はbackendがCWD相対の
+ *   `sample/dataset` へ解決) が登録ルート配下なら **library表示** で起動
+ *   (登録済み画像が見えない・編集できないadhoc表示の混乱解消)。
+ * - dataset が不在 (未指定起動など) で登録ルートがあれば **library表示**
+ *   (空adhocではなく登録済み画像を見せる)。ルート0件なら従来どおり空表示。
+ * - 存在する未登録 dataset は従来どおり adhoc 一時走査 (計測決定論化)。
+ */
+export function startupCatalogView(
+  datasetPath: string | null,
+  datasetExists: boolean,
+  rootPaths: ReadonlyArray<string>,
+): StartupCatalogView {
+  if (
+    datasetPath !== null &&
+    registeredStateFor(
+      datasetPath,
+      rootPaths.map((path) => ({ path })),
+    ) !== null
+  ) {
+    return { kind: "library" };
+  }
+  if (!datasetExists && rootPaths.length > 0) {
+    return { kind: "library" };
+  }
+  return { kind: "adhoc", path: datasetPath };
+}
 
 function toMessage(value: unknown): string {
   return value instanceof Error ? value.message : String(value);

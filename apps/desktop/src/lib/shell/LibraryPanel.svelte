@@ -1,11 +1,13 @@
 <script lang="ts">
   /**
-   * 登録ルート管理ペイン (MVP WP-2資産の製品UI組み込み、WP-4)。
-   *
-   * - パス入力での追加 (親子重複警告はLibraryStoreが保持)
-   * - 有効/無効切替・解除・ライブラリ再スキャン・スキャン停止
-   * - 不在ルート (アンマウント等) は「不在」表示 (WP-2仕様)
-   */
+    * 登録ルート管理ペイン (MVP WP-2資産の製品UI組み込み、WP-4)。
+    *
+    * - パス入力での追加 (親子重複警告はLibraryStoreが保持)
+    * - 有効/無効切替・解除・ライブラリ再スキャン・スキャン停止
+    * - 不在ルート (アンマウント等) は「不在」表示 (WP-2仕様)
+    * - UXLIB-1: 追加成功後のライブラリ表示への自動切替・ルート行クリック・
+    *   「ライブラリを表示」ボタン (切替遷移はAppのshowLibraryが正本)
+    */
   import type { LibraryRoot, LibraryStore } from "../library";
 
   let {
@@ -15,6 +17,7 @@
     error,
     scanBusy,
     onRefresh,
+    onShowLibrary,
   }: {
     library: LibraryStore;
     roots: LibraryRoot[];
@@ -22,6 +25,8 @@
     error: string | null;
     scanBusy: boolean;
     onRefresh: () => void;
+    /** ライブラリ表示 (登録ルート全体) へ切替える (AppのshowLibrary)。 */
+    onShowLibrary: () => Promise<boolean>;
   } = $props();
 
   let newRootPath = $state("");
@@ -31,9 +36,13 @@
       return;
     }
     const ok = await library.addRoot(newRootPath.trim());
-    if (ok) {
-      newRootPath = "";
+    if (!ok) {
+      return;
     }
+    newRootPath = "";
+    // 登録したら自分のライブラリが見える導線 (UXLIB-1)。切替失敗は
+    // showLibraryがlibraryErrorへ出すため、ここでは表示を維持して継続。
+    await onShowLibrary();
   }
 </script>
 
@@ -64,10 +73,16 @@
     <ul class="roots-list">
       {#each roots as root (root.id)}
         <li class:root-unavailable={!root.available}>
-          <span class="roots-path" title={root.path}>{root.path}</span>
-          <span class="roots-state">
-            {root.enabled ? (root.available ? "有効" : "不在") : "無効"}
-          </span>
+          <button
+            class="roots-open"
+            title="ライブラリ表示へ切替 (登録ルート全体)"
+            onclick={() => void onShowLibrary()}
+          >
+            <span class="roots-path" title={root.path}>{root.path}</span>
+            <span class="roots-state">
+              {root.enabled ? (root.available ? "有効" : "不在") : "無効"}
+            </span>
+          </button>
           <span class="roots-actions">
             <button
               onclick={() => void library.setEnabled(root.id, !root.enabled)}
@@ -82,6 +97,12 @@
     </ul>
   {/if}
   <div class="roots-controls">
+    <button
+      onclick={() => void onShowLibrary()}
+      title="登録ルート全体のカタログを表示します (フォルダー絞り込みは検索scope)"
+    >
+      ライブラリを表示
+    </button>
     <button onclick={() => void library.startScan()} disabled={scanBusy}>
       ライブラリ再スキャン
     </button>
@@ -138,9 +159,35 @@
     display: flex;
     flex-direction: column;
     gap: 0.1rem;
-    padding: 0.25rem;
     border: 1px solid light-dark(#d0d7de, #30363d);
     border-radius: 0.375rem;
+  }
+
+  /* 行主要部 (パス+状態) の切替ボタン (UXLIB-1)。押せる範囲を行全体へ
+   * 広げるためpaddingはボタン側へ持つ。有効/無効・解除は兄弟要素のため
+   * 押しても行クリック扱いにならない */
+  .roots-open {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    padding: 0.25rem;
+    border: none;
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    border-radius: 0.375rem;
+  }
+
+  .roots-open:hover {
+    background: light-dark(#eaeef2, #21262d);
+  }
+
+  .roots-actions {
+    display: flex;
+    gap: 0.3rem;
+    padding: 0 0.25rem 0.25rem;
   }
 
   .roots-list li.root-unavailable {
@@ -161,11 +208,6 @@
   .root-unavailable .roots-state {
     color: light-dark(#9a6700, #d29922);
     font-weight: bold;
-  }
-
-  .roots-actions {
-    display: flex;
-    gap: 0.3rem;
   }
 
   .roots-actions button {

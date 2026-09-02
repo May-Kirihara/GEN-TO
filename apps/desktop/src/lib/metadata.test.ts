@@ -3,6 +3,7 @@ import {
   CAPTION_KINDS,
   MetadataStore,
   canEditMetadata,
+  editLockedReason,
   patchOfEvent,
   type AssetUpdatedEvent,
   type MetadataIpc,
@@ -119,6 +120,33 @@ describe("canEditMetadata", () => {
 
   it("項目未選択は編集不可", () => {
     expect(canEditMetadata(true, null)).toBe(false);
+  });
+});
+
+describe("editLockedReason (UXLIB-1 編集不可の理由表示)", () => {
+  it("編集可能なら理由なし (null)", () => {
+    expect(editLockedReason(true, { dbState: "asset" })).toBeNull();
+  });
+
+  it("項目未選択は理由なし (選択を促すプレースホルダーが別にある)", () => {
+    expect(editLockedReason(true, null)).toBeNull();
+    expect(editLockedReason(false, null)).toBeNull();
+  });
+
+  it("一時走査 (未登録フォルダ) はルート登録を案内する", () => {
+    expect(editLockedReason(false, { dbState: "adhoc" })).toBe(
+      "※未登録フォルダ——ルート登録すると編集できます",
+    );
+    // dbState=asset相当でもtemp表示は編集不可 (仕様§4.1) — 同じ案内
+    expect(editLockedReason(false, { dbState: "asset" })).toBe(
+      "※未登録フォルダ——ルート登録すると編集できます",
+    );
+  });
+
+  it("library系表示のハッシュ計算待ち (provisional) は確定後の編集を案内する", () => {
+    expect(editLockedReason(true, { dbState: "provisional" })).toBe(
+      "※ハッシュ計算待ち——確定後に編集できます",
+    );
   });
 });
 

@@ -796,6 +796,14 @@ invoke<CatalogSummary>("set_catalog_source", { source: "temp" | "library" })
   (スナップショットは次の更新で上書きされる)。
 - `CatalogMode` (`CatalogSummary.mode`) に `"library"` を追加 (列挙値追加 =
   minor。`GENTO_API_VERSION` は据え置き)。
+- **起動時の既定表示** (UXLIB-1。WebView側 `startupCatalogView` の判定):
+  health の `dataset_path` が登録ルート配下、または dataset 不在
+  (`dataset_exists: false`) かつ登録ルートありの場合は `library` 表示で
+  起動する (登録済み画像が見えない・編集できないadhoc表示と重複走査の
+  解消)。存在する未登録 dataset は従来どおり `temp` 一時走査 (計測の
+  決定論化を維持)。UIからの切替導線: 登録ルート行/「ライブラリを表示」
+  ボタン (LibraryPanel)・`addRoot` 成功後の自動切替・ツリーの登録済み
+  フォルダ選択が同じ `library` ソースへ遷移する。
 
 ## 18. Events
 
@@ -1108,8 +1116,10 @@ type ImageListItem = {
 
 - レイアウト (ペイン表示/幅/サムネイルサイズ): localStorage `gento:layout:v1`
 - 前回フォルダ・ツリー展開: localStorage `gento:folders:v1`
-  (起動時の走査対象は `--dataset` のまま決定論的。前回フォルダはツリーの
-  選択ハイライトとして復元)
+  (起動時の走査対象は `--dataset` が正本で決定論的。ただしUXLIB-1以降、
+  dataset が登録ルート配下・または dataset 不在で登録ルートありの場合は
+  起動直後にライブラリ表示へ切替する (§17「起動時の既定表示」)。
+  前回フォルダはツリーの選択ハイライトとして復元)
 - **フォルダ別ソート** (QA-WP4): `gento:folders:v1` の `sorts`
   (キー=フォルダ絶対パス / ライブラリ表示は `"library"`。上限128エントリ)。
   フォルダ再オープン時に `open_folder` の `sort` 引数で再適用する

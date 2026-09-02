@@ -18,6 +18,7 @@
   import {
     CAPTION_KINDS,
     canEditMetadata,
+    editLockedReason,
     type AssetDetailDto,
     type CullValue,
     type TagDto,
@@ -159,6 +160,8 @@
   /** 編集可能 = library系表示 (Library・コレクション・検索結果) でAsset確定済み
    * (仕様§4.1: 未登録は編集不可。規則の正本は lib/metadata.ts canEditMetadata)。 */
   const canEdit = $derived(canEditMetadata(libraryMode, item));
+  /** 編集不可の理由文案 (UXLIB-1。ハッシュ待ち/未登録フォルダを案内)。 */
+  const lockReason = $derived(editLockedReason(libraryMode, item));
   const bulk = $derived(selectionCount > 1 && canEdit);
 
   /** 確認待ちの一括操作 (適用/取消)。 */
@@ -646,11 +649,7 @@
     {#if item === null}
       <p class="placeholder-note">画像を選択すると編集できます</p>
     {:else if !canEdit}
-      <p class="placeholder-note">
-        {libraryMode
-          ? "ハッシュ計算待ちの項目です (計算完了後に編集できます)"
-          : "未登録フォルダではメタデータを編集できません (登録ルートをライブラリ表示してください)"}
-      </p>
+      <p class="placeholder-note">{lockReason ?? "この項目は編集できません"}</p>
     {:else}
       {#if bulk}
         <p class="bulk-note">選択 {selectionCount.toLocaleString()}件へ一括適用します (適用前に確認します)</p>
