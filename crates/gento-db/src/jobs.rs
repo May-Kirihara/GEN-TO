@@ -179,6 +179,37 @@ impl SqliteRepos<'_> {
         Ok(rows)
     }
 
+    /// 指定job_type群の実行可能候補を覗き見る (WP-11: 種別別ワーカーが
+    /// 他種のジョブを取り合わないための型フィルタ)。
+    pub fn list_eligible_jobs_of_types(
+        &self,
+        now_rfc3339: &str,
+        limit: u32,
+        job_types: &[&str],
+    ) -> Result<Vec<JobRecord>, RepoError> {
+        let placeholders = job_types.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT {JOB_COLUMNS} FROM jobs \
+             WHERE job_type IN ({placeholders}) AND ({ELIGIBLE_CONDITION}) \
+             ORDER BY priority ASC, id ASC LIMIT ?{}",
+            job_types.len() + 2
+        );
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(job_types.len() + 2);
+        for job_type in job_types {
+            params.push(job_type);
+        }
+        params.push(&now_rfc3339);
+        let limit_i64 = limit as i64;
+        params.push(&limit_i64);
+        let mut stmt = self.conn().prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map(params.as_slice(), map_job)
+            .map_err(map_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_err)?;
+        Ok(rows)
+    }
+
     /// 指定IDのジョブをatomically claimする (queued/retry_waitingかつ
     /// backoff期限到着の場合のみ成功)。他ワーカーとの競合は0変更で敗退。
     pub fn claim_job_by_id(
@@ -244,6 +275,60 @@ impl SqliteRepos<'_> {
         let record = get_job_by_id(&tx, id)?.ok_or(RepoError::NotFound)?;
         tx.commit().map_err(map_err)?;
         Ok(Some(record))
+    }
+
+    /// 指定job_typeの実行可能ジョブを1件atomically claimする (WP-11:
+    /// 種別別ワーカーが他種のジョブを取り合わないための型フィルタ)。
+    /// 規則は [`Self::claim_next_job`] と同じ (優先度昇順・ID昇順)。
+    pub fn claim_next_job_of_type(
+        &self,
+        now_rfc3339: &str,
+        job_type: &str,
+    ) -> Result<Option<JobRecord>, RepoError> {
+        let tx = self
+            .conn()
+            .unchecked_transaction()
+            .map_err(|e| RepoError::Db(e.to_string()))?;
+        let candidate: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM jobs \
+                 WHERE job_type = ?2 AND (status = 'queued' \
+                    OR (status = 'retry_waiting' AND scheduled_at IS NOT NULL \
+                        AND scheduled_at <= ?1)) \
+                 ORDER BY priority ASC, id ASC LIMIT 1",
+                params![now_rfc3339, job_type],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_err)?;
+        let Some(id) = candidate else {
+            return Ok(None);
+        };
+        let now = now_utc_rfc3339();
+        tx.execute(
+            "UPDATE jobs SET status = 'running', attempts = attempts + 1, \
+             started_at = ?2, updated_at = ?2, error = NULL WHERE id = ?1 AND \
+             status IN ('queued', 'retry_waiting')",
+            params![id, now],
+        )
+        .map_err(map_err)?;
+        let record = get_job_by_id(&tx, id)?.ok_or(RepoError::NotFound)?;
+        tx.commit().map_err(map_err)?;
+        Ok(Some(record))
+    }
+
+    /// 指定job_typeのpending (queued/running/retry_waiting) 件数。
+    pub fn pending_job_count_of_type(&self, job_type: &str) -> Result<u64, RepoError> {
+        let count: i64 = self
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM jobs WHERE job_type = ?1 \
+                 AND status IN ('queued', 'running', 'retry_waiting')",
+                [job_type],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        Ok(count.max(0) as u64)
     }
 
     /// 実行成功で確定する (running → succeeded)。
@@ -503,6 +588,49 @@ mod tests {
     }
 
     const NOW: &str = "2026-09-02T00:00:00.000Z";
+
+    #[test]
+    fn typed_claim_and_listing_do_not_cross_job_types() {
+        use crate::embeddings::JOB_TYPE_EMBEDDING;
+        with_repos("typed", |repos| {
+            let ai_job = enqueue(repos, 1).expect("ai job");
+            repos
+                .enqueue_job(JOB_TYPE_EMBEDDING, "asset", 2, 0, "{}")
+                .unwrap();
+            // 型フィルタ候補: AI側はembeddingを覗かない
+            let now = "2026-09-02T00:00:00.000Z";
+            let ai_candidates = repos
+                .list_eligible_jobs_of_types(
+                    now,
+                    16,
+                    &[JOB_TYPE_AI_CAPTION_TAGS, JOB_TYPE_AI_REPARSE],
+                )
+                .unwrap();
+            assert!(ai_candidates
+                .iter()
+                .all(|j| j.job_type != JOB_TYPE_EMBEDDING));
+            assert_eq!(ai_candidates.len(), 1);
+            // 型claim: embedding側はAIジョブを取得しない
+            let claimed = repos
+                .claim_next_job_of_type(now, JOB_TYPE_EMBEDDING)
+                .unwrap()
+                .expect("embedding claim");
+            assert_eq!(claimed.job_type, JOB_TYPE_EMBEDDING);
+            assert_eq!(claimed.target_id, 2);
+            let ai_claimed = repos
+                .claim_next_job_of_type(now, JOB_TYPE_AI_CAPTION_TAGS)
+                .unwrap()
+                .expect("ai claim");
+            assert_eq!(ai_claimed.id, ai_job.id);
+            // pending件数
+            repos.complete_job(claimed.id).unwrap();
+            repos.complete_job(ai_claimed.id).unwrap();
+            assert_eq!(
+                repos.pending_job_count_of_type(JOB_TYPE_EMBEDDING).unwrap(),
+                0
+            );
+        });
+    }
 
     #[test]
     fn enqueue_dedupes_pending_same_target() {

@@ -13,6 +13,7 @@ pub mod collections;
 pub mod db;
 #[cfg(any(debug_assertions, feature = "devtools"))]
 pub mod devtools;
+pub mod embedding;
 pub mod fileops;
 pub mod fsview;
 pub mod library;
@@ -231,7 +232,12 @@ pub fn run() {
         ai::ai_jobs_resume,
         ai::ai_jobs_retry_failed,
         ai::ai_run_history,
-        ai::ai_root_settings_set
+        ai::ai_root_settings_set,
+        embedding::embedding_status,
+        embedding::embedding_enable,
+        embedding::embedding_disable,
+        embedding::embedding_model_delete,
+        embedding::embedding_similar_debug
     ]);
     #[cfg(not(any(debug_assertions, feature = "devtools")))]
     let builder = builder.invoke_handler(tauri::generate_handler![
@@ -318,7 +324,12 @@ pub fn run() {
         ai::ai_jobs_resume,
         ai::ai_jobs_retry_failed,
         ai::ai_run_history,
-        ai::ai_root_settings_set
+        ai::ai_root_settings_set,
+        embedding::embedding_status,
+        embedding::embedding_enable,
+        embedding::embedding_disable,
+        embedding::embedding_model_delete,
+        embedding::embedding_similar_debug
     ]);
     builder
         .setup(move |app| {
@@ -412,6 +423,20 @@ pub fn run() {
                             crate::ai::tauri_event_sink(app.handle().clone()),
                         );
                         state.ai = Some(ai_service);
+                        // WP-11: 埋め込みサービス (ワーカーspawnはlazy。
+                        // models_dirは --models-dir / GENTO_MODELS_DIR /
+                        // 既定 data_dir/models — dependency-notes参照)。
+                        let models_dir = crate::embedding::resolve_models_dir_for_app(
+                            &args,
+                            &app_dirs,
+                        );
+                        tracing::info!(models_dir = %models_dir.display(), "embedding models dir resolved");
+                        let embedding_service = crate::embedding::EmbeddingService::start(
+                            std::sync::Arc::clone(&db),
+                            models_dir,
+                            crate::embedding::tauri_notice_sink(app.handle().clone()),
+                        );
+                        state.embedding = Some(embedding_service);
                         controller.enqueue_scan_all();
                         state.library = Some(controller);
                     }
@@ -441,6 +466,9 @@ pub fn run() {
                     }
                     if let Some(ai) = &state.ai {
                         ai.shutdown();
+                    }
+                    if let Some(embedding) = &state.embedding {
+                        embedding.shutdown();
                     }
                 }
             }

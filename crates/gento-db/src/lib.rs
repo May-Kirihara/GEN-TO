@@ -50,6 +50,7 @@ mod ai;
 mod assetmeta;
 mod collections;
 mod diagnose;
+mod embeddings;
 mod ids;
 mod jobs;
 mod metadata;
@@ -62,6 +63,11 @@ mod search;
 /// AIプロファイル・実行履歴 (WP-10)。
 pub use ai::{AiProfileRecord, AiRunRecord, AssetSource, NewAiProfile};
 pub use diagnose::DbStatus;
+/// 埋め込み永続化とアプリ設定 (WP-11)。
+pub use embeddings::{
+    decode_vector_f32, encode_vector_f32, setting_get_raw, EmbeddingMeta, JOB_TYPE_EMBEDDING,
+    SETTING_EMBEDDING_ENABLED, SETTING_EMBEDDING_MODEL,
+};
 /// 永続ジョブキュー (WP-10)。
 pub use jobs::{rfc3339_after_now, JobRecord, JOB_TYPE_AI_CAPTION_TAGS, JOB_TYPE_AI_REPARSE};
 /// backup/restore正準表現 (パーセントエスケープUTF-8。WP-13で使用)。
@@ -71,9 +77,9 @@ pub use repos::SqliteRepos;
 pub use schema::LATEST_VERSION;
 /// FTS5検索 (WP-8): 文書構築・整合性診断・AST検索実行・一致根拠。
 pub use search::{
-    build_asset_doc, fts_counts, fts_integrity, fts_rebuild, fts_repair, prune_orphan_docs,
-    rebuild_docs_for_assets, search_asset_ids, search_evidence, AssetDoc, DocField, FieldEvidence,
-    FtsIntegrityReport, SearchScope,
+    build_asset_doc, build_search_doc_input, fts_counts, fts_integrity, fts_rebuild, fts_repair,
+    prune_orphan_docs, rebuild_docs_for_assets, search_asset_ids, search_evidence, AssetDoc,
+    DocField, FieldEvidence, FtsIntegrityReport, SearchScope,
 };
 
 /// 既定のbusy_timeout (ms)。PM計画§6-2。

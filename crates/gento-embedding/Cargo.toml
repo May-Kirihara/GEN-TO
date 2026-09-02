@@ -1,0 +1,41 @@
+[package]
+name = "gento-embedding"
+description = "GEN-TO local embedding runtime (ruri-v3 ONNX) and worker protocol"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "gento_embedding"
+path = "src/lib.rs"
+
+# 独立ワーカープロセス (docs/embedding-runtime.md §5)。tauriコアから
+# spawnされ、stdio長さ前置JSONプロトコルで通信する。ホスト側
+# (gento-tauri) はlibのプロトコル型を使用するためbinはlibに依存する。
+[[bin]]
+name = "gento-embedding-worker"
+path = "src/bin/worker.rs"
+
+[dependencies]
+gento-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ort = { workspace = true }
+tokenizers = { workspace = true }
+ndarray = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }
+# モデルDL (進捗・キャンセル・Range再開・プロキシ環境変数尊重)。
+# gento-aiと分離したClientインスタンスとして使用 (dependency-notes参照)。
+reqwest = { workspace = true }
+# DL前の空き容量確認 (statvfs)。Linuxのみ実パス、他OSはskip。
+libc = "0.2"
+# workerバイナリのstderrログ (本体libでは未使用 → binのみ。cargoは
+# bin/lib共通の[dependencies]しか持てないためlib側に余分にリンクされる
+# が、workspace既存crateで新規導入なし)
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+
+[features]
+# WP-0規約: 計測・検証専用機能のコンパイル隔離 (予約。現在使用なし)。
+devtools = []

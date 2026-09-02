@@ -317,7 +317,13 @@ fn run_one_job(
 ) -> bool {
     let now = rfc3339_after_now(0);
     let candidates: Vec<JobRecord> = db
-        .with_reader(|repos| repos.list_eligible_jobs(&now, ELIGIBLE_PEEK))
+        .with_reader(|repos| {
+            repos.list_eligible_jobs_of_types(
+                &now,
+                ELIGIBLE_PEEK,
+                &[JOB_TYPE_AI_CAPTION_TAGS, JOB_TYPE_AI_REPARSE],
+            )
+        })
         .unwrap_or_default();
     if candidates.is_empty() {
         return false;

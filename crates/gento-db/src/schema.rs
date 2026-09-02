@@ -16,7 +16,7 @@
 
 /// migration #1 で作るテーブル (diagnoseの行数計上にも使う)。
 /// WP-10 (#8) で ai_profiles / ai_runs を追加。
-pub(crate) const TABLES: [&str; 14] = [
+pub(crate) const TABLES: [&str; 15] = [
     "library_roots",
     "assets",
     "files",
@@ -31,6 +31,7 @@ pub(crate) const TABLES: [&str; 14] = [
     "embeddings",
     "ai_profiles",
     "ai_runs",
+    "app_settings",
 ];
 
 /// 個別のmigration定義。
@@ -84,11 +85,16 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "wp10_ai_profiles_runs_jobs",
         sql: MIGRATION_V8_SQL,
     },
+    Migration {
+        version: 9,
+        name: "wp11_embedding_jobs_app_settings",
+        sql: MIGRATION_V9_SQL,
+    },
 ];
 
 /// 現在の最新schema version (`PRAGMA user_version` の目標値)。
 /// このbuildの [`crate::Db::open`] は既存DBを必ずこの値へ移行する。
-pub const LATEST_VERSION: i32 = 8;
+pub const LATEST_VERSION: i32 = 9;
 
 /// WP-2 (登録ルート・差分スキャン) のindex追加。
 /// 列追加は不要 — 設定列は#1に含まれ、os_file_idも#1でNULL可として定義済み。
@@ -322,6 +328,57 @@ CREATE INDEX idx_jobs_status_priority ON jobs(status, priority);
 CREATE UNIQUE INDEX idx_jobs_pending_dedupe
     ON jobs(job_type, target_id)
     WHERE status IN ('queued', 'running', 'retry_waiting');
+"#;
+
+/// WP-11: 埋め込みジョブ種別とアプリ設定kvストア。
+///
+/// - `jobs` 表再構築: job_type CHECKへ `embedding` を追加 (ローカル
+///   ruri-v3埋め込みジョブ。ワーカープロセスで実行)。データは恒等コピー
+///   (既存job_typeはすべて新CHECKを満たす)。
+/// - `app_settings`: key-value設定ストア (WP-15の本格設定schemaの前段。
+///   MVPでは自然言語検索の有効フラグと選択モデルのみ)。値はTEXT。
+const MIGRATION_V9_SQL: &str = r#"
+CREATE TABLE jobs_v9 (
+    id INTEGER PRIMARY KEY,
+    uuid TEXT NOT NULL UNIQUE
+        CHECK (length(uuid) = 36 AND uuid = lower(uuid)),
+    job_type TEXT NOT NULL
+        CHECK (job_type IN ('ai_caption_tags', 'ai_reparse', 'embedding')),
+    target_type TEXT NOT NULL,
+    target_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued'
+        CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled',
+                          'retry_waiting')),
+    priority INTEGER NOT NULL DEFAULT 5 CHECK (priority BETWEEN 0 AND 9),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    max_attempts INTEGER NOT NULL DEFAULT 3 CHECK (max_attempts >= 1),
+    payload TEXT NOT NULL DEFAULT '{}',
+    error TEXT,
+    scheduled_at TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+INSERT INTO jobs_v9 (id, uuid, job_type, target_type, target_id, status, priority,
+                     attempts, max_attempts, payload, error, scheduled_at, started_at,
+                     finished_at, created_at, updated_at)
+    SELECT j.id, j.uuid, j.job_type, j.target_type, j.target_id, j.status, j.priority,
+           j.attempts, j.max_attempts, j.payload, j.error, j.scheduled_at, j.started_at,
+           j.finished_at, j.created_at, j.updated_at
+      FROM jobs j;
+DROP TABLE jobs;
+ALTER TABLE jobs_v9 RENAME TO jobs;
+CREATE INDEX idx_jobs_status_priority ON jobs(status, priority);
+CREATE UNIQUE INDEX idx_jobs_pending_dedupe
+    ON jobs(job_type, target_id)
+    WHERE status IN ('queued', 'running', 'retry_waiting');
+
+CREATE TABLE app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 "#;
 
 const MIGRATION_V1_SQL: &str = r#"
@@ -595,9 +652,10 @@ mod tests {
     }
 
     #[test]
-    fn tables_const_lists_14_tables() {
-        assert_eq!(TABLES.len(), 14);
-        // 計画書§9の12テーブル + WP-10 (#8) のAI 2テーブルと一致
+    fn tables_const_lists_15_tables() {
+        assert_eq!(TABLES.len(), 15);
+        // 計画書§9の12テーブル + WP-10 (#8) のAI 2テーブル + WP-11 (#9) の
+        // app_settingsと一致
         let expected = [
             "library_roots",
             "assets",
@@ -613,6 +671,7 @@ mod tests {
             "embeddings",
             "ai_profiles",
             "ai_runs",
+            "app_settings",
         ];
         for t in expected {
             assert!(TABLES.contains(&t), "missing table: {t}");

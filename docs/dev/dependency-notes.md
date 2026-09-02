@@ -1,6 +1,6 @@
 # 依存ライブラリメモ (Phase 2 / WP-2時点)
 
-- 記録日: 2026-08-28 (Phase 1 → WP-2更新 → WP-3更新 2026-08-29 → WP-4更新 2026-08-29 → WP-5更新 2026-08-29 → WP-0確認 2026-08-30 → AVIF-1更新 2026-08-31 → WP-5 (MVP) 更新 2026-08-31 → WP-10更新 2026-09-02)
+- 記録日: 2026-08-28 (Phase 1 → WP-2更新 → WP-3更新 2026-08-29 → WP-4更新 2026-08-29 → WP-5更新 2026-08-29 → WP-0確認 2026-08-30 → AVIF-1更新 2026-08-31 → WP-5 (MVP) 更新 2026-08-31 → WP-10更新 2026-09-02 → WP-11更新 2026-09-02)
 - 方針: バージョンはpin (npmは正確なバージョン指定、Cargoは `=` 付き + Cargo.lock)。追加・変更時に本メモへ記録する。
 
 ## Rust (workspace直依存)
@@ -453,3 +453,84 @@
   レンズ・GPS) の解析へ拡大利用。コンテナ抽出はcrateの
   `read_from_container` (JPEG/TIFF/PNG/WebP) に一任し、読み取り総量上限
   (64MiB) はrepo側のRead wrapperで強制する。
+
+## WP-11 ruri-v3埋め込み (2026-09-02)
+
+- **`gento-embedding` 新crate** (workspace member追加): ONNX埋め込みの
+  実行基盤 (manifest検証・モデル管理・provider・workerプロトコル・DL)。
+  独立バイナリ `gento-embedding-worker` (同crateの `[[bin]]` target) は
+  tauriコアからspawnされstdioで通信する (設計正本 docs/embedding-runtime.md
+  §5)。依存方向: embedding → core。db (build_search_doc_input) / tauri →
+  embedding。
+- **`ort` =2.0.0-rc.13 (default-features=false, features: `std`, `ndarray`, `download-binaries`, `tls-rustls`)** (gento-embedding, 通常依存)
+  - 用途: ONNX RuntimeのRust束縛。ruri-v3 ONNXグラフ
+    (inputs=`input_ids`/`attention_mask`, output=`last_hidden_state`,
+    opset 17。CONV-1変換・検証済み) のCPU推論実行。
+  - **安定版が存在しないRC版である旨のリスク記録 (WP指示)**: pyke-io/ort
+    の2.0系は2024年末からRCが長期継続中。rc.13 (2026-07-28) は
+    ONNX Runtime 1.28を束縛。API破壊の可能性を残すため、利用箇所を
+    gento-embedding::provider (1ファイル) に隔離し、バージョン更新時の
+    影響範囲を最小化する。
+  - **onnxruntime binary取得方式**: `download-binaries` featureにより
+    **build時に** `cdn.pyke.io` (pyke.ioが配布するONNX Runtime公式ソース
+    ビルド済みバイナリ) から `x86_64-unknown-linux-gnu.tar.lzma2` をDLし
+    (dist.tsv内のsha256で固定・検証)、**静的リンク** (libonnxruntime.a)
+    する。生成バイナリはruntimeにonnxruntime共有ライブラリを必要としない。
+    リスク: (1) クリーンビルド時にネットワークDLが発生 (CDNダウン時
+    ビルド不可 — `ORT_LIB_PATH`等の環境変数で手元ビルド済みlibを指す
+    ことで迂回可能)、(2) CDN配布の中断 (404/410応答時、ortは明確な
+    エラーメッセージを出す)。
+  - **配布license**: ONNX Runtime本体は **MIT**
+    (https://github.com/microsoft/onnxruntime/blob/main/LICENSE)。
+    静的リンクしても再配布義務はMITの表示保持のみ。ort crate自身は
+    **MIT OR Apache-2.0**。`tls-rustls` (DL経路のTLS) はring
+    (Cargo.lock既存 0.17.14) をproviderに使用 — opensslリンク回避
+    (reqwestのrustls方針と同一)。
+  - `default-features=false` の理由: 既定の `tracing` featureを外し
+    ログ経路を明示のままにするため。`ndarray` はテンソル構築
+    (Array2/i64) のみに使用 (ortのoptional依存と同一version 0.17系を
+    gento-embeddingも直付け — feature有効化に必要)。
+  - 入手元: crates.io (pyke-io/ort)。
+  - 対応プラットフォーム: Linux/macOS/Windows (prebuilt配布あり。
+    WP-17でWindows/macOS実機確認)。
+- **`tokenizers` =0.23.1 (default-features=false, features: `fancy-regex`)** (gento-embedding, 通常依存)
+  - 用途: ruri-v3のtokenizer.json直読み (CONV-1検証済みの正本方式。
+    LlamaTokenizerFast系はfrom_slow問題があるため`Tokenizer::from_file`
+    を使う — GaOTTT教訓)。Unigramモデル + Metaspace pre-tokenizer +
+    ByteFallback decoderはすべてtokenizers crateの**ネイティブ実装**で
+    動作。`enable_truncation(max_length=manifest値)` を必ず設定する
+    (特殊トークン位置が正しくなる — CONV-1教訓)。
+  - **`fancy-regex` feature必須の判明**: tokenizers 0.23.1は
+    default-features=falseだと「onigまたはfancy-regexを有効化せよ」の
+    compile_errorを出す (src/utils/mod.rs。regex pretokenizer/normalizer
+    のruntime解決のため)。onigはC library (oniguruma) リンクのため、
+    **純Rust実装の`fancy-regex`を選択**した。fancy-regex (MIT OR
+    Apache-2.0) はbit-set/regex-automata等の純Rust依存のみ。ruri-v3の
+    tokenizer.json自体はRegex pre-tokenizerを持たないため、実行パスで
+    使用されない予備である点も記録する。
+  - 入手元: crates.io (huggingface/tokenizers — Rust本体)。
+  - ライセンス: **Apache-2.0** (HF tokenizersはApache-2.0単独)。
+  - 推移依存: fancy-regex / spm_precompiled (dioma/NFDK依存なし)。
+    native libraryなし。
+  - 対応プラットフォーム: 全主要OS。
+- **`ndarray` 0.17系 (default-features=false)** (gento-embedding, 通常依存)
+  - 用途: ortへの入力テンソル構築。ortの `ndarray` featureが要求する
+    同一バージョン帯 (ortはoptional依存として0.17を指定) を直付け。
+    Cargo.lockに新規追加されるが、実体はort利用に必須の配列型のみ。
+  - 入手元: crates.io (rust-ndarray)。ライセンス: MIT OR Apache-2.0。
+- **`sha2` =0.10.9 (default features)** (gento-embedding, 通常依存)
+  - 用途: モデルパッケージ検証 (manifestのsha256)。**Cargo.lockに既存**
+    (0.10.9 = 推移依存として存在。直依存化のみで新規crate導入ではない。
+    0.11系もlock内にあるが、安定版は0.10系)。
+  - 入手元: crates.io (RustCrypto/hashes)。ライセンス: MIT OR Apache-2.0。
+- **`libc` 0.2系 (既存pin帯)** (gento-embedding, 通常依存)
+  - 用途: モデルDL前の空き容量確認 (`statvfs(3)`)。gento-tauri/
+    gento-platformが利用中の同一crate (0.2.189がlock内) の直付け拡大。
+  - ライセンス: MIT OR Apache-2.0。非Linuxでは空き容量確認をskip
+    (fail-open) とし、書き込み失敗時に通常のIOエラーで落ちる。
+- **`reqwest` (既存 =0.13.4) の利用拡大**: モデル配布repoからのDL
+  (進捗・キャンセル・Range再開・プロキシ環境変数尊重)。gento-aiの
+  クライアントとは**分離した別Clientインスタンス** (設計§4「プロキシ
+  環境の考慮」— gento-ai側はsystem-proxy無効化しているのに対し、
+  DL側は`Proxy::system`/環境変数既定を尊重する)。同一crate・同一version
+  のため新規依存ではない。

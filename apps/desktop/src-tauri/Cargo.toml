@@ -20,6 +20,8 @@ gento-platform = { workspace = true }
 gento-search = { workspace = true }
 # AI統合 (OpenAI互換クライアント・パイプライン。WP-10)
 gento-ai = { workspace = true }
+# ローカル埋め込み (ruri-v3 ONNX・ワーカー管理。WP-11)
+gento-embedding = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 tauri = { workspace = true }

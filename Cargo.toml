@@ -7,6 +7,7 @@ members = [
     "crates/gento-image",
     "crates/gento-platform",
     "crates/gento-search",
+    "crates/gento-embedding",
     "apps/desktop/src-tauri",
 ]
 
@@ -32,6 +33,7 @@ gento-db = { path = "crates/gento-db" }
 gento-image = { path = "crates/gento-image" }
 gento-platform = { path = "crates/gento-platform" }
 gento-search = { path = "crates/gento-search" }
+gento-embedding = { path = "crates/gento-embedding" }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 walkdir = "=2.5.0"
@@ -67,3 +69,19 @@ reqwest = { version = "=0.13.4", default-features = false, features = ["json", "
 keyring = "=4.2.0"
 # WP-10: 画像data URL化 (reqwest推移依存と同一version。新規実体なし)
 base64 = "=0.22.1"
+# WP-11: ONNX Runtime束縛 (RC版リスク・binary取得方式はdependency-notes参照)
+ort = { version = "=2.0.0-rc.13", default-features = false, features = [
+    "std",
+    "ndarray",
+    "download-binaries",
+    "tls-rustls",
+] }
+# WP-11: tokenizer.json直読み (fancy-regex = 純Rust regex engine。onigは
+# Cリンクを避けるため不使用。tokenizers 0.23はregex featureが必須)
+tokenizers = { version = "=0.23.1", default-features = false, features = [
+    "fancy-regex",
+] }
+# WP-11: ort入力テンソル構築 (ortのndarray featureが要求する同一version帯)
+ndarray = { version = "=0.17", default-features = false }
+# WP-11: モデルパッケージsha256検証 (lock既存0.10.9の直依存化)
+sha2 = "=0.10.9"

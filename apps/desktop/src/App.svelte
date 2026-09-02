@@ -2906,6 +2906,7 @@
   <AiPanel
     store={aiStore}
     roots={libraryRoots}
+    {ipc}
     onClose={() => (aiPanelOpen = false)}
     onJobsChanged={() => {
       // ジョブ完了 → フォーカス項目の表示を更新 (AIバッジ・キャプション)

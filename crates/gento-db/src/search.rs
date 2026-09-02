@@ -114,9 +114,20 @@ impl SearchScope {
 
 // ===== 文書構築 =====
 
-/// 1 assetの検索文書をDBから組み立てる。presentなFileを持たないasset
-/// (または存在しないasset) はNone (文書なし = 検索対象外)。
-pub fn build_asset_doc(conn: &Connection, asset_id: i64) -> Result<Option<AssetDoc>, RepoError> {
+/// 1 assetの文書構成素材 (build_asset_doc / build_search_doc_input共用)。
+/// captionsはkind順 (description → embedded_prompt → sd_tags) を保持し、
+/// 呼び出し側でpromptの扱いを決める。
+struct DocParts {
+    names: Vec<String>,
+    paths: Vec<String>,
+    tags: Vec<String>,
+    /// kind順の (kind, body)。user_note除く。
+    captions_ordered: Vec<(String, String)>,
+    note: Option<String>,
+}
+
+/// presentなFileを持たないasset (または存在しないasset) はNone。
+fn collect_doc_parts(conn: &Connection, asset_id: i64) -> Result<Option<DocParts>, RepoError> {
     let exists: bool = conn
         .query_row(
             "SELECT EXISTS (SELECT 1 FROM assets WHERE id = ?1)",
@@ -175,8 +186,8 @@ pub fn build_asset_doc(conn: &Connection, asset_id: i64) -> Result<Option<AssetD
     // WP-9でembedded_prompt (positive prompt) を接続 — 検索対象はpositiveのみ。
     // embedded_negative_prompt・workflow全体は意味文書に含めない
     // (data-model §9。明示的全文検索は将来課題)。
-    let mut captions: Vec<String> = Vec::new();
-    let mut note = String::new();
+    let mut captions_ordered: Vec<(String, String)> = Vec::new();
+    let mut note = None;
     {
         let mut stmt = conn
             .prepare(
@@ -193,19 +204,71 @@ pub fn build_asset_doc(conn: &Connection, asset_id: i64) -> Result<Option<AssetD
             if body.is_empty() {
                 continue;
             }
-            match kind.as_str() {
-                "user_note" => note = body,
-                _ => captions.push(body),
+            if kind == "user_note" {
+                note = Some(body);
+            } else {
+                captions_ordered.push((kind, body));
             }
         }
     }
+    Ok(Some(DocParts {
+        names,
+        paths,
+        tags,
+        captions_ordered,
+        note,
+    }))
+}
+
+/// 1 assetの検索文書をDBから組み立てる。presentなFileを持たないasset
+/// (または存在しないasset) はNone (文書なし = 検索対象外)。
+pub fn build_asset_doc(conn: &Connection, asset_id: i64) -> Result<Option<AssetDoc>, RepoError> {
+    let Some(parts) = collect_doc_parts(conn, asset_id)? else {
+        return Ok(None);
+    };
+    // FTS文書: captions列へembedded_promptを含めてkind順に連結
+    // (description → embedded_prompt → sd_tags)。
+    let captions = parts
+        .captions_ordered
+        .into_iter()
+        .map(|(_, body)| body)
+        .collect::<Vec<_>>();
     Ok(Some(AssetDoc {
         asset_id,
-        filename: names.join("\n"),
-        path: paths.join("\n"),
-        tags: tags.join(" "),
+        filename: parts.names.join("\n"),
+        path: parts.paths.join("\n"),
+        tags: parts.tags.join(" "),
         captions: captions.join("\n"),
-        note,
+        note: parts.note.unwrap_or_default(),
+    }))
+}
+
+/// 埋め込み用検索文書入力 (WP-11) をDBから組み立てる。
+/// FTS文書と同じ意味論 (negative prompt・workflow除外) で、キャプション
+/// (description + sd_tags) とpositive promptを分離して返す。
+/// presentなFileを持たないasset / 存在しないassetはNone。
+pub fn build_search_doc_input(
+    conn: &Connection,
+    asset_id: i64,
+) -> Result<Option<gento_core::SearchDocInput>, RepoError> {
+    let Some(parts) = collect_doc_parts(conn, asset_id)? else {
+        return Ok(None);
+    };
+    let mut captions: Vec<String> = Vec::new();
+    let mut prompt: Option<String> = None;
+    for (kind, body) in parts.captions_ordered {
+        if kind == "embedded_prompt" {
+            prompt = Some(body);
+        } else {
+            captions.push(body);
+        }
+    }
+    Ok(Some(gento_core::SearchDocInput {
+        filenames: parts.names,
+        captions,
+        prompt,
+        tags: parts.tags,
+        note: parts.note,
     }))
 }
 
@@ -1297,6 +1360,80 @@ mod tests {
                 .set_caption(asset, CaptionKind::Description, "changed")
                 .unwrap();
             assert!(search_all(repos, "garden").is_empty());
+        });
+    }
+
+    // ===== WP-11: 埋め込み用検索文書入力 =====
+
+    #[test]
+    fn search_doc_input_separates_prompt_and_captions() {
+        with_repos("embedinput", |repos| {
+            let root = repos.add_root(Path::new("/data/ei")).unwrap();
+            let asset = make_asset(repos, "e1");
+            link_file(repos, root.id, "neon.png", asset);
+            repos.add_tags_batch(&[asset], &["夜景", "ネオン"]).unwrap();
+            repos
+                .set_caption(asset, CaptionKind::Description, "雨の夜の街並み")
+                .unwrap();
+            repos
+                .set_caption(asset, CaptionKind::SdTags, "1girl, umbrella")
+                .unwrap();
+            repos
+                .set_caption(asset, CaptionKind::UserNote, "旅行2日目")
+                .unwrap();
+            use gento_core::assetmeta::AssetMetadataRepo as _;
+            repos
+                .save_asset_metadata(
+                    asset,
+                    &[SdRow {
+                        prompt: Some("masterpiece, night city"),
+                        negative: Some("watermark"),
+                        ..SdRow::default()
+                    }
+                    .build()],
+                )
+                .unwrap();
+
+            let input = build_search_doc_input(repos.conn(), asset)
+                .unwrap()
+                .expect("input");
+            assert_eq!(input.filenames, vec!["neon.png".to_string()]);
+            assert_eq!(
+                input.captions,
+                vec!["雨の夜の街並み".to_string(), "1girl, umbrella".to_string()],
+                "captions = description + sd_tags (kind順)"
+            );
+            assert_eq!(
+                input.prompt.as_deref(),
+                Some("masterpiece, night city"),
+                "positive promptは分離される"
+            );
+            assert_eq!(input.tags, vec!["ネオン".to_string(), "夜景".to_string()]);
+            assert_eq!(input.note.as_deref(), Some("旅行2日目"));
+
+            // FTS文書側は従来どおりpromptをcaptionsへ含む (回帰検証)
+            let doc = build_asset_doc(repos.conn(), asset).unwrap().unwrap();
+            assert!(doc.captions.contains("masterpiece, night city"));
+
+            // negativeはどちらにも入らない
+            let composed = gento_core::compose_search_document_default(&input);
+            assert!(!composed.contains("watermark"));
+            assert!(composed.contains("雨の夜の街並み"));
+            assert!(composed.contains("旅行2日目"));
+            assert!(composed.contains("ネオン 夜景"));
+        });
+    }
+
+    #[test]
+    fn search_doc_input_absent_for_asset_without_present_files() {
+        with_repos("embedinput-none", |repos| {
+            let asset = make_asset(repos, "e2");
+            assert!(build_search_doc_input(repos.conn(), asset)
+                .unwrap()
+                .is_none());
+            assert!(build_search_doc_input(repos.conn(), 999999)
+                .unwrap()
+                .is_none());
         });
     }
 

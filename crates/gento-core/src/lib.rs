@@ -4,6 +4,7 @@
 pub mod assetmeta;
 pub mod catalog;
 pub mod collections;
+pub mod embeddoc;
 pub mod file_ops;
 pub mod jobs;
 pub mod library;
@@ -12,6 +13,9 @@ pub mod repo;
 
 pub use assetmeta::{
     AssetMetadataParsed, AssetMetadataRecord, AssetMetadataRepo, MetadataColumns, ReparseTarget,
+};
+pub use embeddoc::{
+    compose_search_document, compose_search_document_default, SearchDocCaps, SearchDocInput,
 };
 
 pub use file_ops::{

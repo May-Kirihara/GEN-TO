@@ -30,21 +30,36 @@
     type AiTestReport,
   } from "../ai";
   import type { LibraryRoot } from "../library";
+  import {
+    EmbeddingStore,
+    MODEL_CHOICES,
+    canEnable,
+    enableConfirmText,
+    modelLabel,
+    packageStateLabel,
+    progressRatio,
+    progressText,
+    workerPhaseLabel,
+    type EmbeddingStatus,
+  } from "../embedding";
 
   let {
     store,
     roots,
     onClose,
     onJobsChanged,
+    ipc,
   }: {
     store: AiStore;
     roots: LibraryRoot[];
     onClose: () => void;
     /** ジョブ完了通知 (App側でInfoPanel再取得などに使う)。 */
     onJobsChanged: () => void;
+    /** 埋め込みタブ用IPC注入 (Appから共有)。 */
+    ipc?: { invoke: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T> };
   } = $props();
 
-  let tab = $state<"profiles" | "jobs" | "auto">("profiles");
+  let tab = $state<"profiles" | "jobs" | "auto" | "search">("profiles");
   let notice = $state("");
   let error = $state<string | null>(null);
   let busy = $state(false);
@@ -80,6 +95,99 @@
   // ===== 自動処理設定 =====
   /** rootId → 設定ドラフト (保存は明示ボタン)。 */
   let autoDrafts = $state<Record<string, { ai: boolean; exif: boolean; gps: boolean }>>({});
+
+  // ===== 自然言語検索 (WP-11) =====
+  let embeddingStore: EmbeddingStore | null = $state(null);
+  let embeddingStatus: EmbeddingStatus | null = $state(null);
+  let embeddingBusy = $state(false);
+  let embeddingError = $state<string | null>(null);
+  let embeddingNotice = $state("");
+  let confirmEnable = $state(false);
+  let confirmDeleteModel: string | null = $state(null);
+  let pollStop: (() => void) | null = null;
+
+  async function refreshEmbedding(): Promise<void> {
+    if (embeddingStore === null) {
+      return;
+    }
+    try {
+      embeddingStatus = await embeddingStore.status();
+      embeddingError = null;
+    } catch (e) {
+      embeddingError = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  async function doEnable(): Promise<void> {
+    if (embeddingStore === null) {
+      return;
+    }
+    embeddingBusy = true;
+    embeddingError = null;
+    confirmEnable = false;
+    try {
+      embeddingStatus = await embeddingStore.enable(embeddingStatus?.model);
+      embeddingNotice = "自然言語検索を有効にしました";
+      await refreshEmbedding();
+    } catch (e) {
+      embeddingError = e instanceof Error ? e.message : String(e);
+    } finally {
+      embeddingBusy = false;
+    }
+  }
+
+  async function doDisable(): Promise<void> {
+    if (embeddingStore === null) {
+      return;
+    }
+    embeddingBusy = true;
+    embeddingError = null;
+    try {
+      embeddingStatus = await embeddingStore.disable();
+      embeddingNotice = "自然言語検索を無効にしました";
+    } catch (e) {
+      embeddingError = e instanceof Error ? e.message : String(e);
+    } finally {
+      embeddingBusy = false;
+    }
+  }
+
+  async function doSelectModel(model: string): Promise<void> {
+    if (embeddingStore === null || embeddingStatus === null) {
+      return;
+    }
+    embeddingBusy = true;
+    embeddingError = null;
+    try {
+      // モデル選択は有効化時のみ影響する (無効状態での選択切り替え)
+      embeddingStatus = { ...embeddingStatus, model };
+      if (embeddingStatus.enabled) {
+        embeddingStatus = await embeddingStore.enable(model);
+      }
+      await refreshEmbedding();
+    } catch (e) {
+      embeddingError = e instanceof Error ? e.message : String(e);
+    } finally {
+      embeddingBusy = false;
+    }
+  }
+
+  async function doDeleteModel(model: string): Promise<void> {
+    if (embeddingStore === null) {
+      return;
+    }
+    embeddingBusy = true;
+    embeddingError = null;
+    confirmDeleteModel = null;
+    try {
+      embeddingStatus = await embeddingStore.deleteModel(model);
+      embeddingNotice = `モデル (${modelLabel(model)}) を削除しました`;
+    } catch (e) {
+      embeddingError = e instanceof Error ? e.message : String(e);
+    } finally {
+      embeddingBusy = false;
+    }
+  }
 
   async function refreshProfiles(): Promise<void> {
     try {
@@ -306,7 +414,13 @@
   }
 
   function handleKeydown(event: KeyboardEvent): void {
-    if (event.key === "Escape" && confirmAllFor === null && deletingFor === null) {
+    if (
+      event.key === "Escape" &&
+      confirmAllFor === null &&
+      deletingFor === null &&
+      !confirmEnable &&
+      confirmDeleteModel === null
+    ) {
       event.preventDefault();
       onClose();
     }
@@ -320,6 +434,26 @@
     });
     return () => {
       stopJobsEvent?.();
+    };
+  });
+
+  $effect(() => {
+    // 自然言語検索タブ: ストア生成 + 表示中の2秒ポーリング + 通知購読
+    if (tab !== "search" || ipc === undefined) {
+      pollStop?.();
+      pollStop = null;
+      return;
+    }
+    embeddingStore ??= new EmbeddingStore({ invoke: ipc.invoke, listen: () => Promise.resolve(() => {}) });
+    void refreshEmbedding();
+    const timer = setInterval(() => void refreshEmbedding(), 2000);
+    void embeddingStore.subscribe((payload) => {
+      embeddingNotice = payload;
+      void refreshEmbedding();
+    });
+    pollStop = () => clearInterval(timer);
+    return () => {
+      clearInterval(timer);
     };
   });
 </script>
@@ -339,6 +473,9 @@
         </button>
         <button class:active={tab === "auto"} onclick={() => (tab = "auto")} role="tab">
           自動処理
+        </button>
+        <button class:active={tab === "search"} onclick={() => (tab = "search")} role="tab">
+          自然言語検索
         </button>
       </nav>
       <button onclick={onClose} aria-label="閉じる">×</button>
@@ -600,6 +737,127 @@
       </div>
     {/if}
 
+    <!-- ===== 自然言語検索 (WP-11) ===== -->
+    {#if tab === "search"}
+      <div class="section" data-testid="embedding-panel">
+        <div class="section-head">
+          <h3>自然言語検索 (ローカル埋め込み)</h3>
+          {#if embeddingStatus?.enabled}
+            <button disabled={embeddingBusy} onclick={() => void doDisable()}>無効化</button>
+          {:else}
+            <button
+              class="primary"
+              disabled={embeddingBusy || embeddingStatus === null || (embeddingStatus !== null && !canEnable(embeddingStatus))}
+              onclick={() => (confirmEnable = true)}
+            >
+              有効化…
+            </button>
+          {/if}
+        </div>
+        <p class="hint">
+          画像のキャプション・タグ・プロンプトから意味の近さで検索するための
+          ローカル埋め込みモデル (ruri-v3) です。外部へは送信されません。
+          検索バーへの統合は次期で提供されます。
+        </p>
+        {#if embeddingNotice}
+          <p class="notice">{embeddingNotice}</p>
+        {/if}
+        {#if embeddingError}
+          <p class="error" data-testid="embedding-error">{embeddingError}</p>
+        {/if}
+        {#if embeddingStatus !== null}
+          {#if embeddingStatus.warning}
+            <p class="error" data-testid="embedding-warning">{embeddingStatus.warning}</p>
+          {/if}
+          <label class="field">
+            モデル
+            <select
+              value={embeddingStatus.model}
+              disabled={embeddingBusy || embeddingStatus.enabled}
+              onchange={(e) => void doSelectModel(e.currentTarget.value)}
+            >
+              {#each MODEL_CHOICES as choice (choice.id)}
+                <option value={choice.id}>{choice.label} — {choice.hint}</option>
+              {/each}
+            </select>
+          </label>
+          <p class="counts">
+            状態: {embeddingStatus.enabled ? "有効" : "無効"} ·
+            ワーカー: {workerPhaseLabel(embeddingStatus.worker.phase)}
+            {#if embeddingStatus.worker.restartCount > 0}
+              (再起動 {embeddingStatus.worker.restartCount}回)
+            {/if}
+            {#if embeddingStatus.loadedModel !== null}
+              · ロード済み: {modelLabel(embeddingStatus.loadedModel)}
+            {/if}
+          </p>
+          <p class="counts" data-testid="embedding-progress">
+            {progressText(embeddingStatus)}
+            ({Math.round(progressRatio(embeddingStatus) * 100)}%)
+          </p>
+          {#if embeddingStatus.enabled && progressRatio(embeddingStatus) < 1}
+            <progress max="1" value={progressRatio(embeddingStatus)}></progress>
+          {/if}
+          <ul class="profile-list">
+            {#each embeddingStatus.packages as pkg (pkg.modelId)}
+              <li class="profile-row" data-testid="embedding-package">
+                <div class="profile-main">
+                  <strong>{modelLabel(pkg.modelId)}</strong>
+                  <span class="profile-url">{pkg.packageDir}</span>
+                  <span class="profile-key">
+                    {packageStateLabel(pkg.state)} · {pkg.embeddingDim}次元 · {pkg.license}
+                  </span>
+                  {#if pkg.state !== "verified"}
+                    <span class="profile-key">{pkg.detail}</span>
+                  {/if}
+                </div>
+                <div class="profile-actions">
+                  {#if pkg.state !== "missing"}
+                    <button
+                      class="danger"
+                      disabled={embeddingBusy || (embeddingStatus.enabled && embeddingStatus.model === pkg.modelId)}
+                      title={embeddingStatus.enabled && embeddingStatus.model === pkg.modelId ? "使用中のため無効化してから削除してください" : "パッケージとベクトルを削除"}
+                      onclick={() => (confirmDeleteModel = pkg.modelId)}
+                    >
+                      削除
+                    </button>
+                  {/if}
+                </div>
+              </li>
+            {/each}
+          </ul>
+          <p class="hint">モデルの保存先: {embeddingStatus.modelsDir}</p>
+        {:else if embeddingError === null}
+          <p class="hint">状態を取得中…</p>
+        {/if}
+      </div>
+    {/if}
+
+    <!-- ===== 確認ダイアログ (埋め込み有効化 / モデル削除) ===== -->
+    {#if confirmEnable && embeddingStatus !== null}
+      <div class="inline-dialog" role="alertdialog" aria-label="自然言語検索の有効化確認">
+        <p style="white-space: pre-line">{enableConfirmText(embeddingStatus)}</p>
+        <div class="actions">
+          <button onclick={() => (confirmEnable = false)}>キャンセル</button>
+          <button class="primary" disabled={embeddingBusy} onclick={() => void doEnable()} data-testid="embedding-confirm-enable">
+            有効にする
+          </button>
+        </div>
+      </div>
+    {/if}
+    {#if confirmDeleteModel !== null}
+      <div class="inline-dialog" role="alertdialog" aria-label="モデル削除の確認">
+        <p>
+          モデル ({modelLabel(confirmDeleteModel)}) のパッケージと埋め込みベクトルを削除します。
+          通常のキーワード・タグ・条件検索には影響しません。
+        </p>
+        <div class="actions">
+          <button onclick={() => (confirmDeleteModel = null)}>キャンセル</button>
+          <button class="danger" disabled={embeddingBusy} onclick={() => void doDeleteModel(confirmDeleteModel!)}>削除</button>
+        </div>
+      </div>
+    {/if}
+
     <!-- ===== 確認ダイアログ (初回全件処理 / プロファイル削除) ===== -->
     {#if confirmAllFor !== null}
       <div class="inline-dialog" role="alertdialog" aria-label="全件処理の確認">
@@ -838,6 +1096,11 @@
     display: flex;
     justify-content: flex-end;
     gap: 0.4rem;
+  }
+
+  progress {
+    width: 100%;
+    height: 0.5rem;
   }
 
   .counts {

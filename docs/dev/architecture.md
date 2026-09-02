@@ -108,6 +108,20 @@ Tauriに依存してよいのは `gento-tauri` のみ。逆方向の依存
 - `pool`: 優先度5段付きワーカープール (dedup・上限4096・協調キャンセル)
 - `stats` / `metrics`: 生成時間パーセンタイル、走査計測ログ (`scan metrics` 行)
 
+### `crates/gento-embedding` — ローカル埋め込み実行基盤 (WP-11)
+
+- ruri-v3 ONNXパッケージのmanifest (docs/dev/ruri3-onnx-manifest.jsonを
+  include_str!で埋め込み) とsha256検証・モデル配置ディレクトリ解決
+- `EmbeddingProvider` trait + `RuriOnnxProvider` (tokenizers→ort CPU→
+  attention mask考慮mean pooling→L2正規化→query/doc接頭辞)
+- 独立バイナリ `gento-embedding-worker` (stdio長さ前置JSONプロトコル。
+  明示load/unload・アイドルアンロード) とホスト側プロトコル型
+- HF配布repoからのDL (進捗・キャンセル・Range再開・プロキシ環境変数
+  尊重。MVP既定では未使用)
+- gento-coreにのみ依存 (DB非依存 — ワーカーを軽量に保つ設計)。
+  詳細は [api-contract.md](api-contract.md) §45 と
+  [embedding-eval.md](embedding-eval.md) 参照
+
 ### `apps/desktop/src-tauri` (`gento-tauri`) — Tauri thin adapter
 
 - `lib.rs`: アプリ本体。`AppDirs` 解決 (dirs crate)、ログ初期化

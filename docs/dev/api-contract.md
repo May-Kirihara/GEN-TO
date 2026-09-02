@@ -1986,3 +1986,84 @@ queued ──claim──▶ running ──成功──▶ succeeded
 - ジョブ実行中 (running) のキャンセルは不可 (HTTP呼び出しの中断なし)。
 - プロンプト本文はタグ+キャプション一括要求 (operation=
   caption_and_tags)。tagsのみ/captionのみの分割は将来拡張。
+
+## 45. WP-11: 自然言語検索 (ローカルruri-v3埋め込み)
+
+### migration #9 (`wp11_embedding_jobs_app_settings`)
+
+- `jobs` 表再構築: job_type CHECKへ `embedding` を追加 (データは恒等コピー)。
+- `app_settings` (key TEXT PRIMARY KEY, value TEXT): MVP設定kv。
+  現在使用するキー: `embedding.enabled` ("0"/"1")・`embedding.model`
+  ("ruri-v3-70m" / "ruri-v3-30m")。WP-15で本格設定schemaへ整理予定。
+
+### モデル管理 (docs/embedding-runtime.md §3/§4が設計正本)
+
+- models_dir解決: `--models-dir`引数 → `GENTO_MODELS_DIR`環境変数 →
+  `AppDirs.data_dir/models`。`.local-models/` (gitignored) を指定して
+  開発・E2Eで使う。
+- manifest正本 = `docs/dev/ruri3-onnx-manifest.json` を
+  `include_str!`で埋め込み (drift不可能)。sha256+サイズ検証をパスした
+  パッケージのみロード可能。検証失敗・不在でもアプリは継続
+  (acceptance — statusの`packages[].state`で観測)。
+- HFダウンロード: `gento_embedding::download` (進捗コールバック・
+  キャンセル・Range再開・空き容量確認・staging→検証→atomic rename。
+  プロキシ環境変数尊重 — gento-aiと分離したClient)。**MVP既定では
+  配布repo未設定 = 未使用** (コマンドからの呼び出し経路なし)。
+
+### 独立ワーカー (`gento-embedding-worker`バイナリ)
+
+- 通信: stdio長さ前置JSON (4バイトLE u32 + JSON。64MiB上限)。
+  コマンド: `load` / `unload` / `embed_query` / `embed_documents` /
+  `status` / `shutdown`。画像データは流さない。
+- 明示load/unload・起動時自動ロードなし・アイドル10分アンロード
+  (ワーカー側)・intra-thread既定 = 論理コア/4 (≈物理コアの半分。
+  `GENTO_EMBEDDING_THREADS`で上書き)。
+- ホスト側 (gento-tauri `embedding::EmbeddingService`): lazy spawn・
+  死亡検出はreaderスレッドEOF・再起動バックオフ 1s→4s→…(cap 60s)・
+  120秒窓内3回死亡で自動再起停止+`embedding:notice`イベント+
+  `worker.phase="crashed"` (enableで手動復帰)。
+
+### 埋め込みジョブ
+
+- jobs `embedding` (target_type="asset"。payloadに`source_hash`)。
+  優先度: 初回掃討=6 / 差分 (走査・メタデータ変更)=4。
+  クエリ埋め込みはキューを経由しない (直接`embed_query` = 最優先)。
+- 差分検出: 検索文書 (gento-core `compose_search_document` — caption
+  512字/prompt 512字/タグ30個/note 256字/ファイル名512字の決定的構成。
+  negative prompt・workflow・パスは除外 = FTS文書と同じ意味論) の
+  BLAKE3 hash を `embeddings.source_hash` と比較。変化 asset を掃討
+  (30秒毎・有効時) でenqueue。
+- ベクトル保存: `embeddings`表 (purpose='doc'・dtype='f32'・vector BLOB =
+  little-endian f32列。UNIQUE(asset_id, purpose, model_name, model_revision)
+  でupsert)。USearch索引はWP-12。
+
+### Commands (すべてasync + spawn_blocking。DTOはcamelCase)
+
+- `embedding_status` → `EmbeddingStatusDto`: enabled・model・modelsDir・
+  packages[] (modelId/state/detail/packageDir/embeddingDim/license)・
+  worker (phase/restartCount/lastError)・loadedModel・embeddedCount・
+  totalCount・pendingJobs・selfcheckMargin・warning。
+  state: "verified"|"missing"|"missing_files"|"mismatch"。
+  worker.phase: "not_started"|"running"|"restarting"|"crashed"。
+- `embedding_enable(model?)` → 検証失敗時Err (有効化しない)。
+- `embedding_disable` / `embedding_model_delete(model)`
+  (ベクトル+パッケージ削除。通常検索への影響なし)。
+- `embedding_similar_debug(assetId? | queryText?, k?)` →
+  `[{assetId, score}]` — 総当たりcosine (WP-12のUSearch前の検証用。
+  **UI非公開**)。
+
+### Events
+
+- `embedding:notice` (payload: string): ワーカークラッシュループ停止・
+  ジョブ実行エラー等の通知。
+
+### セルフチェック (acceptance 5-4)
+
+- ロード完了後に固定対 (近い/遠い文書) のcosineマージンを計算し
+  `selfcheckMargin`へ公開。0.05未満で`warning`設定 (UI表示)。
+
+### 実測 (docs/dev/embedding-eval.mdに詳細)
+
+- Recall@3 = 0.8333 (閾値0.80。公式ST同一接頭辞と完全一致)。
+- 参照実装とのベクトル一致 cos ≥ 0.9999993。
+- embed_query avg 9.6ms・docバッチ 11.5ms/件 (release・70m)。

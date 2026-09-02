@@ -184,7 +184,7 @@ mod tests {
         assert_eq!(status.journal_mode, "wal");
         assert_eq!(status.integrity_check, "ok");
         assert_eq!(status.foreign_key_violations, 0);
-        assert_eq!(status.table_row_counts.len(), 14);
+        assert_eq!(status.table_row_counts.len(), 15);
         assert!(status.table_row_counts.contains_key("library_roots"));
         assert!(status.table_row_counts.values().all(|&n| n == 0));
         assert!(status.db_bytes > 0);
