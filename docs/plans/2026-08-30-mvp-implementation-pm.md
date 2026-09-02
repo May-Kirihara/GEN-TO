@@ -94,6 +94,8 @@ QAレビュー（ユーザー可視面）: WP-4後、WP-8後、WP-18最終。
 - 残余制限の追跡 (WP-7レビュー): stat→trash同一action内窓 / overwrite宛先内容はトークン非バインド / undo補償はFSレベル（DBはスキャン収束）/ 掃除のstrict正規表現foreign一致（低確率）/ crash recoveryの段階的再構築未実装 / 旧result JSON undoはfails closed。
 - 2026-08-31: **WP-8完了** (`6832349` + FG-WP8込み + QA-WP8 `9576bb5`)。FTS5 trigram・検索AST (gento-search新設)・GUIフィルタ合成・保存済み検索=v2 ASTスマートコレクション・一致根拠・fts_integrity/repair/rebuild。5万件合成でp95 42-78ms。**QA pass-with-concerns**: Major（同期コマンドのUIブロック〜1秒）→ async化+spawn_blockingで解消。FG-WP8: PMがE2E失敗を決定的再現（2回）し「ハーネスタイミング」主張を反証——ドライバキー誤り+**検索遷移でcatalogSource未維持の実プロダクト欠陥**を両方修正。グリッド空白化 (WP-7既知1) も根本修正。cargo 575 / vitest 408。**M4完了**。
 - QA手動確認リスト（ユーザー）: 50k級実データでの広域検索体感 / 未登録→検索→Meta編集 / 検索ビューからファイル操作 / スコープ=ルート全体の受け入れ / v2保存検索の左ペイン表示。50k実データE2E・検索ビューFileOps E2EはWP-16へ申し送り。
+- 2026-09-02: **WP-9完了** (`86f2b65`)。EXIF/IPTC/SD-Forge/ComfyUI/NovelAI parser（fd束び・世代トークン規律・元バイト不変）、正規化+Raw保持、embedded_prompt検索接続、FUTURE_KEYS有効化（model/steps/has/sampler/vae/lora）、InfoPanel 3節。cargo 622 / vitest 419。E2E 9/9×3。
+- 2026-09-02: **WP-10完了** (`f2eea9c` + FG-WP10 `f50852e`)。**Codexレビュー**: 1回目reject（5ブロッカー: 縮小上限未強制・非リトライ性失敗の即再送・同時実行レース・応答無制限・鍵欠落未認証送信）→修正→2回目**approve-with-notes**。gento-ai crate（reqwest rustls・mockサーバー）、永続ジョブキュー（backoff・再開・冪等）、keyring+0600ファイルフォールバック、手動編集保護、送信前縮小64-2048強制・GPS独立opt-in・フェイルクローズ。migration #8。cargo 690 / vitest 438。**M5完了**。実endpoint（llama.cpp実機）は手動確認事項。
 
 ## 9. オープンクエスチョン（ユーザー判断不要・PM判断で進行）
 
