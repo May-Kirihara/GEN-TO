@@ -4,11 +4,14 @@
 //! - この層は (1) 確認トークンゲート (WP-7 fileops.rsと同一の
 //!   intent-bound単発トークン方式)、(2) IPC DTO変換 (camelCase)、
 //!   (3) フルDB自動バックアップの背景ループを担う。
-//! - 復元は常に「plan (dry-run) → 確認 → execute」の順。executeは planを
-//!   再計算し、その正準ダイジェストがトークン発行時と一致しなければ
-//!   拒否する (plan→execute間でDBが変わった要求は実行されない)。
+//! - 復元は常に「plan (dry-run) → 確認 → execute」の順。executeは
+//!   意図ダイジェスト (gento-db `restore_intent_digest`) がトークン発行時と
+//!   一致する場合のみトークンを消費し、**消費済みトークンに束縛された
+//!   確定plan**を gento-dbへ渡す — 適用は単一writerトランザクション内で
+//!   現状からplanを再計算し、ダイジェストが再び一致する場合のみ行われる
+//!   (確認→適用間のDB変化は `RestoreError::PlanChanged` で拒否)。
 //! - 埋め込み・サムネイル・FTS・USearchはバックアップ対象外 (派生データ。
-//!   復元後に再構築可能 — gento-db側テストで保証)。
+//!   復元後に再構築可能 — 統合テストで直接保証)。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,8 +19,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use gento_db::{
     build_restore_plan, create_portable_backup, execute_restore, full_db_backup,
-    open_portable_backup, run_auto_backup_if_due, AutoBackupFrequency, BackupError, PortableBackup,
-    RestorePlan, SETTING_BACKUP_AUTO_FULL_DB, SETTING_BACKUP_RETENTION,
+    open_portable_backup, restore_intent_digest, run_auto_backup_if_due, AutoBackupFrequency,
+    BackupError, RestoreError, RestorePlan, SETTING_BACKUP_AUTO_FULL_DB, SETTING_BACKUP_RETENTION,
 };
 use serde::Serialize;
 use tauri::State;
@@ -97,7 +100,15 @@ impl BackupService {
         Ok(RestorePlanDto::from_plan(&plan, token))
     }
 
-    /// 復元実行 (確認トークン必須。planを再計算して一致を検証してから適用)。
+    /// 復元実行 (確認トークン必須。トークンに束縛された確定planを適用)。
+    ///
+    /// シーケンス (FG-WP13-1 B2 — 確認と適用のTOCTOU閉塞):
+    /// 1. 実行時点でplanを再計算し、意図ダイジェストがトークン発行時と
+    ///    一致することを確認して**トークンを消費する** (単発)。
+    /// 2. 消費済みトークンが保証する確定planを gento-dbへ渡す。適用は
+    ///    単一writerトランザクション内で現状からplanを再計算し、
+    ///    ダイジェスト一致を再検証してから行われる — 手順1と適用の間に
+    ///    DBが変化していれば `RestoreError::PlanChanged` で中止される。
     pub fn restore_execute(
         &self,
         backup_dir: &Path,
@@ -106,9 +117,9 @@ impl BackupService {
     ) -> Result<RestoreResultDto, String> {
         let _guard = self.lock_running()?;
         let backup = open_portable_backup(backup_dir).map_err(backup_err)?;
-        // 実行時点でplanを再計算し、トークン発行時の意図と一致するか検証する
-        // (WP-7 FG-WP7-2と同じ構造強制 — 有効なトークンを別のバックアップや
-        // 変更後のDB状態への流用を排除)。
+        // (1) 実行時点のplanと意図ダイジェストでトークンを検証・消費する
+        //     (WP-7 FG-WP7-2と同じ構造強制 — 有効なトークンを別のバック
+        //     アップや変更後のDB状態への流用を排除)。
         let plan = build_restore_plan(&self.db, &backup, target_root_id).map_err(backup_err)?;
         let digest = restore_intent_digest(&backup, &plan);
         if !self.confirm_tokens.consume(confirm_token, &digest) {
@@ -117,7 +128,8 @@ impl BackupService {
                     .to_string(),
             );
         }
-        let result = execute_restore(&self.db, &backup, target_root_id).map_err(backup_err)?;
+        // (2) 確定planの適用 (gento-dbが適用トランザクション内で再検証)。
+        let result = execute_restore(&self.db, &backup, &plan, &digest).map_err(restore_err)?;
         Ok(RestoreResultDto::from_result(&result))
     }
 
@@ -235,45 +247,22 @@ fn backup_err(e: BackupError) -> String {
     }
 }
 
-/// 復元意図の正準ダイジェスト。planとexecuteのそれぞれの時点で同じ式で
-/// 計算し、一致することをトークンが保証する。対象は:
-/// backupの集約digest / バックアップroot uuid / 復元先root id /
-/// 全entryの (asset uuid, action) 昇順列 / summary件数 / コレクション
-/// (uuid, will_create) 昇順列。各フィールドは長さ前置連結 (fileops.rsの
-/// canonical_intent_inputと同じ曖昧さ排除)。
-fn restore_intent_digest(backup: &PortableBackup, plan: &RestorePlan) -> String {
-    let mut input = String::new();
-    let mut push = |part: &str| {
-        input.push_str(&format!("{}:{}", part.len(), part));
-    };
-    push(&backup.info.digest);
-    push(&backup.info.root_uuid);
-    push(&plan.target_root_id.to_string());
-    let mut entry_parts: Vec<String> = plan
-        .entries
-        .iter()
-        .map(|e| format!("{},{}", e.asset_uuid, e.action.as_str()))
-        .collect();
-    entry_parts.sort();
-    for part in &entry_parts {
-        push(part);
+/// 復元実行エラーのUI表示 (PlanChangedは再確認要求として伝える)。
+fn restore_err(e: RestoreError) -> String {
+    match e {
+        RestoreError::PlanChanged { .. } => {
+            "確認の後にライブラリの状態が変化しました。計画をやり直してから実行してください"
+                .to_string()
+        }
+        RestoreError::Backup(inner) => backup_err(inner),
     }
-    let s = &plan.summary;
-    push(&format!(
-        "same={},update={},add={},conflict={},missing={},ambiguous={}",
-        s.same, s.update, s.add, s.conflict, s.missing, s.ambiguous
-    ));
-    let mut collection_parts: Vec<String> = plan
-        .collections
-        .iter()
-        .map(|c| format!("{},{}", c.uuid, c.will_create))
-        .collect();
-    collection_parts.sort();
-    for part in &collection_parts {
-        push(part);
-    }
-    format!("blake3:{}", blake3::hash(input.as_bytes()).to_hex())
 }
+
+/// 復元意図の正準ダイジェストは gento-db `restore_intent_digest` が正本
+/// (トークン発行・消費・適用tx内検証の3時点で同一式である必要があるため)。
+/// 対象は backup集約digest / root uuid / 対象root id / 全entryの
+/// (uuid, match種別, action, 解決済みasset id, content_hash, file rel_path) /
+/// summary件数 / コレクション (uuid, will_create, 項目解決結果)。
 
 // ===== DTO (camelCase — api-contract §47) =====
 
@@ -785,5 +774,332 @@ mod tests {
             service.default_full_dir().display().to_string(),
             default_dir.display().to_string()
         );
+    }
+
+    #[test]
+    fn restore_execute_rejects_token_after_db_changes_between_plan_and_execute() {
+        // トークン発行 (確認) と実行の間にDBが変化したら実行拒否 (TOCTOU閉塞)。
+        let tmp = TestDir::new("toctou");
+        let db = Arc::new(gento_db::Db::open(tmp.path().join("db.sqlite3")).unwrap());
+        let root_dir = tmp.path().join("photos");
+        std::fs::create_dir_all(&root_dir).unwrap();
+        let root_id = seed(&db, &root_dir, "a.png", 1);
+
+        let service = BackupService::new(Arc::clone(&db), tmp.path().join("db-backups"));
+        let created = service
+            .create_portable(root_id, Some(&tmp.path().join("exports")))
+            .unwrap();
+
+        // 復元先は別DB (空ルート + ディスクに同一内容ファイル → PathAdd想定)
+        let fresh = Arc::new(gento_db::Db::open(tmp.path().join("fresh.sqlite3")).unwrap());
+        let fresh_root_dir = tmp.path().join("fresh-root");
+        std::fs::create_dir_all(&fresh_root_dir).unwrap();
+        std::fs::write(fresh_root_dir.join("a.png"), vec![1u8; 32]).unwrap();
+        fresh
+            .with_writer(|repos| repos.add_root(&fresh_root_dir))
+            .unwrap();
+        let fresh_service = BackupService::new(Arc::clone(&fresh), tmp.path().join("bk"));
+        let plan = fresh_service
+            .restore_plan(Path::new(&created.path), None)
+            .unwrap();
+        assert_eq!(plan.summary.add, 1, "空DB → PathAdd");
+
+        // 確認後に現DBを変化させる (同内容をDBへ登録 → hash再関連付けへ変化)
+        let hash = hash_of(&[1u8; 32]);
+        fresh
+            .with_writer(|repos| {
+                let roots = repos.list_roots()?;
+                let file = repos.upsert_file(FileUpsert {
+                    root_id: roots[0].id,
+                    rel_path: PathBuf::from("a.png"),
+                    display_name: "a.png".to_string(),
+                    byte_size: 32,
+                    mtime_ms: 0,
+                    mtime_ns: 0,
+                    scan_state: ScanState::Present,
+                    os_file_id: None,
+                    detach_asset: false,
+                })?;
+                let (asset, _) = repos.create_or_get_asset(NewAsset {
+                    content_hash: hash,
+                    hash_algorithm: "blake3".to_string(),
+                    byte_size: 32,
+                    mime_type: None,
+                    width: None,
+                    height: None,
+                    has_alpha: None,
+                    is_animated: None,
+                    frame_count: None,
+                })?;
+                repos.link_file(file.id, asset.id)?;
+                Ok(())
+            })
+            .unwrap();
+
+        // 旧トークンでは実行拒否 (意図digest不一致 — トークンは焼却)
+        let err = fresh_service
+            .restore_execute(Path::new(&created.path), None, &plan.confirm_token)
+            .unwrap_err();
+        assert!(err.contains("確認が必要です"), "{err}");
+        // 適用されていない
+        let assets: i64 = fresh
+            .with_reader(|repos| {
+                repos
+                    .conn()
+                    .query_row("SELECT count(*) FROM assets", [], |r| r.get(0))
+                    .map_err(|e| RepoError::Db(e.to_string()))
+            })
+            .unwrap();
+        assert_eq!(assets, 1, "現DB側の登録のみ (復元適用なし)");
+    }
+
+    /// 復元 → サムネイル再生成 (cache missでgen) + USearch再構築
+    /// (rebuild後similar検索) の統合受け入れテスト。
+    ///
+    /// §21「サムネイル、FTS、USearchをバックアップなしで再構築できる」の
+    /// 直接カバー — 派生データ (サムネイルキャッシュ・埋め込み索引) は
+    /// 復元後のDB + ディスク実体から再構築できることを実サービス経路で検証。
+    #[test]
+    fn restore_then_thumbnail_and_vector_index_rebuild_acceptance() {
+        use crate::thumbnails::{
+            AssetSnapshot, ThumbEvents, ThumbFailedItem, ThumbReadyItem, ThumbnailService,
+        };
+        use crate::vectorindex::VectorIndexService;
+        use gento_core::{AssetId, Priority, SizeClass};
+        use std::sync::Mutex as StdMutex;
+
+        let tmp = TestDir::new("rebuild");
+        // --- 元DB: 実PNG 2件 (内容が異なる) を含むルート ---
+        let write_real_png = |dir: &Path, name: &str, tone: u8| -> (PathBuf, String) {
+            let img =
+                image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(600, 400, |x, y| {
+                    image::Rgba([
+                        (x as u8 % 56).wrapping_add(tone),
+                        (y as u8 % 56).wrapping_add(tone),
+                        tone,
+                        255,
+                    ])
+                }));
+            let p = dir.join(name);
+            img.save(&p).unwrap();
+            let bytes = std::fs::read(&p).unwrap();
+            (p, hash_of(&bytes))
+        };
+        let src_root = tmp.path().join("photos");
+        std::fs::create_dir_all(&src_root).unwrap();
+        let src_db = Arc::new(gento_db::Db::open(tmp.path().join("src.sqlite3")).unwrap());
+        let (a_path, hash_a) = write_real_png(&src_root, "a.png", 10);
+        let (b_path, hash_b) = write_real_png(&src_root, "b.png", 200);
+        let seed_png = |db: &gento_db::Db, root_id: i64, path: &Path, hash: &str| {
+            let meta = std::fs::metadata(path).unwrap();
+            let file = db
+                .with_writer(|repos| {
+                    repos.upsert_file(FileUpsert {
+                        root_id,
+                        rel_path: PathBuf::from(
+                            path.file_name().unwrap().to_string_lossy().into_owned(),
+                        ),
+                        display_name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                        byte_size: meta.len(),
+                        mtime_ms: 0,
+                        mtime_ns: 0,
+                        scan_state: ScanState::Present,
+                        os_file_id: None,
+                        detach_asset: false,
+                    })
+                })
+                .unwrap();
+            let (asset, _) = db
+                .with_writer(|repos| {
+                    repos.create_or_get_asset(NewAsset {
+                        content_hash: hash.to_string(),
+                        hash_algorithm: "blake3".to_string(),
+                        byte_size: meta.len(),
+                        mime_type: Some("image/png".to_string()),
+                        width: Some(600),
+                        height: Some(400),
+                        has_alpha: None,
+                        is_animated: None,
+                        frame_count: None,
+                    })
+                })
+                .unwrap();
+            db.with_writer(|repos| repos.link_file(file.id, asset.id))
+                .unwrap();
+        };
+        let root_id = src_db
+            .with_writer(|repos| repos.add_root(&src_root))
+            .unwrap()
+            .id;
+        seed_png(&src_db, root_id, &a_path, &hash_a);
+        seed_png(&src_db, root_id, &b_path, &hash_b);
+
+        let service = BackupService::new(Arc::clone(&src_db), tmp.path().join("bk"));
+        let created = service
+            .create_portable(root_id, Some(&tmp.path().join("exports")))
+            .unwrap();
+        assert_eq!(created.asset_count, 2);
+
+        // --- 復元先: 新規DBに空ルート (ディスク実体は同じ場所) ---
+        let cur_db = Arc::new(gento_db::Db::open(tmp.path().join("cur.sqlite3")).unwrap());
+        cur_db
+            .with_writer(|repos| repos.add_root(&src_root))
+            .unwrap();
+        let cur_service = BackupService::new(Arc::clone(&cur_db), tmp.path().join("bk2"));
+        let plan = cur_service
+            .restore_plan(Path::new(&created.path), None)
+            .unwrap();
+        assert_eq!(plan.summary.add, 2, "空DB → PathAdd×2");
+        let result = cur_service
+            .restore_execute(Path::new(&created.path), None, &plan.confirm_token)
+            .unwrap();
+        assert_eq!(result.applied.len(), 2);
+        assert_eq!(result.fts_rebuilt, 2, "FTSは復元経路で再構築済み");
+
+        let (asset_a, asset_b) = cur_db
+            .with_reader(|repos| {
+                Ok((
+                    repos.find_by_hash(&hash_a)?.expect("a復元済み").id,
+                    repos.find_by_hash(&hash_b)?.expect("b復元済み").id,
+                ))
+            })
+            .unwrap();
+        let _ = asset_b;
+
+        // --- (1) サムネイル: 復元後のcache missで生成され、2回目はヒット ---
+        #[derive(Clone, Default)]
+        struct Recorder(Arc<StdMutex<Vec<ThumbReadyItem>>>);
+        impl ThumbEvents for Recorder {
+            fn ready(&self, items: &[ThumbReadyItem]) {
+                self.0.lock().unwrap().extend(items.iter().cloned());
+            }
+            fn failed(&self, items: &[ThumbFailedItem]) {
+                panic!("サムネイル生成が失敗した: {items:?}");
+            }
+        }
+        let recorder = Recorder::default();
+        let thumb =
+            ThumbnailService::new(tmp.path().join("thumb-cache"), Box::new(recorder.clone()))
+                .unwrap();
+        let snapshot_of = |id: i64, path: &Path| -> AssetSnapshot {
+            let md = std::fs::metadata(path).unwrap();
+            AssetSnapshot {
+                id: AssetId::new(id as u64),
+                source_path: path.to_path_buf(),
+                byte_size: md.len(),
+                mtime_ms: md
+                    .modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+                readable: true,
+                content_type: "image/png".to_string(),
+            }
+        };
+        let first = thumb.request(
+            &[snapshot_of(asset_a, &a_path), snapshot_of(asset_b, &b_path)],
+            SizeClass::S256,
+            Priority::Background,
+        );
+        assert_eq!(first.cache_hits, 0, "復元直後はキャッシュ無し (miss)");
+        assert_eq!(first.queued, 2, "miss → 生成ジョブ投入");
+        // 生成完了を待つ (実デコード+リサイズ)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while recorder.0.lock().unwrap().len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "サムネイル生成タイムアウト"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let second = thumb.request(
+            &[snapshot_of(asset_a, &a_path)],
+            SizeClass::S256,
+            Priority::Background,
+        );
+        assert_eq!(second.cache_hits, 1, "生成物がキャッシュへ");
+        assert_eq!(second.queued, 0);
+        thumb.shutdown();
+
+        // --- (2) USearch: 埋め込みは復元対象外 → 再生成 (正本投入) →
+        //     索引を破棄して全再構築 → similar検索で件数・一致検証 ---
+        let identity = crate::vectorindex::identity_of_model("ruri-v3-70m").unwrap();
+        assert_eq!(identity.dimensions, 384);
+        // 決定論的な直交ベクトル (a=第1成分, b=第2成分) — top-1が予測可能
+        let mut vec_a = vec![0f32; 384];
+        vec_a[0] = 1.0;
+        let mut vec_b = vec![0f32; 384];
+        vec_b[1] = 1.0;
+        cur_db
+            .with_writer(|repos| {
+                repos.embedding_upsert(
+                    asset_a,
+                    "ruri-v3-70m",
+                    &identity.model_revision,
+                    384,
+                    "f32",
+                    "hash-a",
+                    &vec_a,
+                )?;
+                repos.embedding_upsert(
+                    asset_b,
+                    "ruri-v3-70m",
+                    &identity.model_revision,
+                    384,
+                    "f32",
+                    "hash-b",
+                    &vec_b,
+                )
+            })
+            .unwrap();
+
+        let notices: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
+        let vis = VectorIndexService::start(
+            Arc::clone(&cur_db),
+            tmp.path().join("data"),
+            Arc::new(move |event: &str, payload: &str| {
+                notices.lock().unwrap().push(format!("{event}: {payload}"));
+            }),
+        );
+        // 索引ファイル無し → 全再構築 (SQLite正本から)
+        vis.rebuild_now();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !vis.is_ready() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "索引再構築タイムアウト"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let status = vis.status();
+        assert_eq!(status.indexed_count, 2, "SQLite正本の2件を再構築");
+        assert_eq!(status.sqlite_count, 2);
+        assert!(status.ready);
+
+        // similar検索: vec_aに最も近いのはasset_a (cosine)
+        let neighbors = vis.search(&vec_a, 2, None).expect("search可能");
+        assert_eq!(neighbors.len(), 2, "件数一致");
+        assert_eq!(neighbors[0].key, asset_a, "top-1一致 (aのベクトルで検索)");
+        assert!(neighbors[0].similarity > neighbors[1].similarity);
+        let neighbors_b = vis.search(&vec_b, 1, None).expect("search可能");
+        assert_eq!(neighbors_b[0].key, asset_b, "bのベクトルのtop-1はb");
+
+        // 再構築冪等性: 明示的に破棄してもう一度再構築しても同一結果
+        vis.rebuild_now();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        // rebuild_nowはスロットを外す → is_readyが一度falseになるのを待ってから完了待ち
+        while !vis.is_ready() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "再構築2回目タイムアウト"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let again = vis.search(&vec_a, 2, None).expect("search可能");
+        assert_eq!(again[0].key, asset_a, "再構築後も同一結果");
+
+        vis.shutdown();
+        drop(vis);
     }
 }

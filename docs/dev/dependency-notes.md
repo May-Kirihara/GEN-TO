@@ -581,3 +581,14 @@
     直付け拡大のため新規外部依存ではない。gento-dbからgento-imageへ
     依存を張るとprobe系を巻き込むため、rawハッシュ計算のみ直付けした。
   - 入手元: crates.io (BLAKE3 team)。ライセンス: CC0-1.0 OR Apache-2.0。
+
+## FG-WP13-1 レビュー対応 (2026-09-03)
+
+- **`happy-dom` =20.13.2** (desktopフロント、dev依存)
+  - 用途: `RestoreDialog.test.ts` のコンポーネント描画テスト専用のDOM
+    環境 (`@vitest-environment happy-dom` docblockでファイル単位のみ有効。
+    他テストは従来どおりnode環境)。ビルド成果物・実運用コードには影響
+    しない。vitestはsvelteをクライアント版で解決する必要があるため、
+    `vite.config.ts` に `process.env.VITEST` 条件でのみ
+    `resolve.conditions: ["browser"]` を追加した (dev/build無関係)。
+  - 入手元: npm (capricorn86/happy-dom)。ライセンス: MIT。

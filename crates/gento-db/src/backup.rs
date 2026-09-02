@@ -3,8 +3,10 @@
 //! # 2種類のバックアップ
 //!
 //! 1. **フルDBバックアップ** (`full_db_backup`): `VACUUM INTO` でDB全体を
-//!    単一SQLiteファイルへ書き出す (migration前backupと同一のWAL安全手法。
-//!    integrity_check検証付き)。出力先は既定 `db-backups/`
+//!    同ディレクトリ内の一時名 (`…sqlite3.tmp-{pid}`) へ書き出し、
+//!    integrity_check検証 → `sync_all` → 最終名へ**原子的リネーム**で
+//!    公開する (クラッシュや中断が最終名の世代を汚さない。migration前
+//!    backupと同一のWAL安全手法)。出力先は既定 `db-backups/`
 //!    ([`crate::BACKUP_DIR_NAME`])、世代保持 (`backup.retention_generations`)。
 //!    自動実行 (off/daily/weekly) は `app_settings` の `backup.auto_full_db`。
 //! 2. **`.gento` ポータブルバックアップ** (`create_portable_backup`):
@@ -30,8 +32,30 @@
 //! - `build_restore_plan`: dry-run。UUID完全一致→content_hash一致→
 //!   rel_path一致の優先でマッチングし、差分・衝突・行方不明・
 //!   同一ハッシュ複数件を**レポートのみ**返す。
-//! - `execute_restore`: planを再計算して適用する。曖昧マッチと行方不明は
-//!   **スキップして結果に報告する** (推測して適用しない)。
+//! - `execute_restore(db, backup, confirmed_plan, expected_digest)`:
+//!   **単一writerトランザクション内で**現状からplanを再計算し、
+//!   その意図ダイジェスト ([`restore_intent_digest`]) が確認時
+//!   (`expected_digest`) と一致する場合のみ、確認済みplan
+//!   (`confirmed_plan`) を適用する。不一致は [`RestoreError::PlanChanged`]
+//!   としてトランザクションごと中止する — 「確認された操作 ==
+//!   適用される操作」がトランザクション下で保証される。
+//!   曖昧マッチと行方不明は**スキップして結果に報告する** (推測して
+//!   適用しない)。
+//!
+//! # `.gento` は敵対的入力
+//!
+//! digestはバックアップ自身が再計算可能なため、整合性だけでは安全でない。
+//! 読み取り側は以下を強制する:
+//! - rel_pathは [`decode_rel_checked`] で検証済みの正規化相対パスのみ
+//!   (絶対パス・`..`・windows prefix表現・NUL拒否)。
+//! - file_digestsは必須2ファイルの過不足なし一意 (manifest完全性)。
+//! - バックアップディレクトリの実ファイルが期待集合と完全一致。
+//! - backup-info.jsonの件数が実解析行数と一致。
+//! - asset/file/collection UUIDの重複拒否。
+//! - シンボリックリンクは「行方不明」として報告 (フォローしない —
+//!   fileopsの `symlink_metadata` 3分類規約に合わせる)。実体ハッシュは
+//!   open前にlink種別を確認し、fd上のfstatで (dev, ino) を突き合わせる
+//!   (検査後の差し替え・symlink escapeを検出)。
 //!
 //! 埋め込みベクトル・サムネイル・FTS・USearch索引はバックアップ対象外
 //! (派生データ)。復元後に再構築できることをテストで保証する
@@ -159,6 +183,39 @@ impl From<RepoError> for BackupError {
 impl From<std::io::Error> for BackupError {
     fn from(e: std::io::Error) -> Self {
         BackupError::Io(e.to_string())
+    }
+}
+
+/// 復元実行の失敗 ([`BackupError`] に加え、確認planと適用時planの不一致)。
+#[derive(Debug)]
+pub enum RestoreError {
+    Backup(BackupError),
+    /// writerトランザクション内で再計算したplanの意図ダイジェストが
+    /// 確認時 (`expected_digest`) と一致しない — 確認から適用までの間に
+    /// DBが変化した。トランザクションは適用前に中止され、DBは無変更。
+    PlanChanged {
+        detail: String,
+    },
+}
+
+impl std::fmt::Display for RestoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RestoreError::Backup(e) => write!(f, "{e}"),
+            RestoreError::PlanChanged { detail } => write!(
+                f,
+                "restore plan changed after confirmation ({detail}); \
+                 the library was modified between confirmation and execution"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RestoreError {}
+
+impl From<BackupError> for RestoreError {
+    fn from(e: BackupError) -> Self {
+        RestoreError::Backup(e)
     }
 }
 
@@ -511,10 +568,16 @@ fn retention_setting(db: &Db) -> Option<usize> {
         .filter(|n| *n >= 1)
 }
 
-/// フルDBバックアップを作成する (VACUUM INTO + integrity_check + 世代回収)。
+/// フルDBバックアップを作成する (VACUUM INTO → 検証 → 原子的公開 → 世代回収)。
 ///
 /// `dest_dir` が `None` なら既定 (`db-backups/`)。保持世代数は
 /// `backup.retention_generations` 設定 (不正なら既定3)。
+///
+/// クラッシュ原子性: `VACUUM INTO` は同ディレクトリ内の一時名
+/// (`{最終名}.tmp-{pid}`) へ書き出し、integrity_check → `sync_all` →
+/// 最終名へのリネームで公開する。中断・クラッシュは一時名の残骸しか
+/// 残さず、最終名 (`library-full-*.sqlite3`) は常に検証済みの完全な
+/// 世代のみになる (一時名は [`list_full_backups`] の対象外)。
 pub fn full_db_backup(
     db: &Db,
     dest_dir: Option<&Path>,
@@ -528,36 +591,41 @@ pub fn full_db_backup(
     std::fs::create_dir_all(&dest_dir)?;
 
     // 同一ミリ秒の連続作成に備えて衝突時は連番suffix (VACUUM INTOは
-    // 既存ファイルへの書き込みを拒否する)。
+    // 既存ファイルへの書き込みを拒否するため、最終名と一時名の両方で
+    // 空きを確認する)。
     let ts = now_utc_compact();
-    let mut dest = dest_dir.join(format!("{FULL_BACKUP_PREFIX}{ts}{FULL_BACKUP_SUFFIX}"));
-    let mut suffix = 1u32;
-    while dest.exists() {
-        dest = dest_dir.join(format!(
-            "{FULL_BACKUP_PREFIX}{ts}-{suffix}{FULL_BACKUP_SUFFIX}"
-        ));
-        suffix += 1;
-    }
-    let dest_str = dest.to_string_lossy().into_owned();
+    let pid = std::process::id();
+    let (dest, tmp) = {
+        let mut suffix = 0u32;
+        loop {
+            let s = if suffix == 0 {
+                String::new()
+            } else {
+                format!("-{suffix}")
+            };
+            let final_name = format!("{FULL_BACKUP_PREFIX}{ts}{s}{FULL_BACKUP_SUFFIX}");
+            let tmp_name = format!("{final_name}.tmp-{pid}");
+            let dest = dest_dir.join(&final_name);
+            let tmp = dest_dir.join(&tmp_name);
+            if !dest.exists() && !tmp.exists() {
+                break (dest, tmp);
+            }
+            suffix += 1;
+        }
+    };
+    let tmp_str = tmp.to_string_lossy().into_owned();
     let conn = open_backup_conn(db)?;
-    conn.execute("VACUUM INTO ?1", [dest_str.as_str()])
-        .map_err(|e| BackupError::Db(format!("VACUUM INTO {dest_str}: {e}")))?;
+    let vacuum = conn
+        .execute("VACUUM INTO ?1", [tmp_str.as_str()])
+        .map_err(|e| BackupError::Db(format!("VACUUM INTO {tmp_str}: {e}")));
     drop(conn);
+    vacuum?;
 
-    // 検証: 開いてintegrity_check (READ_ONLYにしない — FTS5整合性検査が
-    // 内部で書き込みを試みるため。migrate.rsと同じ理由)。
-    let check = Connection::open(&dest)
-        .map_err(|e| BackupError::Io(format!("verify {}: {e}", dest.display())))?;
-    let result: String = check
-        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
-        .map_err(|e| BackupError::Io(format!("integrity check {}: {e}", dest.display())))?;
-    drop(check);
-    if result != "ok" {
-        // 不正backupは世代計算を汚さないよう削除する
-        let _ = std::fs::remove_file(&dest);
-        return Err(BackupError::Db(format!(
-            "backup integrity check failed: {result}"
-        )));
+    // 検証 → 同期 → 原子的公開。失敗時は一時名を掃除して最終名を
+    // 汚さない (retention・外部利用者に不完全な世代を見せない)。
+    if let Err(e) = verify_and_publish(&tmp, &dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
 
     rotate_full_backups(&dest_dir, keep)?;
@@ -566,6 +634,51 @@ pub fn full_db_backup(
         path: dest,
         kept_generations,
     })
+}
+
+/// 一時ファイルを検証して同期し、最終名へ原子的に公開する。
+fn verify_and_publish(tmp: &Path, final_path: &Path) -> Result<(), BackupError> {
+    // 開いてintegrity_check (READ_ONLYにしない — FTS5整合性検査が
+    // 内部で書き込みを試みるため。migrate.rsと同じ理由)。
+    let check = Connection::open(tmp)
+        .map_err(|e| BackupError::Io(format!("verify {}: {e}", tmp.display())))?;
+    let result: String = check
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .map_err(|e| BackupError::Io(format!("integrity check {}: {e}", tmp.display())))?;
+    drop(check);
+    if result != "ok" {
+        return Err(BackupError::Db(format!(
+            "backup integrity check failed: {result}"
+        )));
+    }
+    // データをディスクへ落としてから公開 (renameの原子性はsync無しでも
+    // 成立するが、durable publicationには必要)。
+    std::fs::File::open(tmp)?.sync_all()?;
+    publish_file(tmp, final_path)
+}
+
+/// 同一ファイルシステム上での原子的リネーム公開 (フルDBバックアップ用)。
+/// リネーム失敗時は一時ファイルを掃除する。
+fn publish_file(tmp: &Path, final_path: &Path) -> Result<(), BackupError> {
+    if let Err(e) = std::fs::rename(tmp, final_path) {
+        let _ = std::fs::remove_file(tmp);
+        return Err(BackupError::Io(format!(
+            "publish {}: {e}",
+            final_path.display()
+        )));
+    }
+    // 親ディレクトリのエントリ反映 (best-effort — 対応しないFSがある)。
+    sync_dir_best_effort(final_path.parent());
+    Ok(())
+}
+
+/// ディレクトリエントリの同期 (best-effort)。
+fn sync_dir_best_effort(dir: Option<&Path>) {
+    if let Some(dir) = dir {
+        if let Ok(handle) = std::fs::File::open(dir) {
+            let _ = handle.sync_all();
+        }
+    }
 }
 
 fn list_full_backups(dir: &Path) -> Vec<PathBuf> {
@@ -577,7 +690,11 @@ fn list_full_backups(dir: &Path) -> Vec<PathBuf> {
                     p.file_name()
                         .and_then(|n| n.to_str())
                         .map(|n| {
-                            n.starts_with(FULL_BACKUP_PREFIX) && n.ends_with(FULL_BACKUP_SUFFIX)
+                            // `.tmp-{pid}` 一時名 (VACUUUM INTOの書き出し先・
+                            // クラッシュ残骸) は世代として数えない。
+                            n.starts_with(FULL_BACKUP_PREFIX)
+                                && n.ends_with(FULL_BACKUP_SUFFIX)
+                                && !n.contains(".tmp-")
                         })
                         .unwrap_or(false)
                 })
@@ -980,6 +1097,14 @@ fn read_backup_asset(conn: &Connection, asset_id: i64) -> Result<BackupAssetEntr
     })
 }
 
+/// 書き出して内容をディスクへ同期する (`complete:true` の前に各ファイルを
+/// sync_allする — リネーム後の名前が電源断で失われないため)。
+fn write_file_durable(path: &Path, contents: &str) -> Result<(), BackupError> {
+    std::fs::write(path, contents)?;
+    std::fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
 /// バックアップディレクトリへ内容を書き出す (backup-info.jsonは最後)。
 fn write_backup_dir(dir: &Path, source: &BackupSource) -> Result<BackupInfo, BackupError> {
     // metadata.jsonl (asset行→file行の順。ストリーム書き出し)
@@ -997,12 +1122,12 @@ fn write_backup_dir(dir: &Path, source: &BackupSource) -> Result<BackupInfo, Bac
             out.push_str(&line);
             out.push('\n');
         }
-        std::fs::write(dir.join(METADATA_JSONL_FILE), out)?;
+        write_file_durable(&dir.join(METADATA_JSONL_FILE), &out)?;
     }
     // collections.json
     {
         let json = serde_json::json!({ "collections": source.collections });
-        std::fs::write(dir.join(COLLECTIONS_JSON_FILE), json.to_string())?;
+        write_file_durable(&dir.join(COLLECTIONS_JSON_FILE), &json.to_string())?;
     }
     // digest (名前順。backup-info.json自体は対象外)
     let mut names = [COLLECTIONS_JSON_FILE, METADATA_JSONL_FILE];
@@ -1033,9 +1158,9 @@ fn write_backup_dir(dir: &Path, source: &BackupSource) -> Result<BackupInfo, Bac
         digest: format!("blake3:{}", blake3::hash(aggregate.as_bytes()).to_hex()),
         complete: true,
     };
-    std::fs::write(
-        dir.join(BACKUP_INFO_FILE),
-        serde_json::to_string_pretty(&info).map_err(|e| BackupError::Format(e.to_string()))?,
+    write_file_durable(
+        &dir.join(BACKUP_INFO_FILE),
+        &serde_json::to_string_pretty(&info).map_err(|e| BackupError::Format(e.to_string()))?,
     )?;
     Ok(info)
 }
@@ -1059,6 +1184,12 @@ pub fn create_portable_backup(
         let _ = std::fs::remove_dir_all(&tmp_dir);
         return Err(e);
     }
+    // tmpディレクトリ内のエントリをディスクへ (best-effort — リネームの
+    // 原子性は成立するが、durable publicationにはファイル本体とエントリの
+    // 両方のsyncが必要)。
+    if let Ok(dir) = std::fs::File::open(&tmp_dir) {
+        let _ = dir.sync_all();
+    }
     // 原子的リネーム (同一ファイルシステム上)。最終名が既に存在する場合は
     // 上書きせず連番suffixへ (無断上書き禁止)。
     let ts = now_utc_compact();
@@ -1070,26 +1201,61 @@ pub fn create_portable_backup(
         suffix += 1;
     }
     let final_path = dest_parent.join(&final_name);
-    std::fs::rename(&tmp_dir, &final_path)?;
+    publish_dir(&tmp_dir, &final_path)?;
     Ok(final_path)
 }
 
-/// ディスク上のファイル内容ハッシュ (`blake3:<hex>`。gento-imageと同一形式)。
-fn hash_file_blake3(path: &Path) -> Result<String, BackupError> {
-    let mut file = std::fs::File::open(path)
-        .map_err(|e| BackupError::Io(format!("open {}: {e}", path.display())))?;
+/// 一時ディレクトリを最終名へ原子的にpublishする (ポータブルバックアップ用)。
+/// リネーム失敗時も一時ディレクトリを掃除する (書き出し失敗以外もカバー)。
+fn publish_dir(tmp_dir: &Path, final_path: &Path) -> Result<(), BackupError> {
+    if let Err(e) = std::fs::rename(tmp_dir, final_path) {
+        let _ = std::fs::remove_dir_all(tmp_dir);
+        return Err(BackupError::Io(format!(
+            "publish {}: {e}",
+            final_path.display()
+        )));
+    }
+    // 親ディレクトリのエントリ反映 (best-effort)。
+    sync_dir_best_effort(final_path.parent());
+    Ok(())
+}
+
+/// 検証付きでファイル実体を開いて内容ハッシュを計算する
+/// (`blake3:<hex>`。gento-imageと同一形式)。
+///
+/// symlink不追従方針: open前に `symlink_metadata` でlink種別を確認し
+/// (symlink・ディレクトリ等は `None` = 行方不明扱い)、open後はfd上の
+/// fstatで改めて通常ファイルであることと、unixでは検査時の (dev, ino)
+/// との一致を要求する — 検査後にパスが差し替えられた場合 (symlink
+/// escape含む) は `None`。戻り値のMetadataはfdピン留めされた実体のもの
+/// (mtime・os_file_idの取得元として使う — パスを再解決しない)。
+fn open_and_hash_regular_file(abs: &Path) -> Option<(String, std::fs::Metadata)> {
+    let link_md = std::fs::symlink_metadata(abs).ok()?;
+    if !link_md.is_file() {
+        return None;
+    }
+    let mut file = std::fs::File::open(abs).ok()?;
+    let fd_md = file.metadata().ok()?;
+    if !fd_md.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if (fd_md.dev(), fd_md.ino()) != (link_md.dev(), link_md.ino()) {
+            return None;
+        }
+    }
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; 128 * 1024];
     loop {
-        let n = file
-            .read(&mut buf)
-            .map_err(|e| BackupError::Io(format!("read {}: {e}", path.display())))?;
+        let n = file.read(&mut buf).ok()?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
     }
-    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+    Some((format!("blake3:{}", hasher.finalize().to_hex()), fd_md))
 }
 
 /// パスの在不在3分類 (Path::existsは権限エラーでもfalseになるため使わない)。
@@ -1164,18 +1330,67 @@ pub fn open_portable_backup(dir: &Path) -> Result<PortableBackup, BackupError> {
     if !info.complete {
         return Err(BackupError::Incomplete { dir: dir_display });
     }
+    // digest manifest完全性: 必須2ファイルの過不足なし一意を要求する。
+    // digestはバックアップ自身が再計算可能なため、部分集合や重複を
+    // 許すと認証されない要素が復元経路に混入する。
+    let known = [COLLECTIONS_JSON_FILE, METADATA_JSONL_FILE];
+    let expected_files: std::collections::HashSet<&str> =
+        [BACKUP_INFO_FILE, COLLECTIONS_JSON_FILE, METADATA_JSONL_FILE]
+            .into_iter()
+            .collect();
+    {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for fd in &info.file_digests {
+            if !known.contains(&fd.name.as_str()) {
+                return Err(BackupError::DigestMismatch {
+                    dir: dir_display.clone(),
+                    detail: format!("unexpected file in digest list: {}", fd.name),
+                });
+            }
+            if !seen.insert(fd.name.as_str()) {
+                return Err(BackupError::DigestMismatch {
+                    dir: dir_display.clone(),
+                    detail: format!("duplicate digest entry: {}", fd.name),
+                });
+            }
+        }
+        for required in known {
+            if !seen.contains(required) {
+                return Err(BackupError::DigestMismatch {
+                    dir: dir_display.clone(),
+                    detail: format!("missing required digest entry: {required}"),
+                });
+            }
+        }
+    }
+    // ディレクトリ実ファイルとの一致: manifestに無い実ファイル = 改竄。
+    // (サブディレクトリがあればそれ自体が不一致として拒否される。)
+    {
+        let actual: std::collections::HashSet<String> = std::fs::read_dir(dir)
+            .map_err(|e| BackupError::Io(format!("read dir {}: {e}", dir.display())))?
+            .filter_map(|e| e.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        let expected: std::collections::HashSet<String> =
+            expected_files.iter().map(|s| s.to_string()).collect();
+        if actual != expected {
+            let extra: Vec<String> = actual.difference(&expected).cloned().collect();
+            let missing: Vec<String> = expected.difference(&actual).cloned().collect();
+            return Err(BackupError::DigestMismatch {
+                dir: dir_display.clone(),
+                detail: format!(
+                    "directory contents do not match the manifest \
+                     (extra: {extra:?}, missing: {missing:?})"
+                ),
+            });
+        }
+    }
     // digest検証: 全対象ファイルの内容BLAKE3 + 集約
+    // (名前集合の検証は上で済み — ここは内容一致のみ)
     let mut sorted = info.file_digests.clone();
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
     let mut aggregate = String::new();
-    let known = [COLLECTIONS_JSON_FILE, METADATA_JSONL_FILE];
     for fd in &sorted {
-        if !known.contains(&fd.name.as_str()) {
-            return Err(BackupError::DigestMismatch {
-                dir: dir_display.clone(),
-                detail: format!("unexpected file in digest list: {}", fd.name),
-            });
-        }
         let path = dir.join(&fd.name);
         let bytes = std::fs::read(&path).map_err(|e| BackupError::DigestMismatch {
             dir: dir_display.clone(),
@@ -1231,6 +1446,46 @@ pub fn open_portable_backup(dir: &Path) -> Result<PortableBackup, BackupError> {
 
     let (assets, files, collections) =
         migrate_to_current(info.format_version, assets, files, collections)?;
+    // 件数一致: backup-info.jsonの申告が実解析行数と一致すること。
+    // info自体はdigest対象外のため、申告改変はここでしか検出できない
+    // (改変された表示を信用させない)。
+    if info.asset_count != assets.len() as u64
+        || info.file_count != files.len() as u64
+        || info.collection_count != collections.len() as u64
+    {
+        return Err(BackupError::Format(format!(
+            "backup-info counts do not match parsed rows \
+             (assets {} vs {}, files {} vs {}, collections {} vs {})",
+            info.asset_count,
+            assets.len(),
+            info.file_count,
+            files.len(),
+            info.collection_count,
+            collections.len()
+        )));
+    }
+    // UUID重複拒否: 自己再digestされたバックアップが同一UUIDを行複製する
+    // 改竄を排除する (適用側のHashMapが黙って上書きしない)。
+    {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        if assets.iter().any(|a| !seen.insert(a.uuid.as_str())) {
+            return Err(BackupError::Format(
+                "duplicate asset uuid in backup".to_string(),
+            ));
+        }
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        if files.iter().any(|f| !seen.insert(f.uuid.as_str())) {
+            return Err(BackupError::Format(
+                "duplicate file uuid in backup".to_string(),
+            ));
+        }
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        if collections.iter().any(|c| !seen.insert(c.uuid.as_str())) {
+            return Err(BackupError::Format(
+                "duplicate collection uuid in backup".to_string(),
+            ));
+        }
+    }
     Ok(PortableBackup {
         dir: dir.to_path_buf(),
         info,
@@ -1399,20 +1654,40 @@ pub fn build_restore_plan(
 ) -> Result<RestorePlan, BackupError> {
     // ルート解決
     let roots = db.with_reader(|repos| repos.list_roots())?;
-    let target = match target_root_id {
+    let target = resolve_target_root(&roots, target_root_id, backup)?;
+    let plan =
+        db.with_reader(|repos| build_plan_on_conn(repos.conn(), backup, target).map_err(repo_err))?;
+    Ok(plan)
+}
+
+fn resolve_target_root<'a>(
+    roots: &'a [gento_core::repo::LibraryRootRecord],
+    target_root_id: Option<i64>,
+    backup: &PortableBackup,
+) -> Result<&'a gento_core::repo::LibraryRootRecord, BackupError> {
+    match target_root_id {
         Some(id) => roots
             .iter()
             .find(|r| r.id == id)
-            .ok_or(BackupError::RootNotFound(id))?,
+            .ok_or(BackupError::RootNotFound(id)),
         None => roots
             .iter()
             .find(|r| r.uuid == backup.info.root_uuid)
             .or_else(|| (roots.len() == 1).then(|| &roots[0]))
             .ok_or(BackupError::NoTargetRoot {
                 backup_root_uuid: backup.info.root_uuid.clone(),
-            })?,
-    };
+            }),
+    }
+}
 
+/// 接続上でplan本体を構築する (readerでもwriterトランザクションでも同じ結果)。
+/// execute側は同じ関数を適用トランザクション内で呼び、確認時planと
+/// 意図ダイジェストが一致することを検証する。
+fn build_plan_on_conn(
+    conn: &Connection,
+    backup: &PortableBackup,
+    target: &gento_core::repo::LibraryRootRecord,
+) -> Result<RestorePlan, BackupError> {
     // asset uuid → file列 (表示用)
     let mut files_of: std::collections::HashMap<&str, Vec<&BackupFileEntry>> =
         std::collections::HashMap::new();
@@ -1420,9 +1695,7 @@ pub fn build_restore_plan(
         files_of.entry(f.asset_uuid.as_str()).or_default().push(f);
     }
 
-    let entries = db.with_reader(|repos| {
-        plan_entries(repos.conn(), backup, target, &files_of).map_err(repo_err)
-    })?;
+    let entries = plan_entries(conn, backup, target, &files_of)?;
 
     let mut summary = RestoreSummary::default();
     for e in &entries {
@@ -1440,22 +1713,17 @@ pub fn build_restore_plan(
     }
 
     // コレクション: uuid既存か、項目が解決できるか
-    let current_collection_uuids: std::collections::HashSet<String> = db
-        .with_reader(|repos| {
-            let mut stmt = repos
-                .conn()
-                .prepare("SELECT uuid FROM collections")
-                .map_err(|e| RepoError::Db(e.to_string()))?;
-            let mapped = stmt
-                .query_map([], |r| r.get::<_, String>(0))
-                .map_err(|e| RepoError::Db(e.to_string()))?;
-            mapped
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|e| RepoError::Db(e.to_string()))
-        })
-        .map_err(BackupError::from)?
-        .into_iter()
-        .collect();
+    let current_collection_uuids: std::collections::HashSet<String> = {
+        let mut stmt = conn
+            .prepare("SELECT uuid FROM collections")
+            .map_err(|e| BackupError::Db(e.to_string()))?;
+        let mapped = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| BackupError::Db(e.to_string()))?;
+        mapped
+            .collect::<rusqlite::Result<std::collections::HashSet<_>>>()
+            .map_err(|e| BackupError::Db(e.to_string()))?
+    };
     let resolvable: std::collections::HashSet<&str> = entries
         .iter()
         .filter(|e| e.action != RestoreAction::Skip)
@@ -1513,7 +1781,7 @@ fn plan_entries(
         let mut file_reports: Vec<RestoreFileReport> = Vec::with_capacity(backup_files.len());
         for f in &backup_files {
             let on_disk = matches!(
-                disk_status(&target.path.join(decode_rel(&f.rel_path)?)),
+                disk_status(&target.path.join(decode_rel_checked(&f.rel_path)?)),
                 DiskStatus::File
             );
             file_reports.push(RestoreFileReport {
@@ -1586,7 +1854,7 @@ fn plan_entries(
             let mut conflicts: Vec<String> = Vec::new();
             let mut missing: Vec<String> = Vec::new();
             for (i, f) in backup_files.iter().enumerate() {
-                let rel = decode_rel(&f.rel_path)?;
+                let rel = decode_rel_checked(&f.rel_path)?;
                 let abs = target.path.join(&rel);
                 if state.files_in_root.contains_key(&f.rel_path) {
                     // この分岐に到達した時点でuuid/hash照合は失敗しているため、
@@ -1597,13 +1865,24 @@ fn plan_entries(
                 } else {
                     match disk_status(&abs) {
                         DiskStatus::File => {
-                            if hash_file_blake3(&abs)? == asset.content_hash {
-                                add_candidates.push(f.rel_path.clone());
-                            } else {
-                                conflicts.push(format!(
-                                    "{} のディスク実体はバックアップと別内容です",
-                                    f.rel_path
-                                ));
+                            // open_and_hash_regular_file: symlink不追従・fd照合。
+                            // Noneは検査後の差し替えや読み取り失敗。
+                            match open_and_hash_regular_file(&abs) {
+                                Some((hash, _)) if hash == asset.content_hash => {
+                                    add_candidates.push(f.rel_path.clone());
+                                }
+                                Some(_) => {
+                                    conflicts.push(format!(
+                                        "{} のディスク実体はバックアップと別内容です",
+                                        f.rel_path
+                                    ));
+                                }
+                                None => {
+                                    missing.push(format!(
+                                        "{} の実体を検証できませんでした",
+                                        f.rel_path
+                                    ));
+                                }
                             }
                         }
                         DiskStatus::Absent => {
@@ -1725,28 +2004,161 @@ fn finish_matched(
     })
 }
 
-/// 正準形rel_path → OSパス。
-fn decode_rel(canonical: &str) -> Result<std::path::PathBuf, BackupError> {
+/// 正準形rel_path → 検証済み正規化相対パス。
+///
+/// `.gento`は敵対的入力 (digestは自分で再計算可能) のため、復元側は
+/// すべてのrel_pathをこの関数経由で解釈する。拒否対象:
+/// - 不正な百分号エスケープ (既存挙動)
+/// - NULバイト
+/// - 絶対パス (unix `/` 先頭 = `Path::is_absolute`、windows prefix)
+/// - windows prefixの文字列表現 (drive letter `C:` / UNC `\\`) —
+///   現行linux開発でも拒否する (将来のWindows対応で迂回されないように)
+/// - `..` 親コンポーネント (percent-encoded `..` も復号後に同一判定)
+/// - 空・`.`のみ
+///
+/// `.` は正規化して除去し、`Component::Normal` のみで再構成した相対パスを
+/// 返す (呼び出し側はrootへのjoinのみ行う — 二重検証しない)。
+fn decode_rel_checked(canonical: &str) -> Result<PathBuf, BackupError> {
     let bytes = percent_decode_to_bytes(canonical).ok_or_else(|| {
         BackupError::Format(format!("invalid percent-encoding in rel_path: {canonical}"))
     })?;
-    Ok(decode_path(&bytes))
+    let reject =
+        |reason: &str| BackupError::Format(format!("refusing rel_path {canonical}: {reason}"));
+    if bytes.contains(&0) {
+        return Err(reject("contains NUL"));
+    }
+    if bytes.starts_with(b"\\\\") {
+        return Err(reject("windows UNC prefix"));
+    }
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        return Err(reject("windows drive-letter prefix"));
+    }
+    let raw = decode_path(&bytes);
+    if raw.is_absolute() {
+        return Err(reject("absolute path"));
+    }
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    for component in raw.components() {
+        match component {
+            std::path::Component::Normal(part) => parts.push(part.to_os_string()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => return Err(reject("parent component")),
+            // is_absolute検査済みだが二重防御 (windowsの `C:x` 等の相対prefix)
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                return Err(reject("absolute or prefix component"));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(reject("empty path"));
+    }
+    let mut rel = PathBuf::new();
+    for part in parts {
+        rel.push(part);
+    }
+    Ok(rel)
 }
 
-/// 復元を実行する (planを内部で再計算して適用。1トランザクション)。
+/// 復元意図の正準ダイジェスト (確認トークンの束縛対象)。
 ///
-/// 確認トークンの検証はアプリ層 (tauri backup.rs) の責務 — この関数は
-/// 渡されたバックアップを機械的に適用する。Uuid/Hash一致→メタデータ更新、
-/// PathAdd→新規作成、Conflict/Missing/Ambiguous→スキップして報告。
+/// plan時 (トークン発行)・実行時 (トークン消費)・適用トランザクション内
+/// (最終検証) の各時点で同じ式で計算し、一致することだけが
+/// 「確認された操作 == 適用される操作」を構成する。対象:
+/// - backup集約digest / バックアップroot uuid / 復元先root id
+/// - 全entryの (asset uuid, match種別, action, 解決済みasset id,
+///   content_hash, 対象file rel_path (backup正準形 + 現DB解決形)) 昇順列
+/// - summary件数
+/// - コレクション (uuid, will_create, 項目数, 解決可能項目数) 昇順列
+///
+/// 表示用フィールド (reason / display_name / on_disk) は意図の同値判定から
+/// 意図的に除外する (表示の変化で再確認を強制しない。適用に影響する
+/// 実体状態は適用トランザクション内で改めて検証される)。
+/// 各フィールドは長さ前置連結で曖昧さを排除する (fileops.rsの
+/// canonical_intent_inputと同じ方式)。
+pub fn restore_intent_digest(backup: &PortableBackup, plan: &RestorePlan) -> String {
+    let mut input = String::new();
+    let mut push = |part: &str| {
+        input.push_str(&format!("{}:{}", part.len(), part));
+    };
+    push(&backup.info.digest);
+    push(&backup.info.root_uuid);
+    push(&plan.target_root_id.to_string());
+    let mut entry_parts: Vec<String> = plan
+        .entries
+        .iter()
+        .map(|e| {
+            let mut file_parts: Vec<String> = e
+                .files
+                .iter()
+                .map(|f| {
+                    format!(
+                        "{}>{}",
+                        f.backup_rel_path,
+                        match f.current_rel_path.as_deref() {
+                            Some(p) => format!("1:{p}"),
+                            None => "0:null".to_string(),
+                        }
+                    )
+                })
+                .collect();
+            file_parts.sort();
+            format!(
+                "{},{},{},{},{},{}",
+                e.asset_uuid,
+                e.matched.as_str(),
+                e.action.as_str(),
+                match e.current_asset_id {
+                    Some(id) => id.to_string(),
+                    None => "0:null".to_string(),
+                },
+                e.content_hash,
+                file_parts.join("|")
+            )
+        })
+        .collect();
+    entry_parts.sort();
+    for part in &entry_parts {
+        push(part);
+    }
+    let s = &plan.summary;
+    push(&format!(
+        "same={},update={},add={},conflict={},missing={},ambiguous={}",
+        s.same, s.update, s.add, s.conflict, s.missing, s.ambiguous
+    ));
+    let mut collection_parts: Vec<String> = plan
+        .collections
+        .iter()
+        .map(|c| {
+            format!(
+                "{},{},{},{}",
+                c.uuid, c.will_create, c.items_total, c.items_resolvable
+            )
+        })
+        .collect();
+    collection_parts.sort();
+    for part in &collection_parts {
+        push(part);
+    }
+    format!("blake3:{}", blake3::hash(input.as_bytes()).to_hex())
+}
+
+/// 復元を実行する (確認済みplanを単一writerトランザクションで適用)。
+///
+/// 確認トークンの検証はアプリ層 (tauri backup.rs) が `restore_intent_digest`
+/// で行う。この関数はトークンに束縛された確定plan (`confirmed_plan`) と
+/// その時点の意図ダイジェスト (`expected_digest`) を受け取り、
+/// **writerトランザクション内で**現状からplanを再計算して
+/// ダイジェストが一致する場合のみ適用する。確認から適用までの間に
+/// DBが変化していれば [`RestoreError::PlanChanged`] として中止する
+/// (トランザクションはロールバックされ、DBは無変更)。
+/// Uuid/Hash一致→メタデータ更新、PathAdd→新規作成、
+/// Conflict/Missing/Ambiguous→スキップして報告。
 pub fn execute_restore(
     db: &Db,
     backup: &PortableBackup,
-    target_root_id: Option<i64>,
-) -> Result<RestoreResult, BackupError> {
-    let plan = build_restore_plan(db, backup, target_root_id)?;
-    let target = db
-        .with_reader(|repos| repos.get_root(plan.target_root_id))?
-        .ok_or(BackupError::RootNotFound(plan.target_root_id))?;
+    confirmed_plan: &RestorePlan,
+    expected_digest: &str,
+) -> Result<RestoreResult, RestoreError> {
     let files_of: std::collections::HashMap<&str, Vec<&BackupFileEntry>> = {
         let mut map: std::collections::HashMap<&str, Vec<&BackupFileEntry>> =
             std::collections::HashMap::new();
@@ -1763,31 +2175,73 @@ pub fn execute_restore(
         .map(|c| (c.uuid.as_str(), c))
         .collect();
 
-    db.with_writer(move |repos| {
-        let conn = repos.conn();
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| RepoError::Db(e.to_string()))?;
-        let result = apply_restore_tx(
-            &tx,
-            &plan,
-            &target,
-            &files_of,
-            &backup_assets,
-            &backup_collections,
-        );
-        match result {
-            Ok(result) => {
-                tx.commit().map_err(|e| RepoError::Db(e.to_string()))?;
-                Ok(result)
+    let verdict = db
+        .with_writer(move |repos| {
+            let conn = repos.conn();
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| RepoError::Db(e.to_string()))?;
+            let outcome = restore_in_tx(
+                &tx,
+                backup,
+                confirmed_plan,
+                expected_digest,
+                &files_of,
+                &backup_assets,
+                &backup_collections,
+            );
+            match outcome {
+                Ok(result) => {
+                    tx.commit().map_err(|e| RepoError::Db(e.to_string()))?;
+                    Ok(Ok(result))
+                }
+                Err(e) => {
+                    let _ = tx.rollback();
+                    Ok(Err(e))
+                }
             }
-            Err(e) => {
-                let _ = tx.rollback();
-                Err(RepoError::Db(e.to_string()))
-            }
-        }
-    })
-    .map_err(BackupError::from)
+        })
+        .map_err(|e| RestoreError::Backup(BackupError::Db(e.to_string())))?;
+    verdict
+}
+
+/// 適用トランザクションの本体: plan再計算 → digest一致検証 → 適用。
+fn restore_in_tx(
+    tx: &Connection,
+    backup: &PortableBackup,
+    confirmed_plan: &RestorePlan,
+    expected_digest: &str,
+    files_of: &std::collections::HashMap<&str, Vec<&BackupFileEntry>>,
+    backup_assets: &std::collections::HashMap<&str, &BackupAssetEntry>,
+    backup_collections: &std::collections::HashMap<&str, &BackupCollectionEntry>,
+) -> Result<RestoreResult, RestoreError> {
+    // 対象ルート (確認planが指すid。削除されていれば拒否)。
+    let target = SqliteRepos::new(tx)
+        .get_root(confirmed_plan.target_root_id)
+        .map_err(BackupError::from)?
+        .ok_or(BackupError::RootNotFound(confirmed_plan.target_root_id))?;
+    // トランザクションのスナップショット上でplanを再計算し、確認時の
+    // 意図と一致するか検証する (確認後のDB変化はここで拒否される)。
+    let plan_now = build_plan_on_conn(tx, backup, &target)?;
+    let digest_now = restore_intent_digest(backup, &plan_now);
+    if digest_now != expected_digest {
+        return Err(RestoreError::PlanChanged {
+            detail: format!(
+                "digest {digest_now} != confirmed {expected_digest} \
+                 (target root {})",
+                confirmed_plan.target_root_id
+            ),
+        });
+    }
+    apply_restore_tx(
+        tx,
+        confirmed_plan,
+        &target,
+        files_of,
+        backup_assets,
+        backup_collections,
+    )
+    .map_err(|e| RestoreError::Backup(BackupError::Db(e)))
 }
 
 /// 適用の本体 (トランザクション内)。
@@ -1908,7 +2362,7 @@ fn apply_restore_tx(
                     .cloned()
                     .unwrap_or_default()
                 {
-                    let rel = decode_rel(&f.rel_path).map_err(|e| e.to_string())?;
+                    let rel = decode_rel_checked(&f.rel_path).map_err(|e| e.to_string())?;
                     let abs = target.path.join(&rel);
                     // 既存行 (同パス) は作らない
                     let exists: bool = tx
@@ -1923,20 +2377,21 @@ fn apply_restore_tx(
                     if exists {
                         continue;
                     }
-                    if !matches!(disk_status(&abs), DiskStatus::File) {
+                    // symlink不追従 + fd上の (dev, ino) 照合で実体を確定して
+                    // からhash検証 (検証不能・検査後差し替えは登録しない)。
+                    let Some((hash, md)) = open_and_hash_regular_file(&abs) else {
+                        continue;
+                    };
+                    if hash != asset.content_hash {
                         continue;
                     }
-                    if hash_file_blake3(&abs).map_err(|e| e.to_string())? != asset.content_hash {
-                        continue;
-                    }
-                    let md = std::fs::metadata(&abs)
-                        .map_err(|e| format!("stat {}: {e}", abs.display()))?;
                     #[cfg(unix)]
                     let (mtime_ms, mtime_ns, os_file_id) = {
                         use std::os::unix::fs::MetadataExt;
-                        let mtime_ns = (md.mtime() as i64)
+                        let mtime_ns = md
+                            .mtime()
                             .saturating_mul(1_000_000_000)
-                            .saturating_add(md.mtime_nsec() as i64);
+                            .saturating_add(md.mtime_nsec());
                         let os = gento_core::repo::OsFileId::new(md.dev(), md.ino());
                         (mtime_ns / 1_000_000, mtime_ns, Some(os.to_bytes().to_vec()))
                     };
@@ -2115,10 +2570,16 @@ fn apply_restore_tx(
     Ok(result)
 }
 
-/// テーブルのuuid列が未使用か。
-fn uuid_free(tx: &Connection, table: &str, uuid: &str) -> bool {
-    let sql = format!("SELECT 1 FROM {table} WHERE uuid = ?1");
-    tx.query_row(&sql, [uuid], |_| Ok(true))
+/// テーブルのuuid列が未使用か。テーブル名は閉集合の固定リテラルのみ
+/// (動的SQL組み立てを排除 — 未知の名前は安全側のfalse)。
+fn uuid_free(tx: &Connection, table: &'static str, uuid: &str) -> bool {
+    let sql = match table {
+        "assets" => "SELECT 1 FROM assets WHERE uuid = ?1",
+        "files" => "SELECT 1 FROM files WHERE uuid = ?1",
+        "collections" => "SELECT 1 FROM collections WHERE uuid = ?1",
+        _ => return false,
+    };
+    tx.query_row(sql, [uuid], |_| Ok(true))
         .optional()
         .ok()
         .flatten()
@@ -2363,6 +2824,17 @@ mod tests {
             is_animated: None,
             frame_count: None,
         }
+    }
+
+    /// plan構築 → 意図digest → 実行 (アプリ層の確認フローと同じ手順)。
+    fn plan_digest_execute(
+        db: &Db,
+        backup: &PortableBackup,
+        target: Option<i64>,
+    ) -> Result<RestoreResult, RestoreError> {
+        let plan = build_restore_plan(db, backup, target).map_err(RestoreError::Backup)?;
+        let digest = restore_intent_digest(backup, &plan);
+        execute_restore(db, backup, &plan, &digest)
     }
 
     // ===== 1. フルDBバックアップ =====
@@ -3123,7 +3595,7 @@ mod tests {
         let backup = open_portable_backup(&backup_path).unwrap();
         let cur_root = fx.register_target_root();
 
-        let result = execute_restore(&fx.cur_db, &backup, None).unwrap();
+        let result = plan_digest_execute(&fx.cur_db, &backup, None).unwrap();
         assert_eq!(result.applied.len(), 1);
         assert_eq!(result.applied[0].action, RestoreAction::Add);
         assert!(result.skipped.is_empty(), "{:?}", result.skipped);
@@ -3189,7 +3661,7 @@ mod tests {
         assert_eq!((expected, actual), (1, 1));
 
         // 再実行は冪等 (Sameへ収斂)
-        let again = execute_restore(&fx.cur_db, &backup, None).unwrap();
+        let again = plan_digest_execute(&fx.cur_db, &backup, None).unwrap();
         assert_eq!(again.applied.len(), 1);
         assert_eq!(again.applied[0].action, RestoreAction::Same);
         assert_eq!(again.collection_items_added, 0, "重複追加しない");
@@ -3241,7 +3713,7 @@ mod tests {
             .unwrap();
         let backup_a = open_portable_backup(&fx.backup(root_id)).unwrap();
 
-        let result = execute_restore(&fx.cur_db, &backup_a, Some(cur_root)).unwrap();
+        let result = plan_digest_execute(&fx.cur_db, &backup_a, Some(cur_root)).unwrap();
         assert_eq!(result.applied.len(), 1);
         assert_eq!(result.applied[0].action, RestoreAction::Update);
         assert!(result.applied[0].changed.contains(&"rating".to_string()));
@@ -3252,7 +3724,7 @@ mod tests {
         assert_eq!(rating, 5);
 
         // missing: 現DBに移す (ファイル実体は無い)
-        let result_m = execute_restore(&fx.cur_db, &backup_m, Some(cur_root)).unwrap();
+        let result_m = plan_digest_execute(&fx.cur_db, &backup_m, Some(cur_root)).unwrap();
         assert!(result_m.applied.is_empty());
         assert_eq!(result_m.skipped.len(), 1);
         assert_eq!(result_m.skipped[0].matched, RestoreMatch::Missing);
@@ -3281,7 +3753,7 @@ mod tests {
                 .with_writer(|repos| repos.link_file(f.id, asset.id))
                 .unwrap();
         }
-        let result_dup = execute_restore(&fx.cur_db, &backup_a, Some(cur_root)).unwrap();
+        let result_dup = plan_digest_execute(&fx.cur_db, &backup_a, Some(cur_root)).unwrap();
         assert_eq!(result_dup.skipped.len(), 1);
         assert_eq!(result_dup.skipped[0].matched, RestoreMatch::Ambiguous);
         assert_eq!(
@@ -3321,7 +3793,7 @@ mod tests {
             .unwrap();
         let _ = hash;
 
-        execute_restore(&fx.cur_db, &backup, Some(cur_root)).unwrap();
+        plan_digest_execute(&fx.cur_db, &backup, Some(cur_root)).unwrap();
         let count = fx
             .cur_db
             .with_reader(|repos| {
@@ -3359,7 +3831,7 @@ mod tests {
         let backup = open_portable_backup(&fx.backup(root_id)).unwrap();
 
         fx.register_target_root();
-        let result = execute_restore(&fx.cur_db, &backup, None).unwrap();
+        let result = plan_digest_execute(&fx.cur_db, &backup, None).unwrap();
         assert_eq!(result.fts_rebuilt, 1);
         let (expected, actual) = fx
             .cur_db
@@ -3431,7 +3903,7 @@ mod tests {
             assert_eq!(backup.files[0].rel_path, "d%FF/b.png");
 
             let cur_root = fx.register_target_root();
-            let result = execute_restore(&fx.cur_db, &backup, Some(cur_root)).unwrap();
+            let result = plan_digest_execute(&fx.cur_db, &backup, Some(cur_root)).unwrap();
             assert_eq!(result.applied.len(), 1);
             // 現DBのfile行は元の非UTF-8バイト列で復元される
             fx.cur_db
@@ -3480,7 +3952,7 @@ mod tests {
 
         let backup = open_portable_backup(&fx.backup(root_id)).unwrap();
         fx.register_target_root();
-        let result = execute_restore(&fx.cur_db, &backup, None).unwrap();
+        let result = plan_digest_execute(&fx.cur_db, &backup, None).unwrap();
         assert_eq!(result.collections_created, 1);
         let restored = fx
             .cur_db
@@ -3491,5 +3963,600 @@ mod tests {
             .find(|c| c.name == "ast-smart")
             .expect("smart復元");
         assert_eq!(smart.item_count, 1, "評価結果も復元後DBで機能する");
+    }
+
+    // ===== 6. 敵対的入力と安全性 (FG-WP13-1) =====
+
+    /// 改変後の内容で自己再digestしたバックアップディレクトリを書く
+    /// (敵対的`.gento`の再現 — digestは攻撃者自身が再計算可能なため、
+    /// digest整合だけでは防御にならない)。
+    fn write_self_redigested(dir: &Path, b: &PortableBackup) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(METADATA_JSONL_FILE), serialize_jsonl(b)).unwrap();
+        std::fs::write(dir.join(COLLECTIONS_JSON_FILE), serialize_collections(b)).unwrap();
+        let mut names = [COLLECTIONS_JSON_FILE, METADATA_JSONL_FILE];
+        names.sort_unstable();
+        let mut aggregate = String::new();
+        let mut digests = Vec::new();
+        for name in names {
+            let hex = blake3::hash(&std::fs::read(dir.join(name)).unwrap())
+                .to_hex()
+                .to_string();
+            aggregate.push_str(&format!("{name}:{hex}\n"));
+            digests.push(BackupFileDigest {
+                name: name.to_string(),
+                blake3: hex,
+            });
+        }
+        let mut info = b.info.clone();
+        info.file_digests = digests;
+        info.digest = format!("blake3:{}", blake3::hash(aggregate.as_bytes()).to_hex());
+        info.complete = true;
+        std::fs::write(
+            dir.join(BACKUP_INFO_FILE),
+            serde_json::to_string_pretty(&info).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// backup-info.jsonを書き換え、file_digestsの現物から集約digestを
+    /// 再計算して自己整合させる (manifest改変テスト用)。
+    fn rewrite_info_self_consistent(dir: &Path, mutate: impl FnOnce(&mut BackupInfo)) {
+        let mut info: BackupInfo =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(BACKUP_INFO_FILE)).unwrap())
+                .unwrap();
+        mutate(&mut info);
+        let mut sorted = info.file_digests.clone();
+        sorted.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut aggregate = String::new();
+        for fd in &sorted {
+            aggregate.push_str(&format!("{}:{}\n", fd.name, fd.blake3));
+        }
+        info.digest = format!("blake3:{}", blake3::hash(aggregate.as_bytes()).to_hex());
+        std::fs::write(
+            dir.join(BACKUP_INFO_FILE),
+            serde_json::to_string_pretty(&info).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn decode_rel_checked_rejects_traversal_and_normalizes() {
+        // 拒否: 絶対パス・親コンポーネント・windows prefix表現・NUL・空
+        for hostile in [
+            "/etc/passwd",
+            "../outside.png",
+            "a/../../outside.png",
+            "..",
+            "../",
+            ".",
+            "",
+            "a/..",
+            "C:\\outside.png",
+            "C:/outside.png",
+            "c:",
+            "\\\\server\\share\\x.png",
+            "%00.png",
+            "a/%2E%2E/b.png",
+            "%2E%2E%2Foutside.png",
+            "%2Fetc%2Fpasswd",
+            "C%3A%5Coutside.png",
+        ] {
+            let err = decode_rel_checked(hostile)
+                .err()
+                .unwrap_or_else(|| panic!("{hostile} should be rejected"));
+            assert!(matches!(err, BackupError::Format(_)), "{err}");
+        }
+        // 正規化: `.`は除去、Normal成分のみで再構成
+        assert_eq!(
+            decode_rel_checked("a/./b.png").unwrap(),
+            PathBuf::from("a/b.png")
+        );
+        assert_eq!(
+            decode_rel_checked("./a.png").unwrap(),
+            PathBuf::from("a.png")
+        );
+        assert_eq!(decode_rel_checked("a.png").unwrap(), PathBuf::from("a.png"));
+        // 非UTF-8バイトも保持される (正当な相対パス)
+        assert_eq!(
+            decode_rel_checked("d%FF/b.png").unwrap(),
+            decode_path(&[b'd', 0xff, b'/', b'b', b'.', b'p', b'n', b'g'])
+        );
+    }
+
+    #[test]
+    fn hostile_rel_path_traversal_is_rejected_at_plan_time() {
+        // 敵対的バックアップのrel_path (traversal/絶対/prefix) は
+        // digestを自分で再計算していてもplan時点で拒否される。
+        let fx = Fixture::new("traversal");
+        let (root_id, _) = seed_library(&fx.src_db, &fx.root_dir, "a.png", 1);
+        let valid = open_portable_backup(&fx.backup(root_id)).unwrap();
+        fx.register_target_root();
+        let hostile_paths = [
+            "../outside.png",
+            "%2E%2E/outside.png",
+            "sub/../../outside.png",
+            "/etc/passwd",
+            "%2Fetc%2Fpasswd",
+            "C:%5Coutside.png",
+            "C:/outside.png",
+            "\\\\server\\share\\x.png",
+            "",
+            ".",
+            "%00.png",
+        ];
+        for (index, hostile) in hostile_paths.iter().enumerate() {
+            let mut b = valid.clone();
+            b.files[0].rel_path = hostile.to_string();
+            let dir = fx.tmp().join(format!("hostile-{index}.gento"));
+            let _ = std::fs::remove_dir_all(&dir);
+            write_self_redigested(&dir, &b);
+            // digestは自己整合 (open自体は通る — 改竄検知ではなく経路検証で防ぐ)
+            let opened = open_portable_backup(&dir).unwrap();
+            let err = build_restore_plan(&fx.cur_db, &opened, None).unwrap_err();
+            assert!(
+                err.to_string().contains("refusing rel_path"),
+                "{hostile}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_target_is_reported_missing_and_never_followed() {
+        // symlinkは「行方不明」として報告し、リンク先を実体として扱わない
+        // (fileopsの3分類規約。外部へのescapeも同型)。
+        let fx = Fixture::new("symlink");
+        let (root_id, _) = seed_library(&fx.src_db, &fx.root_dir, "a.png", 1);
+        let backup = open_portable_backup(&fx.backup(root_id)).unwrap();
+        let cur_root = fx.register_target_root();
+        // ルート内a.pngを、ルート外の**同一内容**実体へのsymlinkへ差し替え
+        std::fs::remove_file(fx.root_dir.join("a.png")).unwrap();
+        let outside = fx.tmp().join("outside.png");
+        std::fs::write(&outside, vec![1u8; 64]).unwrap();
+        std::os::unix::fs::symlink(&outside, fx.root_dir.join("a.png")).unwrap();
+
+        let plan = build_restore_plan(&fx.cur_db, &backup, None).unwrap();
+        let e = &plan.entries[0];
+        assert_eq!(e.matched, RestoreMatch::Missing, "symlinkは行方不明扱い");
+        assert!(!e.files[0].on_disk);
+        assert_eq!(plan.summary.missing, 1);
+
+        // 実行しても登録されない (リンク先をhash検証・登録しない)
+        let result = plan_digest_execute(&fx.cur_db, &backup, Some(cur_root)).unwrap();
+        assert!(result.applied.is_empty(), "{:?}", result.applied);
+        assert_eq!(result.skipped.len(), 1);
+        let file_rows: i64 = fx
+            .cur_db
+            .with_reader(|repos| {
+                repos
+                    .conn()
+                    .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
+                    .map_err(|e| RepoError::Db(e.to_string()))
+            })
+            .unwrap();
+        assert_eq!(file_rows, 0, "ルート外実体へのsymlinkは登録しない");
+    }
+
+    #[test]
+    fn execute_rejects_when_db_changes_after_confirmation() {
+        // (a) match種別・actionの変化: 確認後に同一内容を複製 → ambiguousへ
+        {
+            let fx = Fixture::new("pc-match");
+            let (root_id, hash_a) = seed_library(&fx.src_db, &fx.root_dir, "a.png", 1);
+            let backup = open_portable_backup(&fx.backup(root_id)).unwrap();
+            let cur_root = fx.register_target_root();
+            write_image(&fx.root_dir, "moved.png", 1);
+            let moved = fx
+                .cur_db
+                .with_writer(|repos| {
+                    repos.upsert_file(FileUpsert {
+                        root_id: cur_root,
+                        rel_path: PathBuf::from("moved.png"),
+                        display_name: "moved.png".to_string(),
+                        byte_size: 64,
+                        mtime_ms: 0,
+                        mtime_ns: 0,
+                        scan_state: ScanState::Present,
+                        os_file_id: None,
+                        detach_asset: false,
+                    })
+                })
+                .unwrap();
+            let (asset, _) = fx
+                .cur_db
+                .with_writer(|repos| repos.create_or_get_asset(make_asset_input(&hash_a)))
+                .unwrap();
+            fx.cur_db
+                .with_writer(|repos| repos.link_file(moved.id, asset.id))
+                .unwrap();
+            let plan = build_restore_plan(&fx.cur_db, &backup, None).unwrap();
+            assert_eq!(plan.entries[0].matched, RestoreMatch::Hash);
+            let digest = restore_intent_digest(&backup, &plan);
+            // 確認後の変化: 同一内容をもう1箇所へ → hash一致がambiguousになる
+            write_image(&fx.root_dir, "moved2.png", 1);
+            let dup = fx
+                .cur_db
+                .with_writer(|repos| {
+                    repos.upsert_file(FileUpsert {
+                        root_id: cur_root,
+                        rel_path: PathBuf::from("moved2.png"),
+                        display_name: "moved2.png".to_string(),
+                        byte_size: 64,
+                        mtime_ms: 0,
+                        mtime_ns: 0,
+                        scan_state: ScanState::Present,
+                        os_file_id: None,
+                        detach_asset: false,
+                    })
+                })
+                .unwrap();
+            fx.cur_db
+                .with_writer(|repos| repos.link_file(dup.id, asset.id))
+                .unwrap();
+            let err = execute_restore(&fx.cur_db, &backup, &plan, &digest).unwrap_err();
+            assert!(
+                matches!(err, RestoreError::PlanChanged { .. }),
+                "match種別変化は拒否: {err}"
+            );
+        }
+        // (b) 解決済みasset id・現DB rel_pathの変化: 確認後にassetを作り直す
+        {
+            let fx = Fixture::new("pc-assetid");
+            let (root_id, hash_a) = seed_library(&fx.src_db, &fx.root_dir, "a.png", 1);
+            let backup = open_portable_backup(&fx.backup(root_id)).unwrap();
+            let cur_root = fx.register_target_root();
+            write_image(&fx.root_dir, "moved.png", 1);
+            let (asset, moved) = fx
+                .cur_db
+                .with_writer(|repos| {
+                    let file = repos.upsert_file(FileUpsert {
+                        root_id: cur_root,
+                        rel_path: PathBuf::from("moved.png"),
+                        display_name: "moved.png".to_string(),
+                        byte_size: 64,
+                        mtime_ms: 0,
+                        mtime_ns: 0,
+                        scan_state: ScanState::Present,
+                        os_file_id: None,
+                        detach_asset: false,
+                    })?;
+                    let (a, _) = repos.create_or_get_asset(make_asset_input(&hash_a))?;
+                    repos.link_file(file.id, a.id)?;
+                    Ok((a, file))
+                })
+                .unwrap();
+            let _ = asset;
+            let plan = build_restore_plan(&fx.cur_db, &backup, None).unwrap();
+            assert_eq!(
+                plan.entries[0].files[0].current_rel_path.as_deref(),
+                Some("moved.png")
+            );
+            let digest = restore_intent_digest(&backup, &plan);
+            // 確認後の変化: 行を作り直す (asset idも現DB rel_pathも変わる)
+            fx.cur_db
+                .with_writer(|repos| {
+                    repos
+                        .conn()
+                        .execute(
+                            "DELETE FROM files WHERE id = ?1",
+                            rusqlite::params![moved.id],
+                        )
+                        .map_err(|e| RepoError::Db(e.to_string()))?;
+                    repos
+                        .conn()
+                        .execute(
+                            "DELETE FROM assets WHERE id = ?1",
+                            rusqlite::params![asset.id],
+                        )
+                        .map_err(|e| RepoError::Db(e.to_string()))?;
+                    write_image(&fx.root_dir, "recreated.png", 1);
+                    let file = repos.upsert_file(FileUpsert {
+                        root_id: cur_root,
+                        rel_path: PathBuf::from("recreated.png"),
+                        display_name: "recreated.png".to_string(),
+                        byte_size: 64,
+                        mtime_ms: 0,
+                        mtime_ns: 0,
+                        scan_state: ScanState::Present,
+                        os_file_id: None,
+                        detach_asset: false,
+                    })?;
+                    let (a, _) = repos.create_or_get_asset(make_asset_input(&hash_a))?;
+                    repos.link_file(file.id, a.id)?;
+                    Ok(())
+                })
+                .unwrap();
+            let err = execute_restore(&fx.cur_db, &backup, &plan, &digest).unwrap_err();
+            assert!(
+                matches!(err, RestoreError::PlanChanged { .. }),
+                "asset id / rel_path変化は拒否: {err}"
+            );
+            // 適用されていない (再作成したassetはそのまま)
+            let count: i64 = fx
+                .cur_db
+                .with_reader(|repos| {
+                    repos
+                        .conn()
+                        .query_row("SELECT count(*) FROM assets", [], |r| r.get(0))
+                        .map_err(|e| RepoError::Db(e.to_string()))
+                })
+                .unwrap();
+            assert_eq!(count, 1);
+        }
+    }
+
+    #[test]
+    fn execute_rolls_back_completely_on_injected_mid_restore_failure() {
+        // 2件目のINSERTがCHECK制約違反で失敗する自己再digestバックアップ →
+        // 1件目の適用も含めて完全ロールバックされる。
+        let fx = Fixture::new("rollback");
+        let (root_id, hash_a) = seed_library(&fx.src_db, &fx.root_dir, "a.png", 1);
+        let (hash_b, file_b) = {
+            // 同一ルートへ別内容の2件目
+            write_image(&fx.root_dir, "b.png", 2);
+            let (file, asset) = fx
+                .src_db
+                .with_writer(|repos| {
+                    let file = repos.upsert_file(FileUpsert {
+                        root_id,
+                        rel_path: PathBuf::from("b.png"),
+                        display_name: "b.png".to_string(),
+                        byte_size: 64,
+                        mtime_ms: 0,
+                        mtime_ns: 0,
+                        scan_state: ScanState::Present,
+                        os_file_id: None,
+                        detach_asset: false,
+                    })?;
+                    let (a, _) =
+                        repos.create_or_get_asset(make_asset_input(&hash_of(&[2u8; 64])))?;
+                    repos.link_file(file.id, a.id)?;
+                    Ok((file, a))
+                })
+                .unwrap();
+            let _ = file;
+            (asset.content_hash, file)
+        };
+        let _ = hash_a;
+        let valid = open_portable_backup(&fx.backup(root_id)).unwrap();
+        assert_eq!(valid.assets.len(), 2);
+
+        // 敵対的改変: b側assetのtriageをCHECK違反値へ (適用途中で失敗する)
+        let mut hostile = valid.clone();
+        for a in &mut hostile.assets {
+            if a.content_hash == hash_b {
+                a.triage = "bogus".to_string();
+            }
+        }
+        let dir = fx.tmp().join("hostile-rollback.gento");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_self_redigested(&dir, &hostile);
+        let opened = open_portable_backup(&dir).unwrap();
+        let cur_root = fx.register_target_root();
+
+        let err = plan_digest_execute(&fx.cur_db, &opened, Some(cur_root)).unwrap_err();
+        assert!(
+            err.to_string().contains("CHECK"),
+            "CHECK制約違反で失敗する: {err}"
+        );
+
+        // ロールバック完全性: 1件目 (a.png) も含め何も適用されていない
+        let (assets, files, tags, captions): (i64, i64, i64, i64) = fx
+            .cur_db
+            .with_reader(|repos| {
+                let conn = repos.conn();
+                let q = |sql: &str| {
+                    conn.query_row(sql, [], |r| r.get(0))
+                        .map_err(|e| RepoError::Db(e.to_string()))
+                };
+                Ok((
+                    q("SELECT count(*) FROM assets")?,
+                    q("SELECT count(*) FROM files")?,
+                    q("SELECT count(*) FROM tags")?,
+                    q("SELECT count(*) FROM captions")?,
+                ))
+            })
+            .unwrap();
+        assert_eq!((assets, files, tags, captions), (0, 0, 0, 0));
+        let _ = file_b;
+
+        // 同じ現DBへ正規のバックアップなら適用できる (状態は無傷)
+        let ok = plan_digest_execute(&fx.cur_db, &valid, Some(cur_root)).unwrap();
+        assert_eq!(ok.applied.len(), 2);
+    }
+
+    #[test]
+    fn full_db_backup_ignores_tmp_leftovers_and_leaves_no_tmp_on_success() {
+        let tmp = TempDir::new("fulltmp");
+        let db = Db::open(tmp.path().join("db.sqlite3")).unwrap();
+        seed_library(&db, tmp.path().join("root1"), "a.png", 1);
+        let dest = tmp.path().join("backups");
+        let out = full_db_backup(&db, Some(&dest)).unwrap();
+
+        // 成功時: 一時名は残らない (最終名のみ)
+        let tmp_leftovers: Vec<String> = std::fs::read_dir(&dest)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(tmp_leftovers.is_empty(), "{tmp_leftovers:?}");
+
+        // クラッシュ残骸の模擬 (VACUUM INTO中断相当の部分書き込み一時名)
+        let garbage = dest.join("library-full-20260101T000000000Z.sqlite3.tmp-999");
+        std::fs::write(&garbage, b"partial garbage from a crashed VACUUM").unwrap();
+
+        // 一時名は世代に数えない (retention・復元対象外)
+        let listed = list_full_backups(&dest);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0], out.path);
+
+        // 追加作成: tmp残骸が世代計算を汚さない (keep=3に対して実世代2)
+        let out2 = full_db_backup(&db, Some(&dest)).unwrap();
+        assert_eq!(out2.kept_generations, 2);
+        assert!(
+            garbage.exists(),
+            "tmp残骸は勝手に削除しない (外部の物は触らない)"
+        );
+        let final_count = std::fs::read_dir(&dest)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("library-full-") && n.ends_with(".sqlite3"))
+            .count();
+        assert_eq!(final_count, 2);
+    }
+
+    #[test]
+    fn publish_failure_cleans_temporary_artifacts() {
+        let tmp = TempDir::new("publish");
+        // (a) フルDB: 最終名がディレクトリ → rename失敗 → 一時ファイル掃除
+        {
+            let dir = tmp.path().join("file-case");
+            std::fs::create_dir_all(&dir).unwrap();
+            let tmp_file = dir.join("backup.tmp-1");
+            std::fs::write(&tmp_file, b"data").unwrap();
+            let final_path = dir.join("final.sqlite3");
+            std::fs::create_dir(&final_path).unwrap();
+            let err = publish_file(&tmp_file, &final_path).unwrap_err();
+            assert!(matches!(err, BackupError::Io(_)), "{err}");
+            assert!(!tmp_file.exists(), "失敗時はtmpを掃除");
+        }
+        // (b) ポータブル: 最終名がdangling symlink → rename失敗 → 一時dir掃除
+        #[cfg(unix)]
+        {
+            let dir = tmp.path().join("dir-case");
+            let tmp_dir = dir.join(".gento-tmp-x");
+            std::fs::create_dir_all(&tmp_dir).unwrap();
+            std::fs::write(tmp_dir.join(METADATA_JSONL_FILE), b"{}").unwrap();
+            let final_path = dir.join("final.gento");
+            std::os::unix::fs::symlink(dir.join("nonexistent-target"), &final_path).unwrap();
+            let err = publish_dir(&tmp_dir, &final_path).unwrap_err();
+            assert!(matches!(err, BackupError::Io(_)), "{err}");
+            assert!(!tmp_dir.exists(), "失敗時はtmpを掃除");
+        }
+    }
+
+    #[test]
+    fn open_rejects_manifest_tampering_counts_and_duplicate_uuids() {
+        let tmp = TempDir::new("manifest");
+        let root_dir = tmp.path().join("photos");
+        std::fs::create_dir_all(&root_dir).unwrap();
+        let db = Db::open(tmp.path().join("db.sqlite3")).unwrap();
+        let (root_id, hash) = seed_library(&db, &root_dir, "a.png", 1);
+        // collection UUID重複ケース用にコレクションを1つ作っておく
+        {
+            let asset = db
+                .with_reader(|repos| repos.find_by_hash(&hash))
+                .unwrap()
+                .expect("asset");
+            let col = db
+                .with_writer(|repos| repos.create_manual_collection("選択"))
+                .unwrap();
+            db.with_writer(|repos| repos.add_collection_items(col.id, &[asset.id]))
+                .unwrap();
+        }
+        let dest = tmp.path().join("exports");
+        std::fs::create_dir_all(&dest).unwrap();
+        let path = create_portable_backup(&db, root_id, &dest).unwrap();
+
+        // (a) 必須digestエントリの欠落 (collections.jsonを除去・自己再計算)
+        {
+            let dir = tmp.path().join("missing-entry.gento");
+            let _ = std::fs::remove_dir_all(&dir);
+            dircopy(&path, &dir);
+            rewrite_info_self_consistent(&dir, |info| {
+                info.file_digests
+                    .retain(|fd| fd.name != COLLECTIONS_JSON_FILE);
+            });
+            let err = open_portable_backup(&dir).unwrap_err();
+            assert!(
+                matches!(err, BackupError::DigestMismatch { .. })
+                    && err.to_string().contains("missing required digest entry"),
+                "{err}"
+            );
+        }
+        // (b) digestエントリの重複 (metadata.jsonlを2つ・自己再計算)
+        {
+            let dir = tmp.path().join("dup-entry.gento");
+            let _ = std::fs::remove_dir_all(&dir);
+            dircopy(&path, &dir);
+            rewrite_info_self_consistent(&dir, |info| {
+                if let Some(fd) = info
+                    .file_digests
+                    .iter()
+                    .find(|fd| fd.name == METADATA_JSONL_FILE)
+                    .cloned()
+                {
+                    info.file_digests.push(fd);
+                }
+            });
+            let err = open_portable_backup(&dir).unwrap_err();
+            assert!(
+                matches!(err, BackupError::DigestMismatch { .. })
+                    && err.to_string().contains("duplicate digest entry"),
+                "{err}"
+            );
+        }
+        // (c) manifestに無い実ファイル (改竄・混入)
+        {
+            let dir = tmp.path().join("extra-file.gento");
+            let _ = std::fs::remove_dir_all(&dir);
+            dircopy(&path, &dir);
+            std::fs::write(dir.join("evil.txt"), b"injected").unwrap();
+            let err = open_portable_backup(&dir).unwrap_err();
+            assert!(
+                matches!(err, BackupError::DigestMismatch { .. })
+                    && err.to_string().contains("do not match the manifest"),
+                "{err}"
+            );
+        }
+        // (d) backup-info.jsonの件数改変 (infoはdigest対象外のため自己整合のまま)
+        {
+            let dir = tmp.path().join("bad-counts.gento");
+            let _ = std::fs::remove_dir_all(&dir);
+            dircopy(&path, &dir);
+            rewrite_info_self_consistent(&dir, |info| {
+                info.asset_count += 1;
+            });
+            let err = open_portable_backup(&dir).unwrap_err();
+            assert!(
+                matches!(err, BackupError::Format(_)) && err.to_string().contains("counts"),
+                "{err}"
+            );
+        }
+        // (e) asset UUID重複 (自己再digest。件数申告は合わせてくる攻撃を想定)
+        {
+            let valid = open_portable_backup(&path).unwrap();
+            let mut hostile = valid.clone();
+            let dup = hostile.assets[0].clone();
+            hostile.assets.push(dup);
+            hostile.info.asset_count = hostile.assets.len() as u64;
+            let dir = tmp.path().join("dup-asset-uuid.gento");
+            let _ = std::fs::remove_dir_all(&dir);
+            write_self_redigested(&dir, &hostile);
+            let err = open_portable_backup(&dir).unwrap_err();
+            assert!(
+                matches!(err, BackupError::Format(_)) && err.to_string().contains("duplicate"),
+                "{err}"
+            );
+        }
+        // (f) collection UUID重複
+        {
+            let valid = open_portable_backup(&path).unwrap();
+            let mut hostile = valid.clone();
+            let dup = hostile.collections[0].clone();
+            hostile.collections.push(dup);
+            hostile.info.collection_count = hostile.collections.len() as u64;
+            let dir = tmp.path().join("dup-collection-uuid.gento");
+            let _ = std::fs::remove_dir_all(&dir);
+            write_self_redigested(&dir, &hostile);
+            let err = open_portable_backup(&dir).unwrap_err();
+            assert!(
+                matches!(err, BackupError::Format(_)) && err.to_string().contains("duplicate"),
+                "{err}"
+            );
+        }
     }
 }

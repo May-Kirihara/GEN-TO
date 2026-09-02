@@ -13,6 +13,10 @@ export default defineConfig({
       ignored: ["**/src-tauri/**"],
     },
   },
+  // vitest実行時のみ: svelteをブラウザ版で解決し、コンポーネントを
+  // クライアント (mount可能) としてコンパイルする (RestoreDialog.test.ts
+  // の描画テストで必要。dev/buildの解決には影響しない)。
+  ...(process.env.VITEST ? { resolve: { conditions: ["browser"] } } : {}),
   test: {
     include: ["src/**/*.test.ts"],
   },

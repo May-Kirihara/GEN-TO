@@ -1,7 +1,7 @@
 # GEN-TO IPC API契約 (Phase 2 / WP-2時点)
 
 - 作成日: 2026-08-28 (WP-2)
-- 最終更新: 2026-09-03 (**WP-13 (MVP): §47 バックアップと復元のcommand群・`.gento`バックアップ形式追加** / 2026-09-02 WP-12 §46 / WP-11 §45 / WP-10 §44 / WP-9 §43 / WP-8 §42 / WP-7 §39-41 / WP-6 §34-38 / WP-5 §31-33 / WP-4 §26-33 / WP-3 §22-24 / WP-2 §17-21 / WP-1 §1/§16 / WP-0 §0/§1/§14/§15)
+- 最終更新: 2026-09-03 (**FG-WP13-1: §47 改訂 — トークン束縛された確定plan適用・rel_pathパス検証規約・digest manifest完全性・フルDB原子公開** / WP-13 (MVP): §47 バックアップと復元のcommand群・`.gento`バックアップ形式追加 / 2026-09-02 WP-12 §46 / WP-11 §45 / WP-10 §44 / WP-9 §43 / WP-8 §42 / WP-7 §39-41 / WP-6 §34-38 / WP-5 §31-33 / WP-4 §26-33 / WP-3 §22-24 / WP-2 §17-21 / WP-1 §1/§16 / WP-0 §0/§1/§14/§15)
 - 目的: Tauri command・イベント・ローカル画像プロトコルの形状をWP-3〜6の契約基準として固定する。
 - 整合性情報: 本書の型は `crates/gento-core/src/catalog.rs`、`apps/desktop/src-tauri/src/catalog.rs`
   (ページDTOのversion拡張もここ)、
@@ -2184,35 +2184,75 @@ score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
 
 - **2種類のバックアップ**:
   1. **フルDBバックアップ** (`backup_full_db`): `VACUUM INTO` でDB全体を
-     単一SQLiteファイルへ (migration前backupと同一のWAL安全手法 +
-     integrity_check検証 + 世代保持)。出力先は既定 `db-backups/`
-     (`BACKUP_DIR_NAME`)。ファイル名 `library-full-{YYYYMMDDTHHMMSSmmmZ}.sqlite3`
-     (タイムスタンプ先行・固定幅 = 辞書順が時系列。migration用
-     `library-pre-*` とは接頭辞で分離し相互に回収しない)。
-     VACUUM INTOはreader接続の `PRAGMA query_only` に拒否されるため、
-     専用の短命接続で実行する (writerロックを長時間専有しない)。
+     同ディレクトリ内の**一時名** (`{最終名}.tmp-{pid}`) へ書き出し、
+     integrity_check検証 → データ`sync_all` → 最終名への**原子的リネーム**
+     で公開する (クラッシュや中断が最終名の世代を汚さない。一時名は
+     retention・復元対象外 — `list_full_backups` は `.tmp-` を含む名を
+     除外)。検証・同期・リネームの失敗はいずれも一時名を掃除する。
+     **原子rename と durable publication の区別**: renameは可視性の
+     原子性のみを保証するため、公開前にファイル内容の`sync_all`、公開後に
+     親ディレクトリのsync (best-effort) を行う。出力先は既定
+     `db-backups/` (`BACKUP_DIR_NAME`)。ファイル名
+     `library-full-{YYYYMMDDTHHMMSSmmmZ}.sqlite3` (タイムスタンプ先行・
+     固定幅 = 辞書順が時系列。migration用 `library-pre-*` とは接頭辞で
+     分離し相互に回収しない)。VACUUM INTOはreader接続の
+     `PRAGMA query_only` に拒否されるため、専用の短命接続で実行する
+     (writerロックを長時間専有しない)。
   2. **`.gento` ポータブルバックアップ** (`backup_portable_create`):
      登録ルート単位の**ディレクトリ形式** (単一アーカイブは却下 —
      圧縮依存を増やさずJSONLの部分検査・ストリーム書き出しが容易)。
-     画像ファイル本体は含まない (保守メタデータのみ)。
+     画像ファイル本体は含まない (保守メタデータのみ)。作成は一時
+     ディレクトリ `.gento-tmp-{uuid}` へ各ファイルを`sync_all`付きで
+     書き、tmpディレクトリもsync (best-effort) してから最終名へ原子的
+     リネームで公開 (リネーム失敗時もtmpを掃除する)。
 - **自動フルDBバックアップ**: `app_settings` の `backup.auto_full_db`
   (`off`|`daily`|`weekly`、既定 `off`) + `backup.retention_generations`
   (既定3)。起動時+1時間毎の背景チェック (`backup.last_auto_run` 内部キー
   で前回実行epoch msを管理)。
-- **不完全バックアップを正常扱いしない**: 作成は一時ディレクトリ
-  `.gento-tmp-{uuid}` へ全ファイルを書き、`backup-info.json` を**最後に**
-  書いてから `{root名}-{YYYYMMDDTHHMMSSmmmZ}.gento` へ原子的リネーム。
-  復元側は `complete:true` + 全ファイルBLAKE3 digest一致を検証し、
-  不完全 (フラグ無し・digest不一致・tmp残骸・info欠落) は拒否する。
-- **復元は2フェーズ + 確認トークン**:
+- **`.gento` は敵対的入力 (digest完全性規約)**: digestはバックアップ自身が
+  再計算可能なため、整合性だけでは防御にならない。`open_portable_backup`
+  は以下を強制する:
+  - `complete:true` + 全ファイルBLAKE3 digest一致 (不完全 = 拒否)。
+  - `file_digests` は必須2ファイル (`metadata.jsonl` /
+    `collections.json`) の**過不足なし一意** (欠落・重複・未知名は
+    `DigestMismatch` で拒否 — 部分集合では認証されない要素が復元経路に
+    混入するため)。
+  - バックアップディレクトリの**実ファイルが期待集合 (上記2つ +
+    `backup-info.json`) と完全一致** (manifestに無い実ファイル = 改竄)。
+  - `backup-info.json` の件数 (asset/file/collection) が実解析行数と一致。
+  - asset/file/collection UUIDの重複拒否。
+- **rel_pathパス検証規約**: 復元側はすべてのrel_pathを単一の検証関数
+  (`decode_rel_checked`) で解釈する。拒否対象 = 不正な百分号エスケープ、
+  NUL、絶対パス (unix `/`・windows prefix)、windows prefixの文字列表現
+  (drive letter `C:` / UNC `\\` — 現行linux開発でも拒否)、`..` 親
+  コンポーネント (percent-encoded `..` も復号後に同一判定)、空・`.`のみ。
+  `.` は正規化して除去し `Component::Normal` のみで再構成した相対パスを
+  ルートへjoinする。**symlinkはフォローしない**: `symlink_metadata` で
+  link種別を確認し、symlinkは「行方不明」として報告する (fileopsの3分類
+  規約に同じ)。実体ハッシュ計算はopen前にlink種別を確認し、open後はfd上
+  のfstatで通常ファイル性と (unix) (dev, ino) 一致を検証する — 検査後の
+  パス差し替え (symlink escape含む) を検出して登録しない。
+- **復元は2フェーズ + トークン束縛された確定plan**:
   (a) `backup_restore_plan` = dry-run。マッチング優先度は
   **UUID完全一致 → content_hash一致 → rel_path一致**。差分
   (追加/更新/同一)・衝突・行方不明・同一ハッシュ複数件を**レポートのみ**返す。
-  (b) `backup_restore_execute` = plan再計算の正準ダイジェスト
-  (backup集約digest + root uuid + 対象 + 全entry (uuid, action) + 件数 +
-  コレクション列を長さ前置連結してBLAKE3) に束ねられた**単発確認トークン**
-  を必須とする (WP-7 FG-WP7-2のintent-bound tokenパターン踏襲。5分失効・
-  1回限り・不一致/流用/再利用は全て拒否)。
+  (b) `backup_restore_execute` = 単発確認トークン必須 (WP-7 FG-WP7-2の
+  intent-bound tokenパターン踏襲。5分失効・1回限り・不一致/流用/再利用は
+  全て拒否)。実行シーケンス:
+  1. 実行時点でplanを再計算し、意図ダイジェスト
+     (`restore_intent_digest` = backup集約digest + root uuid + 対象root id +
+     全entry (uuid, match種別, action, 解決済みasset id, content_hash,
+     file rel_path) + summary件数 + コレクション (uuid, will_create,
+     項目数, 解決可能項目数) を長さ前置連結してBLAKE3) がトークン発行時と
+     一致することを確認して**トークンを消費**する。
+  2. 消費済みトークンが保証する確定planを適用する。適用は**単一writer
+     トランザクション内**で現状からplanを再計算し、ダイジェストが再び
+     一致する場合のみ行われる (手順1と適用の間のDB変化は
+     `RestoreError::PlanChanged` =「確認の後にライブラリの状態が変化
+     しました」で中止。トランザクションはロールバックされDBは無変更)。
+     表示用フィールド (reason/display_name/on_disk) は意図ダイジェストの
+     同値判定から意図的に除外する (適用に影響する実体状態は適用tx内で
+     改めて検証される)。
 - **推測して適用しない**: 曖昧マッチ (同一内容が現DBで複数箇所) と
   行方不明 (バックアップにのみ存在し現DBにもディスクにも無い/不明) は
   スキップして結果に報告する。復元は現DBのデータを**削除しない**
@@ -2262,6 +2302,10 @@ score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
 - `digest` = `"{name}:{blake3hex}\n"` 行を名前順連結したもののBLAKE3
   (`backup-info.json` 自身は対象外)。読み取りは format_version ≤ 1 を
   要求し、将来は `migrate_to_current` フックで変換する (現状v1のみ)。
+  **`file_digests` は必須2ファイルの過不足なし一意であることを要求する**
+  (欠落・重複・未成名は拒否 — digest自体は再計算可能なため完全性強制が
+  本質)。`asset_count`/`file_count`/`collection_count` は実解析行数との
+  一致を要求する (info自体はdigest対象外のため)。
 - `metadata.jsonl` の asset行: uuid / content_hash / hash_algorithm /
   byte_size / mime_type / width / height / has_alpha / is_animated /
   frame_count / rating / triage / favorite / tags[] (display_name,
@@ -2301,6 +2345,9 @@ score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
   collectionItemsAdded, collectionItemsUnresolved, ftsRebuilt}`。
   applied[]: `{assetUuid, action, changed[]}` (changedは
   rating/triage/favorite/tags/captions/created)。
+  トークン無効・意図不一致は「復元の実行には確認が必要です…」、
+  確認後のDB変化は「確認の後にライブラリの状態が変化しました。計画を
+  やり直してから実行してください」(PlanChanged) としてErr。
 - `backup_settings_get()` → `{autoFullDb, retentionGenerations}`。
 - `backup_settings_set(autoFullDb, retentionGenerations?)` → 同上
   (頻度は `off|daily|weekly`、世代数は1〜100で検証)。
