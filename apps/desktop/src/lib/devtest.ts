@@ -18,10 +18,19 @@
  * - wheel/pointerイベントは実リスナー (store.zoomAt / dragBy) を通る。
  *   setPointerCaptureだけは合成pointerIdでNotFoundになるため
  *   操作中のみ一時的にパッチする (本来の呼び出しは維持)
+ * - DEVUX-1: 画面右上の読み出しpreは**既定で非表示** (ヘッダーとの重なりが
+ *   製品UIの視認を妨げるため)。ctrl+shift+F12 → m (readoutToggle) でトグル、
+ *   選択はlocalStorageへ永続化。ログ送出 (reportCompact) とは独立に常時継続
  * - WP-7: グリッド/統計/パフォーマンス行 (G/T/P) を追加し、
  *   `devtest:` ログ行 (Rust経由) と document.title を機械可読チャネルとして
  *   1秒周期で送出する (bash側はログをgrepして数値を採取)
  */
+
+import {
+  DEVTEST_READOUT_KEY,
+  parseDevReadoutVisible,
+  toggleDevReadout,
+} from "./devtest-readout";
 
 export type DevBridgeStores = {
   getViewer: () => unknown;
@@ -404,6 +413,16 @@ export function installDevBridge(stores: DevBridgeStores): void {
     "position:fixed;right:8px;top:8px;z-index:9999;pointer-events:none;" +
     "margin:0;padding:6px 10px;background:#000d;color:#7fe7a0;" +
     "font:13px/1.35 monospace;white-space:pre;border-radius:6px;";
+  // DEVUX-1: 既定非表示。永続化された選択のみ復元 (localStorage不在環境はOFF)
+  let readoutVisible = false;
+  try {
+    readoutVisible = parseDevReadoutVisible(
+      window.localStorage.getItem(DEVTEST_READOUT_KEY),
+    );
+  } catch {
+    // localStorage不在環境では既定OFFのまま
+  }
+  readout.style.display = readoutVisible ? "" : "none";
   document.body.appendChild(readout);
 
   const report = (line: string): void => {
@@ -430,6 +449,17 @@ export function installDevBridge(stores: DevBridgeStores): void {
         // localStorage不在環境では何もしない
       }
       window.location.reload();
+    },
+    // DEVUX-1: 画面読み出しの可視性トグル (既定OFF・localStorageへ永続化)。
+    // ログ側のreportCompact送出はこのトグルの影響を受けない
+    readoutToggle: () => {
+      try {
+        readoutVisible = toggleDevReadout(window.localStorage);
+      } catch {
+        // localStorage不在環境では今回のセッション内でのみ反転
+        readoutVisible = !readoutVisible;
+      }
+      readout.style.display = readoutVisible ? "" : "none";
     },
     select2: () => {
       clickCell(0, false);
@@ -1042,7 +1072,10 @@ export function installDevBridge(stores: DevBridgeStores): void {
     const mrect = rect
       ? `${Math.round(rect.x)},${Math.round(rect.y)},${Math.round(rect.width)},${Math.round(rect.height)}`
       : "0,0,0,0";
-    return [`U menu=${menu} mbtn=${buttons} mrect=${mrect} qp=${qp} note=${notice}`];
+    return [
+      `U menu=${menu} mbtn=${buttons} mrect=${mrect} qp=${qp}` +
+        ` ro=${readoutVisible ? 1 : 0} note=${notice}`,
+    ];
   }
 
   /** V/C行 (ビューア・比較) の構築。dump表示とログ報告の両方で使う。 */
@@ -1197,6 +1230,8 @@ export function installDevBridge(stores: DevBridgeStores): void {
           g: "foForeverConfirm",
           r: "foRetryConfirm",
           n: "foFocusRename",
+          // DEVUX-1: 読み出しトグル (rはfoRetryConfirmが使用済みのためm)
+          m: "readoutToggle",
           h: "srFocusInput",
           j: "srRun",
           l: "srRefresh",
