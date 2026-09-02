@@ -8,6 +8,7 @@
 //! のときのみコンパイルされる。通常releaseビルドからは完全に除去される。
 
 pub mod ai;
+pub mod backup;
 pub mod catalog;
 pub mod collections;
 pub mod db;
@@ -241,7 +242,14 @@ pub fn run() {
         embedding::embedding_similar_debug,
         search::similar_search_run,
         vectorindex::vector_index_status,
-        vectorindex::vector_index_rebuild
+        vectorindex::vector_index_rebuild,
+        backup::backup_portable_create,
+        backup::backup_full_db,
+        backup::backup_default_dir,
+        backup::backup_restore_plan,
+        backup::backup_restore_execute,
+        backup::backup_settings_get,
+        backup::backup_settings_set
     ]);
     #[cfg(not(any(debug_assertions, feature = "devtools")))]
     let builder = builder.invoke_handler(tauri::generate_handler![
@@ -336,7 +344,14 @@ pub fn run() {
         embedding::embedding_similar_debug,
         search::similar_search_run,
         vectorindex::vector_index_status,
-        vectorindex::vector_index_rebuild
+        vectorindex::vector_index_rebuild,
+        backup::backup_portable_create,
+        backup::backup_full_db,
+        backup::backup_default_dir,
+        backup::backup_restore_plan,
+        backup::backup_restore_execute,
+        backup::backup_settings_get,
+        backup::backup_settings_set
     ]);
     builder
         .setup(move |app| {
@@ -463,6 +478,14 @@ pub fn run() {
                         });
                         state.embedding = Some(embedding_service);
                         state.vector_index = Some(vector_index_service);
+                        // WP-13: バックアップサービス (フルDB自動バックアップの
+                        // 背景ループ含む。既定=offで何もしない)。
+                        let backup_service = crate::backup::BackupService::new(
+                            std::sync::Arc::clone(&db),
+                            gento_db::default_backup_dir(db.path()),
+                        );
+                        backup_service.start_auto_loop();
+                        state.backup = Some(backup_service);
                         controller.enqueue_scan_all();
                         state.library = Some(controller);
                     }
@@ -498,6 +521,9 @@ pub fn run() {
                     }
                     if let Some(vector_index) = &state.vector_index {
                         vector_index.shutdown();
+                    }
+                    if let Some(backup) = &state.backup {
+                        backup.shutdown();
                     }
                 }
             }

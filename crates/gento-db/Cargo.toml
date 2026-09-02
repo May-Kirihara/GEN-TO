@@ -10,6 +10,10 @@ gento-search = { workspace = true }
 rusqlite = { workspace = true }
 uuid = { workspace = true }
 serde = { workspace = true }
+# WP-13: .gentoバックアップのJSON直列化 (workspace既存pinの昇格のみ)。
+serde_json = { workspace = true }
+# WP-13: バックアップdigest・復元時内容ハッシュ (workspace既存pinの直付け)。
+blake3 = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

@@ -48,6 +48,7 @@ use rusqlite::Connection;
 
 mod ai;
 mod assetmeta;
+mod backup;
 mod collections;
 mod diagnose;
 mod embeddings;
@@ -62,6 +63,17 @@ mod search;
 
 /// AIプロファイル・実行履歴 (WP-10)。
 pub use ai::{AiProfileRecord, AiRunRecord, AssetSource, NewAiProfile};
+/// バックアップと復元 (WP-13)。
+pub use backup::{
+    auto_frequency, build_restore_plan, create_portable_backup, execute_restore, full_db_backup,
+    open_portable_backup, run_auto_backup_if_due, AutoBackupFrequency, BackupAssetEntry,
+    BackupCaptionEntry, BackupCollectionEntry, BackupCollectionItem, BackupError, BackupFileDigest,
+    BackupFileEntry, BackupInfo, BackupTagEntry, FullDbBackupOutcome, PortableBackup,
+    RestoreAction, RestoreApplied, RestoreCollectionReport, RestoreEntry, RestoreFileReport,
+    RestoreMatch, RestorePlan, RestoreResult, RestoreSkipped, RestoreSummary,
+    BACKUP_FORMAT_VERSION, BACKUP_INFO_FILE, COLLECTIONS_JSON_FILE, DEFAULT_BACKUP_RETENTION,
+    METADATA_JSONL_FILE, SETTING_BACKUP_AUTO_FULL_DB, SETTING_BACKUP_RETENTION, TMP_DIR_PREFIX,
+};
 pub use diagnose::DbStatus;
 /// 埋め込み永続化とアプリ設定 (WP-11)。
 pub use embeddings::{

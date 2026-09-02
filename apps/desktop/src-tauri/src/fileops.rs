@@ -121,15 +121,17 @@ struct ConfirmTokenEntry {
 const CONFIRM_TOKEN_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// 確認トークンストア (メモリ。プロセス再起動で失効 = 再確認要求)。
+/// WP-13のバックアップ復元 (backup.rs) も同一パターンで使用するため
+/// crate内共有。
 #[derive(Default)]
-struct ConfirmTokenStore {
+pub(crate) struct ConfirmTokenStore {
     tokens: Mutex<HashMap<String, ConfirmTokenEntry>>,
 }
 
 impl ConfirmTokenStore {
     /// 期限切れを刈り取りつつ新しいトークンを発行する (破壊的意図の
     /// ダイジェストに束ねる)。
-    fn issue(&self, intent_digest: String) -> String {
+    pub(crate) fn issue(&self, intent_digest: String) -> String {
         let token = Uuid::now_v7().to_string();
         // v7は時刻順序付きの乱数 (122bit randomness) — 予測困難性は
         // 秘密性ではなく「持っていること」の証明に十分。
@@ -149,7 +151,7 @@ impl ConfirmTokenStore {
     /// トークンを検証して**消費する** (1回限り)。要求の正準ダイジェストが
     /// 発行時と一致し、かつ未失効である場合のみtrue。いかなる使用試行も
     /// トークンを破棄する (不一致・失効・再利用の全てで焼却 = 再試行不可)。
-    fn consume(&self, token: &str, intent_digest: &str) -> bool {
+    pub(crate) fn consume(&self, token: &str, intent_digest: &str) -> bool {
         let mut guard = self.tokens.lock().unwrap_or_else(|p| p.into_inner());
         match guard.remove(token) {
             Some(entry) => {

@@ -18,6 +18,9 @@
     scanBusy,
     onRefresh,
     onShowLibrary,
+    onBackupRoot,
+    onRestore,
+    onFullDbBackup,
   }: {
     library: LibraryStore;
     roots: LibraryRoot[];
@@ -27,6 +30,12 @@
     onRefresh: () => void;
     /** ライブラリ表示 (登録ルート全体) へ切替える (AppのshowLibrary)。 */
     onShowLibrary: () => Promise<boolean>;
+    /** ルート単位の.gentoバックアップ作成ダイアログを開く (WP-13)。 */
+    onBackupRoot: (root: LibraryRoot) => void;
+    /** 復元ダイアログを開く (WP-13)。 */
+    onRestore: () => void;
+    /** フルDBバックアップを作成 (WP-13)。 */
+    onFullDbBackup: () => void;
   } = $props();
 
   let newRootPath = $state("");
@@ -90,6 +99,12 @@
             >
               {root.enabled ? "無効化" : "有効化"}
             </button>
+            <button
+              onclick={() => onBackupRoot(root)}
+              title="このルートのメタデータを.gentoバックアップへ書き出す"
+            >
+              バックアップ
+            </button>
             <button onclick={() => void library.removeRoot(root.id)}>解除</button>
           </span>
         </li>
@@ -108,6 +123,13 @@
     </button>
     <button onclick={() => void library.stopScan()} disabled={!scanBusy}>停止</button>
     <button onclick={onRefresh}>再取得</button>
+    <button onclick={onRestore} title=".gentoバックアップからメタデータを復元">復元</button>
+    <button
+      onclick={onFullDbBackup}
+      title="DB全体を単一SQLiteファイルへバックアップ (世代保持)"
+    >
+      DBバックアップ
+    </button>
   </div>
   <p class="roots-status">
     {library.status.phase ?? "待機"} /

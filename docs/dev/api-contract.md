@@ -1,7 +1,7 @@
 # GEN-TO IPC API契約 (Phase 2 / WP-2時点)
 
 - 作成日: 2026-08-28 (WP-2)
-- 最終更新: 2026-08-30 (WP-0: §0/§1 healthへ `api_version` 追加・§14 devtools feature化・§15 APIバージョン互換方針追加 / WP-1: §1 healthへ `db_open` 追加・§16 `db_status` 追加 / WP-2: §17〜21 登録ルート・永続カタログ・`set_catalog_source`・`"library"`モード追加 / **WP-3 (MVP): §22〜24 形式拡張・Orientation・アニメーション・透過背景・`isAnimated`フィールド追加**)
+- 最終更新: 2026-09-03 (**WP-13 (MVP): §47 バックアップと復元のcommand群・`.gento`バックアップ形式追加** / 2026-09-02 WP-12 §46 / WP-11 §45 / WP-10 §44 / WP-9 §43 / WP-8 §42 / WP-7 §39-41 / WP-6 §34-38 / WP-5 §31-33 / WP-4 §26-33 / WP-3 §22-24 / WP-2 §17-21 / WP-1 §1/§16 / WP-0 §0/§1/§14/§15)
 - 目的: Tauri command・イベント・ローカル画像プロトコルの形状をWP-3〜6の契約基準として固定する。
 - 整合性情報: 本書の型は `crates/gento-core/src/catalog.rs`、`apps/desktop/src-tauri/src/catalog.rs`
   (ページDTOのversion拡張もここ)、
@@ -2177,3 +2177,144 @@ score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
 - 実モデル (ruri-v3-70m・WP-11評価セット): 索引top-3 == 総当たりtop-3
   が100%一致、Recall@3 = 0.8333 (総当たりと同一 — 索引化で品質低下なし)。
 - 構築中もstatus応答最大4.2ms (96回サンプリング) — UI非ブロック実証。
+
+## 47. WP-13: バックアップと復元
+
+### 概要 (設計判断の記録)
+
+- **2種類のバックアップ**:
+  1. **フルDBバックアップ** (`backup_full_db`): `VACUUM INTO` でDB全体を
+     単一SQLiteファイルへ (migration前backupと同一のWAL安全手法 +
+     integrity_check検証 + 世代保持)。出力先は既定 `db-backups/`
+     (`BACKUP_DIR_NAME`)。ファイル名 `library-full-{YYYYMMDDTHHMMSSmmmZ}.sqlite3`
+     (タイムスタンプ先行・固定幅 = 辞書順が時系列。migration用
+     `library-pre-*` とは接頭辞で分離し相互に回収しない)。
+     VACUUM INTOはreader接続の `PRAGMA query_only` に拒否されるため、
+     専用の短命接続で実行する (writerロックを長時間専有しない)。
+  2. **`.gento` ポータブルバックアップ** (`backup_portable_create`):
+     登録ルート単位の**ディレクトリ形式** (単一アーカイブは却下 —
+     圧縮依存を増やさずJSONLの部分検査・ストリーム書き出しが容易)。
+     画像ファイル本体は含まない (保守メタデータのみ)。
+- **自動フルDBバックアップ**: `app_settings` の `backup.auto_full_db`
+  (`off`|`daily`|`weekly`、既定 `off`) + `backup.retention_generations`
+  (既定3)。起動時+1時間毎の背景チェック (`backup.last_auto_run` 内部キー
+  で前回実行epoch msを管理)。
+- **不完全バックアップを正常扱いしない**: 作成は一時ディレクトリ
+  `.gento-tmp-{uuid}` へ全ファイルを書き、`backup-info.json` を**最後に**
+  書いてから `{root名}-{YYYYMMDDTHHMMSSmmmZ}.gento` へ原子的リネーム。
+  復元側は `complete:true` + 全ファイルBLAKE3 digest一致を検証し、
+  不完全 (フラグ無し・digest不一致・tmp残骸・info欠落) は拒否する。
+- **復元は2フェーズ + 確認トークン**:
+  (a) `backup_restore_plan` = dry-run。マッチング優先度は
+  **UUID完全一致 → content_hash一致 → rel_path一致**。差分
+  (追加/更新/同一)・衝突・行方不明・同一ハッシュ複数件を**レポートのみ**返す。
+  (b) `backup_restore_execute` = plan再計算の正準ダイジェスト
+  (backup集約digest + root uuid + 対象 + 全entry (uuid, action) + 件数 +
+  コレクション列を長さ前置連結してBLAKE3) に束ねられた**単発確認トークン**
+  を必須とする (WP-7 FG-WP7-2のintent-bound tokenパターン踏襲。5分失効・
+  1回限り・不一致/流用/再利用は全て拒否)。
+- **推測して適用しない**: 曖昧マッチ (同一内容が現DBで複数箇所) と
+  行方不明 (バックアップにのみ存在し現DBにもディスクにも無い/不明) は
+  スキップして結果に報告する。復元は現DBのデータを**削除しない**
+  (追加・更新のみ)。
+- **埋め込みは再生成扱いに固定** (バックアップに含めない)。サムネイル・
+  FTS・USearch索引も対象外 — FTSは復元触ったassetの文書を
+  `rebuild_docs_for_assets` (WP-8経路) で即時再構築、サムネイルはキャッシュ
+  ミス再生成、USearchはSQLite embeddings正本からの再構築 (WP-12)。
+- **キャプション復元の挙動**: 現行行とbodyが異なるkindは現行を履歴
+  (`current=0`) へ降格してバックアップ内容を新現行へ挿入する
+  (手動編集保護フラグ・sourceはバックアップ側を保存)。タグは正規化名で
+  併合 (現DB側のタグを削除しない)。コレクションはuuid一致なら項目
+  マージ (冪等)、無ければ同名で新規作成 (smartのquery_jsonは検証してから
+  そのまま保存)。
+
+### `.gento` ディレクトリ構成 (format_version 1)
+
+```
+{root名}-{YYYYMMDDTHHMMSSmmmZ}.gento/
+├── backup-info.json   # 最後に書かれる (complete フラグの意味)
+├── metadata.jsonl     # 1行1レコード: {"type":"asset",...} / {"type":"file",...}
+└── collections.json   # {"collections":[{uuid,name,kind,query_json,items:[...]}]}
+```
+
+- `backup-info.json` schema:
+
+```json
+{
+  "format_version": 1,
+  "api_version": 1,
+  "app_version": "0.x.y",
+  "created_at": "2026-09-02T00:00:00.000Z",
+  "root_uuid": "…36hex…",
+  "root_display_path": "/data/photos",
+  "asset_count": 3,
+  "file_count": 4,
+  "collection_count": 2,
+  "file_digests": [
+    {"name": "collections.json", "blake3": "…64hex…"},
+    {"name": "metadata.jsonl",  "blake3": "…64hex…"}
+  ],
+  "digest": "blake3:…64hex…",
+  "complete": true
+}
+```
+
+- `digest` = `"{name}:{blake3hex}\n"` 行を名前順連結したもののBLAKE3
+  (`backup-info.json` 自身は対象外)。読み取りは format_version ≤ 1 を
+  要求し、将来は `migrate_to_current` フックで変換する (現状v1のみ)。
+- `metadata.jsonl` の asset行: uuid / content_hash / hash_algorithm /
+  byte_size / mime_type / width / height / has_alpha / is_animated /
+  frame_count / rating / triage / favorite / tags[] (display_name,
+  normalized_name, source, manually_edited) / captions[] (kind, body,
+  source, language, manually_edited — 現行行のみ)。
+- file行: uuid / asset_uuid / **rel_path (百分号エスケープ正準形 —
+  非UTF-8バイトも `%XX` で完全保持)** / display_name / extension /
+  byte_size / mtime_ms / mtime_ns / os_file_id `[dev, ino]` / scan_state。
+
+### plan応答のマッチング分類 (`matched`) と action
+
+| matched | 意味 | action |
+|---|---|---|
+| `uuid` | asset UUID完全一致 (内容も同一) | `same` / `update` |
+| `hash` | content_hashで再関連付け (パス移動後) | `same` / `update` |
+| `path_add` | 現DBに無いがディスクの同パスに内容一致 | `add` |
+| `conflict` | 同一UUIDに別内容 / バックアップ経路に別内容 | `skip` |
+| `missing` | バックアップのみ存在・現DBにもディスクにも無い/不明 | `skip` |
+| `ambiguous` | 同一内容が現DBで複数箇所 (対応づけ不能) | `skip` |
+
+### Commands (すべてasync + spawn_blocking。DTOはcamelCase)
+
+- `backup_portable_create(rootId, destDir?)` →
+  `{path, assetCount, fileCount, collectionCount}`。`rootId` は10進文字列。
+- `backup_full_db(destDir?)` → `{path, keptGenerations}`。
+- `backup_default_dir()` → string (db-backups/ の絶対パス。UI初期値用)。
+- `backup_restore_plan(backupDir, targetRootId?)` →
+  `{rootUuid, rootDisplayPath, createdAt, targetRootId, targetRootPath,
+  entries[], collections[], summary{same,update,add,conflict,missing,ambiguous},
+  confirmToken}`。`targetRootId` 省略時はバックアップroot uuid一致 →
+  ルート1つの2段で解決 (不可ならErr「復元先のルートを解決できません」)。
+  entries[]: `{assetUuid, contentHash, displayName, currentAssetId,
+  matched, action, reason, files:[{backupRelPath, currentRelPath, onDisk}]}`。
+  collections[]: `{uuid, name, kind, willCreate, itemsTotal, itemsResolvable}`。
+- `backup_restore_execute(backupDir, targetRootId?, confirmToken)` →
+  `{applied[], skipped[], collectionsCreated, collectionsMerged,
+  collectionItemsAdded, collectionItemsUnresolved, ftsRebuilt}`。
+  applied[]: `{assetUuid, action, changed[]}` (changedは
+  rating/triage/favorite/tags/captions/created)。
+- `backup_settings_get()` → `{autoFullDb, retentionGenerations}`。
+- `backup_settings_set(autoFullDb, retentionGenerations?)` → 同上
+  (頻度は `off|daily|weekly`、世代数は1〜100で検証)。
+
+### Events
+
+- なし (作成・復元はcommand応答で完結。進捗イベントは将来課題)。
+
+### UI統合 (最小限 — WP-15で本格化)
+
+- LibraryPanel: ルート行ごとに「バックアップ」(BackupDialog: 保存先
+  テキスト入力+フォルダツリー、既定値 `backup_default_dir`)。
+- LibraryPanel: ペイン単位に「復元」(RestoreDialog: .gento選択ツリー →
+  planサマリ+警告+内訳 → 確認トークン付き実行 → 結果レポート) と
+  「DBバックアップ」(既定先へ即時作成)。
+- 復元実行ボタンは `planHasWork` (更新/追加/コレクション作業あり) で
+  ゲーティング。衝突・行方不明・曖昧は警告領域に列挙。

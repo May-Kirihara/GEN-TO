@@ -102,6 +102,9 @@
   import DestPicker from "./lib/ui/DestPicker.svelte";
   import ConflictDialog from "./lib/ui/ConflictDialog.svelte";
   import DeleteForeverDialog from "./lib/ui/DeleteForeverDialog.svelte";
+  // WP-13: バックアップと復元
+  import BackupDialog from "./lib/ui/BackupDialog.svelte";
+  import RestoreDialog from "./lib/ui/RestoreDialog.svelte";
   type TriageKeyAction = import("./lib/triage-keys").TriageKeyAction;
   import ContextMenu, { type MenuAction } from "./lib/ui/ContextMenu.svelte";
   import FolderTree from "./lib/shell/FolderTree.svelte";
@@ -293,6 +296,32 @@
   let renameId = $state<string | null>(null);
   let renameInitial = $state("");
   let disposeFileOpsProgress: (() => void) | null = null;
+
+  // ===== バックアップと復元 (WP-13) =====
+
+  /** .gento作成ダイアログ中のルート。 */
+  let backupFor = $state<LibraryRoot | null>(null);
+  /** 復元ダイアログ。 */
+  let restoreOpen = $state(false);
+  /** フルDBバックアップ実行中。 */
+  let fullDbBusy = $state(false);
+
+  async function runFullDbBackup(): Promise<void> {
+    if (fullDbBusy) {
+      return;
+    }
+    fullDbBusy = true;
+    try {
+      const out = await invoke<{ path: string; keptGenerations: number }>("backup_full_db", {
+        destDir: null,
+      });
+      libraryNotice = `DBバックアップを作成しました: ${out.path} (保持${out.keptGenerations}世代)`;
+    } catch (error) {
+      libraryError = error instanceof Error ? error.message : String(error);
+    } finally {
+      fullDbBusy = false;
+    }
+  }
 
   /** 選択項目のパス列 (ライブラリ表示中のみ。ファイル操作の対象)。 */
   function selectedLibraryPaths(): string[] {
@@ -2565,6 +2594,9 @@
           scanBusy={libraryScanBusy}
           onRefresh={() => void library.refreshRoots()}
           onShowLibrary={() => showLibrary()}
+          onBackupRoot={(root) => (backupFor = root)}
+          onRestore={() => (restoreOpen = true)}
+          onFullDbBackup={() => void runFullDbBackup()}
         />
       </aside>
       <div
@@ -3174,6 +3206,18 @@
     onConfirm={() => void confirmDeleteForever()}
     onCancel={() => (deleteForeverFor = null)}
   />
+{/if}
+
+{#if backupFor !== null}
+  <BackupDialog
+    root={backupFor}
+    roots={libraryRoots}
+    onClose={() => (backupFor = null)}
+  />
+{/if}
+
+{#if restoreOpen}
+  <RestoreDialog roots={libraryRoots} onClose={() => (restoreOpen = false)} />
 {/if}
 
 {#if retryReport !== null}

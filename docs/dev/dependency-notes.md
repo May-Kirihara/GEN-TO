@@ -565,3 +565,19 @@
     リリース)。Rust APIはcxx bridge経由で安定だが、minor更新で
     `IndexOptions`等のフィールドが増える可能性あり — 更新時は
     `vector_index.rs` のみ追従すればよい構造にしてある。
+
+## WP-13 バックアップと復元 (2026-09-02)
+
+- **`serde_json` (既存 =1.0.151) の dev依存→通常依存への昇格** (gento-db)
+  - 用途: `.gento`ポータブルバックアップの `backup-info.json` /
+    `collections.json` / `metadata.jsonl` の直列化・解析。従来
+    dev-dependency (テスト専用) だったものを通常依存へ昇格するのみで、
+    workspace単位の版本pin・Cargo.lock実体とも変更なし
+    (gento-core等が同じpinを既に使用)。
+- **`blake3` (既存 =1.8.7) の直依存化** (gento-db)
+  - 用途: バックアップファイル_digest・復元時のon-disk内容ハッシュ
+    (`blake3:<hex>` 形式はgento-imageと同一算法・同一表現)。
+    gento-image / gento-tauriが利用中の同一crate・同一versionの
+    直付け拡大のため新規外部依存ではない。gento-dbからgento-imageへ
+    依存を張るとprobe系を巻き込むため、rawハッシュ計算のみ直付けした。
+  - 入手元: crates.io (BLAKE3 team)。ライセンス: CC0-1.0 OR Apache-2.0。
