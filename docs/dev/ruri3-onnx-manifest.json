@@ -1,0 +1,141 @@
+{
+  "schema": "gento-ruri3-onnx-manifest",
+  "schema_version": 1,
+  "generated_utc": "2026-09-02T05:49:31+00:00",
+  "conversion_script": {
+    "path": "scripts/convert-ruri3-onnx.py",
+    "version": "1.0.0",
+    "base_commit": "477a839",
+    "environment": {
+      "python": "3.12.11",
+      "torch": "2.14.0+cpu",
+      "transformers": "4.57.6",
+      "sentence-transformers": "6.0.1",
+      "optimum": "2.1.0",
+      "optimum-onnx": "0.1.0",
+      "onnx": "1.22.0",
+      "onnxruntime": "1.29.0",
+      "tokenizers": "0.22.2"
+    }
+  },
+  "packages": {
+    "ruri-v3-70m": {
+      "package_name": "ruri-v3-70m-onnx",
+      "package_version": 1,
+      "created_utc": "2026-09-02T05:49:25+00:00",
+      "source": {
+        "repository_id": "cl-nagoya/ruri-v3-70m",
+        "revision": "07a8b0aba47d29d2ca21f89b915c1efe2c23d1cc",
+        "license": "Apache-2.0",
+        "model_safetensors_sha256": "c959b76a535eee838b1f1e6b8999ba513ef8d87a6f8c3534c50dcda1eb5f6a62"
+      },
+      "conversion": {
+        "script": "scripts/convert-ruri3-onnx.py",
+        "script_version": "1.0.0",
+        "base_commit": "477a839",
+        "method": "optimum-export",
+        "onnx_opset": 17,
+        "precision": "fp32"
+      },
+      "model": {
+        "model_type": "modernbert",
+        "architecture": "ModernBertModel",
+        "embedding_dim": 384,
+        "max_input_length": 8192,
+        "distance_metric": "cosine",
+        "pooling": "mean_tokens",
+        "normalization": "l2",
+        "query_prefix": "検索クエリ: ",
+        "document_prefix": "検索文書: "
+      },
+      "runtime": {
+        "verified_onnxruntime_version": "1.29.0"
+      },
+      "files": {
+        "LICENSE": {
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+          "size_bytes": 11358
+        },
+        "NOTICE": {
+          "sha256": "27e2e855c26acff9528851feb0d85eacfa65156a87977b169592ac7e6be9fb90",
+          "size_bytes": 868
+        },
+        "config.json": {
+          "sha256": "f03b934538e46fc12a36067c17cb9e214c8ef0d89375293aa68c81bdc1f937ae",
+          "size_bytes": 1323
+        },
+        "model.onnx": {
+          "sha256": "f92074503910dd52b8d19eb5c4966e79005906b0c3c84712e11fe714267661b1",
+          "size_bytes": 280279285
+        },
+        "tokenizer.json": {
+          "sha256": "0a94ac9a0a02c067bdef25b72ae9f4ee33f48f552e55988d444f6d25eeb1d062",
+          "size_bytes": 6724873
+        },
+        "tokenizer_config.json": {
+          "sha256": "34004511993472f15c7202074284c57788c161fb6567de164b8e0c0266f155e4",
+          "size_bytes": 3779
+        }
+      }
+    },
+    "ruri-v3-30m": {
+      "package_name": "ruri-v3-30m-onnx",
+      "package_version": 1,
+      "created_utc": "2026-09-02T05:49:31+00:00",
+      "source": {
+        "repository_id": "cl-nagoya/ruri-v3-30m",
+        "revision": "24899e5de370b56d179604a007c0d727bf144504",
+        "license": "Apache-2.0",
+        "model_safetensors_sha256": "e94155e342cbfc33280c345c6e2912905fb5de6e1a3adeb938f395aafd2f8832"
+      },
+      "conversion": {
+        "script": "scripts/convert-ruri3-onnx.py",
+        "script_version": "1.0.0",
+        "base_commit": "477a839",
+        "method": "optimum-export",
+        "onnx_opset": 17,
+        "precision": "fp32"
+      },
+      "model": {
+        "model_type": "modernbert",
+        "architecture": "ModernBertModel",
+        "embedding_dim": 256,
+        "max_input_length": 8192,
+        "distance_metric": "cosine",
+        "pooling": "mean_tokens",
+        "normalization": "l2",
+        "query_prefix": "検索クエリ: ",
+        "document_prefix": "検索文書: "
+      },
+      "runtime": {
+        "verified_onnxruntime_version": "1.29.0"
+      },
+      "files": {
+        "LICENSE": {
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+          "size_bytes": 11358
+        },
+        "NOTICE": {
+          "sha256": "5d61bf54dc70d09c12c8eb2c1e0a09fb75c9c3ae5fe74b0c2f68ba8ce8c37787",
+          "size_bytes": 868
+        },
+        "config.json": {
+          "sha256": "3230a8666ce50d245a0e68f5bff4682c419c541f1212ba001a497f327fb7a9e5",
+          "size_bytes": 1323
+        },
+        "model.onnx": {
+          "sha256": "a7965d3661681dcb8189fbfd9b09c7aae9c52c2142e8f05637927b0436a843df",
+          "size_bytes": 147020821
+        },
+        "tokenizer.json": {
+          "sha256": "0a94ac9a0a02c067bdef25b72ae9f4ee33f48f552e55988d444f6d25eeb1d062",
+          "size_bytes": 6724873
+        },
+        "tokenizer_config.json": {
+          "sha256": "34004511993472f15c7202074284c57788c161fb6567de164b8e0c0266f155e4",
+          "size_bytes": 3779
+        }
+      }
+    }
+  }
+}

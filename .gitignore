@@ -18,3 +18,6 @@ sample/dataset/
 # 計測ログは証拠としてリポジトリに保全する (FG-1)
 !docs/dev/measurements/logs/*.log
 .DS_Store
+
+# ローカル変換モデル (CONV-1成果物。配布先決定後はDL運用に置換)
+.local-models/
