@@ -1840,3 +1840,120 @@ docs/dev/measurements/ とhandoff参照。
   プロンプト抽出なし。rawのprompt JSONで確認可能)
 - 1ファイルに複数生成形式が混在する敵対的ケースは正規化優先順位
   (sd-params > comfy > nai) で決定論化
+
+## 44. WP-10: 永続ジョブ基盤とOpenAI互換AI
+
+### migration #8 (`wp10_ai_profiles_runs_jobs`)
+
+- `ai_profiles` (data-model §8.1 + `enabled`): 接続プロファイル。
+  **`api_key_ref` は資格情報ストア参照のみ** (`"keyring:<uuid>"` /
+  `"file:<uuid>"`)。鍵本体をDBへ書く経路は存在しない
+  (検証: gento-ai `e2e_api_key_sent_as_bearer_and_never_in_db` —
+  DB/WAL全バイト走査)。
+- `ai_runs` (§8.2): 試行ごとの実行履歴 (status: running/succeeded/failed。
+  再試行のたびに新規行 — UPDATEで使い回さない)。`profile_id` は
+  ON DELETE SET NULL (プロファイル削除で履歴は失われない)。
+- `asset_tags.ai_run_id` / `captions.ai_run_id` をADD COLUMNで追加
+  (#1計画どおり。NULL既定のADD COLUMNならFK参照を付与可能)。
+- `jobs` 表再構築: status CHECKへ `retry_waiting` を追加。バックオフ期限は
+  既存 `scheduled_at` を流用。pending中の同一 (job_type, target_id) 重複を
+  防ぐ部分UNIQUE index `idx_jobs_pending_dedupe`。
+
+### ジョブ状態機械 (spec §11.2)
+
+```text
+queued ──claim──▶ running ──成功──▶ succeeded
+  ▲                 │失敗 (attempts<max)──▶ retry_waiting (scheduled_at=期限)
+  │                 │失敗 (attempts>=max)──▶ failed ──retry_failed(手動)──▶ queued
+  │                 └(起動回復: running→queued)
+  └──cancel──▶ cancelled (queued/retry_waitingのみ。runningは中断不可)
+```
+
+- バックオフ: `gento_core::jobs::backoff_delay_ms` (純粋関数)。
+  基準 30s→2m→8m (×4) + ジッター [0.5, 1.5)倍 + 上限1h。
+- worker: gento-tauri `ai::AiService` (std::thread ×2。library.rsの
+  ワーカー規約に同じ)。起床 = エンキュー/resume通知 or 500msポーリング。
+  プロファイル毎のconcurrencyは実行中カウントのセマフォで強制。
+- キュー一時停止はメモリフラグ (永続化しない — 再起動で再開が既定)。
+
+### 送信プライバシー (spec §16)
+
+- EXIF/GPS送信 = `library_roots.send_exif/send_gps` ∧
+  プロファイル追加設定 (`extra_json` の `send_exif/send_gps`)。
+  GPSはsend_exifとは**独立した**opt-in (EXIF許可でもGPS拒否なら座標は
+  送らない)。実効判定は `gento_ai::prompt::effective_privacy`。
+- 送信画像は必ず再エンコード (長辺 `max_image_edge` 既定1024px・JPEG q85
+  ・EXIF等メタデータは再エンコードで除去)。
+- プロンプト: `PROMPT_VERSION = 1` (ai_runs.prompt_versionに記録。
+  変更時は必ず版を上げる — 自動処理の重複抑止が版ベース)。
+
+### APIキー保管
+
+1. keyring crate (Linux=Secret Service via zbus / macOS=Keychain /
+   Windows=Credential Manager) を試行
+2. 利用不能 (ヘッドレス等) の場合、`{data_dir}/ai-secrets/<uuid>.key`
+   (0600・平文・README警告同梱) へフォールバック。
+   簡易難読化は意図的にしない (同一マシンに鍵を置く疑似安全を避ける)。
+3. `ApiKey` newtypeのDebug/Displayは `****` (ログ混入の構造的防止)。
+
+### Commands (camelCase引数)
+
+- `ai_profile_list()` → `[{id, uuid, displayName, baseUrl, model,
+  visionCapable, enabled, timeoutMs, concurrency, extra, hasApiKey,
+  apiKeyStore}]` (鍵本体は返さない)
+- `ai_profile_save(profile, apiKey?)` — apiKey: 省略=変更なし / `""`=削除 /
+  値=保存。`extra` はProfileExtra (省略時は既存値引継ぎ)
+- `ai_profile_delete(profileId)` — 待機中ジョブをキャンセルし鍵も削除
+- `ai_profile_test_connection|test_text|test_vision|test_structured(profileId)`
+  → `{ok, detail, elapsedMs, status}` (保存済みプロファイルに対して実行)
+- `ai_jobs_enqueue(assetIds, force?)` — 手動投入。force無効時は
+  「同prompt_versionで成功済み」assetをスキップ (§11.4 既存結果の保持)
+- `ai_root_pending_count(rootId)` — 未処理件数 (確認ダイアログ用)
+- `ai_jobs_enqueue_all_for_root(rootId, confirmed)` — confirmed=falseは
+  エラー (§11.3「件数を提示してから開始」のbackend側ゲート)
+- `ai_jobs_list(status?, limit?)` → `{jobs, counts, paused}`
+- `ai_job_cancel(jobId)` — queued/retry_waitingのみ
+- `ai_jobs_pause()` / `ai_jobs_resume()` / `ai_jobs_retry_failed(jobIds?)`
+- `ai_run_history(assetId)` → `[{id, profileId, operation, status,
+  promptVersion, requestSummary, error, startedAt, finishedAt}]`
+- `ai_root_settings_set(rootId, aiEnabled, sendExif, sendGps)` —
+  ルート設定 (watch_enabledは既存値保持)
+- `library_roots_list` のDTOに `ai_enabled/send_exif/send_gps` を追加
+
+### Events
+
+- `ai:jobs` — `{changes: [AiJobDto], counts: {status: n}, paused}`。
+  ワーカーの状態変化を500msバッチで送出 (emitterスレッド)。
+  フロントはInfoPanelのAI履歴・ジョブ一覧の更新に使用。
+
+### 自動処理 (spec §11.3)
+
+- ハッシュ確定 (HashJob成功) ごとに `ai::on_asset_linked`:
+  ルートai_enabled=1 ∧ 有効プロファイル存在 ∧ 同prompt_versionで未成功
+  の場合のみ投入。**初回登録時の全件処理は自動では行わない** — UIが
+  件数を提示し、ユーザー確認のうえ `ai_jobs_enqueue_all_for_root
+  (confirmed=true)` を呼ぶ。
+- AI endpoint停止中: ジョブは接続失敗 (retryable) → backoffで再試行
+  (上限3試行でfailed)。UI・ファイラー機能は同一DBのreader/writer分離と
+  専用スレッドで阻害されない (検証:
+  `service_e2e_endpoint_down_backoff_and_filer_unblocked`)。
+
+### 手動編集保護 (spec §11.4。acceptance 6)
+
+- タグ: AI付与は `INSERT ... ON CONFLICT DO NOTHING`。既存付与
+  (手動・AI問わず) は一切更新しない。
+- キャプション: 現行行が `manually_edited=1` なら現行を保持し、AI結果は
+  非現行 (current=0) のai行として履歴へ保存。それ以外は旧現行を降格して
+  新現行ai行を挿入 (旧AI行は履歴に残る)。
+
+### 既知の制限 / 実endpoint確認項目
+
+- **実llama.cpp/OpenAI等の実endpointへの接続は手動確認項目**
+  (本リポジトリの自動証明は in-process mock OpenAI互換サーバー
+  `gento_ai::testserver` 相手 — Bearer検証・遅延・500注入・
+  response_format非対応の模倣を含む)。
+- `response_format: json_object` は既定で送らない (対応確認は
+  test_structured)。プロファイル `extra.send_response_format=true` で明示ON。
+- ジョブ実行中 (running) のキャンセルは不可 (HTTP呼び出しの中断なし)。
+- プロンプト本文はタグ+キャプション一括要求 (operation=
+  caption_and_tags)。tagsのみ/captionのみの分割は将来拡張。

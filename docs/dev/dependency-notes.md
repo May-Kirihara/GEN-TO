@@ -1,6 +1,6 @@
 # 依存ライブラリメモ (Phase 2 / WP-2時点)
 
-- 記録日: 2026-08-28 (Phase 1 → WP-2更新 → WP-3更新 2026-08-29 → WP-4更新 2026-08-29 → WP-5更新 2026-08-29 → WP-0確認 2026-08-30 → AVIF-1更新 2026-08-31 → WP-5 (MVP) 更新 2026-08-31)
+- 記録日: 2026-08-28 (Phase 1 → WP-2更新 → WP-3更新 2026-08-29 → WP-4更新 2026-08-29 → WP-5更新 2026-08-29 → WP-0確認 2026-08-30 → AVIF-1更新 2026-08-31 → WP-5 (MVP) 更新 2026-08-31 → WP-10更新 2026-09-02)
 - 方針: バージョンはpin (npmは正確なバージョン指定、Cargoは `=` 付き + Cargo.lock)。追加・変更時に本メモへ記録する。
 
 ## Rust (workspace直依存)
@@ -381,6 +381,55 @@
     rowid=asset_idの1:1管理 + rowid経由のDELETE/INSERTで索引更新を
     O(log n) にする (WHERE asset_idでの相関EXISTSは50k行×全走査に
     なる — 計測で顕在化し修正済み)。
+
+## WP-10 永続ジョブ基盤とOpenAI互換AI (2026-09-02)
+
+- **`reqwest` =0.13.4 (features: `json`, `rustls`, `blocking`。default-features=false)** (gento-ai, 通常依存)
+  - 用途: OpenAI互換endpoint (`/v1/chat/completions`, `/v1/models`) へのHTTP通信。
+    `blocking` featureで同期クライアントを生成し、AIジョブworkerを既存の
+    std::threadワーカー規約 (library.rsのハッシュ会計スレッド等) と同じ
+    モデルで実装する (tauri async runtime上でのブロッキング回避と、
+    cargo test単体テストでの直接実行の両立)。
+  - **`default-features=false` の理由**: 既定の `default-tls` はnative-tls
+    (Linuxではopensslリンク) を引き込む。`rustls` featureで純Rust TLSに
+    限定し、opensslのnative依存を回避 (PM計画§6の指示)。
+    rustlsのproviderはaws-lc-rs (`__rustls-aws-lc-rs`経由)。aws-lc-rsは
+    C+アセンブリビルド (cc。bindgen不要) — bundled SQLiteと同様の
+    「ccでビルドできるものは許容」枠。
+  - `http2`/`charset`/`system-proxy`を無効化: ローカルllama.cpp等は
+    HTTP/1.1で十分、JSON応答はUTF-8、また環境変数プロキシ
+    (`http_proxy`等)によるlocalhost宛て通信の意図しない迂回を避けるため
+    直結とする (プロキシ対応が必要になった時点で再検討)。
+  - 入手元: crates.io (seanmonstar/reqwest)。
+  - ライセンス: **MIT OR Apache-2.0**。
+  - 推移依存 (主要): hyper 1 / hyper-util / hyper-rustls / tokio-rustls /
+    rustls / aws-lc-rs (ISC + MIT OR Apache-2.0 with OpenSSL例外) /
+    serde_json (既存) 等。native library: なし (aws-lc-rsはccでセルフビルド)。
+  - 対応プラットフォーム: 全主要OS。
+- **`keyring` =4.2.0 (既定features = `v1`)** (gento-ai, 通常依存)
+  - 用途: APIキーのOS資格情報ストア保存。LinuxではSecret Service
+    (GNOME Keyring等) をzbus (pure Rust D-Bus) 経由で利用、macOSは
+    Keychain、WindowsはWindows Credential Manager (feature `v1` の
+    既定構成 — プラットフォーム毎のstore選択をcrateに任せる)。
+  - 入手元: crates.io (keyring-rs。repositoryは
+    open-source-cooperative/keyring-rsへ移管されている形式 —
+    licenses.md生成結果に基づき記録)。
+  - ライセンス: **MIT OR Apache-2.0**。
+  - 推移依存: zbus 5.19.0 (MIT OR Apache-2.0) はtauri経由でCargo.lockに
+    既存在存のため新規導入ではない。LinuxのSecret Serviceが利用不能な
+    環境 (ヘッドレスCI等) では保存時にエラーとなるため、アプリデータ
+    ディレクトリ直下の専用ファイル (0600・平文・警告文同梱) への
+    フォールバックを実装 (docs/handoff/2026-09-02-mvp-wp10.md 参照)。
+  - 対応プラットフォーム: Linux/macOS/Windows (WP-17で実機確認)。
+- **`base64` =0.22.1 (default features)** (gento-ai, 通常依存)
+  - 用途: 画像のdata URL化 (`data:image/jpeg;base64,...`)。reqwestが
+    既に利用中の同一バージョンをCargo.lockに持つため重複導入なし。
+  - 入手元: crates.io (marshallpierce/rust-base64)。
+  - ライセンス: **MIT OR Apache-2.0**。native依存なし。
+- **`image` (既存 =0.25.10) の利用拡大**: AI送信前の画像縮小
+  (最大辺1024px・JPEG再エンコード) で既定featureのcodec構成をそのまま
+  使用 (新規featureなし)。デコード制限 (`Limits`) もサムネイル経路と
+  同一値を適用。
 
 ## WP-9 画像メタデータ (2026-09-02)
 

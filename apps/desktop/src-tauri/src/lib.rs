@@ -7,6 +7,7 @@
 //! `devtools` module配下で `debug_assertions` または `--features devtools`
 //! のときのみコンパイルされる。通常releaseビルドからは完全に除去される。
 
+pub mod ai;
 pub mod catalog;
 pub mod collections;
 pub mod db;
@@ -213,7 +214,24 @@ pub fn run() {
         thumbnails::get_thumbnail_stats,
         thumbnails::pause_thumbnail_generation,
         thumbnails::clear_thumbnail_cache,
-        thumbnails::set_failure_injection
+        thumbnails::set_failure_injection,
+        ai::ai_profile_list,
+        ai::ai_profile_save,
+        ai::ai_profile_delete,
+        ai::ai_profile_test_connection,
+        ai::ai_profile_test_text,
+        ai::ai_profile_test_vision,
+        ai::ai_profile_test_structured,
+        ai::ai_jobs_enqueue,
+        ai::ai_root_pending_count,
+        ai::ai_jobs_enqueue_all_for_root,
+        ai::ai_jobs_list,
+        ai::ai_job_cancel,
+        ai::ai_jobs_pause,
+        ai::ai_jobs_resume,
+        ai::ai_jobs_retry_failed,
+        ai::ai_run_history,
+        ai::ai_root_settings_set
     ]);
     #[cfg(not(any(debug_assertions, feature = "devtools")))]
     let builder = builder.invoke_handler(tauri::generate_handler![
@@ -283,7 +301,24 @@ pub fn run() {
         thumbnails::generate_all_thumbnails,
         thumbnails::get_thumbnail_stats,
         thumbnails::pause_thumbnail_generation,
-        thumbnails::clear_thumbnail_cache
+        thumbnails::clear_thumbnail_cache,
+        ai::ai_profile_list,
+        ai::ai_profile_save,
+        ai::ai_profile_delete,
+        ai::ai_profile_test_connection,
+        ai::ai_profile_test_text,
+        ai::ai_profile_test_vision,
+        ai::ai_profile_test_structured,
+        ai::ai_jobs_enqueue,
+        ai::ai_root_pending_count,
+        ai::ai_jobs_enqueue_all_for_root,
+        ai::ai_jobs_list,
+        ai::ai_job_cancel,
+        ai::ai_jobs_pause,
+        ai::ai_jobs_resume,
+        ai::ai_jobs_retry_failed,
+        ai::ai_run_history,
+        ai::ai_root_settings_set
     ]);
     builder
         .setup(move |app| {
@@ -331,7 +366,8 @@ pub fn run() {
             // WP-2: 登録ルート制御。DBが開けている場合のみ生成し、
             // 有効ルートの監視を開始して初回スキャンを非同期投入する
             // (UIブロックなし。再起動復元はスナップショット生成で担保)。
-            if let Some(db) = state.db.as_ref().and_then(|d| d.db.clone()) {
+            let db_handle = state.db.as_ref().and_then(|d| d.db.clone());
+            if let Some(db) = db_handle {
                 match library::LibraryController::new(
                     db.clone(),
                     std::sync::Arc::new(library::TauriLibraryHost {
@@ -360,7 +396,7 @@ pub fn run() {
                         // WP-7: ファイル操作サービス + 起動時回復
                         // (executing残留の確定と .gento-tmp- 掃除)。
                         let file_ops_service = fileops::FileOpsService::new(
-                            db,
+                            std::sync::Arc::clone(&db),
                             std::sync::Arc::new(fileops::TauriFileOpsHost {
                                 app: app.handle().clone(),
                             }),
@@ -369,6 +405,13 @@ pub fn run() {
                             tracing::warn!(notice = %notice, "file ops recovery");
                         }
                         state.file_ops = Some(file_ops_service);
+                        // WP-10: AIジョブサービス (起動時回復はstart内)。
+                        let ai_service = crate::ai::AiService::start(
+                            std::sync::Arc::clone(&db),
+                            app_dirs.data_dir.clone(),
+                            crate::ai::tauri_event_sink(app.handle().clone()),
+                        );
+                        state.ai = Some(ai_service);
                         controller.enqueue_scan_all();
                         state.library = Some(controller);
                     }
@@ -395,6 +438,9 @@ pub fn run() {
                     if let Some(controller) = &state.library {
                         tracing::info!("shutting down library controller");
                         controller.shutdown();
+                    }
+                    if let Some(ai) = &state.ai {
+                        ai.shutdown();
                     }
                 }
             }

@@ -46,10 +46,12 @@ use gento_core::library::{AllRepos, RepoStore};
 use gento_core::repo::RepoError;
 use rusqlite::Connection;
 
+mod ai;
 mod assetmeta;
 mod collections;
 mod diagnose;
 mod ids;
+mod jobs;
 mod metadata;
 mod migrate;
 mod paths;
@@ -57,7 +59,11 @@ mod repos;
 mod schema;
 mod search;
 
+/// AIプロファイル・実行履歴 (WP-10)。
+pub use ai::{AiProfileRecord, AiRunRecord, AssetSource, NewAiProfile};
 pub use diagnose::DbStatus;
+/// 永続ジョブキュー (WP-10)。
+pub use jobs::{rfc3339_after_now, JobRecord, JOB_TYPE_AI_CAPTION_TAGS, JOB_TYPE_AI_REPARSE};
 /// backup/restore正準表現 (パーセントエスケープUTF-8。WP-13で使用)。
 pub use paths::{percent_decode_to_bytes, percent_encode_bytes};
 pub use repos::SqliteRepos;

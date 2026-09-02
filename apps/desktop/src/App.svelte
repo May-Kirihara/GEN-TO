@@ -95,6 +95,9 @@
   import LibraryPanel from "./lib/shell/LibraryPanel.svelte";
   import InfoPanel from "./lib/shell/InfoPanel.svelte";
   import DevDrawer from "./lib/shell/DevDrawer.svelte";
+  // WP-10: AI統合 (プロファイル・ジョブキュー・自動処理)
+  import AiPanel from "./lib/shell/AiPanel.svelte";
+  import { AiStore, type AiRun } from "./lib/ai";
 
   // ===== IPC・ストア (既存資産) =====
 
@@ -183,6 +186,52 @@
   /** セッションID → カタログindex (移動・集計の高速化。UI非反映の内部キャッシュ)。 */
   // eslint-disable-next-line svelte/prefer-svelte-reactivity -- 永続化不要な補助写像
   const sessionIndex = new Map<string, number>();
+
+  // ===== AI (WP-10) =====
+
+  const aiStore = new AiStore(ipc);
+  let aiPanelOpen = $state(false);
+  /** フォーカス項目のAI実行履歴 (InfoPanelのAIバッジ照会)。 */
+  let aiRuns: AiRun[] = $state([]);
+
+  /** 安定AssetIdのみの選択 (AIジョブ投入対象)。 */
+  function stableSelectionIds(): string[] {
+    if (catalogSource !== "library") {
+      return [];
+    }
+    return gridSelection.ids.filter((id) => gridPagerHasId(id));
+  }
+
+  /** 選択項目へAI生成ジョブを投入 (成功済みはスキップ。再生成はAIパネル/force)。 */
+  async function enqueueAiForSelection(): Promise<void> {
+    const ids = stableSelectionIds();
+    if (ids.length === 0) {
+      metaNotice = "AI生成はライブラリ表示中の確定済み画像に対して実行します";
+      return;
+    }
+    try {
+      const n = await aiStore.enqueue(ids, false);
+      metaNotice =
+        n > 0
+          ? `AI生成を${n.toLocaleString()}件キューへ投入しました`
+          : "対象はすべて処理済みです (再生成はAI設定から)";
+    } catch (error) {
+      metaNotice = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  /** フォーカス項目のAI実行履歴を取得 (detail更新・ジョブ完了時に呼ぶ)。 */
+  async function refreshAiRuns(assetId: string | null): Promise<void> {
+    if (assetId === null || catalogSource !== "library" || !gridPagerHasId(assetId)) {
+      aiRuns = [];
+      return;
+    }
+    try {
+      aiRuns = await aiStore.runHistory(assetId);
+    } catch {
+      aiRuns = [];
+    }
+  }
 
   // ===== メタデータ編集 (WP-5) =====
 
@@ -1604,6 +1653,7 @@
           metaAssetMetadata = null;
         }
       });
+    void refreshAiRuns(assetId);
     try {
       const detail = await metadata.assetDetail(assetId);
       if (generation === detailGeneration) {
@@ -1753,6 +1803,19 @@
           },
         },
       );
+    }
+    // AI生成 (WP-10。stable AssetIdが必要なため Library系表示のみ)
+    if (canCollection) {
+      actions.push({
+        id: "ai-caption-tags",
+        label:
+          items.length > 1
+            ? `AI: タグ・キャプション生成 (${items.length.toLocaleString()}件)`
+            : "AI: タグ・キャプション生成",
+        run: async () => {
+          await enqueueAiForSelection();
+        },
+      });
     }
     if (canCollection) {
       actions.push({
@@ -2313,6 +2376,13 @@
     <button class:active={rightVisible} onclick={toggleRight} title="情報パネルの表示切替">
       右ペイン
     </button>
+    <button
+      class:active={aiPanelOpen}
+      onclick={() => (aiPanelOpen = !aiPanelOpen)}
+      title="AIプロファイル・ジョブキュー・自動処理設定 (WP-10)"
+    >
+      AI
+    </button>
     {#if devBridgeActive}
       <button class:active={devPanelOpen} onclick={() => (devPanelOpen = !devPanelOpen)}>
         開発パネル
@@ -2812,6 +2882,8 @@
               void saveCollectionMemo(item.id, note);
             }
           }}
+          aiRuns={focusInfo !== null && metaDetail?.id === focusInfo.id ? aiRuns : []}
+          onEnqueueAi={() => void enqueueAiForSelection()}
         />
       </aside>
     {/if}
@@ -2829,6 +2901,22 @@
     />
   {/if}
 </div>
+
+{#if aiPanelOpen}
+  <AiPanel
+    store={aiStore}
+    roots={libraryRoots}
+    onClose={() => (aiPanelOpen = false)}
+    onJobsChanged={() => {
+      // ジョブ完了 → フォーカス項目の表示を更新 (AIバッジ・キャプション)
+      const item = focusInfo;
+      if (item !== null) {
+        void refreshMetaDetail(item.id);
+        void refreshAiRuns(item.id);
+      }
+    }}
+  />
+{/if}
 
 {#if contextMenu !== null}
   <ContextMenu

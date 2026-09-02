@@ -18,6 +18,8 @@ gento-image = { workspace = true }
 # OS差の土台 (ゴミ箱・OSファイルID。WP-7)
 gento-platform = { workspace = true }
 gento-search = { workspace = true }
+# AI統合 (OpenAI互換クライアント・パイプライン。WP-10)
+gento-ai = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 tauri = { workspace = true }

@@ -1,0 +1,22 @@
+[package]
+name = "gento-ai"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gento-core = { workspace = true }
+gento-db = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+image = { workspace = true }
+reqwest = { workspace = true }
+keyring = { workspace = true }
+base64 = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+
+[features]
+# WP-0規約: 計測・検証専用機能 (testserver) のコンパイル隔離。
+# debug buildではdebug_assertionsにより常に有効扱い。
+devtools = []

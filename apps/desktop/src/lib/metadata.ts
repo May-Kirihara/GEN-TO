@@ -45,6 +45,8 @@ export type TagDto = {
   normalized_name: string;
   usage_count: number;
   manually_edited: boolean;
+  /** 付与由来 "manual" | "ai" | "import" | "embedded_metadata" (WP-10)。 */
+  source: string;
 };
 
 /** キャプションDTO (backend CaptionDto)。 */

@@ -82,6 +82,8 @@ pub struct TagDto {
     pub usage_count: u64,
     /// 手動編集済み (asset_tags_listのみ意味を持つ。一覧系はfalse)。
     pub manually_edited: bool,
+    /// 付与由来 "manual" | "ai" | ... (WP-10のAIバッジ表示。asset_tags_listのみ)。
+    pub source: String,
 }
 
 /// キャプションDTO (`asset_detail` の `captions` 要素。現行のみ)。
@@ -312,12 +314,21 @@ pub(crate) fn tags_remove_impl(
 }
 
 fn tag_dto(tag: &gento_core::metadata::TagRecord, manually_edited: bool) -> TagDto {
+    tag_dto_with_source(tag, manually_edited, "manual")
+}
+
+fn tag_dto_with_source(
+    tag: &gento_core::metadata::TagRecord,
+    manually_edited: bool,
+    source: &str,
+) -> TagDto {
     TagDto {
         id: tag.id.to_string(),
         name: tag.display_name.clone(),
         normalized_name: tag.normalized_name.clone(),
         usage_count: tag.usage_count,
         manually_edited,
+        source: source.to_string(),
     }
 }
 
@@ -328,7 +339,7 @@ pub(crate) fn tags_list_impl(state: &AppState, asset_id: String) -> Result<Vec<T
         .map(|records| {
             records
                 .iter()
-                .map(|r| tag_dto(&r.tag, r.manually_edited))
+                .map(|r| tag_dto_with_source(&r.tag, r.manually_edited, r.source.as_str()))
                 .collect()
         })
         .map_err(repo_error_message)
@@ -457,7 +468,7 @@ pub(crate) fn asset_detail_impl(
             favorite: asset.favorite,
             tags: tags
                 .iter()
-                .map(|r| tag_dto(&r.tag, r.manually_edited))
+                .map(|r| tag_dto_with_source(&r.tag, r.manually_edited, r.source.as_str()))
                 .collect(),
             captions,
         })
@@ -1420,6 +1431,7 @@ mod tests {
                 normalized_name: "sky".to_string(),
                 usage_count: 2,
                 manually_edited: true,
+                source: "manual".to_string(),
             }],
             captions: vec![CaptionDto {
                 kind: "user_note".to_string(),

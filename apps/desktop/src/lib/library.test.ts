@@ -18,6 +18,9 @@ function root(overrides: Partial<LibraryRoot> = {}): LibraryRoot {
     enabled: true,
     watch_enabled: true,
     available: true,
+    ai_enabled: false,
+    send_exif: false,
+    send_gps: false,
     ...overrides,
   };
 }

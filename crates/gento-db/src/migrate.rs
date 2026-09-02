@@ -312,19 +312,19 @@ mod tests {
         }
     }
 
-    fn failing_migration_v8() -> Migration {
+    fn failing_migration_v9() -> Migration {
         Migration {
-            version: 8,
+            version: 9,
             name: "test_failing",
-            sql: "CREATE TABLE wp1_test_extra (id INTEGER PRIMARY KEY); INSERT INTO wp1_test_extra VALUES (1); INSERT INTO nonexistent_table VALUES (1);",
+            sql: "CREATE TABLE wp10_test_extra (id INTEGER PRIMARY KEY); INSERT INTO wp10_test_extra VALUES (1); INSERT INTO nonexistent_table VALUES (1);",
         }
     }
 
-    fn ok_migration_v8() -> Migration {
+    fn ok_migration_v9() -> Migration {
         Migration {
-            version: 8,
+            version: 9,
             name: "test_ok_extra",
-            sql: "CREATE TABLE wp1_test_extra (id INTEGER PRIMARY KEY);",
+            sql: "CREATE TABLE wp10_test_extra (id INTEGER PRIMARY KEY);",
         }
     }
 
@@ -333,11 +333,11 @@ mod tests {
         let tmp = TempDir::new("fresh");
         let mut conn = Connection::open(tmp.path().join("db.sqlite3")).unwrap();
         let outcome = run_migrations(&mut conn, MIGRATIONS, &MigrationOpts::default()).unwrap();
-        assert_eq!(outcome.applied, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(outcome.applied, vec![1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(outcome.backup, None); // 新規DB (v0) はbackup不要
         assert_eq!(read_user_version(&conn).unwrap(), LATEST_VERSION);
 
-        // 12テーブル + 主要インデックスが存在する
+        // 14テーブル + 主要インデックスが存在する
         let mut stmt = conn
             .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
             .unwrap();
@@ -432,7 +432,7 @@ mod tests {
             keep_generations: 3,
         };
         let outcome = run_migrations(&mut conn, MIGRATIONS, &opts).unwrap();
-        assert_eq!(outcome.applied, vec![3, 4, 5, 6, 7]);
+        assert_eq!(outcome.applied, vec![3, 4, 5, 6, 7, 8]);
         assert_eq!(read_user_version(&conn).unwrap(), LATEST_VERSION);
         let backup = outcome.backup.expect("v2からの移行でbackup作成");
         assert!(backup.starts_with(&backup_dir));
@@ -491,7 +491,7 @@ mod tests {
             keep_generations: 3,
         };
         let outcome = run_migrations(&mut conn, MIGRATIONS, &opts).unwrap();
-        assert_eq!(outcome.applied, vec![4, 5, 6, 7]);
+        assert_eq!(outcome.applied, vec![4, 5, 6, 7, 8]);
         assert_eq!(read_user_version(&conn).unwrap(), LATEST_VERSION);
         assert!(outcome
             .backup
@@ -546,7 +546,7 @@ mod tests {
 
         // 実migration一覧の後に、途中で失敗するテストmigrationを注入して実行
         let mut list: Vec<Migration> = MIGRATIONS.to_vec();
-        list.push(failing_migration_v8());
+        list.push(failing_migration_v9());
         let opts = MigrationOpts {
             backup_dir: Some(backup_dir.clone()),
             keep_generations: 3,
@@ -562,7 +562,7 @@ mod tests {
         assert_eq!(n, 1);
         let exists: bool = conn
             .query_row(
-                "SELECT count(*) > 0 FROM sqlite_master WHERE name='wp1_test_extra'",
+                "SELECT count(*) > 0 FROM sqlite_master WHERE name='wp10_test_extra'",
                 [],
                 |r| r.get(0),
             )
@@ -584,7 +584,7 @@ mod tests {
 
         // 再実行 (今度は成功するテストmigration) で最新→+1へ進めることもできる
         let mut list_ok: Vec<Migration> = MIGRATIONS.to_vec();
-        list_ok.push(ok_migration_v8());
+        list_ok.push(ok_migration_v9());
         let outcome = run_migrations(&mut conn, &list_ok, &opts).unwrap();
         assert_eq!(outcome.applied, vec![LATEST_VERSION + 1]);
         assert_eq!(read_user_version(&conn).unwrap(), LATEST_VERSION + 1);
@@ -598,7 +598,7 @@ mod tests {
         run_migrations(&mut conn, MIGRATIONS, &MigrationOpts::default()).unwrap();
 
         let mut list: Vec<Migration> = MIGRATIONS.to_vec();
-        list.push(ok_migration_v8());
+        list.push(ok_migration_v9());
         let opts = MigrationOpts {
             backup_dir: Some(backup_dir.clone()),
             keep_generations: 3,
@@ -627,7 +627,7 @@ mod tests {
         let mut conn = Connection::open(tmp.path().join("db.sqlite3")).unwrap();
         run_migrations(&mut conn, MIGRATIONS, &MigrationOpts::default()).unwrap();
         let mut list: Vec<Migration> = MIGRATIONS.to_vec();
-        list.push(ok_migration_v8());
+        list.push(ok_migration_v9());
         let opts = MigrationOpts {
             backup_dir: Some(backup_dir.clone()),
             keep_generations: 3,
@@ -743,15 +743,15 @@ mod tests {
     }
 
     #[test]
-    fn migration_v1_defers_ai_run_id_columns_to_wp10() {
-        // FKなしのai_run_id列を先行定義すると、後のFK付与にはテーブル再構築が
-        // 必要になる (SQLiteは既存列へのFK追加ができない)。WP-10で
-        // ai_runsテーブル作成と同時にADD COLUMNで追加するため、#1には含めない。
-        // 検証はPRAGMA table_info (実列) で行う — sqlite_masterのSQL文本体には
-        // 経緯コメントが残り得るため。
+    fn migration_v8_adds_ai_run_id_columns_and_defers_no_longer() {
+        // #1ではai_run_id列を持たせず (既存列へのFK付与はテーブル再構築が
+        // 必要なため)、WP-10の#8でai_runs作成と同時にADD COLUMNで追加する
+        // (NULL既定ならFK参照を付与可能)。#7適用時点では列が無く、
+        // 全migration適用後はFK付きで存在することを検証する。
         let tmp = TempDir::new("airunid");
         let mut conn = Connection::open(tmp.path().join("db.sqlite3")).unwrap();
-        run_migrations(&mut conn, MIGRATIONS, &MigrationOpts::default()).unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run_migrations(&mut conn, &MIGRATIONS[..7], &MigrationOpts::default()).unwrap();
         for table in ["asset_tags", "captions"] {
             let mut stmt = conn
                 .prepare(&format!("PRAGMA table_info({table})"))
@@ -766,6 +766,51 @@ mod tests {
                 "{table} に ai_run_id 列が存在する: {columns:?}"
             );
         }
+
+        // #8適用: 列がFK付きで追加される
+        run_migrations(&mut conn, MIGRATIONS, &MigrationOpts::default()).unwrap();
+        for table in ["asset_tags", "captions"] {
+            let fk_list: Vec<(i64, String)> = {
+                let mut stmt = conn
+                    .prepare(&format!("PRAGMA foreign_key_list({table})"))
+                    .unwrap();
+                stmt.query_map([], |r| Ok((r.get(0)?, r.get(2)?)))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap()
+            };
+            assert!(
+                fk_list
+                    .iter()
+                    .any(|(id, to)| to == "ai_runs" && *id != i64::MAX),
+                "{table} のai_run_id FKがai_runsを指す: {fk_list:?}"
+            );
+        }
+        // ai_runs自身のFK (asset CASCADE / profile SET NULL) も検証
+        // foreign_key_list: (id, seq, table, from, to, on_update, on_delete, ..)
+        let mut stmt = conn.prepare("PRAGMA foreign_key_list(ai_runs)").unwrap();
+        let runs_fk: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(2)?, r.get(6)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            runs_fk.contains(&("assets".to_string(), "CASCADE".to_string())),
+            "{runs_fk:?}"
+        );
+        assert!(
+            runs_fk.contains(&("ai_profiles".to_string(), "SET NULL".to_string())),
+            "{runs_fk:?}"
+        );
+        // jobs表のretry_waitingがCHECKで許可される
+        conn.execute(
+            "INSERT INTO jobs (uuid, job_type, target_type, target_id, status, \
+             created_at, updated_at) VALUES \
+             ('00000000-0000-7000-8000-0000000000aa', 'ai_caption_tags', 'asset', 1, \
+              'retry_waiting', '2026-09-02T00:00:00.000Z', '2026-09-02T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
     }
 
     #[test]

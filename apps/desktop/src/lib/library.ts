@@ -27,6 +27,10 @@ export type LibraryRoot = {
   watch_enabled: boolean;
   /** パスが現在存在するか (アンマウント等で不在表示に使う)。 */
   available: boolean;
+  /** AI自動処理設定 (WP-10。§11.3)。 */
+  ai_enabled: boolean;
+  send_exif: boolean;
+  send_gps: boolean;
 };
 
 /** `library_roots_add` の応答。 */

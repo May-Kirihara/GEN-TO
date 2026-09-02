@@ -1197,7 +1197,10 @@ impl Job for HashJob {
             &self.token,
             &self.shared.cancel,
         ) {
-            Ok(_asset) => {
+            Ok(asset) => {
+                // WP-10: asset確定時に自動AI処理の投入判定
+                // (ルートai_enabled=1・有効プロファイル・未処理の場合のみ)。
+                crate::ai::on_asset_linked(&self.shared.db, self.file_id, asset.id);
                 let hashed = {
                     update_progress(&self.shared, |current| current.hashed += 1);
                     self.shared
@@ -1426,6 +1429,10 @@ pub struct LibraryRootDto {
     pub watch_enabled: bool,
     /// パスが現在存在するか (アンマウント検出。UIの無効表示用)。
     pub available: bool,
+    /// AI自動処理 (WP-10。§11.3)。
+    pub ai_enabled: bool,
+    pub send_exif: bool,
+    pub send_gps: bool,
 }
 
 fn root_dto(root: &LibraryRootRecord, available: bool) -> LibraryRootDto {
@@ -1436,6 +1443,9 @@ fn root_dto(root: &LibraryRootRecord, available: bool) -> LibraryRootDto {
         enabled: root.enabled,
         watch_enabled: root.watch_enabled,
         available,
+        ai_enabled: root.ai_enabled,
+        send_exif: root.send_exif,
+        send_gps: root.send_gps,
     }
 }
 

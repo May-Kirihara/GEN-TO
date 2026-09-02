@@ -35,6 +35,7 @@
     type MetaRow,
   } from "../asset-metadata";
   import { copyText } from "../ui/clipboard";
+  import type { AiRun } from "../ai";
 
   let {
     item,
@@ -61,6 +62,8 @@
     onSaveCollectionMemo = undefined,
     searchEvidence = null,
     assetMetadata = null,
+    aiRuns = [],
+    onEnqueueAi = undefined,
   }: {
     item: ImageListItem | null;
     selectionCount: number;
@@ -104,6 +107,10 @@
     searchEvidence?: SearchFieldMatch[] | null;
     /** WP-9: 埋め込み画像メタデータ (asset_metadata_get。null=未取得/なし)。 */
     assetMetadata?: AssetMetadataDto | null;
+    /** WP-10: フォーカス項目のAI実行履歴 (空=非表示)。 */
+    aiRuns?: AiRun[];
+    /** WP-10: 選択項目へのAI生成ジョブ投入。 */
+    onEnqueueAi?: () => void;
   } = $props();
 
   const DB_STATE_LABELS: Record<string, string> = {
@@ -319,12 +326,20 @@
     });
   });
 
-  function captionOf(kind: string): { body: string; manuallyEdited: boolean } | null {
+  function captionOf(kind: string): {
+    body: string;
+    manuallyEdited: boolean;
+    source: string;
+  } | null {
     const found = detail?.captions.find((c) => c.kind === kind);
     if (found === undefined) {
       return null;
     }
-    return { body: found.body, manuallyEdited: found.manually_edited };
+    return {
+      body: found.body,
+      manuallyEdited: found.manually_edited,
+      source: found.source,
+    };
   }
 
   function saveCaption(kind: "description" | "sd_tags" | "user_note"): void {
@@ -677,6 +692,7 @@
           {#each detail?.tags ?? [] as tag (tag.id)}
             <span class="tag-chip" title="使用数: {tag.usage_count.toLocaleString()} · クリックで解除">
               {tag.name}
+              {#if tag.source === "ai"}<span class="tag-ai" title="AI生成 (WP-10)">AI</span>{/if}
               {#if tag.manually_edited}<span class="tag-manual" title="手動編集済み (AI再生成で保護)">✎</span>{/if}
               <button
                 class="tag-remove"
@@ -732,6 +748,7 @@
             <span class="meta-label">
               {label}
               <span class="meta-hint">{hint}</span>
+              {#if current?.source === "ai"}<span class="tag-ai" title="AI生成 (WP-10)">AI</span>{/if}
               {#if current?.manuallyEdited}
                 <span class="tag-manual" title="手動編集済み (AI再生成で上書きされません)">✎手動編集済み</span>
               {/if}
@@ -768,6 +785,38 @@
           {undoLabel === null ? "元に戻す (履歴なし)" : `元に戻す: ${undoLabel}`}
         </button>
       </div>
+
+      <!-- WP-10: AI生成投入 + 実行履歴 -->
+      {#if onEnqueueAi !== undefined}
+        <div class="meta-row meta-col" data-meta="ai">
+          <div class="ai-controls">
+            <button
+              onclick={() => onEnqueueAi?.()}
+              disabled={busy}
+              title="選択項目のタグ・キャプションをAIで生成 (未処理のみ。実行はバックグラウンド)"
+            >
+              AI: タグ・キャプション生成
+            </button>
+            <span class="meta-hint">手動編集済みの情報は上書きされません</span>
+          </div>
+          {#if aiRuns.length > 0}
+            <details class="ai-runs" data-testid="ai-runs">
+              <summary>AI実行履歴 ({aiRuns.length.toLocaleString()}件)</summary>
+              <ul>
+                {#each aiRuns.slice(0, 10) as run (run.id)}
+                  <li>
+                    <span class="ai-run-status" data-status={run.status}>
+                      {run.status === "succeeded" ? "成功" : run.status === "failed" ? "失敗" : "実行中"}
+                    </span>
+                    <span class="ai-run-meta">pv{run.promptVersion} · {run.startedAt}</span>
+                    {#if run.error}<span class="ai-run-error" title={run.error}>{run.error}</span>{/if}
+                  </li>
+                {/each}
+              </ul>
+            </details>
+          {/if}
+        </div>
+      {/if}
     {/if}
     {#if metaBusy}
       <p class="placeholder-note">読み込み中…</p>
@@ -1141,6 +1190,71 @@
   .tag-manual {
     color: light-dark(#9a6700, #d29922);
     font-size: 0.7rem;
+  }
+
+  /* WP-10: AI由来バッジ */
+  .tag-ai {
+    color: light-dark(#0969da, #58a6ff);
+    border: 1px solid light-dark(#0969da, #58a6ff);
+    border-radius: 0.25rem;
+    font-size: 0.62rem;
+    line-height: 1;
+    padding: 0.05rem 0.2rem;
+    font-weight: 600;
+  }
+
+  .ai-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+  }
+
+  .ai-runs summary {
+    cursor: pointer;
+    font-size: 0.75rem;
+    color: light-dark(#57606a, #8b949e);
+  }
+
+  .ai-runs ul {
+    list-style: none;
+    margin: 0.25rem 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    font-size: 0.72rem;
+  }
+
+  .ai-runs li {
+    display: flex;
+    gap: 0.4rem;
+    align-items: baseline;
+    flex-wrap: wrap;
+  }
+
+  .ai-run-status {
+    font-weight: 600;
+  }
+
+  .ai-run-status[data-status="succeeded"] {
+    color: light-dark(#1a7f37, #3fb950);
+  }
+
+  .ai-run-status[data-status="failed"] {
+    color: light-dark(#cf222e, #f85149);
+  }
+
+  .ai-run-meta {
+    color: light-dark(#8b949e, #6e7681);
+  }
+
+  .ai-run-error {
+    flex-basis: 100%;
+    color: light-dark(#8b949e, #6e7681);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .tag-remove {

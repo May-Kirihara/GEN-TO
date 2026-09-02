@@ -17,6 +17,11 @@ pub(crate) fn now_utc_rfc3339() -> String {
     format_epoch_rfc3339(std::time::SystemTime::now())
 }
 
+/// 任意時刻のRFC3339整形 (jobs.rsのバックオフ期限計算から使用)。
+pub(crate) fn format_epoch_rfc3339_pub(t: std::time::SystemTime) -> String {
+    format_epoch_rfc3339(t)
+}
+
 /// backupファイル名などに使うコンパクト形式 (`YYYYMMDDTHHMMSSmmmZ`)。
 pub(crate) fn now_utc_compact() -> String {
     let d = std::time::SystemTime::now()

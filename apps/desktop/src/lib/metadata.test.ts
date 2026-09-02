@@ -21,9 +21,9 @@ function fakeIpc() {
       if (command === "tag_suggest") {
         const prefix = String(args?.prefix ?? "");
         const all: TagDto[] = [
-          { id: "1", name: "sky", normalized_name: "sky", usage_count: 3, manually_edited: false },
-          { id: "2", name: "skyline", normalized_name: "skyline", usage_count: 1, manually_edited: false },
-          { id: "3", name: "sunset", normalized_name: "sunset", usage_count: 2, manually_edited: false },
+          { id: "1", name: "sky", normalized_name: "sky", usage_count: 3, manually_edited: false, source: "manual" },
+          { id: "2", name: "skyline", normalized_name: "skyline", usage_count: 1, manually_edited: false, source: "manual" },
+          { id: "3", name: "sunset", normalized_name: "sunset", usage_count: 2, manually_edited: false, source: "manual" },
         ];
         return all.filter((t) => t.normalized_name.startsWith(prefix.toLowerCase())) as T;
       }

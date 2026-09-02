@@ -46,7 +46,8 @@ impl<'a> SqliteRepos<'a> {
         self.conn
     }
 
-    fn get_root(&self, id: i64) -> Result<Option<LibraryRootRecord>, RepoError> {
+    /// ルート主キー検索 (WP-10: ai.rs (tauri) の設定保存でも使用)。
+    pub fn get_root(&self, id: i64) -> Result<Option<LibraryRootRecord>, RepoError> {
         let sql = format!("SELECT {ROOT_COLUMNS} FROM library_roots WHERE id = ?1");
         self.conn
             .query_row(&sql, [id], map_library_root)

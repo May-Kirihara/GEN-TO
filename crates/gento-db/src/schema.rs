@@ -15,7 +15,8 @@
 //! - インデックスは検索頻度の高いものを初期migrationに含める。
 
 /// migration #1 で作るテーブル (diagnoseの行数計上にも使う)。
-pub(crate) const TABLES: [&str; 12] = [
+/// WP-10 (#8) で ai_profiles / ai_runs を追加。
+pub(crate) const TABLES: [&str; 14] = [
     "library_roots",
     "assets",
     "files",
@@ -28,6 +29,8 @@ pub(crate) const TABLES: [&str; 12] = [
     "jobs",
     "file_operations",
     "embeddings",
+    "ai_profiles",
+    "ai_runs",
 ];
 
 /// 個別のmigration定義。
@@ -76,11 +79,16 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "wp8_asset_docs_fts5",
         sql: MIGRATION_V7_SQL,
     },
+    Migration {
+        version: 8,
+        name: "wp10_ai_profiles_runs_jobs",
+        sql: MIGRATION_V8_SQL,
+    },
 ];
 
 /// 現在の最新schema version (`PRAGMA user_version` の目標値)。
 /// このbuildの [`crate::Db::open`] は既存DBを必ずこの値へ移行する。
-pub const LATEST_VERSION: i32 = 7;
+pub const LATEST_VERSION: i32 = 8;
 
 /// WP-2 (登録ルート・差分スキャン) のindex追加。
 /// 列追加は不要 — 設定列は#1に含まれ、os_file_idも#1でNULL可として定義済み。
@@ -200,6 +208,105 @@ CREATE VIRTUAL TABLE asset_docs USING fts5(
     note,
     tokenize='trigram'
 );
+"#;
+
+/// WP-10: AI接続プロファイル・実行履歴・永続ジョブキューの本格化。
+///
+/// - `ai_profiles` (data-model §8.1): OpenAI互換endpoint接続設定。
+///   **`api_key_ref` は資格情報ストアの参照IDのみ。鍵本体をSQLiteへ
+///   保存することはacceptance違反** (検証テスト: api_keys_never_in_db)。
+///   `enabled` は §8.1の属性に無い追加列 — 自動処理で使う「有効
+///   プロファイル」の選択用 (api-contract §44)。
+/// - `ai_runs` (§8.2): 試行ごとのAI実行履歴。profile削除で履歴が
+///   失われないよう `profile_id` はSET NULL。
+/// - `asset_tags.ai_run_id` / `captions.ai_run_id`: #1で確定した計画
+///   どおりADD COLUMNで追加 (NULL既定ならFK参照を付与可能)。
+///   asset削除時のCASCADE順序は実験検証済み (plain REFERENCESで
+///   削除が完結する — jobs.rsのテスト)。
+/// - `jobs` 表再構築: `retry_waiting` 状態を追加 (§11.2)。再試行の
+///   バックオフ期限は既存 `scheduled_at` 列を流用 (queuedは即時)。
+///   pending中の同一 (job_type, target_id) 重複投入を防ぐ部分UNIQUE
+///   indexを追加 (自動処理の多重エンキュー抑止)。
+const MIGRATION_V8_SQL: &str = r#"
+CREATE TABLE ai_profiles (
+    id INTEGER PRIMARY KEY,
+    uuid TEXT NOT NULL UNIQUE
+        CHECK (length(uuid) = 36 AND uuid = lower(uuid)),
+    display_name TEXT NOT NULL,
+    base_url TEXT NOT NULL,
+    model TEXT NOT NULL,
+    -- 資格情報ストア参照 ("keyring:..." / "file:...")。NULL = APIキー無し
+    -- (ローカルendpoint等)。鍵本体は絶対に保存しない (acceptance)。
+    api_key_ref TEXT,
+    vision_capable INTEGER NOT NULL DEFAULT 0 CHECK (vision_capable IN (0, 1)),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    timeout_ms INTEGER NOT NULL DEFAULT 60000 CHECK (timeout_ms BETWEEN 1000 AND 600000),
+    concurrency INTEGER NOT NULL DEFAULT 2 CHECK (concurrency BETWEEN 1 AND 8),
+    -- 追加設定JSON (send_exif / send_gps / max_image_edge 等。WP-10の既定値は
+    -- gento-ai::prompt::ProfileExtraが正本)。
+    extra_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE ai_runs (
+    id INTEGER PRIMARY KEY,
+    uuid TEXT NOT NULL UNIQUE
+        CHECK (length(uuid) = 36 AND uuid = lower(uuid)),
+    asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+    profile_id INTEGER REFERENCES ai_profiles(id) ON DELETE SET NULL,
+    operation TEXT NOT NULL
+        CHECK (operation IN ('caption', 'tags', 'caption_and_tags', 'embedding', 'rag')),
+    status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed')),
+    prompt_version INTEGER NOT NULL CHECK (prompt_version >= 1),
+    -- リクエスト概要JSON (モデル名・画像バイト数・送信設定。鍵は含まない)。
+    request_summary TEXT,
+    raw_response TEXT,
+    error TEXT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX idx_ai_runs_asset_id ON ai_runs(asset_id, id);
+
+ALTER TABLE asset_tags ADD COLUMN ai_run_id INTEGER REFERENCES ai_runs(id);
+ALTER TABLE captions ADD COLUMN ai_run_id INTEGER REFERENCES ai_runs(id);
+
+CREATE TABLE jobs_v8 (
+    id INTEGER PRIMARY KEY,
+    uuid TEXT NOT NULL UNIQUE
+        CHECK (length(uuid) = 36 AND uuid = lower(uuid)),
+    job_type TEXT NOT NULL
+        CHECK (job_type IN ('ai_caption_tags', 'ai_reparse')),
+    target_type TEXT NOT NULL,
+    target_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued'
+        CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled',
+                          'retry_waiting')),
+    priority INTEGER NOT NULL DEFAULT 5 CHECK (priority BETWEEN 0 AND 9),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    max_attempts INTEGER NOT NULL DEFAULT 3 CHECK (max_attempts >= 1),
+    payload TEXT NOT NULL DEFAULT '{}',
+    error TEXT,
+    scheduled_at TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+INSERT INTO jobs_v8 (id, uuid, job_type, target_type, target_id, status, priority,
+                     attempts, max_attempts, payload, error, scheduled_at, started_at,
+                     finished_at, created_at, updated_at)
+    SELECT id, uuid, job_type, target_type, target_id, status, priority,
+           attempts, max_attempts, payload, error, scheduled_at, started_at,
+           finished_at, created_at, updated_at
+      FROM jobs;
+DROP TABLE jobs;
+ALTER TABLE jobs_v8 RENAME TO jobs;
+CREATE INDEX idx_jobs_status_priority ON jobs(status, priority);
+CREATE UNIQUE INDEX idx_jobs_pending_dedupe
+    ON jobs(job_type, target_id)
+    WHERE status IN ('queued', 'running', 'retry_waiting');
 "#;
 
 const MIGRATION_V1_SQL: &str = r#"
@@ -473,9 +580,9 @@ mod tests {
     }
 
     #[test]
-    fn tables_const_lists_12_tables() {
-        assert_eq!(TABLES.len(), 12);
-        // 計画書§9の12テーブルと一致
+    fn tables_const_lists_14_tables() {
+        assert_eq!(TABLES.len(), 14);
+        // 計画書§9の12テーブル + WP-10 (#8) のAI 2テーブルと一致
         let expected = [
             "library_roots",
             "assets",
@@ -489,6 +596,8 @@ mod tests {
             "jobs",
             "file_operations",
             "embeddings",
+            "ai_profiles",
+            "ai_runs",
         ];
         for t in expected {
             assert!(TABLES.contains(&t), "missing table: {t}");

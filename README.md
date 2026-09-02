@@ -5,9 +5,10 @@
 
 ## リポジトリ構成
 
-- `crates/gento-core` — ID・基本ドメイン型・repository抽象・登録ルート走査エンジン (Tauri非依存)
-- `crates/gento-db` — SQLite基盤 (migration・repository実装。メタデータの正本)
+- `crates/gento-core` — ID・基本ドメイン型・repository抽象・登録ルート走査エンジン・バックオフ計算 (Tauri非依存)
+- `crates/gento-db` — SQLite基盤 (migration・repository実装・永続ジョブキュー。メタデータの正本)
 - `crates/gento-image` — 画像パイプライン (走査・プローブ・BLAKE3・サムネイル・キャッシュ。Tauri非依存)
+- `crates/gento-ai` — OpenAI互換AI統合 (HTTPクライアント・versionedプロンプト・APIキー保管・実行パイプライン。Tauri非依存)
 - `apps/desktop` — Svelte 5 + Vite フロントエンドと `src-tauri` (Tauri 2 thin adapter)
 
 ## 製品UIシェル (3ペイン、WP-4)
@@ -31,8 +32,25 @@
   EXIF読み取り専用表示) + 生成メタデータ (WP-9: SD WebUI / ComfyUI /
   NovelAIのツール・モデル・Sampler・Steps・Seed・positive/negative prompt
   とComfyUI workflow JSONを折りたたみ表示・全文コピー。未知形式もRaw
-  metadataとして表示・コピー可能) + 選別セッション (順序・位置・
-  確認済み/採用/除外/保留カウント、途中終了→再開)
+  metadataとして表示・コピー可能) + AI実行履歴 (WP-10: AI由来タグ/
+  キャプションには「AI」バッジ。手動編集済み情報は再生成で保護) +
+  選別セッション (順序・位置・確認済み/採用/除外/保留カウント、途中終了→再開)
+
+## AI支援 (WP-10)
+
+OpenAI互換endpoint (llama.cpp等) への接続プロファイルを登録すると、
+画像からのタグ・キャプション生成をバックグラウンドジョブとして実行できる。
+
+- ヘッダー「AI」→ プロファイル (Base URL・モデル・APIキー)・接続/テキスト/
+  Vision/構造化JSONの4種テスト・ジョブキュー (一時停止/再開/失敗再試行)・
+  登録ルートごとの自動処理設定
+- APIキーはOS資格情報ストアへ保存 (利用不可環境では0600の平文ファイル+
+  警告。DB・ログへは書かない)
+- 送信プライバシー: EXIF/GPS送信はルート設定とプロファイル設定のAND
+  (GPSは独立opt-in)。送信画像は最大辺1024pxへ縮小しメタデータを除去
+- endpoint停止中もファイラー機能は継続し、ジョブはバックオフ
+  (30s→2m→8m) で再試行。アプリ再起動後にジョブを再開
+- 詳細な契約は [docs/dev/api-contract.md](docs/dev/api-contract.md) §44
 
 キーボード: Space=クイックプレビュー、Enter/ダブルクリック=ビューア、
 Esc=閉じる、F2=リネーム/WP-7、Delete=ゴミ箱/WP-7。右クリックで

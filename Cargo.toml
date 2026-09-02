@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/gento-core",
     "crates/gento-db",
+    "crates/gento-ai",
     "crates/gento-image",
     "crates/gento-platform",
     "crates/gento-search",
@@ -26,6 +27,7 @@ edition = "2021"
 
 [workspace.dependencies]
 gento-core = { path = "crates/gento-core" }
+gento-ai = { path = "crates/gento-ai" }
 gento-db = { path = "crates/gento-db" }
 gento-image = { path = "crates/gento-image" }
 gento-platform = { path = "crates/gento-platform" }
@@ -59,3 +61,9 @@ blake3 = "=1.8.7"
 notify = "=8.2.0"
 # WP-7: OSゴミ箱 (freedesktop Trash仕様。失敗時の通常削除フォールバック禁止)
 trash = "=5.2.6"
+# WP-10: OpenAI互換HTTPクライアント (rustls限定。opensslリンク回避はdependency-notes参照)
+reqwest = { version = "=0.13.4", default-features = false, features = ["json", "rustls", "blocking"] }
+# WP-10: APIキーのOS資格情報ストア (Linux=Secret Service via zbus。非可用時はファイルフォールバック)
+keyring = "=4.2.0"
+# WP-10: 画像data URL化 (reqwest推移依存と同一version。新規実体なし)
+base64 = "=0.22.1"
