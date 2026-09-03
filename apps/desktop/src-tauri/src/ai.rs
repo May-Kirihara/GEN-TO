@@ -1285,25 +1285,27 @@ pub(crate) fn tauri_event_sink(app: AppHandle) -> Arc<EventSink> {
     })
 }
 
-// ===== テスト (サービスレベルE2E: mock OpenAI互換endpoint相手) =====
-// 依存testserver (mock) はWP-0規約でコンパイル隔離された開発専用機能の
-// ため、本モジュールも同ゲートで囲む (通常releaseビルドでは空)。
-#[cfg(all(test, any(debug_assertions, feature = "devtools")))]
-mod tests {
+// ===== テスト =====
+// mock OpenAI互換endpoint (testserver) に依存するテストと非依存テストは
+// モジュール分離されている (FG-WP16-3 N5):
+// - `tests` (testserver非依存): release `--all-targets` でも実行される
+//   (IPC境界値・鍵参照保存・履歴概要などのacceptance coverage維持)。
+// - `tests_mock` (testserver依存): WP-0規約のゲート
+//   `debug_assertions || feature = "devtools"` を維持する。
+// 共通ヘルパーは `test_util` (cfg(test))。
+
+/// テスト共通ヘルパー (mock依存・非依存の両テストモジュールから利用)。
+#[cfg(test)]
+mod test_util {
     use super::*;
-    use gento_ai::testserver::{MockBehavior, MockServer};
-    use gento_core::assetmeta::{AssetMetadataParsed, AssetMetadataRepo, MetadataColumns};
-    use gento_core::metadata::{AssetTagRepo, CaptionKind, CaptionRepo};
-    use gento_core::repo::{
-        AssetRepo, FileRepo, FileUpsert, LibraryRootRepo, NewAsset, RootSettings, ScanState,
-    };
+    use gento_core::repo::{AssetRepo, FileRepo, FileUpsert, LibraryRootRepo, NewAsset, ScanState};
     use gento_db::NewAiProfile;
     use std::sync::Mutex as StdMutex;
 
-    struct TempDir(PathBuf);
+    pub(super) struct TempDir(pub PathBuf);
 
     impl TempDir {
-        fn new(tag: &str) -> Self {
+        pub(super) fn new(tag: &str) -> Self {
             let path = std::env::temp_dir().join(format!(
                 "gento-tauri-ai-{tag}-{}-{}",
                 std::process::id(),
@@ -1323,7 +1325,7 @@ mod tests {
         }
     }
 
-    fn test_png(path: &std::path::Path) {
+    pub(super) fn test_png(path: &std::path::Path) {
         use image::{Rgb, RgbImage};
         let img = RgbImage::from_fn(64, 48, |x, _| Rgb([(x % 256) as u8, 0x80, 0x40]));
         img.write_with_encoder(image::codecs::png::PngEncoder::new(
@@ -1333,7 +1335,7 @@ mod tests {
     }
 
     /// DB + ルート + asset + 代表ファイル。
-    fn fixture(tag: &str) -> (TempDir, Arc<Db>, i64, i64) {
+    pub(super) fn fixture(tag: &str) -> (TempDir, Arc<Db>, i64, i64) {
         let tmp = TempDir::new(tag);
         let root_dir = tmp.0.join("photos");
         std::fs::create_dir_all(&root_dir).unwrap();
@@ -1371,7 +1373,7 @@ mod tests {
         (tmp, db, root_id, asset_id)
     }
 
-    fn add_profile(db: &Arc<Db>, base_url: &str) -> i64 {
+    pub(super) fn add_profile(db: &Arc<Db>, base_url: &str) -> i64 {
         db.with_writer(|repos| {
             repos.insert_ai_profile(&NewAiProfile {
                 display_name: "mock".to_string(),
@@ -1389,7 +1391,9 @@ mod tests {
     }
 
     /// wait_until: 条件が真になるかタイムアウトまでポーリング。
-    fn wait_until(timeout_ms: u64, f: impl Fn() -> bool) -> bool {
+    /// (mock側テストのみ使用 — release非devtoolsではdead codeになるため同ゲート)
+    #[cfg(any(debug_assertions, feature = "devtools"))]
+    pub(super) fn wait_until(timeout_ms: u64, f: impl Fn() -> bool) -> bool {
         let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
         while std::time::Instant::now() < deadline {
             if f() {
@@ -1400,7 +1404,9 @@ mod tests {
         f()
     }
 
-    fn job_status(db: &Arc<Db>) -> Vec<(String, String)> {
+    /// (mock側テストのみ使用 — 上記wait_untilと同ゲート)
+    #[cfg(any(debug_assertions, feature = "devtools"))]
+    pub(super) fn job_status(db: &Arc<Db>) -> Vec<(String, String)> {
         db.with_reader(|repos| {
             Ok(repos
                 .list_jobs(20)?
@@ -1412,7 +1418,7 @@ mod tests {
     }
 
     /// イベント記録sink。
-    fn recorder() -> (Arc<StdMutex<Vec<AiJobsEventPayload>>>, Arc<EventSink>) {
+    pub(super) fn recorder() -> (Arc<StdMutex<Vec<AiJobsEventPayload>>>, Arc<EventSink>) {
         let log: Arc<StdMutex<Vec<AiJobsEventPayload>>> = Arc::new(StdMutex::new(Vec::new()));
         let sink: Arc<EventSink> = {
             let log = Arc::clone(&log);
@@ -1422,6 +1428,278 @@ mod tests {
         };
         (log, sink)
     }
+}
+
+/// testserver非依存のテスト (release `--all-targets` でも実行 —
+/// FG-WP16-3 N5。到達不能endpoint (127.0.0.1:9) のみを使用)。
+#[cfg(test)]
+mod tests {
+    use super::test_util::*;
+    use super::*;
+
+    /// FG-WP10 blocker 1: IPC (save_profile_impl) は範囲外max_image_edgeを拒否。
+    #[test]
+    fn ipc_rejects_out_of_range_max_image_edge() {
+        let (tmp, db, _root, _asset) = fixture("edge-ipc");
+        let (_log, sink) = recorder();
+        let service = AiService::start(db, tmp.0.clone(), sink);
+        let base = json!({
+            "displayName": "edge",
+            "baseUrl": "http://127.0.0.1:9/v1",
+            "model": "m",
+        });
+        for bad in [0u32, 63, 2049, 8192, u32::MAX] {
+            let input = json!({
+                "displayName": "edge",
+                "baseUrl": "http://127.0.0.1:9/v1",
+                "model": "m",
+                "extra": { "max_image_edge": bad },
+            });
+            let err = save_profile_impl(&service, &input, None).unwrap_err();
+            assert!(
+                err.contains("64〜2048"),
+                "拒否される ({bad}): {err} / input={input}"
+            );
+        }
+        // 境界値・範囲内・既定は受理
+        for ok in [64u32, 1024, 2048] {
+            let input = json!({
+                "displayName": "edge-ok",
+                "baseUrl": "http://127.0.0.1:9/v1",
+                "model": "m",
+                "extra": { "max_image_edge": ok },
+            });
+            let dto = save_profile_impl(&service, &input, None).unwrap();
+            assert_eq!(dto.extra["max_image_edge"].as_u64(), Some(ok as u64));
+        }
+        // extra省略 (UI互換) は既定1024
+        let dto = save_profile_impl(&service, &base, None).unwrap();
+        assert_eq!(dto.extra["max_image_edge"].as_u64(), Some(1024));
+        service.shutdown();
+    }
+
+    /// FG-WP10 blocker 1: 既存プロファイル保存値 (0/8192) は読み込み時に
+    /// クランプされてDTOへ出る (ProfileExtra::parse経路)。
+    #[test]
+    fn legacy_saved_out_of_range_edge_is_clamped_in_dto() {
+        let (_tmp, db, _root, _asset) = fixture("edge-legacy");
+        let profile_id = add_profile(&db, "http://127.0.0.1:9/v1");
+        for (saved, clamped) in [(0u32, 64u32), (8192, 2048), (100, 100)] {
+            db.with_writer(|repos| -> Result<(), gento_core::repo::RepoError> {
+                // savedはu32のためSQL注入なし (値の直埋め)
+                repos
+                    .conn()
+                    .execute(
+                        &format!(
+                            "UPDATE ai_profiles SET extra_json = '{{\"max_image_edge\":{saved}}}' \
+                             WHERE id = {profile_id}"
+                        ),
+                        [],
+                    )
+                    .map_err(|e| gento_core::repo::RepoError::Db(e.to_string()))?;
+                Ok(())
+            })
+            .unwrap();
+            let record = db
+                .with_reader(|repos| repos.get_ai_profile(profile_id))
+                .unwrap()
+                .unwrap();
+            let dto = profile_dto(&record, None);
+            assert_eq!(
+                dto.extra["max_image_edge"].as_u64(),
+                Some(clamped as u64),
+                "保存値{saved} → クランプ{clamped}"
+            );
+        }
+    }
+
+    /// FG-WP10 非ブロッカー8: 鍵クリアはDB参照クリア→成功後secret削除の順
+    /// (成功時は両方の効果が観測される。保存先がkeyringでもfileでも成立)。
+    #[test]
+    fn key_clear_removes_db_ref_then_secret() {
+        let (tmp, db, _root, _asset) = fixture("keyclear");
+        let (_log, sink) = recorder();
+        let service = AiService::start(Arc::clone(&db), tmp.0.clone(), sink);
+        let input = json!({
+            "displayName": "クリア",
+            "baseUrl": "http://127.0.0.1:9/v1",
+            "model": "m",
+        });
+        let dto = save_profile_impl(&service, &input, Some("sk-clear-me".to_string())).unwrap();
+        assert!(dto.has_api_key);
+        // 鍵が読み取れる (保存先がkeyring/fileのどちらでも同じAPIで検証)
+        let store = SecretStore::new(&tmp.0);
+        let record = db
+            .with_reader(|repos| repos.get_ai_profile(dto.id.parse().unwrap()))
+            .unwrap()
+            .unwrap();
+        let key_ref = record.api_key_ref.clone().unwrap();
+        assert!(store.load(&key_ref).is_some(), "保存直後は読み取れる");
+
+        // 空文字列で削除 (同一プロファイルのidを渡す) → 参照と実体の両方が消える
+        let clear_input = json!({
+            "id": dto.id,
+            "displayName": "クリア",
+            "baseUrl": "http://127.0.0.1:9/v1",
+            "model": "m",
+        });
+        let cleared = save_profile_impl(&service, &clear_input, Some(String::new())).unwrap();
+        assert!(!cleared.has_api_key);
+        assert!(
+            store.load(&key_ref).is_none(),
+            "secret実体も削除されている (DB参照クリア後)"
+        );
+        service.shutdown();
+    }
+
+    /// save_profile_implのAPIキー保存: keyring不可環境ではfileフォールバック
+    /// (警告ログ) でも参照が記録され、DTOには鍵本体が載らない。
+    #[test]
+    fn save_profile_stores_key_ref_not_secret_in_dto_or_logs() {
+        let (tmp, db, _root, _asset) = fixture("svc-key");
+        let (_log, sink) = recorder();
+        let service = AiService::start(db, tmp.0.clone(), sink);
+        let secret = "sk-tauri-test-do-not-log".to_string();
+
+        let input = json!({
+            "displayName": "キー付き",
+            "baseUrl": "http://127.0.0.1:9/v1",
+            "model": "m",
+            "visionCapable": true,
+            "enabled": true,
+        });
+        let dto = save_profile_impl(&service, &input, Some(secret.clone())).unwrap();
+        assert!(dto.has_api_key);
+        assert!(dto.api_key_store.is_some());
+        let dto_json = serde_json::to_string(&dto).unwrap();
+        assert!(!dto_json.contains(&secret), "DTOに鍵が含まれる: {dto_json}");
+
+        // 通常ログ (tracing) に鍵が出ないこと: バッファsinkで検証
+        let captured: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            use tracing_subscriber::fmt::MakeWriter;
+            struct BufferWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+            impl std::io::Write for BufferWriter {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(buf);
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            struct Maker(Arc<std::sync::Mutex<Vec<u8>>>);
+            impl<'a> MakeWriter<'a> for Maker {
+                type Writer = BufferWriter;
+                fn make_writer(&'a self) -> Self::Writer {
+                    BufferWriter(Arc::clone(&self.0))
+                }
+            }
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(Maker(Arc::clone(&captured)))
+                .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                // 鍵を扱う操作一式
+                let input2 = json!({
+                    "displayName": "ログ検証",
+                    "baseUrl": "http://127.0.0.1:9/v1",
+                    "model": "m",
+                });
+                let dto2 = save_profile_impl(&service, &input2, Some(secret.clone())).unwrap();
+                assert!(dto2.has_api_key);
+                // 読み出し (パイプラインでの鍵解決を含む失敗リクエスト)
+                let profile = service
+                    .db()
+                    .with_reader(|repos| repos.get_ai_profile(dto2.id.parse().unwrap()))
+                    .unwrap()
+                    .unwrap();
+                let key = profile
+                    .api_key_ref
+                    .as_deref()
+                    .and_then(|r| service.secret_store().load(r));
+                assert!(key.is_some());
+                let client = AiClient::new(
+                    AiEndpoint {
+                        base_url: profile.base_url.clone(),
+                        model: profile.model.clone(),
+                        timeout: Duration::from_millis(200),
+                    },
+                    key,
+                    false,
+                );
+                let report = test_connection(&client);
+                assert!(!report.ok, "到達不能endpoint: {report:?}");
+                let _ = gento_ai::client::test_text(&client);
+            });
+        }
+        let logs = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
+        assert!(!logs.contains(&secret), "ログに鍵が含まれる: {logs}");
+        // DBファイル群にも鍵が無い
+        let mut found = false;
+        for entry in std::fs::read_dir(&tmp.0).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() && path.extension().and_then(|e| e.to_str()) != Some("png") {
+                let bytes = std::fs::read(&path).unwrap();
+                if bytes.windows(secret.len()).any(|w| w == secret.as_bytes()) {
+                    found = true;
+                }
+            }
+        }
+        assert!(!found, "DB/WALに鍵平文が存在");
+        service.shutdown();
+    }
+
+    /// enqueue_all_for_rootの確認ゲートと対象絞り込み。
+    #[test]
+    fn enqueue_all_requires_confirmation_and_skips_done() {
+        let (tmp, db, root, asset_id) = fixture("svc-all");
+        let _profile_id = add_profile(&db, "http://127.0.0.1:9/v1");
+        let (_log, sink) = recorder();
+        let service = AiService::start(Arc::clone(&db), tmp.0.clone(), sink);
+
+        // confirmed=false は拒否
+        let err = enqueue_all_for_root_impl(&service, &root.to_string(), false).unwrap_err();
+        assert!(err.contains("確認"), "{err}");
+        // confirmed=true で投入
+        let n = enqueue_all_for_root_impl(&service, &root.to_string(), true).unwrap();
+        assert_eq!(n, 1);
+        // 成功扱いにしてから再実行 → 0件
+        db.with_writer(|repos| {
+            repos.insert_ai_run(
+                asset_id,
+                None,
+                "caption_and_tags",
+                gento_ai::PROMPT_VERSION,
+                None,
+            )
+        })
+        .unwrap();
+        db.with_writer(|repos| {
+            repos.conn().execute(
+                "UPDATE ai_runs SET status = 'succeeded', finished_at = started_at WHERE asset_id = ?1",
+                [asset_id],
+            ).map_err(|e| gento_core::repo::RepoError::Db(e.to_string()))
+        })
+        .unwrap();
+        let n2 = enqueue_all_for_root_impl(&service, &root.to_string(), true).unwrap();
+        assert_eq!(n2, 0, "成功済みは対象外");
+        service.shutdown();
+    }
+}
+
+/// testserver (mock OpenAI互換endpoint) 依存のテスト。
+/// WP-0規約のコンパイル隔離ゲートを維持 (通常releaseビルドでは空)。
+#[cfg(all(test, any(debug_assertions, feature = "devtools")))]
+mod tests_mock {
+    use super::test_util::*;
+    use super::*;
+    use gento_ai::testserver::{MockBehavior, MockServer};
+    use gento_core::assetmeta::{AssetMetadataParsed, AssetMetadataRepo, MetadataColumns};
+    use gento_core::metadata::{AssetTagRepo, CaptionKind, CaptionRepo};
+    use gento_core::repo::{AssetRepo, LibraryRootRepo, NewAsset, RootSettings, ScanState};
+    use gento_db::NewAiProfile;
+    use std::sync::Mutex as StdMutex;
 
     #[test]
     fn service_e2e_job_succeeds_and_emits_batched_events() {
@@ -1726,82 +2004,6 @@ mod tests {
         .unwrap()
     }
 
-    /// FG-WP10 blocker 1: IPC (save_profile_impl) は範囲外max_image_edgeを拒否。
-    #[test]
-    fn ipc_rejects_out_of_range_max_image_edge() {
-        let (tmp, db, _root, _asset) = fixture("edge-ipc");
-        let (_log, sink) = recorder();
-        let service = AiService::start(db, tmp.0.clone(), sink);
-        let base = json!({
-            "displayName": "edge",
-            "baseUrl": "http://127.0.0.1:9/v1",
-            "model": "m",
-        });
-        for bad in [0u32, 63, 2049, 8192, u32::MAX] {
-            let input = json!({
-                "displayName": "edge",
-                "baseUrl": "http://127.0.0.1:9/v1",
-                "model": "m",
-                "extra": { "max_image_edge": bad },
-            });
-            let err = save_profile_impl(&service, &input, None).unwrap_err();
-            assert!(
-                err.contains("64〜2048"),
-                "拒否される ({bad}): {err} / input={input}"
-            );
-        }
-        // 境界値・範囲内・既定は受理
-        for ok in [64u32, 1024, 2048] {
-            let input = json!({
-                "displayName": "edge-ok",
-                "baseUrl": "http://127.0.0.1:9/v1",
-                "model": "m",
-                "extra": { "max_image_edge": ok },
-            });
-            let dto = save_profile_impl(&service, &input, None).unwrap();
-            assert_eq!(dto.extra["max_image_edge"].as_u64(), Some(ok as u64));
-        }
-        // extra省略 (UI互換) は既定1024
-        let dto = save_profile_impl(&service, &base, None).unwrap();
-        assert_eq!(dto.extra["max_image_edge"].as_u64(), Some(1024));
-        service.shutdown();
-    }
-
-    /// FG-WP10 blocker 1: 既存プロファイル保存値 (0/8192) は読み込み時に
-    /// クランプされてDTOへ出る (ProfileExtra::parse経路)。
-    #[test]
-    fn legacy_saved_out_of_range_edge_is_clamped_in_dto() {
-        let (_tmp, db, _root, _asset) = fixture("edge-legacy");
-        let profile_id = add_profile(&db, "http://127.0.0.1:9/v1");
-        for (saved, clamped) in [(0u32, 64u32), (8192, 2048), (100, 100)] {
-            db.with_writer(|repos| -> Result<(), gento_core::repo::RepoError> {
-                // savedはu32のためSQL注入なし (値の直埋め)
-                repos
-                    .conn()
-                    .execute(
-                        &format!(
-                            "UPDATE ai_profiles SET extra_json = '{{\"max_image_edge\":{saved}}}' \
-                             WHERE id = {profile_id}"
-                        ),
-                        [],
-                    )
-                    .map_err(|e| gento_core::repo::RepoError::Db(e.to_string()))?;
-                Ok(())
-            })
-            .unwrap();
-            let record = db
-                .with_reader(|repos| repos.get_ai_profile(profile_id))
-                .unwrap()
-                .unwrap();
-            let dto = profile_dto(&record, None);
-            assert_eq!(
-                dto.extra["max_image_edge"].as_u64(),
-                Some(clamped as u64),
-                "保存値{saved} → クランプ{clamped}"
-            );
-        }
-    }
-
     /// FG-WP10 blocker 2: 4xx (認証失敗) は1回で確定failed — 再送しない。
     #[test]
     fn service_permanent_4xx_fails_once_without_retry() {
@@ -2035,180 +2237,6 @@ mod tests {
             0,
             "認証失敗リクエストも無し (送信していない)"
         );
-        service.shutdown();
-    }
-
-    /// FG-WP10 非ブロッカー8: 鍵クリアはDB参照クリア→成功後secret削除の順
-    /// (成功時は両方の効果が観測される。保存先がkeyringでもfileでも成立)。
-    #[test]
-    fn key_clear_removes_db_ref_then_secret() {
-        let (tmp, db, _root, _asset) = fixture("keyclear");
-        let (_log, sink) = recorder();
-        let service = AiService::start(Arc::clone(&db), tmp.0.clone(), sink);
-        let input = json!({
-            "displayName": "クリア",
-            "baseUrl": "http://127.0.0.1:9/v1",
-            "model": "m",
-        });
-        let dto = save_profile_impl(&service, &input, Some("sk-clear-me".to_string())).unwrap();
-        assert!(dto.has_api_key);
-        // 鍵が読み取れる (保存先がkeyring/fileのどちらでも同じAPIで検証)
-        let store = SecretStore::new(&tmp.0);
-        let record = db
-            .with_reader(|repos| repos.get_ai_profile(dto.id.parse().unwrap()))
-            .unwrap()
-            .unwrap();
-        let key_ref = record.api_key_ref.clone().unwrap();
-        assert!(store.load(&key_ref).is_some(), "保存直後は読み取れる");
-
-        // 空文字列で削除 (同一プロファイルのidを渡す) → 参照と実体の両方が消える
-        let clear_input = json!({
-            "id": dto.id,
-            "displayName": "クリア",
-            "baseUrl": "http://127.0.0.1:9/v1",
-            "model": "m",
-        });
-        let cleared = save_profile_impl(&service, &clear_input, Some(String::new())).unwrap();
-        assert!(!cleared.has_api_key);
-        assert!(
-            store.load(&key_ref).is_none(),
-            "secret実体も削除されている (DB参照クリア後)"
-        );
-        service.shutdown();
-    }
-
-    /// save_profile_implのAPIキー保存: keyring不可環境ではfileフォールバック
-    /// (警告ログ) でも参照が記録され、DTOには鍵本体が載らない。
-    #[test]
-    fn save_profile_stores_key_ref_not_secret_in_dto_or_logs() {
-        let (tmp, db, _root, _asset) = fixture("svc-key");
-        let (_log, sink) = recorder();
-        let service = AiService::start(Arc::clone(&db), tmp.0.clone(), sink);
-        let secret = "sk-tauri-test-do-not-log".to_string();
-
-        let input = json!({
-            "displayName": "キー付き",
-            "baseUrl": "http://127.0.0.1:9/v1",
-            "model": "m",
-            "visionCapable": true,
-            "enabled": true,
-        });
-        let dto = save_profile_impl(&service, &input, Some(secret.clone())).unwrap();
-        assert!(dto.has_api_key);
-        assert!(dto.api_key_store.is_some());
-        let dto_json = serde_json::to_string(&dto).unwrap();
-        assert!(!dto_json.contains(&secret), "DTOに鍵が含まれる: {dto_json}");
-
-        // 通常ログ (tracing) に鍵が出ないこと: バッファsinkで検証
-        let captured: Arc<StdMutex<Vec<u8>>> = Arc::new(StdMutex::new(Vec::new()));
-        {
-            use tracing_subscriber::fmt::MakeWriter;
-            struct BufferWriter(Arc<StdMutex<Vec<u8>>>);
-            impl std::io::Write for BufferWriter {
-                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                    self.0.lock().unwrap().extend_from_slice(buf);
-                    Ok(buf.len())
-                }
-                fn flush(&mut self) -> std::io::Result<()> {
-                    Ok(())
-                }
-            }
-            struct Maker(Arc<StdMutex<Vec<u8>>>);
-            impl<'a> MakeWriter<'a> for Maker {
-                type Writer = BufferWriter;
-                fn make_writer(&'a self) -> Self::Writer {
-                    BufferWriter(Arc::clone(&self.0))
-                }
-            }
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(Maker(Arc::clone(&captured)))
-                .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
-                .finish();
-            tracing::subscriber::with_default(subscriber, || {
-                // 鍵を扱う操作一式
-                let input2 = json!({
-                    "displayName": "ログ検証",
-                    "baseUrl": "http://127.0.0.1:9/v1",
-                    "model": "m",
-                });
-                let dto2 = save_profile_impl(&service, &input2, Some(secret.clone())).unwrap();
-                assert!(dto2.has_api_key);
-                // 読み出し (パイプラインでの鍵解決を含む失敗リクエスト)
-                let profile = service
-                    .db()
-                    .with_reader(|repos| repos.get_ai_profile(dto2.id.parse().unwrap()))
-                    .unwrap()
-                    .unwrap();
-                let key = profile
-                    .api_key_ref
-                    .as_deref()
-                    .and_then(|r| service.secret_store().load(r));
-                assert!(key.is_some());
-                let client = AiClient::new(
-                    AiEndpoint {
-                        base_url: profile.base_url.clone(),
-                        model: profile.model.clone(),
-                        timeout: Duration::from_millis(200),
-                    },
-                    key,
-                    false,
-                );
-                let report = test_connection(&client);
-                assert!(!report.ok, "到達不能endpoint: {report:?}");
-                let _ = gento_ai::client::test_text(&client);
-            });
-        }
-        let logs = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
-        assert!(!logs.contains(&secret), "ログに鍵が含まれる: {logs}");
-        // DBファイル群にも鍵が無い
-        let mut found = false;
-        for entry in std::fs::read_dir(&tmp.0).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_file() && path.extension().and_then(|e| e.to_str()) != Some("png") {
-                let bytes = std::fs::read(&path).unwrap();
-                if bytes.windows(secret.len()).any(|w| w == secret.as_bytes()) {
-                    found = true;
-                }
-            }
-        }
-        assert!(!found, "DB/WALに鍵平文が存在");
-        service.shutdown();
-    }
-
-    /// enqueue_all_for_rootの確認ゲートと対象絞り込み。
-    #[test]
-    fn enqueue_all_requires_confirmation_and_skips_done() {
-        let (tmp, db, root, asset_id) = fixture("svc-all");
-        let _profile_id = add_profile(&db, "http://127.0.0.1:9/v1");
-        let (_log, sink) = recorder();
-        let service = AiService::start(Arc::clone(&db), tmp.0.clone(), sink);
-
-        // confirmed=false は拒否
-        let err = enqueue_all_for_root_impl(&service, &root.to_string(), false).unwrap_err();
-        assert!(err.contains("確認"), "{err}");
-        // confirmed=true で投入
-        let n = enqueue_all_for_root_impl(&service, &root.to_string(), true).unwrap();
-        assert_eq!(n, 1);
-        // 成功扱いにしてから再実行 → 0件
-        db.with_writer(|repos| {
-            repos.insert_ai_run(
-                asset_id,
-                None,
-                "caption_and_tags",
-                gento_ai::PROMPT_VERSION,
-                None,
-            )
-        })
-        .unwrap();
-        db.with_writer(|repos| {
-            repos.conn().execute(
-                "UPDATE ai_runs SET status = 'succeeded', finished_at = started_at WHERE asset_id = ?1",
-                [asset_id],
-            ).map_err(|e| gento_core::repo::RepoError::Db(e.to_string()))
-        })
-        .unwrap();
-        let n2 = enqueue_all_for_root_impl(&service, &root.to_string(), true).unwrap();
-        assert_eq!(n2, 0, "成功済みは対象外");
         service.shutdown();
     }
 

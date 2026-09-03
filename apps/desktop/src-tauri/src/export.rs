@@ -12,18 +12,26 @@
 //!   `PRAGMA query_only` で書き込みSQLを構造的に拒否)。
 //! - **無断上書き厳禁**: 出力先に同名既存ファイルがある場合、サイズ一致なら
 //!   内容比較し、一致=「既に書き出し済み」でskip (冪等)、不一致=skip +
-//!   衝突報告。新規書き出しは tmp書き → `rename_noreplace` による原子公開
+//!   衝突報告。新規書き出しは tmp書き → no-clobber rename による原子公開
 //!   (上書き競合は失敗扱い)。tmp名は fileops (WP-7) と同一の厳密形式
 //!   `.{名前}.gento-tmp-{32hex}-{6桁seq}` — 出力先が登録ルート内だった
 //!   場合に起動時掃除の対象となり、クラッシュ残骸が片付く。
+//! - **出力経路の包含 (FG-WP16-3 B1)**: 出力rootは `O_DIRECTORY|O_NOFOLLOW`
+//!   でfd固定 (root最終成分がsymlinkなら拒否)。サブディレクトリは
+//!   `openat(O_NOFOLLOW)` 成分歩行 + `mkdirat` 競合安全作成、書き出し
+//!   (tmp→sync→`renameat2 NOREPLACE`) はすべてdir fd相対。出力dir内の
+//!   既存symlink (`DEST/sub -> /outside`) を辿った外部書き出しは構造的に
+//!   起きない (該当項目はfailedとして報告)。
 //! - **代表fileの決定論**: 同一assetの複数file (重複登録) は
 //!   `scan_state='present'` の最小file id (無ければ全体の最小id) を代表に。
 //! - **命名の決定論**: 出力名 = 代表fileのdisplay_name。異なるasset間の
 //!   同名衝突は asset uuid 辞書順で `{stem}-{n}.{ext}` suffixを振る
 //!   (再実行で同一結果)。
-//! - **manifest**: `export-manifest.json` を出力dirへ tmp→原子rename で
-//!   公開 (自身の成果物のため再実行での置換は許容)。キャンセル・部分失敗
-//!   も含めた全エントリを記録する。
+//! - **manifest**: `export-manifest.json` を出力dirへ
+//!   tmp→sync→`renameat2 NOREPLACE` で出版。既存ファイルがGEN-TO自身の
+//!   旧manifest (format_version一致) なら置換、それ以外 (ユーザー所有) は
+//!   上書きせず回避名 `export-manifest-{run uuid}.json` へ出版する
+//!   (FG-WP16-3 N3)。キャンセル・部分失敗も含めた全エントリを記録する。
 //! - キャンセルは協調 ([`ExportService::cancel`] → AtomicBool、per-item境界)。
 //!   キャンセル時もそれまでの成果 + manifestは残す。
 
@@ -229,6 +237,206 @@ pub fn txt_file_name(image_name: &OsStr) -> OsString {
     OsString::from(format!("{stem}.txt"))
 }
 
+/// fdをストリーム読みしBLAKE3 hex (プレフィックスなし) を算出後、先頭へ巻き戻す。
+fn hash_and_rewind(file: &mut File) -> Option<String> {
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 128 * 1024];
+    loop {
+        let n = file.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    file.seek(SeekFrom::Start(0)).ok()?;
+    Some(hasher.finalize().to_hex().to_string())
+}
+
+/// tmp名 (fileops WP-7と同一の厳密形式。出力先が登録ルート内なら起動時
+/// 掃除の対象となる)。NAME_MAX超過は File 作成のエラーに任せる。
+fn tmp_name_for(final_name: &OsStr, run_uuid: &str, seq: &mut u32) -> OsString {
+    let name = final_name.to_string_lossy();
+    let out = format!(".{name}.gento-tmp-{run_uuid}-{:06}", seq);
+    *seq += 1;
+    OsString::from(out)
+}
+
+/// ディレクトリハンドル配下の既存画像の分類 (ソース実体fdと比較)。
+/// サイズ一致時のみBLAKE3ストリーム比較。ソースfdは比較後に先頭へ巻き戻す。
+/// 最終成分がsymlink・判定不能は安全側 (Conflict = 書き込まない)。
+fn classify_file_at(
+    dir: &gento_core::OutputDir,
+    name: &OsStr,
+    source: &mut File,
+    source_len: u64,
+) -> ExistingState {
+    let (mut existing, md) = match dir.open_regular_at(name) {
+        Ok(opened) => opened,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ExistingState::NotExists,
+        // symlink最終成分 (ELOOP)・権限等 → 安全側 (書き込まない)
+        Err(_) => return ExistingState::Conflict,
+    };
+    if !md.is_file() || md.len() != source_len {
+        return ExistingState::Conflict;
+    }
+    let Some(target_hash) = hash_and_rewind(&mut existing) else {
+        return ExistingState::Conflict;
+    };
+    let Some(source_hash) = hash_and_rewind(source) else {
+        return ExistingState::Conflict;
+    };
+    if target_hash == source_hash {
+        ExistingState::Identical
+    } else {
+        ExistingState::Conflict
+    }
+}
+
+/// ディレクトリハンドル配下の既存 `.txt` の分類 (期待bytesと直接比較)。
+fn classify_bytes_at(dir: &gento_core::OutputDir, name: &OsStr, expect: &[u8]) -> ExistingState {
+    match dir.open_regular_at(name) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ExistingState::NotExists,
+        Err(_) => ExistingState::Conflict,
+        Ok((mut file, md)) => {
+            if !md.is_file() || md.len() != expect.len() as u64 {
+                return ExistingState::Conflict;
+            }
+            let mut buf = Vec::with_capacity(expect.len());
+            if file.read_to_end(&mut buf).is_err() {
+                return ExistingState::Conflict;
+            }
+            if buf == expect {
+                ExistingState::Identical
+            } else {
+                ExistingState::Conflict
+            }
+        }
+    }
+}
+
+/// 書き出し結果の失敗分類 (publish共通)。
+enum PublishIssue {
+    /// 宛先既存 (上書きしない → Conflict)。
+    DestinationExists,
+    /// その他のIO失敗。
+    Failed(std::io::Error),
+}
+
+/// ソース (先頭巻き戻し済み) をtmpへcopy → sync → 原子公開
+/// (すべてdirハンドルfd相対 — 出力dir包含の担保)。
+fn publish_copy_at(
+    dir: &gento_core::OutputDir,
+    final_name: &OsStr,
+    source: &mut File,
+    run_uuid: &str,
+    seq: &mut u32,
+) -> FileOutcome {
+    publish_at(dir, final_name, run_uuid, seq, |out| {
+        source.seek(SeekFrom::Start(0))?;
+        std::io::copy(source, out)?;
+        Ok(())
+    })
+}
+
+/// bytesをtmp書き→sync→原子公開 (.txt用。同様にfd相対)。
+fn publish_bytes_at(
+    dir: &gento_core::OutputDir,
+    final_name: &OsStr,
+    bytes: &[u8],
+    run_uuid: &str,
+    seq: &mut u32,
+) -> FileOutcome {
+    publish_at(dir, final_name, run_uuid, seq, |out| out.write_all(bytes))
+}
+
+/// 公共のtmp書き→sync→no-clobber rename。上書き競合
+/// (DestinationExists) はConflict、その他失敗はFailed。失敗時tmpは掃除。
+fn publish_at(
+    dir: &gento_core::OutputDir,
+    final_name: &OsStr,
+    run_uuid: &str,
+    seq: &mut u32,
+    write: impl FnOnce(&mut File) -> std::io::Result<()>,
+) -> FileOutcome {
+    let tmp = tmp_name_for(final_name, run_uuid, seq);
+    let result = (|| -> Result<(), PublishIssue> {
+        let cleanup_tmp = |issue: PublishIssue| -> PublishIssue {
+            let _ = dir.remove_file_at(&tmp);
+            issue
+        };
+        let mut out = dir
+            .create_exclusive_at(&tmp)
+            .map_err(PublishIssue::Failed)?;
+        let written = write(&mut out);
+        let synced = written.and_then(|()| out.sync_all());
+        drop(out);
+        synced.map_err(|e| cleanup_tmp(PublishIssue::Failed(e)))?;
+        match dir.rename_noreplace_at(&tmp, final_name) {
+            Ok(()) => Ok(()),
+            Err(gento_core::RenameAtNoReplaceError::DestinationExists) => {
+                Err(cleanup_tmp(PublishIssue::DestinationExists))
+            }
+            Err(e) => Err(cleanup_tmp(PublishIssue::Failed(std::io::Error::other(
+                e.to_string(),
+            )))),
+        }
+    })();
+    match result {
+        Ok(()) => FileOutcome::Written,
+        Err(PublishIssue::DestinationExists) => FileOutcome::Conflict,
+        Err(PublishIssue::Failed(e)) => FileOutcome::Failed(format!(
+            "{}/{}: {e}",
+            dir.display(),
+            final_name.to_string_lossy()
+        )),
+    }
+}
+
+/// 1項目 (画像 + .txt) の書き出し。単一失敗で他方へ影響させない。
+/// subdirのopen-or-createはsymlink成分を拒否する (包含担保) —
+/// その場合も両方Failedとして報告し、外部へは書かない。
+fn export_one(
+    item: &PlannedItem,
+    root: &gento_core::OutputDir,
+    run_uuid: &str,
+    seq: &mut u32,
+) -> (FileOutcome, FileOutcome) {
+    let txt_name = txt_file_name(&item.output_name);
+    let dir = match root.open_or_create_subdir(&item.subdir) {
+        Ok(dir) => dir,
+        Err(e) => {
+            let reason = format!(
+                "{}/{}: {e}",
+                root.display(),
+                rel_display(&item.subdir, &OsString::new())
+            );
+            return (
+                FileOutcome::Failed(reason.clone()),
+                FileOutcome::Failed(reason),
+            );
+        }
+    };
+    let image = match open_source(item) {
+        Ok((mut source, md)) => {
+            match classify_file_at(&dir, &item.output_name, &mut source, md.len()) {
+                ExistingState::NotExists => {
+                    publish_copy_at(&dir, &item.output_name, &mut source, run_uuid, seq)
+                }
+                ExistingState::Identical => FileOutcome::IdenticalSkip,
+                ExistingState::Conflict => FileOutcome::Conflict,
+            }
+        }
+        Err(reason) => FileOutcome::Failed(reason),
+    };
+    let txt_bytes = item.caption.as_bytes();
+    let txt = match classify_bytes_at(&dir, &txt_name, txt_bytes) {
+        ExistingState::NotExists => publish_bytes_at(&dir, &txt_name, txt_bytes, run_uuid, seq),
+        ExistingState::Identical => FileOutcome::IdenticalSkip,
+        ExistingState::Conflict => FileOutcome::Conflict,
+    };
+    (image, txt)
+}
+
 /// 衝突suffix付き名前 `{stem}-{n}.{ext}` (拡張子なしは `{stem}-{n}`)。
 pub fn suffixed_name(image_name: &OsStr, n: u32) -> OsString {
     let text = image_name.to_string_lossy().into_owned();
@@ -388,195 +596,8 @@ pub fn plan_export(
     }
 }
 
-/// 画像/テキスト出力先の既存状態を、ソース実体 (fdピン留め) と比較して分類。
-/// サイズ一致時のみBLAKE3ストリーム比較 (不一致は即Conflict)。
-/// ソースfdは比較後に先頭へ巻き戻す (呼び出し側がそのままcopyできる)。
-fn classify_existing(target: &Path, source: &mut File, source_len: u64) -> ExistingState {
-    let Ok(md) = std::fs::symlink_metadata(target) else {
-        // 存在確認失敗 ( NotFound含む ) → 新規扱い。実pathの上書き競合は
-        // 書き出し側のrename_noreplaceが原子検出するため安全側。
-        return ExistingState::NotExists;
-    };
-    if !md.is_file() || md.len() != source_len {
-        return ExistingState::Conflict;
-    }
-    let Some(source_hash) = hash_and_rewind(source) else {
-        return ExistingState::Conflict;
-    };
-    match hash_path(target) {
-        Some(target_hash) if target_hash == source_hash => ExistingState::Identical,
-        _ => ExistingState::Conflict,
-    }
-}
-
-/// fdをストリーム読みしBLAKE3 hex (プレフィックスなし) を算出後、先頭へ巻き戻す。
-fn hash_and_rewind(file: &mut File) -> Option<String> {
-    let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; 128 * 1024];
-    loop {
-        let n = file.read(&mut buf).ok()?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    file.seek(SeekFrom::Start(0)).ok()?;
-    Some(hasher.finalize().to_hex().to_string())
-}
-
-/// パスのファイル内容のBLAKE3 hex。
-fn hash_path(path: &Path) -> Option<String> {
-    let mut file = File::open(path).ok()?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; 128 * 1024];
-    loop {
-        let n = file.read(&mut buf).ok()?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Some(hasher.finalize().to_hex().to_string())
-}
-
-/// 実行時の1ファイル分類 (classify_existingの実行版:
-/// 結果をFileOutcomeへ直結させる)。
-fn classify_for_write(target: &Path, source: &mut File, source_len: u64) -> FileOutcome {
-    match classify_existing(target, source, source_len) {
-        ExistingState::Identical => FileOutcome::IdenticalSkip,
-        ExistingState::Conflict => FileOutcome::Conflict,
-        ExistingState::NotExists => FileOutcome::Written, // 呼び出し側で書き出す
-    }
-}
-
-/// tmp名 (fileops WP-7と同一の厳密形式。出力先が登録ルート内なら起動時
-/// 掃除の対象となる)。NAME_MAX超過は File::create のエラーに任せる。
-fn tmp_name_for(final_name: &OsStr, run_uuid: &str, seq: &mut u32) -> OsString {
-    let name = final_name.to_string_lossy();
-    let out = format!(".{name}.gento-tmp-{run_uuid}-{:06}", seq);
-    *seq += 1;
-    OsString::from(out)
-}
-
-/// ソース (先頭巻き戻し済み) をtmpへcopy → sync → 原子公開。
-/// 上書き競合 (DestinationExists) はConflict、その他失敗はFailed。
-fn publish_copy(source: &mut File, target: &Path, run_uuid: &str, seq: &mut u32) -> FileOutcome {
-    let mut run = || -> std::io::Result<()> {
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        source.seek(SeekFrom::Start(0))?;
-        let tmp = target.parent().unwrap_or(Path::new(".")).join(tmp_name_for(
-            target.file_name().unwrap_or_default(),
-            run_uuid,
-            seq,
-        ));
-        let result = (|| -> std::io::Result<()> {
-            let mut out = File::create(&tmp)?;
-            std::io::copy(source, &mut out)?;
-            out.sync_all()?;
-            drop(out);
-            Ok(())
-        })();
-        match result {
-            Ok(()) => match gento_platform::rename_noreplace(&tmp, target) {
-                Ok(()) => Ok(()),
-                Err(gento_platform::RenameNoReplaceError::DestinationExists) => {
-                    let _ = std::fs::remove_file(&tmp);
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        "destination exists",
-                    ))
-                }
-                Err(e) => {
-                    let _ = std::fs::remove_file(&tmp);
-                    Err(std::io::Error::other(e.to_string()))
-                }
-            },
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                Err(e)
-            }
-        }
-    };
-    match run() {
-        Ok(()) => FileOutcome::Written,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => FileOutcome::Conflict,
-        Err(e) => FileOutcome::Failed(format!("{}: {e}", target.display())),
-    }
-}
-
-/// bytesをtmp書き→sync→原子公開 (.txt用)。
-fn publish_bytes(bytes: &[u8], target: &Path, run_uuid: &str, seq: &mut u32) -> FileOutcome {
-    let mut run = || -> std::io::Result<()> {
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = target.parent().unwrap_or(Path::new(".")).join(tmp_name_for(
-            target.file_name().unwrap_or_default(),
-            run_uuid,
-            seq,
-        ));
-        let result = (|| -> std::io::Result<()> {
-            let mut out = File::create(&tmp)?;
-            out.write_all(bytes)?;
-            out.sync_all()?;
-            drop(out);
-            Ok(())
-        })();
-        match result {
-            Ok(()) => match gento_platform::rename_noreplace(&tmp, target) {
-                Ok(()) => Ok(()),
-                Err(gento_platform::RenameNoReplaceError::DestinationExists) => {
-                    let _ = std::fs::remove_file(&tmp);
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        "destination exists",
-                    ))
-                }
-                Err(e) => {
-                    let _ = std::fs::remove_file(&tmp);
-                    Err(std::io::Error::other(e.to_string()))
-                }
-            },
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                Err(e)
-            }
-        }
-    };
-    match run() {
-        Ok(()) => FileOutcome::Written,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => FileOutcome::Conflict,
-        Err(e) => FileOutcome::Failed(format!("{}: {e}", target.display())),
-    }
-}
-
-/// 1項目 (画像 + .txt) の書き出し。単一失敗で他方へ影響させない。
-fn export_one(
-    item: &PlannedItem,
-    dest_dir: &Path,
-    run_uuid: &str,
-    seq: &mut u32,
-) -> (FileOutcome, FileOutcome) {
-    let txt_name = txt_file_name(&item.output_name);
-    let image_target = output_target(dest_dir, &item.subdir, &item.output_name);
-    let txt_target = output_target(dest_dir, &item.subdir, &txt_name);
-    let image = match open_source(item) {
-        Ok((mut source, md)) => match classify_for_write(&image_target, &mut source, md.len()) {
-            FileOutcome::Written => publish_copy(&mut source, &image_target, run_uuid, seq),
-            other => other,
-        },
-        Err(reason) => FileOutcome::Failed(reason),
-    };
-    let txt_bytes = item.caption.as_bytes();
-    let txt = match classify_existing_bytes(&txt_target, txt_bytes) {
-        ExistingState::Identical => FileOutcome::IdenticalSkip,
-        ExistingState::Conflict => FileOutcome::Conflict,
-        ExistingState::NotExists => publish_bytes(txt_bytes, &txt_target, run_uuid, seq),
-    };
-    (image, txt)
-}
+// 画像/テキスト出力先の既存分類はディレクトリハンドル相対
+// (`classify_file_at` / `classify_bytes_at`) で行う — FG-WP16-3 B1。
 
 /// 1 asset分のplan項目を組む (plan_export内の per-asset処理。
 /// ユーザー向け日本語エラーはここで確定する)。
@@ -659,6 +680,8 @@ fn plan_one_item(
 
 /// 実行: planを組み直して (クライアント由来のplanは信頼しない) 項目ごとに
 /// 書き出す。単一失敗で続行 (manifestに記録)。cancel は per-item境界で確認。
+/// 出力rootはfdピン留め (`OutputDir::open_root` — 最終成分symlink拒否) し、
+/// 以降の書き出しはすべてfd相対 (FG-WP16-3 B1の出力包含担保)。
 pub fn run_export(
     db: &gento_db::Db,
     asset_ids: &[i64],
@@ -669,11 +692,23 @@ pub fn run_export(
 ) -> Result<ExportRun, String> {
     let plan = plan_export(db, asset_ids, dest_dir, structure);
     let total = plan.items.len() as u64;
-    std::fs::create_dir_all(dest_dir).map_err(|e| {
-        format!(
-            "出力先ディレクトリを作成できません: {} ({e})",
-            dest_dir.display()
-        )
+    let root = gento_core::OutputDir::open_root(dest_dir).map_err(|e| {
+        // root最終成分がsymlink (ELOOP/ENOTDIR) は分かりやすく報告
+        let code = e.raw_os_error();
+        if code == Some(libc::ELOOP)
+            || code == Some(libc::ENOTDIR)
+            || e.to_string().contains("symlink")
+        {
+            format!(
+                "出力先ディレクトリがシンボリックリンクであるため安全に開けません: {} ({e})",
+                dest_dir.display()
+            )
+        } else {
+            format!(
+                "出力先ディレクトリを作成/オープンできません: {} ({e})",
+                dest_dir.display()
+            )
+        }
     })?;
     let run_uuid = Uuid::now_v7().simple().to_string();
     let mut seq: u32 = 0;
@@ -684,7 +719,7 @@ pub fn run_export(
             cancelled = true;
             break;
         }
-        let (image, txt) = export_one(item, dest_dir, &run_uuid, &mut seq);
+        let (image, txt) = export_one(item, &root, &run_uuid, &mut seq);
         let txt_name = txt_file_name(&item.output_name);
         let result = ItemResult {
             asset_id: item.asset_id,
@@ -765,10 +800,9 @@ struct ExportManifestError {
     reason: String,
 }
 
-/// manifestを tmp書き→sync→原子rename で出版し、パスを返す。
-/// `export-manifest.json` はGEN-TO自身の成果物のため、再実行での
-/// 置換 (最新runの記録) は許容する — ユーザーファイルの無断上書き規約の
-/// 対象外 (api-contract §48)。
+/// manifestを組み立てて出版し、パスを返す。出版の所有権規約は
+/// [`publish_manifest_file`] (FG-WP16-3 N3: 自身の旧manifestのみ置換、
+/// ユーザー所有ファイルは上書きしない)。
 fn publish_manifest(run: &ExportRun, created_at: &str) -> Result<PathBuf, String> {
     let mut exported = 0u64;
     let mut identical = 0u64;
@@ -805,7 +839,11 @@ fn publish_manifest(run: &ExportRun, created_at: &str) -> Result<PathBuf, String
         cancelled: run.cancelled,
         structure: run.structure.as_str().to_string(),
         dest_dir: run.dest_dir.display().to_string(),
-        asset_count: run.items.len() as u64 + run.planning_errors.len() as u64,
+        // asset_count = 要求した一意asset数 (処理済み + plan失敗 + キャンセル
+        // 未処理を含む — 結果DTOのtotalと同一定義。FG-WP16-3 N2)
+        asset_count: run.items.len() as u64
+            + run.planning_errors.len() as u64
+            + run.skipped_by_cancel,
         summary: ExportManifestSummary {
             exported,
             identical,
@@ -826,32 +864,110 @@ fn publish_manifest(run: &ExportRun, created_at: &str) -> Result<PathBuf, String
     };
     let json = serde_json::to_string_pretty(&manifest)
         .map_err(|e| format!("manifest直列化に失敗しました: {e}"))?;
-    let final_path = run.dest_dir.join(EXPORT_MANIFEST_FILE);
-    let tmp = run.dest_dir.join(format!(
-        ".{EXPORT_MANIFEST_FILE}.gento-tmp-{}-000001",
-        Uuid::now_v7().simple()
+    publish_manifest_file(&run.dest_dir, json.as_bytes())
+}
+
+/// manifestファイルを出版する (tmp書き→sync→`renameat2 NOREPLACE`。
+/// FG-WP16-3 N3: 既存 `export-manifest.json` が**GEN-TO自身の成果物**
+/// (format_version一致で判定) なら最新runの記録として置換する。ユーザー
+/// 所有のファイル (判定不能・破損) は上書きせず、回避名
+/// `export-manifest-{run uuid}.json` へ出版する。
+fn publish_manifest_file(dest_dir: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    let root = gento_core::OutputDir::open_root(dest_dir).map_err(|e| {
+        format!(
+            "出力先ディレクトリを開けません: {} ({e})",
+            dest_dir.display()
+        )
+    })?;
+    let run_uuid = Uuid::now_v7().simple().to_string();
+    let tmp = OsString::from(format!(
+        ".{EXPORT_MANIFEST_FILE}.gento-tmp-{run_uuid}-000001"
     ));
     let write = (|| -> Result<(), String> {
-        let mut out = File::create(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
-        out.write_all(json.as_bytes())
-            .map_err(|e| format!("{}: {e}", tmp.display()))?;
+        let mut out = root
+            .create_exclusive_at(&tmp)
+            .map_err(|e| format!("{}/{}: {e}", root.display(), tmp.to_string_lossy()))?;
+        out.write_all(bytes)
+            .map_err(|e| format!("{}/{}: {e}", root.display(), tmp.to_string_lossy()))?;
         out.sync_all()
-            .map_err(|e| format!("{}: {e}", tmp.display()))?;
+            .map_err(|e| format!("{}/{}: {e}", root.display(), tmp.to_string_lossy()))?;
         drop(out);
-        // 置換を許容 (自身の成果物)。rename自体は原子的。
-        std::fs::rename(&tmp, &final_path).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            format!("{}: {e}", final_path.display())
-        })?;
-        if let Ok(dir) = File::open(&run.dest_dir) {
-            let _ = dir.sync_all();
-        }
         Ok(())
     })();
-    write.inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })?;
-    Ok(final_path)
+    if let Err(e) = write {
+        let _ = root.remove_file_at(&tmp);
+        return Err(e);
+    }
+    let final_name = OsString::from(EXPORT_MANIFEST_FILE);
+    match root.rename_noreplace_at(&tmp, &final_name) {
+        Ok(()) => {
+            sync_dir_best_effort(dest_dir);
+            Ok(dest_dir.join(EXPORT_MANIFEST_FILE))
+        }
+        Err(gento_core::RenameAtNoReplaceError::DestinationExists) => {
+            if manifest_is_gento_owned(&root, &final_name) {
+                // 自身の旧manifest → 最新runの記録として置換 (remove→norename)
+                if root.remove_file_at(&final_name).is_ok() {
+                    if let Ok(()) = root.rename_noreplace_at(&tmp, &final_name) {
+                        sync_dir_best_effort(dest_dir);
+                        return Ok(dest_dir.join(EXPORT_MANIFEST_FILE));
+                    }
+                }
+                // 置換に失敗 (競合) → 回避名へ (下と同じ経路)
+            }
+            // ユーザー所有または置換失敗 → 回避名 (決して上書きしない)
+            let alt = OsString::from(format!("export-manifest-{run_uuid}.json"));
+            let result = root.rename_noreplace_at(&tmp, &alt);
+            match result {
+                Ok(()) => {
+                    sync_dir_best_effort(dest_dir);
+                    Ok(dest_dir.join(alt.to_string_lossy().into_owned()))
+                }
+                Err(gento_core::RenameAtNoReplaceError::DestinationExists) => {
+                    let _ = root.remove_file_at(&tmp);
+                    Err(format!(
+                        "manifestの出版先が決定できません: {}",
+                        dest_dir.display()
+                    ))
+                }
+                Err(e) => {
+                    let _ = root.remove_file_at(&tmp);
+                    Err(format!("manifestの公開に失敗しました: {e}"))
+                }
+            }
+        }
+        Err(e) => {
+            let _ = root.remove_file_at(&tmp);
+            Err(format!("{}/{}: {e}", root.display(), EXPORT_MANIFEST_FILE))
+        }
+    }
+}
+
+/// 親ディレクトリのエントリ反映 (best-effort — 出版済みファイルのfsyncは
+/// 済んでおり、ここは追加点検のみ)。
+fn sync_dir_best_effort(dest_dir: &Path) {
+    if let Ok(dir) = File::open(dest_dir) {
+        let _ = dir.sync_all();
+    }
+}
+
+/// 既存の `export-manifest.json` がGEN-TO自身の成果物か (format_versionが
+/// 現行と一致するJSON)。破損・不一致・読取不能はユーザー所有扱い。
+fn manifest_is_gento_owned(root: &gento_core::OutputDir, name: &OsStr) -> bool {
+    let Ok((mut file, _md)) = root.open_regular_at(name) else {
+        return false;
+    };
+    let mut body = String::new();
+    if file.read_to_string(&mut body).is_err() {
+        return false;
+    }
+    match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(value) => {
+            value.get("format_version").and_then(|v| v.as_u64())
+                == Some(EXPORT_MANIFEST_VERSION as u64)
+        }
+        Err(_) => false,
+    }
 }
 
 // ===== サービス・ホスト =====
@@ -1106,13 +1222,21 @@ fn build_preview_dto(
     let mut to_write = 0u64;
     let mut already = 0u64;
     let mut conflict = 0u64;
+    // 既存分類はdest (とsubdir) が実在する場合のみ読み取り専用ハンドルで
+    // 行う (dry-runは一切作成しない — open_existing系のみ)。
+    let dest_root = gento_core::OutputDir::open_existing_root(dest_dir).ok();
     for item in &plan.items {
-        let image_target = output_target(dest_dir, &item.subdir, &item.output_name);
         let txt_name = txt_file_name(&item.output_name);
-        let txt_target = output_target(dest_dir, &item.subdir, &txt_name);
         let caption_bytes = item.caption.as_bytes();
+        // subdir (またはdest自体) が無ければ全て新規扱い
+        let subdir = dest_root
+            .as_ref()
+            .and_then(|root| root.open_existing_subdir(&item.subdir).ok());
         let image_state = match open_source(item) {
-            Ok((mut source, md)) => classify_existing(&image_target, &mut source, md.len()),
+            Ok((mut source, md)) => match &subdir {
+                Some(dir) => classify_file_at(dir, &item.output_name, &mut source, md.len()),
+                None => ExistingState::NotExists,
+            },
             Err(reason) => {
                 // ソース読取不能はplan失敗扱い (dry-runで気づかせる)
                 entries.push(ExportPreviewEntryDto {
@@ -1131,7 +1255,10 @@ fn build_preview_dto(
                 continue;
             }
         };
-        let txt_state = classify_existing_bytes(&txt_target, caption_bytes);
+        let txt_state = match &subdir {
+            Some(dir) => classify_bytes_at(dir, &txt_name, caption_bytes),
+            None => ExistingState::NotExists,
+        };
         match (image_state, txt_state) {
             (ExistingState::Identical, ExistingState::Identical) => already += 1,
             (ExistingState::Conflict, _) | (_, ExistingState::Conflict) => conflict += 1,
@@ -1166,7 +1293,8 @@ fn build_preview_dto(
     }
 }
 
-/// runから結果DTOを組む。
+/// runから結果DTOを組む。summaryのconflict/failedは**truncation前の全件数**
+/// (issues配列だけが先頭100件に切り詰められる — FG-WP16-3 N1)。
 fn build_result_dto(run: &ExportRun, manifest_path: &Path) -> ExportResultDto {
     let mut exported = 0u64;
     let mut identical = 0u64;
@@ -1190,6 +1318,9 @@ fn build_result_dto(run: &ExportRun, manifest_path: &Path) -> ExportResultDto {
             }),
         }
     }
+    // 集計は全件ベースで確定させてから配列のみ切り詰める
+    let conflict_count = conflict_items.len() as u64;
+    let failed_count = failed_items.len() as u64;
     let mut truncated = false;
     if failed_items.len() > ISSUE_REPORT_LIMIT {
         failed_items.truncate(ISSUE_REPORT_LIMIT);
@@ -1209,8 +1340,8 @@ fn build_result_dto(run: &ExportRun, manifest_path: &Path) -> ExportResultDto {
                 + run.skipped_by_cancel,
             exported,
             identical,
-            conflict: conflict_items.len() as u64,
-            failed: failed_items.len() as u64,
+            conflict: conflict_count,
+            failed: failed_count,
             planning_errors: run.planning_errors.len() as u64,
             cancelled: run.skipped_by_cancel,
         },
@@ -1252,37 +1383,6 @@ fn open_source(item: &PlannedItem) -> Result<(File, std::fs::Metadata), String> 
             item.source_display
         )
     })
-}
-
-/// 出力先絶対パス (subdir + name)。
-fn output_target(dest_dir: &Path, subdir: &[OsString], name: &OsStr) -> PathBuf {
-    let mut path = dest_dir.to_path_buf();
-    for component in subdir {
-        path.push(component);
-    }
-    path.push(name);
-    path
-}
-
-/// `.txt` 用の既存分類 (期待bytesと直接比較)。
-fn classify_existing_bytes(target: &Path, expect: &[u8]) -> ExistingState {
-    match std::fs::symlink_metadata(target) {
-        Ok(md) if md.is_file() => {
-            if md.len() != expect.len() as u64 {
-                return ExistingState::Conflict;
-            }
-            match std::fs::read(target) {
-                Ok(existing) if existing == expect => ExistingState::Identical,
-                Ok(_) => ExistingState::Conflict,
-                Err(_) => ExistingState::Conflict,
-            }
-        }
-        // 存在するが通常ファイルでない → 衝突として扱う
-        Ok(_) => ExistingState::Conflict,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ExistingState::NotExists,
-        // 権限等で判定不能 → 安全側 (書き込まない) に倒す
-        Err(_) => ExistingState::Conflict,
-    }
 }
 
 // ===== Tauri commands =====
@@ -2154,6 +2254,252 @@ mod tests {
             .execute(&[asset_id], &dest2, ExportStructure::Preserve)
             .unwrap();
         assert!(dest2.join("copy/b.png").exists(), "present優先の代表選択");
+    }
+
+    // ===== FG-WP16-3 B1: 出力経路の包含 (symlink脱出防止) =====
+
+    /// dir直下のファイル/ディレクトリ列挙 (パス文字列化)。
+    fn entry_names(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect()
+    }
+
+    /// preserve構造で出力dir内の既存symlink (`DEST/sub -> /outside`) を
+    /// 辿って外部へ書き出さない (中間ディレクトリ成分の構造的拒否)。
+    /// 失敗は項目単位で報告され、外部には1ファイルも作られない。
+    #[test]
+    #[cfg(unix)]
+    fn preserve_export_does_not_escape_through_subdir_symlink() {
+        let (dir, db, service, _host, root_dir) = flat_service("symsub");
+        let root_id = root_id_of(&db);
+        let (a, _, _) = add_asset(&db, root_id, &root_dir, "sub/dir/x.png", 1);
+        let dest = dir.0.join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        let outside = dir.0.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, dest.join("sub")).unwrap();
+
+        let result = service
+            .execute(&[a], &dest, ExportStructure::Preserve)
+            .unwrap();
+        assert_eq!(
+            result.summary.failed, 1,
+            "symlink成分への書き出しは失敗報告: {:?}",
+            result.summary
+        );
+        assert!(
+            result
+                .failures
+                .iter()
+                .any(|f| f.output_rel_path.contains("sub")),
+            "失敗理由に出力先が現れる: {:?}",
+            result.failures
+        );
+        // 外部へは1ファイルも作られない (blockerの本体)
+        assert!(
+            entry_names(&outside).is_empty(),
+            "symlink先の外部へファイルが作られた: {:?}",
+            entry_names(&outside)
+        );
+        // symlink自体は無傷 (指す先を辿って差し替えない)
+        assert!(std::fs::symlink_metadata(dest.join("sub"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    /// 出力root自体の最終成分がsymlinkなら実行を拒否する (分かりやすい
+    /// エラー報告)。リンク先の実ディレクトリには何も書かない。
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_destination_root_is_rejected() {
+        let (dir, db, service, _host, root_dir) = flat_service("symroot-out");
+        let root_id = root_id_of(&db);
+        let (a, _, _) = add_asset(&db, root_id, &root_dir, "img.png", 1);
+        let real = dir.0.join("real-out");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.0.join("out-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let err = service
+            .execute(&[a], &link, ExportStructure::Flat)
+            .unwrap_err();
+        assert!(
+            err.contains("シンボリックリンク"),
+            "root symlinkは日本語で報告: {err}"
+        );
+        assert!(
+            entry_names(&real).is_empty(),
+            "リンク先へ書き込まれた: {:?}",
+            entry_names(&real)
+        );
+    }
+
+    /// 最終ファイル名が (外部実体への) symlinkの場合はConflict扱い —
+    /// リンクもリンク先の実体も書き換えない。
+    #[test]
+    #[cfg(unix)]
+    fn final_name_symlink_in_destination_is_conflict_not_overwrite() {
+        let (dir, db, service, _host, root_dir) = flat_service("symlast");
+        let root_id = root_id_of(&db);
+        let (a, _, _) = add_asset(&db, root_id, &root_dir, "img.png", 1);
+        let dest = dir.0.join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        let outside_target = dir.0.join("outside-img.png");
+        std::fs::write(&outside_target, b"user file").unwrap();
+        std::os::unix::fs::symlink(&outside_target, dest.join("img.png")).unwrap();
+
+        let result = service.execute(&[a], &dest, ExportStructure::Flat).unwrap();
+        assert_eq!(result.summary.conflict, 1, "{:?}", result.summary);
+        assert_eq!(std::fs::read(&outside_target).unwrap(), b"user file");
+        assert!(std::fs::symlink_metadata(dest.join("img.png"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    // ===== FG-WP16-3 N1/N2/N3: summary集計・asset_count・manifest所有権 =====
+
+    /// summaryのconflict/failedはtruncation前の全件から計算される (>100件)。
+    #[test]
+    fn result_summary_counts_full_issues_before_truncation() {
+        let mk_item = |i: i64, image: FileOutcome, txt: FileOutcome| ItemResult {
+            asset_id: i,
+            asset_uuid: format!("u{i}"),
+            display_name: format!("i{i}.png"),
+            source_display: format!("/src/i{i}.png"),
+            output_rel: format!("i{i}.png"),
+            txt_rel: format!("i{i}.txt"),
+            image,
+            txt,
+            caption_origin: CaptionOrigin::None,
+        };
+        let mut items = Vec::new();
+        for i in 0..150 {
+            items.push(mk_item(
+                i,
+                FileOutcome::Failed("x".to_string()),
+                FileOutcome::Failed("x".to_string()),
+            ));
+        }
+        for i in 150..260 {
+            items.push(mk_item(i, FileOutcome::Conflict, FileOutcome::Conflict));
+        }
+        let run = ExportRun {
+            dest_dir: PathBuf::from("/tmp/unused"),
+            structure: ExportStructure::Flat,
+            items,
+            planning_errors: Vec::new(),
+            cancelled: false,
+            skipped_by_cancel: 0,
+        };
+        let dto = build_result_dto(&run, Path::new("/tmp/unused/export-manifest.json"));
+        assert_eq!(dto.summary.failed, 150, "{:?}", dto.summary);
+        assert_eq!(dto.summary.conflict, 110, "{:?}", dto.summary);
+        assert_eq!(dto.summary.total, 260);
+        assert!(dto.issues_truncated);
+        assert_eq!(dto.failures.len(), ISSUE_REPORT_LIMIT);
+        assert_eq!(dto.conflicts.len(), ISSUE_REPORT_LIMIT);
+    }
+
+    /// manifestのasset_countはキャンセル未処理を含む (DTOのtotalと同一定義)。
+    #[test]
+    fn manifest_asset_count_includes_cancelled_skips() {
+        let dir = TestDir::new("mcount");
+        let item = ItemResult {
+            asset_id: 1,
+            asset_uuid: "u1".to_string(),
+            display_name: "a.png".to_string(),
+            source_display: "/src/a.png".to_string(),
+            output_rel: "a.png".to_string(),
+            txt_rel: "a.txt".to_string(),
+            image: FileOutcome::Written,
+            txt: FileOutcome::Written,
+            caption_origin: CaptionOrigin::None,
+        };
+        let run = ExportRun {
+            dest_dir: dir.0.clone(),
+            structure: ExportStructure::Flat,
+            items: vec![item],
+            planning_errors: vec![PlannedError {
+                asset_id: 2,
+                reason: "不在".to_string(),
+            }],
+            cancelled: true,
+            skipped_by_cancel: 3,
+        };
+        let manifest_path = publish_manifest(&run, "2026-09-03T00:00:00Z").unwrap();
+        assert_eq!(manifest_path, dir.0.join(EXPORT_MANIFEST_FILE));
+        let parsed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.0.join(EXPORT_MANIFEST_FILE)).unwrap(),
+        )
+        .unwrap();
+        // 1 (処理済み) + 1 (plan失敗) + 3 (キャンセル) = 5
+        assert_eq!(parsed["asset_count"], 5, "{parsed}");
+        assert_eq!(parsed["summary"]["cancelled"], 3);
+        assert_eq!(parsed["cancelled"], true);
+    }
+
+    /// 既存の `export-manifest.json` がGEN-TO成果物 (format_version一致) なら
+    /// 最新runの記録として置換する (従来どおり同一パス)。
+    #[test]
+    fn manifest_replaces_gento_owned_file_in_place() {
+        let dir = TestDir::new("mown");
+        // 先行runのmanifest (format_version 1)
+        let first = cancelled_run_base(dir.0.clone());
+        publish_manifest(&first, "2026-09-03T00:00:00Z").unwrap();
+        assert!(dir.0.join(EXPORT_MANIFEST_FILE).exists());
+        // 再実行 → 同一名へ置換
+        let second = cancelled_run_base(dir.0.clone());
+        let path = publish_manifest(&second, "2026-09-03T00:01:00Z").unwrap();
+        assert_eq!(path, dir.0.join(EXPORT_MANIFEST_FILE));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["created_at"], "2026-09-03T00:01:00Z");
+    }
+
+    fn cancelled_run_base(dest_dir: PathBuf) -> ExportRun {
+        ExportRun {
+            dest_dir,
+            structure: ExportStructure::Flat,
+            items: Vec::new(),
+            planning_errors: Vec::new(),
+            cancelled: true,
+            skipped_by_cancel: 0,
+        }
+    }
+
+    /// ユーザー所有の `export-manifest.json` は上書きしない — 回避名へ出版し、
+    /// ユーザーファイルは無傷 (FG-WP16-3 N3)。
+    #[test]
+    fn manifest_never_overwrites_user_owned_file() {
+        let dir = TestDir::new("muser");
+        let user_file = dir.0.join(EXPORT_MANIFEST_FILE);
+        std::fs::write(&user_file, "{\"not\":\"a gento manifest\"}").unwrap();
+        let run = cancelled_run_base(dir.0.clone());
+        let path = publish_manifest(&run, "2026-09-03T00:00:00Z").unwrap();
+        assert_ne!(path, user_file, "回避名へ出版される");
+        assert!(path.to_string_lossy().contains("export-manifest-"));
+        // ユーザーファイルは無傷
+        assert_eq!(
+            std::fs::read_to_string(&user_file).unwrap(),
+            "{\"not\":\"a gento manifest\"}"
+        );
+        // 回避名のmanifestも読める
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["format_version"], EXPORT_MANIFEST_VERSION);
+        // tmp残骸なし
+        let leftovers: Vec<String> = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .filter_map(|e| {
+                let name = e.unwrap().file_name().into_string().unwrap();
+                name.contains("gento-tmp").then_some(name)
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     // ===== サービス排他 =====

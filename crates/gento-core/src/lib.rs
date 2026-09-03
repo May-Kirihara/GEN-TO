@@ -35,7 +35,7 @@ pub use library::{
     ScanOptions, ScanPhase, ScanProgress, ScanSummary, WalkOutcome, WatchBuffer,
     DEFAULT_SCAN_BATCH_SIZE, PROVISIONAL_FILE_FLAG,
 };
-pub use path_safety::open_regular_beneath;
+pub use path_safety::{open_regular_beneath, OutputDir, RenameAtNoReplaceError};
 pub use repo::{
     AssetRecord, AssetRepo, FileRecord, FileRepo, FileUpsert, HashState, LibraryRootRecord,
     LibraryRootRepo, NewAsset, OsFileId, ParseScanStateError, RepoError, RootSettings, ScanState,

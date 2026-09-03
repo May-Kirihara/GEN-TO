@@ -298,44 +298,32 @@ fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// 絶対パスらしい部分 (`/` 始まりの区間) を `<path>` へ置換する
-/// (診断bundleの実パス除外・WP-15)。
+/// 絶対パスらしい部分を `<path>` へ置換する
+/// (診断bundleの実パス除外・WP-15。FG-WP16-3 B4でWindows対応・空白混入
+/// パスの丸ごとsculpt化)。
 ///
-/// パス開始の条件: `/` が語頭・空白・句読点等の直後にあること
-/// (英数字・`/`・`:` の直後の `/` はURL (`https://…/v1` 等) の続きや
-/// 相対表現のため対象外)。区間はパス構成文字
-/// (`A-Za-z0-9._+-`) の連続。
+/// 開始条件 (いずれも語境界 — 英数字・`/`・`\`・`:`・`.` の直後はURL等の
+/// 続きのため対象外):
+/// - unix絶対: `/` で始まる区間
+/// - UNC: `\\` で始まる区間
+/// - Windowsドライブ: `[A-Za-z]:[/\\]` (直前が英数字/`_`でないこと —
+///   `https://` 等のURL部を誤検出しない)
+///
+/// 区間はパス構成文字 (`A-Za-z0-9._+-`) と区切り (`/`・`\`) の連続。
+/// **空白混入パス**: 区間の直後に空白があり、その後の (パス文字|区切り|空白)
+/// の連続の中にさらに区切りが現れる場合はパスが続いているとみなし、
+/// 空白ごと丸ごと対象にする (`/home/u/My Photos/x.png` 等。過剰scrubの
+/// 誤爆 < 漏れ、の方針 — URLは `:` が連続を打ち切るため保持される)。
 pub fn scrub_paths(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = String::with_capacity(input.len());
     let mut i = 0usize;
     while i < bytes.len() {
-        let b = bytes[i];
-        if b == b'/'
-            && (i == 0
-                || !(bytes[i - 1].is_ascii_alphanumeric()
-                    || bytes[i - 1] == b'/'
-                    || bytes[i - 1] == b':'
-                    || bytes[i - 1] == b'.'))
-        {
-            let mut end = i;
-            while end < bytes.len() {
-                let c = bytes[end];
-                let is_path_char =
-                    c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-' | b'+' | b'/');
-                if !is_path_char {
-                    break;
-                }
-                end += 1;
-            }
-            // 末尾の`/`は区切りの可能性が高いため除外
-            let mut trim = end;
-            while trim > i && bytes[trim - 1] == b'/' {
-                trim -= 1;
-            }
-            if trim > i + 1 {
+        if let Some(end) = path_candidate_end(bytes, i) {
+            // 末尾の区切り/空白は除外済み。実質1文字しか無ければ置換しない
+            if end > i + 1 {
                 out.push_str("<path>");
-                i = trim;
+                i = end;
                 continue;
             }
         }
@@ -349,6 +337,77 @@ pub fn scrub_paths(input: &str) -> String {
         i += ch_len;
     }
     out
+}
+
+/// パス構成文字 (`A-Za-z0-9._+-`)。
+fn is_path_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b'+')
+}
+
+/// パス区切り (`/` と `\` — Windows両用)。
+fn is_path_sep(b: u8) -> bool {
+    b == b'/' || b == b'\\'
+}
+
+/// `i` が絶対パス候補の開始ならその終端 (末尾の区切り・空白を除く) を
+/// 返す。候補でなければNone。
+fn path_candidate_end(bytes: &[u8], i: usize) -> Option<usize> {
+    let boundary = |pos: usize| -> bool {
+        pos == 0
+            || !(bytes[pos - 1].is_ascii_alphanumeric()
+                || bytes[pos - 1] == b'/'
+                || bytes[pos - 1] == b'\\'
+                || bytes[pos - 1] == b':'
+                || bytes[pos - 1] == b'.')
+    };
+    let is_drive_start = bytes[i].is_ascii_alphabetic()
+        && bytes.get(i + 1) == Some(&b':')
+        && bytes.get(i + 2).is_some_and(|&b| is_path_sep(b))
+        // ドライブ文字の直前は英数字/`_`でないこと (URLスキーム末尾の
+        // "s:" 等を誤検出しない)
+        && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'));
+    let starts = bytes[i] == b'/' && boundary(i)
+        || bytes[i] == b'\\' && bytes.get(i + 1) == Some(&b'\\') && boundary(i)
+        || is_drive_start;
+    if !starts {
+        return None;
+    }
+    // ドライブ文字の場合は "C:" の分を読み飛ばしてからrunを消費する
+    // (区切りから始まる)
+    let mut end = if is_drive_start { i + 2 } else { i };
+    loop {
+        while end < bytes.len() && (is_path_char(bytes[end]) || is_path_sep(bytes[end])) {
+            end += 1;
+        }
+        // 空白継続判定: 続く (パス文字|区切り|空白) 連続の中に区切りが
+        // さらに現れれば、パスが空白を挟んで続いているとみなす
+        if end < bytes.len() && bytes[end] == b' ' {
+            let mut j = end;
+            while j < bytes.len()
+                && (is_path_char(bytes[j]) || is_path_sep(bytes[j]) || bytes[j] == b' ')
+            {
+                j += 1;
+            }
+            if bytes[end..j].iter().any(|&b| is_path_sep(b)) {
+                // 最後の区切りに続く構成要素までをパスに含める
+                // (末尾の空白区切りの通常語はパスの外 — 例:
+                // "/home/u/My Photos/x.png ignored" の "ignored")
+                let last_sep = bytes[end..j].iter().rposition(|&b| is_path_sep(b)).unwrap() + end;
+                let mut k = last_sep + 1;
+                while k < bytes.len() && (is_path_char(bytes[k]) || is_path_sep(bytes[k])) {
+                    k += 1;
+                }
+                end = k;
+                continue;
+            }
+        }
+        break;
+    }
+    // 末尾の区切り・空白は区切りとして除外
+    while end > i && (is_path_sep(bytes[end - 1]) || bytes[end - 1] == b' ') {
+        end -= 1;
+    }
+    Some(end)
 }
 
 #[cfg(test)]
@@ -497,6 +556,48 @@ mod tests {
         assert_eq!(scrub_paths(url), url);
         // 相対パス・日本語は無傷
         let casual = "file a.png in dir/sub, 件数 3";
+        assert_eq!(scrub_paths(casual), casual);
+    }
+
+    /// FG-WP16-3 B4: Windows絶対パス (ドライブ文字・UNC) と空白混入unixパスを
+    /// 丸ごscrubする (誤爆 < 漏れの方針。URLは保持)。
+    #[test]
+    fn scrub_paths_covers_windows_drive_unc_and_space_containing_paths() {
+        // ドライブ文字 (区切り\\と/両方)
+        let drive = "failed to read C:\\Users\\name\\work\\img.png (denied)";
+        let scrubbed = scrub_paths(drive);
+        assert!(!scrubbed.contains("Users"), "{scrubbed}");
+        assert!(!scrubbed.contains("img.png"), "{scrubbed}");
+        assert!(scrubbed.contains("<path>"), "{scrubbed}");
+        assert!(scrubbed.contains("(denied)"), "{scrubbed}");
+
+        let fwd = "open C:/Users/name/work/x.png ok";
+        let scrubbed = scrub_paths(fwd);
+        assert!(!scrubbed.contains("Users"), "{scrubbed}");
+        assert!(scrubbed.contains("ok"), "{scrubbed}");
+
+        // UNC (\\\\server\\share\\…)
+        let unc = "load \\\\fileserver\\photos\\2026\\img.png failed";
+        let scrubbed = scrub_paths(unc);
+        assert!(!scrubbed.contains("fileserver"), "{scrubbed}");
+        assert!(!scrubbed.contains("photos"), "{scrubbed}");
+        assert!(scrubbed.contains("failed"), "{scrubbed}");
+
+        // 空白混入unixパス (`/` を含む続きは丸ごと1パス候補)
+        let spaced = "cannot stat /home/u/My Photos/x.png ignored";
+        let scrubbed = scrub_paths(spaced);
+        assert!(!scrubbed.contains("My Photos"), "{scrubbed}");
+        assert!(!scrubbed.contains("x.png"), "{scrubbed}");
+        assert!(
+            scrubbed.contains("cannot stat <path> ignored"),
+            "{scrubbed}"
+        );
+
+        // URLは相変わらず保持 (ドライブ文字誤検出しない)
+        let url = "endpoint https://api.example.com/v1 responded";
+        assert_eq!(scrub_paths(url), url);
+        // 時刻表現・区切り付き本文はドライブ扱いしない
+        let casual = "at 10:00:00 done, ratio 3:4 ok";
         assert_eq!(scrub_paths(casual), casual);
     }
 }

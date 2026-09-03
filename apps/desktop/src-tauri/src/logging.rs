@@ -120,12 +120,12 @@ pub(crate) static SUBSCRIBER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex:
 // (tracingの既知の制限)。テストからログを検証する場合はこちらの
 // プロセス-global subscriberを使い、出力をthread idで仕分ける。
 
-#[cfg(test)]
+#[cfg(all(test, any(debug_assertions, feature = "devtools")))]
 pub(crate) struct TestCapture {
     lines: std::sync::Mutex<Vec<(String, String)>>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(debug_assertions, feature = "devtools")))]
 impl TestCapture {
     fn push(&self, thread: String, line: String) {
         let mut lines = self.lines.lock().unwrap_or_else(|p| p.into_inner());
@@ -147,14 +147,14 @@ impl TestCapture {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(debug_assertions, feature = "devtools")))]
 #[derive(Clone, Default)]
 pub(crate) struct TestCaptureWriter {
     sink: Option<std::sync::Arc<TestCapture>>,
     buf: Vec<u8>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(debug_assertions, feature = "devtools")))]
 impl std::io::Write for TestCaptureWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if let Some(sink) = &self.sink {
@@ -174,7 +174,7 @@ impl std::io::Write for TestCaptureWriter {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(debug_assertions, feature = "devtools")))]
 impl<'a> MakeWriter<'a> for TestCaptureWriter {
     type Writer = TestCaptureWriter;
 
@@ -183,12 +183,12 @@ impl<'a> MakeWriter<'a> for TestCaptureWriter {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(debug_assertions, feature = "devtools")))]
 static TEST_CAPTURE: std::sync::OnceLock<std::sync::Arc<TestCapture>> = std::sync::OnceLock::new();
 
 /// テストbinary全体で1つのcapture subscriberをinstallする
 /// (二度目以降の呼び出しは既存のcaptureを返す)。
-#[cfg(test)]
+#[cfg(all(test, any(debug_assertions, feature = "devtools")))]
 pub(crate) fn test_capture() -> std::sync::Arc<TestCapture> {
     let existing = TEST_CAPTURE.get();
     if let Some(cap) = existing {

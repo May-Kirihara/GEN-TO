@@ -8,7 +8,7 @@
 //!
 //! 契約: docs/dev/api-contract.md §7以降。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -117,8 +117,10 @@ enum EnqueueOutcome {
 }
 
 /// 全件生成のbacklog項目 (キュー上限で入れ切れなかった残り)。
+/// `generation` は投入元の `request_all` 世代 (FG-WP16-3 B3)。
 #[derive(Debug, Clone)]
 struct BacklogItem {
+    generation: u64,
     asset: AssetSnapshot,
     size_class: SizeClass,
     priority: Priority,
@@ -128,6 +130,9 @@ struct BacklogItem {
 #[derive(Debug, Default)]
 struct BacklogState {
     items: VecDeque<BacklogItem>,
+    /// このbacklogの属する `request_all` 世代 (単調増加トークン。
+    /// `request_generation` カウンタ由来 — 0は初期/clear後)。
+    generation: u64,
     /// 現在の要求で繰延された総数 (報告用。置換時にリセット)。
     deferred_total: u64,
     /// 現在の要求でbacklogから処理 (投入・統合・フィード時ヒット) した数。
@@ -252,6 +257,8 @@ pub struct ThumbnailService {
     core: Arc<ThumbnailCore>,
     /// 全件生成の繰延残り (キュー空きを完了通知で待つ。WP-16 F1)。
     backlog: Arc<Mutex<BacklogState>>,
+    /// `request_all` の世代トークン供給 (単調増加 — FG-WP16-3 B3)。
+    request_generation: AtomicU64,
     /// feeder起床チャネルの複製 (backlog積み上げ直後の即時排液用)。
     feeder_wake: Sender<()>,
     feeder_stop: Arc<AtomicBool>,
@@ -348,6 +355,7 @@ impl ThumbnailService {
         Ok(Arc::new(Self {
             core,
             backlog,
+            request_generation: AtomicU64::new(0),
             feeder_wake: feeder_wake_tx,
             feeder_stop,
             feeder: Mutex::new(Some(feeder)),
@@ -407,7 +415,15 @@ impl ThumbnailService {
     /// (library.rsのハッシュ再提出と同一の需要駆動方式)。返し値の
     /// `deferred` が繰延件数。既存のbacklogは新しいスナップショットで
     /// 置換され、排液完了・置換・終了時の残数はログで報告される。
+    ///
+    /// 世代安全性 (FG-WP16-3 B3): 各呼び出しは単調増加のgeneration tokenを
+    /// 取得し、開始時にbacklogを自世代で初期化した上で、繰延分を**単一
+    /// ロック+世代検査で一括install**する。install時点でより新しい
+    /// request_allが開始済みなら自世代の繰延分は破棄される (backlogは
+    /// 常に最新世代のみ)。プールへ**既に投入済み**の旧世代jobは冪等な
+    /// cache書き込みのため完了を許容する (仕様 — docs/dev/api-contract §8)。
     pub fn request_all(&self, assets: &[AssetSnapshot], size_class: SizeClass) -> RequestAccepted {
+        let generation = self.request_generation.fetch_add(1, Ordering::SeqCst) + 1;
         {
             let mut backlog = lock_backlog(&self.backlog);
             if !backlog.items.is_empty() {
@@ -418,10 +434,14 @@ impl ThumbnailService {
                     "generate-all backlog replaced by a new request"
                 );
             }
-            *backlog = BacklogState::default();
+            backlog.items.clear();
+            backlog.generation = generation;
+            backlog.deferred_total = 0;
+            backlog.processed = 0;
         }
         let mut counters = RequestAccepted::default();
         let mut immediate = Vec::new();
+        let mut deferred: Vec<BacklogItem> = Vec::new();
         for asset in assets {
             if !asset.readable {
                 counters.skipped_unreadable += 1;
@@ -438,19 +458,34 @@ impl ThumbnailService {
                     immediate.push(item);
                 }
                 EnqueueOutcome::Full => {
-                    let mut backlog = lock_backlog(&self.backlog);
-                    backlog.items.push_back(BacklogItem {
+                    deferred.push(BacklogItem {
+                        generation,
                         asset: asset.clone(),
                         size_class,
                         priority: Priority::Background,
                     });
-                    backlog.deferred_total += 1;
                     counters.deferred += 1;
                 }
                 EnqueueOutcome::Shutdown => counters.rejected_full += 1,
             }
         }
         send_immediate(&self.core.emitter_tx, immediate);
+        // 繰延分の一括install (世代検査付き — 旧実装の「clear後に逐次append」は
+        // 並行request_allやdrainと交錯して混在backlogを生んだ)
+        {
+            let mut backlog = lock_backlog(&self.backlog);
+            if backlog.generation == generation {
+                backlog.deferred_total = deferred.len() as u64;
+                backlog.items.extend(deferred);
+            } else if !deferred.is_empty() {
+                tracing::info!(
+                    generation,
+                    superseded_by = backlog.generation,
+                    dropped = deferred.len(),
+                    "generate-all deferred items discarded: superseded by a newer request"
+                );
+            }
+        }
         // backlogを積んだ直後にすでに空きがある場合へ備えfeederを即時起床
         // させる (完了通知のみを待つと出発が遅れる)。
         let _ = self.feeder_wake.send(());
@@ -484,8 +519,48 @@ impl ThumbnailService {
     }
 
     /// 要求のキャンセル (未開始は即時、実行中は協調)。
+    /// プールに**未投入**のbacklog entries (generate-all繰延分) も同じ
+    /// キーで破棄する — 破棄分がfeederから二度と投入されない
+    /// (FG-WP16-3 B2)。
     pub fn cancel(&self, assets: &[AssetSnapshot], size_class: SizeClass) -> CancelResult {
         let mut result = CancelResult::default();
+        // backlogから破棄したキー (プール未投入のためpool.cancel_jobは
+        // NotFoundになる — 二重計上しない)
+        let mut dropped_keys: HashSet<String> = HashSet::new();
+        {
+            let keys: HashSet<String> = assets
+                .iter()
+                .filter(|a| a.readable)
+                .map(|a| {
+                    cache_key(
+                        &asset_fingerprint(&a.source_path, a.byte_size, a.mtime_ms),
+                        size_class,
+                    )
+                    .hex
+                })
+                .collect();
+            if !keys.is_empty() {
+                let mut backlog = lock_backlog(&self.backlog);
+                let before = backlog.items.len();
+                backlog.items.retain(|item| {
+                    let key = cache_key(
+                        &asset_fingerprint(
+                            &item.asset.source_path,
+                            item.asset.byte_size,
+                            item.asset.mtime_ms,
+                        ),
+                        item.size_class,
+                    );
+                    !keys.contains(&key.hex)
+                });
+                let dropped = (before - backlog.items.len()) as u64;
+                if dropped > 0 {
+                    tracing::info!(dropped, "generate-all backlog entries dropped by cancel");
+                    result.cancelled_backlog = dropped;
+                    dropped_keys = keys;
+                }
+            }
+        }
         for asset in assets {
             if !asset.readable {
                 result.skipped_unreadable += 1;
@@ -498,7 +573,11 @@ impl ThumbnailService {
             match self.core.pool.cancel_job(&key.hex) {
                 CancelOutcome::CancelledQueued => result.cancelled_queued += 1,
                 CancelOutcome::CancelRequested => result.cancel_requested += 1,
-                CancelOutcome::NotFound => result.not_found += 1,
+                CancelOutcome::NotFound => {
+                    if !dropped_keys.contains(&key.hex) {
+                        result.not_found += 1;
+                    }
+                }
             }
         }
         result
@@ -685,23 +764,45 @@ fn drain_backlog(core: &ThumbnailCore, backlog: &Mutex<BacklogState>, stop: &Ato
                 break;
             };
             taken += 1;
+            // popからsubmitの間に新しいrequest_allがbacklogを置換しても、
+            // このitemの再キューは世代検査で拒否される (旧世代は破棄)。
             match core.enqueue_asset(&item.asset, item.size_class, item.priority) {
                 EnqueueOutcome::Queued | EnqueueOutcome::Merged => {
-                    lock_backlog(backlog).processed += 1;
+                    let mut b = lock_backlog(backlog);
+                    if b.generation == item.generation {
+                        b.processed += 1;
+                    }
                 }
                 EnqueueOutcome::CacheHit(hit) => {
-                    lock_backlog(backlog).processed += 1;
+                    let mut b = lock_backlog(backlog);
+                    if b.generation == item.generation {
+                        b.processed += 1;
+                    }
                     immediate.push(hit);
                 }
                 EnqueueOutcome::Full => {
                     // 他の投入と競合して満杯: 先頭へ戻して次の完了で再試行
-                    lock_backlog(backlog).items.push_front(item);
+                    // (ただし自世代のみ — 置換済みなら破棄)
+                    let mut b = lock_backlog(backlog);
+                    if b.generation == item.generation {
+                        b.items.push_front(item);
+                    } else {
+                        tracing::debug!(
+                            generation = item.generation,
+                            superseded_by = b.generation,
+                            "popped backlog item discarded: superseded while submitting"
+                        );
+                    }
                     hit_full = true;
                     break;
                 }
                 EnqueueOutcome::Shutdown => {
                     // プール停止: 以降の再投入は無意味 (残りは停止時報告)
-                    lock_backlog(backlog).items.push_front(item);
+                    let mut b = lock_backlog(backlog);
+                    if b.generation == item.generation {
+                        b.items.push_front(item);
+                    }
+                    send_immediate(&core.emitter_tx, immediate);
                     return;
                 }
             }
@@ -842,6 +943,9 @@ pub struct ReprioritizeResult {
 pub struct CancelResult {
     pub cancelled_queued: u64,
     pub cancel_requested: u64,
+    /// backlog (プール未投入のgenerate-all繰延分) から破棄した件数
+    /// (FG-WP16-3 B2 — 差し替え投入されない)。
+    pub cancelled_backlog: u64,
     pub not_found: u64,
     pub skipped_unreadable: u64,
 }
@@ -1396,6 +1500,159 @@ mod tests {
             4,
             "shutdown時点の残りは報告 (ログ) のうえ投入されずに残る"
         );
+    }
+
+    /// FG-WP16-3 B2: cancelはプール未投入のbacklog entriesも破棄する
+    /// (feederが破棄分を二度と投入しない)。
+    #[test]
+    fn cancel_discards_deferred_backlog_entries() {
+        let dir = TestDir::new("backlog-cancel");
+        let events = SharedEvents::default();
+        let svc = service_with_queue_capacity(&dir, events.clone(), 1);
+        svc.set_paused(true); // 決定的にキューを埋める
+        let assets: Vec<AssetSnapshot> = (0..3)
+            .map(|i| {
+                asset(
+                    u64::try_from(i).unwrap() + 1,
+                    &dir.write_png(&format!("c{i}.png"), 64, 64),
+                    true,
+                )
+            })
+            .collect();
+        let accepted = svc.request_all(&assets, SizeClass::S256);
+        assert_eq!(accepted.queued, 1);
+        assert_eq!(accepted.deferred, 2);
+        assert_eq!(svc.backlog_len(), 2);
+
+        let cancel = svc.cancel(&assets, SizeClass::S256);
+        assert_eq!(cancel.cancelled_queued, 1, "{cancel:?}");
+        assert_eq!(
+            cancel.cancelled_backlog, 2,
+            "backlog分も破棄報告: {cancel:?}"
+        );
+        assert_eq!(cancel.not_found, 0, "{cancel:?}");
+        assert_eq!(svc.backlog_len(), 0, "cancelでbacklogは空になる");
+
+        // 解除して十分待っても、破棄分が投入されることはない
+        svc.set_paused(false);
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            events.ready_items().is_empty(),
+            "キャンセル済み資産は生成されない: {:?}",
+            events.ready_items()
+        );
+        assert_eq!(svc.stats_dto().generated, 0);
+        svc.shutdown();
+    }
+
+    /// FG-WP16-3 B3: 再押下 (request_all) はbacklogを最新世代で置換する。
+    /// プールに投入済みの旧世代jobの完了は冪等なcache書き込みのため許容、
+    /// backlogから投入されるのは最後のrequestの資産のみ。
+    #[test]
+    fn generate_all_repress_replaces_backlog_with_latest_generation() {
+        let dir = TestDir::new("backlog-repress");
+        let events = SharedEvents::default();
+        let svc = service_with_queue_capacity(&dir, events.clone(), 2);
+        svc.set_paused(true);
+        let mk = |prefix: &str, base_id: u64, n: usize| -> Vec<AssetSnapshot> {
+            (0..n)
+                .map(|i| {
+                    asset(
+                        base_id + u64::try_from(i).unwrap(),
+                        &dir.write_png(&format!("{prefix}{i}.png"), 64, 64),
+                        true,
+                    )
+                })
+                .collect()
+        };
+        let a = mk("a", 1, 4);
+        let b = mk("b", 100, 2);
+
+        let first = svc.request_all(&a, SizeClass::S256);
+        assert_eq!(first.queued, 2);
+        assert_eq!(first.deferred, 2, "a2,a3がbacklogへ");
+        let second = svc.request_all(&b, SizeClass::S256);
+        assert_eq!(second.deferred, 2, "プールはa0,a1で満杯のためbも繰延");
+        // backlogは最後のrequest (b) の資産のみ
+        assert_eq!(svc.backlog_len(), 2);
+        let ids: Vec<u64> = lock_backlog(&svc.backlog)
+            .items
+            .iter()
+            .map(|item| item.asset.id.value())
+            .collect();
+        assert!(ids.contains(&100) && ids.contains(&101), "{ids:?}");
+        assert!(
+            !ids.contains(&3) && !ids.contains(&4),
+            "旧世代a2,a3は不在: {ids:?}"
+        );
+
+        // 排液: a0,a1 (プール投入済み旧世代 — 完了許容) + b0,b1のみ
+        svc.set_paused(false);
+        let ready = events.wait_ready_count(4);
+        wait_backlog_drained(&svc);
+        let ready_ids: std::collections::HashSet<u64> =
+            ready.iter().map(|r| r.asset_id.value()).collect();
+        for expected in [1u64, 2, 100, 101] {
+            assert!(
+                ready_ids.contains(&expected),
+                "生成済み: {expected} in {ready_ids:?}"
+            );
+        }
+        assert!(
+            !ready_ids.contains(&3) && !ready_ids.contains(&4),
+            "置換された旧世代のbacklog資産は生成されない: {ready_ids:?}"
+        );
+        assert_eq!(svc.stats_dto().generated, 4);
+        svc.shutdown();
+    }
+
+    /// FG-WP16-3 B3: 並行request_allでもbacklogは常に単一世代 (混在しない)。
+    /// 旧実装の「clear後に旧世代itemを逐次append」は競合で混在を生む —
+    /// 世代検査付き一括installで構造的に排除する。
+    #[test]
+    fn concurrent_request_all_never_mixes_generations_in_backlog() {
+        let dir = TestDir::new("backlog-concurrent");
+        let events = SharedEvents::default();
+        let svc = service_with_queue_capacity(&dir, events.clone(), 2);
+        svc.set_paused(true); // 全件をbacklog経路に流す
+        let mk = |prefix: &str, base_id: u64| -> Vec<AssetSnapshot> {
+            (0..48)
+                .map(|i| {
+                    asset(
+                        base_id + u64::try_from(i).unwrap(),
+                        &dir.write_png(&format!("{prefix}{i:02}.png"), 64, 64),
+                        true,
+                    )
+                })
+                .collect()
+        };
+        let assets_a = Arc::new(mk("x", 1000));
+        let assets_b = Arc::new(mk("y", 2000));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for assets in [Arc::clone(&assets_a), Arc::clone(&assets_b)] {
+            let svc = Arc::clone(&svc);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                svc.request_all(&assets, SizeClass::S256);
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let ids: Vec<u64> = lock_backlog(&svc.backlog)
+            .items
+            .iter()
+            .map(|item| item.asset.id.value())
+            .collect();
+        let all_a = ids.iter().all(|id| (1000..1048).contains(id));
+        let all_b = ids.iter().all(|id| (2000..2048).contains(id));
+        assert!(
+            all_a || all_b,
+            "backlogは単一世代でなければならない (混在): {ids:?}"
+        );
+        svc.shutdown();
     }
 
     #[test]

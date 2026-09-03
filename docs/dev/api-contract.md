@@ -294,12 +294,17 @@ invoke<{ updated, not_updated, not_found, skipped_unreadable }>(
 ### `cancel_thumbnail_requests`
 
 ```ts
-invoke<{ cancelled_queued, cancel_requested, not_found, skipped_unreadable }>(
+invoke<{ cancelled_queued, cancel_requested, cancelled_backlog, not_found,
+         skipped_unreadable }>(
   "cancel_thumbnail_requests", { ids: string[], sizeClass })
 ```
 
 - 未開始=即時除去 (イベントは出ない)。実行中=協調キャンセル要求
   (ジョブがデコード前/リサイズ前/エンコード前で検査)。
+- `cancelled_backlog` (FG-WP16-3 B2): プールに**未投入**のgenerate-all
+  繰延分 (backlog) から破棄した件数。同一キーのbacklog entryは同じ
+  cancelで破棄されるため、破棄分がfeederから後段投入されることはない
+  (backlog破棄済みキーは `not_found` に二重計上しない)。
 
 ### `generate_all_thumbnails`
 
@@ -312,6 +317,16 @@ invoke<RequestAccepted>("generate_all_thumbnails", { sizeClass: SizeClassId })
   (`deferred` に件数)、プール完了駆動で空きができ次第投入される
   (WP-16 F1。ライブラリのハッシュ再提出と同一の需要駆動方式)。
   排液完了・再要求による置換・終了/キャッシュ全削除での残数はログで報告。
+- **置換の世代規約 (FG-WP16-3 B3)**: 各 `generate_all` 呼び出しは単調
+  増加のgeneration tokenを取得する。呼び出し開始時にbacklogは即座に
+  新世代へ置換され、繰延分は**単一ロック+世代検査で一括install**される
+  (より新しい呼び出しが開始済みなら破棄)。このためbacklogは常に
+  **最新の要求の資産のみ**を含む (並行押下・排液中の再押下で混入しない)。
+  ただし**プールへ既に投入済み**の旧世代jobは取り消されず、その完了は
+  **冪等なキャッシュ書き込みのため許容**する (内容はキーに対応する
+  正当なサムネイル。cancelで明示的に止めることは可能)。
+  drain中にpopされた旧世代itemが満杯でbacklogへ戻る場合も世代検査で
+  破棄される (再投入されない)。
 
 ### `get_thumbnail_stats`
 
@@ -2412,6 +2427,17 @@ score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
   `gento_core::open_regular_beneath` (登録ルートfdから全コンポーネント歩行。
   FG-WP13-2)。DB参照は `with_reader` (reader接続は `PRAGMA query_only` で
   書き込みSQLを構造的に拒否)。ソースは読み取り専用openのためmtimeも不変。
+- **出力経路の包含 (FG-WP16-3 B1)**: 出力dirはユーザー指定パスを
+  `O_DIRECTORY|O_NOFOLLOW` で開いてfd固定する (**root最終成分がsymlink
+  なら拒否** — 日本語エラーで報告)。preserve構造のサブディレクトリは
+  `openat(.., O_DIRECTORY|O_NOFOLLOW)` の成分歩行で開き、不在なら
+  `mkdirat`→再open (作成とopenの競合安全。既存成分がsymlinkならELOOP
+  拒否)。ファイル書き出し (tmp `O_CREAT|O_EXCL` → sync →
+  `renameat2(RENAME_NOREPLACE)`) も同じdir fd相対で行う。このため
+  `DEST/sub -> /outside` のような**出力dir内の既存symlinkを辿った外部
+  書き出しは構造的に起きない** (該当項目はfailedとして報告され、外部に
+  は1ファイルも作られない)。最終ファイル名が (外部実体への) symlinkの
+  場合はConflict扱い (リンクもリンク先も無傷)。
 - **無断上書き厳禁 (既存出力との衝突)**: 出力先に同名ファイルがある場合、
   サイズ一致ならBLAKE3ストリーム比較し、**内容一致 = 「既に書き出し済み」
   でskip (冪等)**、不一致 = skip + 衝突報告 (manifestと結果DTOに記録)。
@@ -2419,7 +2445,7 @@ score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
   あり、DBの content_hash ではない (スキャン後の変化に強い)。
   新規書き出しは tmp書き (`.{名前}.gento-tmp-{32hex}-{6桁seq}` —
   WP-7 fileopsと同一の厳密形式。出力先が登録ルート内なら起動時掃除の
-  対象) → `sync_all` → `gento_platform::rename_noreplace` による原子公開。
+  対象) → `sync_all` → no-clobber rename による原子公開。
   上書き競合 (renameのDestinationExists) は失敗として扱う。
 - **フォルダ構造**: `preserve` = 代表fileのrel_path親dir構造を出力先に再現
   (成分は `Component::Normal` のみ許可 — `..` 等は構造的に拒否して
@@ -2437,14 +2463,20 @@ score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
   「別のエクスポートが実行中です」)。実行中のpanicで排他状態が残留した
   場合は以後のエクスポートを拒否し続ける (安全側 — 再起動で回復)。
 - **manifest** (`export-manifest.json` を出力dirへ): tmp書き→sync→
-  原子renameで出版。**GEN-TO自身の成果物のため再実行での置換は許容**
-  (最新runの記録が残る。ユーザーファイルの無断上書き規約の対象外)。
+  **`renameat2(RENAME_NOREPLACE)` で出版** (FG-WP16-3 N3)。
+  既存 `export-manifest.json` が**GEN-TO自身の旧manifest**
+  (format_versionが現行と一致するJSON) なら最新runの記録として同一名で
+  置換する。それ以外 (ユーザー所有のファイル・破損) は**上書きせず**
+  回避名 `export-manifest-{run uuid}.json` へ出版する (応答の
+  `manifestPath` が実際のパスを報告)。
   snake_case (backup artifactと同一規約)。内容: format_version / created_at /
-  cancelled / structure / dest_dir / asset_count / summary (exported,
-  identical, conflict, failed, planning_errors, cancelled) / entries[]
-  (asset_id, asset_uuid, display_name, source_display, output_rel,
-  caption_source, image ("written|identical|conflict|failed") + error,
-  txt + error) / errors[] (plan失敗)。
+  cancelled / structure / dest_dir / **asset_count (処理済み + plan失敗 +
+  キャンセル未処理 = 要求した一意asset数。DTOの `total` と同一定義 —
+  FG-WP16-3 N2)** / summary (exported, identical, conflict, failed,
+  planning_errors, cancelled) / entries[] (asset_id, asset_uuid,
+  display_name, source_display, output_rel, caption_source,
+  image ("written|identical|conflict|failed") + error, txt + error) /
+  errors[] (plan失敗)。
 
 ### Commands (preview/executeはasync + spawn_blocking。DTOはcamelCase)
 
@@ -2459,6 +2491,9 @@ score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
   `{manifestPath, cancelled, summary, failures[], conflicts[], issuesTruncated}`。
   summary: `{total, exported, identical, conflict, failed, planningErrors,
   cancelled}` (total = 処理済み + plan失敗 + キャンセル未処理)。
+  **summaryのconflict/failedはtruncation前の全件から計算する**
+  (FG-WP16-3 N1 — 配列だけが先頭100件に切り詰められ、`issuesTruncated`
+  がtrueになる)。
   failures[]/conflicts[]: `{assetUuid, displayName, outputRelPath, reason}`
   (各々先頭100件まで。全量はmanifest)。
   `structure` は `"preserve" | "flat"`。
@@ -2514,7 +2549,11 @@ score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
   追加**した:
   - `gento_core::redact`: `redact_key` (先頭4字+マスク)、`scrub_text`
     (Bearer/Authorization/sk-系/api_key=/GPS座標らしい高精度小数5桁以上の
-    除外)、`scrub_paths` (絶対パス→`<path>`)。
+    除外)、`scrub_paths` (絶対パス→`<path>`。unix `/` 始まりに加え
+    **Windowsドライブ (`C:\…` / `C:/…`) とUNC (`\\server\share\…`) も
+    対象**。**空白を挟んで後に区切り (`/` `\`) が続くトークンはパス候補
+    として丸ごと** scrubする (`/home/u/My Photos/x.png` 等。誤爆<漏れの
+    方針。URLは `:` が継続を打ち切るため保持 — FG-WP16-3 B4)。
   - `MetadataColumns`/`AssetMetadataParsed` のDebugを手動実装 (GPS列は
     `<gps>`、rawスロットはバイト数要約に伏せる — `{:?}` 混入時の防護)。
   - AIジョブ失敗時のwarnログ (scrub通し)。panic payloadのscrub。
@@ -2550,7 +2589,10 @@ score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
   loadedModel}, jobs:{byType[{jobType, status, count}],
   oldestPendingAgeSeconds}}`。
 - `diagnostics_bundle_create(destDir)` → `{path}`。
-  ファイル名 `gento-diagnostics-{RFC3339}.json` (衝突時-連番)。
+  ファイル名 `gento-diagnostics-{RFC3339}.json` (同一時刻印の先任者が
+  いれば `-連番`。命名は実行lock + uuid付きtmp + `rename_noreplace` で
+  競合安全 — 並行生成でも各成果物が別名で残り上書き失効しない。
+  FG-WP16-3 N4)。
 - 既存 `clear_thumbnail_cache` / `backup_settings_get` / `backup_settings_set`
   はそのまま (SettingsDialogのキャッシュ・バックアップタブから利用)。
 

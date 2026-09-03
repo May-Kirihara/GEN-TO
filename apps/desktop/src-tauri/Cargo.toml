@@ -55,6 +55,8 @@ custom-protocol = ["tauri/custom-protocol"]
 #   cargo build --release -p gento-tauri --features custom-protocol,devtools
 #   pnpm tauri build --no-bundle -- --features devtools   (CLIはcustom-protocolを自動付与)
 # featureはworkspaceルートで一元管理する設計意图だが、cargoのfeatureは
-# crate単位のため、伝播チェーン (gento-tauri → gento-core/gento-image) を
-# ここで宣言する。
-devtools = ["gento-core/devtools", "gento-image/devtools"]
+# crate単位のため、伝播チェーン (gento-tauri → gento-core/gento-image/
+# gento-ai) をここで宣言する。gento-aiはtestserver (mock) のコンパイル
+# 隔離ゲートにdevtools featureを使う (FG-WP16-3 N5: devtools軸の
+# `cargo test -p gento-tauri --features devtools` が通るように伝播)。
+devtools = ["gento-core/devtools", "gento-image/devtools", "gento-ai/devtools"]

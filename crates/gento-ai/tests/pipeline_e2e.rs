@@ -10,7 +10,10 @@
 //! - 接続失敗は再試行可能エラーとして扱われる
 //!
 //! 依存するtestserver (mock) はWP-0規約でコンパイル隔離された開発専用
-//! 機能のため、本ファイル全体も同ゲートで囲む (通常releaseビルドでは空)。
+//! 機能のため、mockを必要とするテストは本ファイル (同ゲート内) に置く。
+//! **testserver非依存のテストは `pipeline_offline.rs` へ分離してあり、
+//! release `--all-targets` でも実行される** (FG-WP16-3 N5 — 通常release
+//! テスト実行からacceptance coverageが消えないようにする)。
 
 #![cfg(any(debug_assertions, feature = "devtools"))]
 
@@ -560,56 +563,8 @@ fn e2e_api_key_sent_as_bearer_and_never_in_db() {
 }
 
 // ===== 接続失敗の分離 (endpoint停止 → 再試行可能) =====
-
-#[test]
-fn e2e_connection_failure_is_retryable_and_local_reads_unaffected() {
-    // 使用しないportを開けて即閉じる (接続拒否を安定させる)
-    let dead_port = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        port
-    };
-    let base_url = format!("http://127.0.0.1:{dead_port}/v1");
-    let (_tmp, db, root, asset_id) = fixture("down", false, false, false);
-    let profile = profile_for(&db, &base_url, ProfileExtra::default());
-    let job = enqueue(&db, asset_id, profile.id);
-    let claimed = db
-        .with_writer(|repos| repos.claim_job_by_id(job.id, &gento_db::rfc3339_after_now(0)))
-        .unwrap()
-        .expect("claim");
-
-    let outcome = run_caption_tags_job(&db, &claimed, &profile, None, &PipelineOptions::default());
-    match &outcome {
-        AiRunOutcome::Failed {
-            retryable, error, ..
-        } => {
-            assert!(retryable, "接続失敗は再試行可能: {error}");
-        }
-        other => panic!("expected failure: {other:?}"),
-    }
-    // ai_runsに失敗が記録される
-    let runs = db
-        .with_reader(|repos| repos.list_ai_runs_for_asset(asset_id, 10))
-        .unwrap();
-    assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0].status, "failed");
-    assert!(runs[0].error.is_some());
-    // ファイラー機能 (DB読み取り) は阻害されない — 同一DBへの並行読み書き
-    let count = db
-        .with_reader(|repos| {
-            Ok(repos
-                .conn()
-                .query_row(
-                    "SELECT count(*) FROM files WHERE root_id = ?1",
-                    [root],
-                    |r| r.get::<_, i64>(0),
-                )
-                .unwrap())
-        })
-        .unwrap();
-    assert_eq!(count, 1);
-}
+// (testserver非依存のため pipeline_offline.rs へ移動 — releaseでも実行。
+//  FG-WP16-3 N5)
 
 // ===== acceptance: 送信前の最大辺 =====
 

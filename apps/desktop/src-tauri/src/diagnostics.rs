@@ -548,21 +548,24 @@ fn bundle_value(sources: &DiagSources, ring: Option<&crate::logging::LogRing>) -
     })
 }
 
-/// bundleを書き出す (tmp書き→sync→原子rename)。
+/// bundle書き出しの実行排他 (同一プロセス内の並行生成でfinal名/tmp名の
+/// 競合を構造的に排除 — FG-WP16-3 N4。跨プロセス競合はtmpのuuid付与と
+/// rename_noreplaceが最終防御)。
+static BUNDLE_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// bundleを書き出す (tmp書き→sync→`rename_noreplace` 公開。
+/// 同一stampの衝突は連番回避。FG-WP16-3 N4)。
 fn write_bundle_atomic(dest_dir: &Path, value: &Value) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dest_dir)
         .map_err(|e| format!("出力先ディレクトリを作成できません: {e}"))?;
+    let _guard = BUNDLE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let stamp = gento_db::rfc3339_after_now(0).replace([':', '.'], "-");
-    let mut final_path = dest_dir.join(format!("gento-diagnostics-{stamp}.json"));
-    // 同一stampの連続生成に備えて衝突回避
-    let mut suffix = 1u32;
-    while final_path.exists() {
-        final_path = dest_dir.join(format!("gento-diagnostics-{stamp}-{suffix}.json"));
-        suffix += 1;
-    }
+    // tmp名はuuid付き (PIDのみでは同一プロセス内の並行生成で衝突する)
     let tmp_path = dest_dir.join(format!(
-        ".{}.tmp-{}",
-        final_path.file_name().unwrap_or_default().to_string_lossy(),
+        ".gento-diagnostics-{stamp}-{}.tmp-{}",
+        uuid::Uuid::now_v7().simple(),
         std::process::id()
     ));
     let body = serde_json::to_string_pretty(value)
@@ -575,17 +578,34 @@ fn write_bundle_atomic(dest_dir: &Path, value: &Value) -> Result<PathBuf, String
         let _ = std::fs::remove_file(&tmp_path);
         return Err(format!("診断bundleの書き込みに失敗しました: {e}"));
     }
-    if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(format!("診断bundleの公開に失敗しました: {e}"));
-    }
-    // 親ディレクトリのエントリ反映 (best-effort)
-    if let Some(parent) = final_path.parent() {
-        if let Ok(handle) = std::fs::File::open(parent) {
-            let _ = handle.sync_all();
+    // no-replaceで出版。同一stampの先任者がいれば連番で回避する
+    // (exists()+renameのTOCTOU窓を排する)。
+    let mut suffix: u32 = 0;
+    loop {
+        let name = if suffix == 0 {
+            format!("gento-diagnostics-{stamp}.json")
+        } else {
+            format!("gento-diagnostics-{stamp}-{suffix}.json")
+        };
+        let final_path = dest_dir.join(&name);
+        match gento_platform::rename_noreplace(&tmp_path, &final_path) {
+            Ok(()) => {
+                // 親ディレクトリのエントリ反映 (best-effort)
+                if let Ok(handle) = std::fs::File::open(dest_dir) {
+                    let _ = handle.sync_all();
+                }
+                return Ok(final_path);
+            }
+            Err(gento_platform::RenameNoReplaceError::DestinationExists) => {
+                suffix += 1;
+                continue;
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(format!("診断bundleの公開に失敗しました: {e}"));
+            }
         }
     }
-    Ok(final_path)
 }
 
 /// bundle生成の本体 (commandとテストから呼ぶ)。
@@ -959,6 +979,55 @@ mod tests {
         // 2回目も衝突しない
         let second = build_bundle(&sources, None, &out_dir).unwrap();
         assert_ne!(result.path, second.path);
+    }
+
+    /// FG-WP16-3 N4: 並行bundle生成は実行lock + no-replace rename + 連番で
+    /// 競合しない — 各スレッドの成果物が全て異なる名前で残り、tmp残骸・
+    /// 上書き失効が起きない。同一stamp (同一ミリ秒) での衝突を高確率で
+    /// 起こすためバリア同期で一斉スタートする。
+    #[test]
+    fn concurrent_bundle_creations_get_distinct_names_without_clobber() {
+        let (tmp, sources, _asset) = sources_with_library("concurrent");
+        let out_dir = tmp.path().join("out");
+        let sources = Arc::new(sources);
+        const THREADS: usize = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let out_dir = out_dir.clone();
+            let sources = Arc::clone(&sources);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                build_bundle(&sources, None, &out_dir)
+            }));
+        }
+        let mut paths = Vec::new();
+        for handle in handles {
+            let result = handle.join().unwrap().unwrap_or_else(|e| {
+                panic!("並行生成が失敗した (命名競合): {e}");
+            });
+            paths.push(result.path);
+        }
+        // 全て成功し、名前は相互に異なる
+        let unique: std::collections::HashSet<&String> = paths.iter().collect();
+        assert_eq!(unique.len(), paths.len(), "名前重複: {paths:?}");
+        // 全ファイルが実在し、validなbundleである
+        let mut json_count = 0;
+        let mut tmp_count = 0;
+        for entry in std::fs::read_dir(&out_dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            if name.ends_with(".json") {
+                let body = std::fs::read_to_string(out_dir.join(&name)).unwrap();
+                let value: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(value["format_version"], BUNDLE_FORMAT_VERSION, "{name}");
+                json_count += 1;
+            } else if name.contains(".tmp-") {
+                tmp_count += 1;
+            }
+        }
+        assert_eq!(json_count, THREADS, "全スレッド分が独立に出版されている");
+        assert_eq!(tmp_count, 0, "tmp残骸なし");
     }
 
     #[test]
