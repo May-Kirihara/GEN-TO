@@ -672,7 +672,8 @@ impl FileOpsService {
 /// 1. **op recordによるpath所有権**: 走査中のパスが
 ///    `owned` (request/result JSONに記録された所有パス) に一致すること。
 ///    厳密tmp文法 (`is_owned_tmp_name`) への名前一致だけで削除しない
-///    (文法は `.gento-tmp-` 類似文件の**報告フィルタ**としてのみ使用)。
+///    (文法は `.gento-tmp-` 類似文件の**報告フィルタ**としてのみ使用 —
+///    FG-WP17-2: 報告フィルタもマーカー部分一致でなく厳格文法match)。
 /// 2. **fd同一性検証**: 所有recordが作成時の `(dev, ino)` を記録して
 ///    いる (`Some`) 場合、`O_NOFOLLOW` で開いたfdのfstatが一致すること。
 ///    不一致 (差し替え攻撃) は残留+報告。recordにIDが無い (`None`:
@@ -682,11 +683,20 @@ impl FileOpsService {
 /// traversalはfd歩行 (`OutputDir`: O_NOFOLLOW|O_DIRECTORY のピン留め +
 /// `unlinkat` 相対削除) のため、ディレクトリ→symlink差し替えで登録ルート
 /// 外へ出ない。削除対象はO_NOFOLLOWで開いたfdが通常ファイルであることを
-/// fstatで確認した後のみ。**既知の残存窓**: fstat確認→unlinkat間の
-/// ナノ秒オーダー窓は残る (Linuxにfd基準の削除APIが存在しないため —
-/// 原子性の限界として文書化。api-contract §41参照)。
+/// fstatで確認した後のみ。FG-WP17-2 (r2 blocker対応): unlinkatの直前に
+/// **名前のentryを `fstatat(AT_SYMLINK_NOFOLLOW)` で再照合**し、open検証
+/// 後のentry置換を捕捉する (open検証後に長時間停止していても再検査が
+/// 置換を検出 — 決定論raceテストあり)。
 ///
-/// 戻り値: (削除件数, 残置した `.gento-tmp-` 類似文件の説明メッセージ)。
+/// **残存窓 (正直な脅威モデル — 「ナノ秒窓」表記は不正確なため廃止)**:
+/// fstatat再検査→unlinkat間は理論上無制限 (プロセス停止等) だが、攻撃に
+/// は (a) ライブラリルートへの書込権限 (b) 残留tmp名の知識 (c) 窓内での
+/// entry置換が全て必要で、(a)を持つ行為者は直接ユーザーファイルを削除
+/// できる — GEN-TO固有の追加リスクは窓内に置換されたentryが削除される
+/// ことに実質限定される (api-contract §41の脅威モデル参照。利用者承認
+/// 事項)。
+///
+/// 戻り値: (削除件数, 残置した厳密tmp文法一致文件の説明メッセージ)。
 fn sweep_tmp_files(root: &Path, owned: &HashMap<PathBuf, Option<OsFileId>>) -> (u64, Vec<String>) {
     let mut removed = 0u64;
     let mut skipped = Vec::new();
@@ -718,11 +728,13 @@ fn sweep_tmp_dir(
             }
             continue;
         }
-        // 報告フィルタ: tmp文法に似た名前のみ通知対象 (削除可否とは無関係)
+        // 報告フィルタ: 厳密tmp文法に一致する名前のみ通知対象 (削除可否と
+        // は無関係。FG-WP17-2: マーカー部分一致から厳格文法matchへ統一 —
+        // 文法不一致の類似名は報告にも出さない)
         let Some(name_str) = name.to_str() else {
             continue;
         };
-        if !name_str.contains(gento_core::file_ops::TMP_FILE_MARKER) {
+        if !gento_core::file_ops::is_owned_tmp_name(name_str) {
             continue;
         }
         let Some(recorded_id) = owned.get(&path) else {
@@ -750,11 +762,29 @@ fn sweep_tmp_dir(
                     ));
                     continue;
                 }
-                // 親fd相対のunlinkat (no-follow)。fstat→unlinkat間の
-                // ナノ秒窓は構造的に除去不可 (doc参照)
-                match dir.remove_file_at(&name) {
-                    Ok(()) => *removed += 1,
-                    Err(e) => skipped.push(format!("{} (削除失敗: {e})", path.display())),
+                // 決定論raceテスト用注入点 (prod releaseには存在しない):
+                // open検証通過後・削除系syscall前に一時停止できる
+                // (対象entry名でキーing — 他テストのsweepと干渉しない)。
+                #[cfg(any(debug_assertions, feature = "devtools"))]
+                sweep_unlink_gate_wait(&name);
+                // FG-WP17-2 (r2 blocker): unlinkat直前の最終同一性再検査 —
+                // 名前のentryをfstatat(AT_SYMLINK_NOFOLLOW)で検査し、open
+                // 検証後に差し替えられていたらここで捕捉して削除しない。
+                // 残るのはfstatat→unlinkat間のみ (api-contract §41の脅威
+                // モデル参照)。
+                match dir.stat_name_id_nofollow(&name) {
+                    Ok(name_id) if name_id == *expect => match dir.remove_file_at(&name) {
+                        Ok(()) => *removed += 1,
+                        Err(e) => skipped.push(format!("{} (削除失敗: {e})", path.display())),
+                    },
+                    Ok(_) => skipped.push(format!(
+                        "{} (削除直前再検査で名前のentryが記録と不一致 — open検証後の差し替えの可能性。削除せず残置)",
+                        path.display()
+                    )),
+                    Err(e) => skipped.push(format!(
+                        "{} (削除直前再検査に失敗 — 削除せず残置: {e})",
+                        path.display()
+                    )),
                 }
             }
             Err(e) => {
@@ -764,6 +794,126 @@ fn sweep_tmp_dir(
                 ));
             }
         }
+    }
+}
+
+// ===== 決定論raceテスト用ゲート (devtools/debug専用 — FG-WP17-2) =====
+
+/// sweepの削除直前 (open検証後・削除系syscall前) に一時停止する注入フック
+/// (WP-17 r2 blocker対応: open検証→unlinkat間のentry置換raceを決定論的
+/// に再現する)。`set_failure_injection` 等と同じコンパイルゲートで、
+/// prod releaseには存在しない。接続モデルはthumbnailsのFeederGateと同じ
+/// (装填→到達→解放の1往復 — 一度だけ有効)。
+///
+/// sweepはフリー関数でサービス状態を持たないため静的に置く。その代わり
+/// 接続は**対象entry名でキーing**する — テスト並列実行下で他のsweep
+/// テストが同じ静的へ到達しても、名前が一致しない限り一時停止せず
+/// (wiringを消費もしない)、相互干渉しない。
+#[cfg(any(debug_assertions, feature = "devtools"))]
+struct SweepUnlinkGate {
+    wiring: Mutex<Option<SweepUnlinkGateWiring>>,
+}
+
+#[cfg(any(debug_assertions, feature = "devtools"))]
+struct SweepUnlinkGateWiring {
+    name: std::ffi::OsString,
+    reached: std::sync::mpsc::Sender<()>,
+    go: std::sync::mpsc::Receiver<()>,
+}
+
+/// sweepはフリー関数のためサービス状態ではなく静的に置く。
+#[cfg(any(debug_assertions, feature = "devtools"))]
+static SWEEP_UNLINK_GATE: SweepUnlinkGate = SweepUnlinkGate {
+    wiring: Mutex::new(None),
+};
+
+#[cfg(any(debug_assertions, feature = "devtools"))]
+impl SweepUnlinkGate {
+    /// sweep側から呼ぶ: 対象名で接続されていれば到達を通知して解放を
+    /// 待つ。接続がない (通常運用) または名前が一致しない場合は即座に
+    /// 通過する (一致しない接続は消費しない)。
+    fn wait_if_armed(&self, name: &std::ffi::OsStr) {
+        let wiring = {
+            let mut guard = self
+                .wiring
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match guard.as_ref() {
+                Some(w) if w.name == name => guard.take(),
+                _ => None,
+            }
+        };
+        if let Some(wiring) = wiring {
+            let _ = wiring.reached.send(());
+            // 解放を待つ。ハンドルdropも解放扱い (試験停滞防止)。
+            let _ = wiring.go.recv();
+        }
+    }
+}
+
+/// sweep内の注入点から呼ぶ (未装填なら即通過)。
+#[cfg(any(debug_assertions, feature = "devtools"))]
+fn sweep_unlink_gate_wait(name: &std::ffi::OsStr) {
+    SWEEP_UNLINK_GATE.wait_if_armed(name);
+}
+
+/// [`sweep_arm_unlink_gate`] が返すテスト側ハンドル。dropすると装填中の
+/// 接続を解除する (未到達のままsweepが終わった場合の残留防止)。
+#[cfg(any(debug_assertions, feature = "devtools"))]
+pub struct SweepUnlinkGateHandle {
+    armed_name: std::ffi::OsString,
+    reached: std::sync::mpsc::Receiver<()>,
+    go: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(any(debug_assertions, feature = "devtools"))]
+impl SweepUnlinkGateHandle {
+    /// sweepが注入点へ到達した (open検証を通過した) ことを待つ。
+    pub fn wait_reached(&self) -> bool {
+        self.reached
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .is_ok()
+    }
+
+    /// 注入点を解放し、sweepの削除処理を再開させる。
+    pub fn release(&self) {
+        let _ = self.go.send(());
+    }
+}
+
+#[cfg(any(debug_assertions, feature = "devtools"))]
+impl Drop for SweepUnlinkGateHandle {
+    fn drop(&mut self) {
+        // 未消費の接続を解除 (sweep未到達のままテストが終わった場合)。
+        let mut guard = SWEEP_UNLINK_GATE
+            .wiring
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(w) = guard.as_ref() {
+            if w.name == self.armed_name {
+                *guard = None;
+            }
+        }
+    }
+}
+
+/// sweep削除直前ゲートを対象entry名で装填する (一度だけ有効)。
+#[cfg(any(debug_assertions, feature = "devtools"))]
+pub fn sweep_arm_unlink_gate(name: &std::ffi::OsStr) -> SweepUnlinkGateHandle {
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel();
+    *SWEEP_UNLINK_GATE
+        .wiring
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(SweepUnlinkGateWiring {
+        name: name.to_os_string(),
+        reached: reached_tx,
+        go: go_rx,
+    });
+    SweepUnlinkGateHandle {
+        armed_name: name.to_os_string(),
+        reached: reached_rx,
+        go: go_tx,
     }
 }
 
@@ -2920,6 +3070,68 @@ mod tests {
         assert!(legacy.exists());
         assert_eq!(skipped2.len(), 1, "旧世代残留を報告: {skipped2:?}");
         assert!(skipped2[0].contains("旧世代"), "{skipped2:?}");
+    }
+
+    /// (e) **決定論的置換race** (WP-17 r2 blocker): open検証 (fd同一性
+    /// 確認) とunlinkatの間でtmp名のentryが攻撃的に置換された場合、
+    /// 置換後のファイル (被害ファイル) は削除されず残留報告される。
+    /// 注入点でsweepを一時停止させ、その間に `rename` でentryを差し替える
+    /// (プロセスがsyscalls間でdescheduleされる状況の決定論的再現)。
+    /// entry名は他テストと衝突しない一意名 (ゲートは名前キーing)。
+    #[test]
+    #[cfg(all(unix, any(debug_assertions, feature = "devtools")))]
+    fn sweep_recheck_catches_swap_between_open_and_unlink() {
+        let dir = TestDir::new("sweep-race");
+        let tmp_name = strict_tmp_name("race.png");
+        let tmp_path = dir.0.join(&tmp_name);
+        std::fs::write(&tmp_path, b"original-tmp").unwrap();
+        let recorded = file_id_of(&tmp_path).expect("unixではID取得可");
+        // 攻撃者がtmp名へ差し込むファイル (削除されてはならない本体)
+        let attacker_src = dir.0.join("attacker.png");
+        std::fs::write(&attacker_src, b"precious-user-file").unwrap();
+        let owned = HashMap::from([(tmp_path.clone(), Some(recorded))]);
+
+        let handle = sweep_arm_unlink_gate(std::ffi::OsStr::new(&tmp_name));
+        let root = dir.0.clone();
+        let sweep_thread = std::thread::spawn(move || sweep_tmp_files(&root, &owned));
+        assert!(handle.wait_reached(), "open検証通過後の注入点へ到達");
+        // 注入: 検証済みtmp名のentryを攻撃ファイルへ差し替え (rename(2)は
+        // ターゲットを原子的に置換 — openが掴んだfdのinodeとは別のinodeになる)
+        std::fs::rename(&attacker_src, &tmp_path).unwrap();
+        handle.release();
+
+        let (removed, skipped) = sweep_thread.join().unwrap();
+        assert_eq!(removed, 0, "open検証後の差し替えはunlink前に捕捉");
+        assert_eq!(
+            std::fs::read(&tmp_path).unwrap(),
+            b"precious-user-file",
+            "差し替えられた被害ファイルは無傷"
+        );
+        assert_eq!(skipped.len(), 1, "残留を報告: {skipped:?}");
+        assert!(skipped[0].contains("再検査"), "{skipped:?}");
+    }
+
+    /// (f) 報告フィルタは厳密tmp文法のみ (FG-WP17-2 non-blocking対応):
+    /// `.gento-tmp-` 部分一致だがuuid/seq形式を満たさない名前は削除対象
+    /// でないのは当然として、**残留報告からも除外される** (報告精度の
+    /// 文法厳格化 — 削除権限には無関係)。
+    #[test]
+    fn sweep_report_filter_requires_strict_grammar() {
+        let dir = TestDir::new("sweep-filter");
+        // マーカー部分一致だが厳密形式ではない (uuid非hex・seq無し)
+        let noisy = dir.write("note.gento-tmp-hogehoge.png", b"user file");
+        let owned = HashMap::new();
+        let (removed, skipped) = sweep_tmp_files(&dir.0, &owned);
+        assert_eq!(removed, 0);
+        assert_eq!(
+            std::fs::read(&noisy).unwrap(),
+            b"user file",
+            "部分一致名のユーザーファイルは無傷"
+        );
+        assert!(
+            skipped.is_empty(),
+            "文法不一致の類似名は報告しない (報告フィルタ厳格化): {skipped:?}"
+        );
     }
 
     /// E2E: 配置失敗で残留したtmp (result JSONにtmp+作成時IDが記録される)

@@ -1057,6 +1057,49 @@ impl OutputDir {
         }
     }
 
+    /// 配下の名前の `(dev, ino)` を `fstatat(AT_SYMLINK_NOFOLLOW)` で
+    /// 検査する (FG-WP17-2: 削除直前の最終同一性再検査用 — fd検証と
+    /// unlinkatの間にentryが差し替えられていた場合の検出。symlinkは
+    /// 辿らないため、検査時にentryがsymlinkへ差し替えられていた場合は
+    /// リンク自身のID = 不一致として返る)。
+    ///
+    /// 非unixでは常に `Unsupported` エラー (呼び出し側はfail-closed扱い —
+    /// ただし非unixは `os_file_id_of` が常時 `None` のため削除ゲート自体に
+    /// 到達しない。platform-notes §2参照)。
+    pub fn stat_name_id_nofollow(&self, name: &OsStr) -> io::Result<crate::repo::OsFileId> {
+        validate_single_component(name)?;
+        #[cfg(unix)]
+        {
+            // SAFETY: fd読み取りのみ。
+            let dirfd = std::os::unix::io::AsRawFd::as_raw_fd(&self.fd);
+            // SAFETY: 全整数フィールドのC構造体。ゼロ埋めは有効。
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: fstatat(2)はdirfd相対でpath文字列を読むだけ。
+            let rc = unsafe {
+                libc::fstatat(
+                    dirfd,
+                    os_cstring(name)?.as_ptr(),
+                    &mut st,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(crate::repo::OsFileId::new(
+                st.st_dev as u64,
+                st.st_ino as u64,
+            ))
+        }
+        #[cfg(not(unix))]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "stat_name_id_nofollow: unixのみ (非unixはfail-closed扱い)",
+            ))
+        }
+    }
+
     /// エラー報告用の表示パス (lossy)。
     pub fn display(&self) -> &str {
         &self.display
@@ -1779,6 +1822,50 @@ mod tests {
             let err = root.create_exclusive_at(&OsString::from(bad)).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{bad}: {err}");
         }
+    }
+
+    /// stat_name_id_nofollow: 名前のentryの `(dev, ino)` はopen_regular_at
+    /// のfd側fstatと一致し、entry差し替え (rename置換) 後は不一致へ変化
+    /// する (FG-WP17-2: 削除直前再検査の土台)。不在はNotFound・symlinkは
+    /// リンク自身のID (ターゲットとは不一致)・不正成分は事前拒否。
+    #[test]
+    #[cfg(unix)]
+    fn output_dir_stat_name_id_nofollow_tracks_entry_swaps() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = TestDir::new("outstat");
+        let root = OutputDir::open_root(&tmp.path().join("dest")).unwrap();
+        std::fs::write(tmp.path().join("dest/a"), b"1").unwrap();
+        std::fs::write(tmp.path().join("dest/b"), b"22").unwrap();
+        let id_a = root.stat_name_id_nofollow(&OsString::from("a")).unwrap();
+        let id_b = root.stat_name_id_nofollow(&OsString::from("b")).unwrap();
+        assert_ne!(id_a, id_b, "前提: 別ファイルは別ID");
+        // fd側 (open_regular_atのfstat) と一致
+        let (_f, md) = root.open_regular_at(&OsString::from("a")).unwrap();
+        assert_eq!(id_a, crate::repo::OsFileId::new(md.dev(), md.ino()));
+        // entry差し替え (rename置換) 後は名前のIDが変化する
+        std::fs::rename(tmp.path().join("dest/b"), tmp.path().join("dest/a")).unwrap();
+        assert_eq!(
+            root.stat_name_id_nofollow(&OsString::from("a")).unwrap(),
+            id_b,
+            "差し替え後の名前は新inodeを指す"
+        );
+        // 不在はNotFound
+        let err = root
+            .stat_name_id_nofollow(&OsString::from("gone"))
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+        // symlinkへ差し替えた名前はリンク自身のID (ターゲットと不一致)
+        std::fs::write(tmp.path().join("target"), b"t").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("target"), tmp.path().join("dest/l")).unwrap();
+        let tmd = std::fs::symlink_metadata(tmp.path().join("target")).unwrap();
+        let id_target = crate::repo::OsFileId::new(tmd.dev(), tmd.ino());
+        let id_link = root.stat_name_id_nofollow(&OsString::from("l")).unwrap();
+        assert_ne!(id_link, id_target, "NOFOLLOW: リンク自身のIDを返す");
+        // 不正成分 (区切り文字) は事前拒否
+        let err = root
+            .stat_name_id_nofollow(&OsString::from("a/b"))
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
     }
 
     #[test]

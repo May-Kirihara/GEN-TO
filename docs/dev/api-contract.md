@@ -1,7 +1,7 @@
 # GEN-TO IPC API契約 (Phase 2 / WP-2時点)
 
 - 作成日: 2026-08-28 (WP-2)
-- 最終更新: 2026-09-04 (**FG-WP17-1: §41 改訂 — 起動掃除の所有権+fd同一性モデル (名前文法一致のみの削除禁止・旧record fail-closed・fd歩行/unlinkat・残存窓の明記) / §47 改訂 — `is_lexically_beneath` のverbatim trailing space/dot保存・mix形式拒否・verbatim `/` 非区切り・malformed UNC構造検証・ASCII-only folding明記 / §49 改訂 — scrub_paths終端spaced成分の拡張** / WP-17-1: §41 改訂 — copy_fileのnever-unlink・排他create_new / §47 改訂 — 中間symlink保護のプラットフォーム対応表・plan→差し替え→execute検知の実証記載 / §49 改訂 — scrub_paths非ASCII成分政策 / FG-WP13-2: §47 改訂 — rel_path symlink規約を全コンポーネント歩行へ強化・列挙fail-closed・durability境界明記 / FG-WP13-1: §47 改訂 — トークン束縛された確定plan適用・rel_pathパス検証規約・digest manifest完全性・フルDB原子公開 / WP-13 (MVP): §47 バックアップと復元のcommand群・`.gento`バックアップ形式追加 / 2026-09-02 WP-12 §46 / WP-11 §45 / WP-10 §44 / WP-9 §43 / WP-8 §42 / WP-7 §39-41 / WP-6 §34-38 / WP-5 §31-33 / WP-4 §26-33 / WP-3 §22-24 / WP-2 §17-21 / WP-1 §1/§16 / WP-0 §0/§1/§14/§15)
+- 最終更新: 2026-09-04 (**FG-WP17-2: §41 改訂 — 削除直前のfstatat(AT_SYMLINK_NOFOLLOW)最終同一性再検査 (r2 blocker対応)・残存窓の脅威モデル再定義 (「ナノ秒窓」表記廃止・利用者承認事項化)・inode再利用とrecordライフサイクルの調査記録・報告フィルタの厳格文法match** / FG-WP17-1: §41 改訂 — 起動掃除の所有権+fd同一性モデル (名前文法一致のみの削除禁止・旧record fail-closed・fd歩行/unlinkat・残存窓の明記) / §47 改訂 — `is_lexically_beneath` のverbatim trailing space/dot保存・mix形式拒否・verbatim `/` 非区切り・malformed UNC構造検証・ASCII-only folding明記 / §49 改訂 — scrub_paths終端spaced成分の拡張** / WP-17-1: §41 改訂 — copy_fileのnever-unlink・排他create_new / §47 改訂 — 中間symlink保護のプラットフォーム対応表・plan→差し替え→execute検知の実証記載 / §49 改訂 — scrub_paths非ASCII成分政策 / FG-WP13-2: §47 改訂 — rel_path symlink規約を全コンポーネント歩行へ強化・列挙fail-closed・durability境界明記 / FG-WP13-1: §47 改訂 — トークン束縛された確定plan適用・rel_pathパス検証規約・digest manifest完全性・フルDB原子公開 / WP-13 (MVP): §47 バックアップと復元のcommand群・`.gento`バックアップ形式追加 / 2026-09-02 WP-12 §46 / WP-11 §45 / WP-10 §44 / WP-9 §43 / WP-8 §42 / WP-7 §39-41 / WP-6 §34-38 / WP-5 §31-33 / WP-4 §26-33 / WP-3 §22-24 / WP-2 §17-21 / WP-1 §1/§16 / WP-0 §0/§1/§14/§15)
 - 目的: Tauri command・イベント・ローカル画像プロトコルの形状をWP-3〜6の契約基準として固定する。
 - 整合性情報: 本書の型は `crates/gento-core/src/catalog.rs`、`apps/desktop/src-tauri/src/catalog.rs`
   (ページDTOのversion拡張もここ)、
@@ -1665,14 +1665,47 @@ type FileOpsProgressEvent = {
     で開き直すfd歩行 (dir→symlink差し替えで登録ルート外に出ない)。
     削除は親fd相対の `unlinkat` (no-follow)。削除対象は `O_NOFOLLOW`
     で開いたfdが通常ファイルであることをfstat確認した後のみ。
-    **既知の残存窓**: fstat確認→unlinkat間のナノ秒オーダー窓は
-    構造的に除去不可 (Linuxにfd基準の削除APIが存在しないため)。
+    **削除直前の最終同一性再検査 (FG-WP17-2 — r2 blocker対応)**:
+    unlinkatの直前に `fstatat(parent_dirfd, name, AT_SYMLINK_NOFOLLOW)`
+    で**名前のentry**の `(dev, ino)` をrecordと再照合する。open検証後に
+    プロセスが長時間停止していても、その間のentry置換をこの再検査が
+    捕捉し、削除スキップ+残留報告する (決定論raceテスト
+    `sweep_recheck_catches_swap_between_open_and_unlink` で実証)。
+    **残存窓と脅威モデル (FG-WP17-2 — 従来の「ナノ秒オーダー窓」表記は
+    不正確のため廃止)**: fstatat再検査→unlinkat間は理論上無制限である
+    (プロセス停止等。Linuxにfdが指すinodeを削除するAPIは存在せず、
+    unlinkは常に名前基準のため構造的に除去不可)。ただし**この窓の攻撃に
+    は (a) ライブラリルートへの書込権限 (entry置換に必要) (b) 残留tmp名
+    の知識 (c) 窓内でのentry置換、の3つが全て必要**であり、(a)を持つ
+    行為者は直接ユーザーファイルを削除できる — **GEN-TO固有の追加
+    リスクは実質的に「窓内に置換された残留tmp名のentryが削除される」
+    ことに限定**される (置換者が自分で作った物を削除される以上の害は
+    生まない)。この脅威モデルの再定義は**利用者承認事項**である
+    (PMが別途取得)。
+  - **`(dev, ino)` の非恒久性 (inode再利用) とrecordライフサイクル**
+    (FG-WP17-2 non-blocking指摘の調査結果): `file_operations` 行には
+    DELETE/pruneが存在せずrecordは現行**無期限保持** (操作履歴UIが正本。
+    起動掃除の登録簿は `list_recent_operations(u32::MAX)` = 全行)。
+    inode再利用による誤削除には「(1) recordの所有パスと完全一致する
+    tmp名のファイルが新規に作成される」かつ「(2) そのinodeがrecordの
+    作成時IDと同一 (元tmpのinode解放→再割当)」の両立が必要。
+    (1)の名前は `.{名前}.gento-tmp-{32桁hex}-{6桁seq}` の自己識別的
+    dotfileであり、通常のユーザーファイル・アプリ作成ファイルがこの
+    名前を持つことは実質不可能 (作成にはライブラリルートへの書込権限
+    が必要 — 上記脅威モデルの(a)に包含)。hardlinkによる意図的攻撃も
+    「リンクを1つ削除する」に留まり、リンク元ファイルは無傷 (かつ
+    攻撃者は直接削除可能)。誤一致は極稀かつ攻撃者シナリオは非escalation
+    と評価し、record保持期間の制限は導入しない (将来の保全策候補:
+    `(dev, ino)` へのmtime_ns併記 — DB migration要のため本WP範囲外)。
   - **掃除が覆わない残留 (正直な限界)**: ①プロセス死亡でstep結果が
     result JSONへ確定する前に残ったtmp (executing残留のrequest再構築
     分 — ino記録が存在しないためfail-closed残留報告) ②undo経由の
     tmp (recordへpath/IDを登録しない — 同様にfail-closed報告)。
     いずれも `.gento-tmp-` 類似名として毎起動ログ通知される。
-    それ以外の `.gento-tmp-` 類似ファイルも同様に残置しログで通知。
+    それ以外の**厳密tmp文法に一致しない** `.gento-tmp-` 類似ファイルは
+    削除しないのは当然として、**残留報告からも除外する** (FG-WP17-2:
+    報告フィルタの文法厳格化 — `is_owned_tmp_name` の正規文法に一致する
+    名前のみ通知。報告精度のみの変更で削除権限には無関係)。
 - **移動の原子性**: 同一FSはNOREPLACEリネーム。跨界 (EXDEV) は
   copy+fsync+NOREPLACE配置→元削除へフォールバック (元削除失敗は
   warning付き成功 — 宛先完成済みのため)。

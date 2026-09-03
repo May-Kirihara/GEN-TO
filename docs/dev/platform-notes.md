@@ -1,6 +1,7 @@
 # プラットフォーム別既知制限と検証状況 (WP-17-1 / WP-17-2)
 
-最終更新: 2026-09-04 (FG-WP17-1: §2改訂 — 字句包含判定の意味論改訂・
+最終更新: 2026-09-04 (FG-WP17-2: §2.3改訂 — 削除直前fstatat再検査
+(unix実装のみ)を含む削除条件の整理 / FG-WP17-1: §2改訂 — 字句包含判定の意味論改訂・
 起動掃除のfd同一性モデルに伴うWindows挙動・installer targets設定)
 
 GEN-TO MVPの正規開発・検証環境はLinux (x86_64) のみ。本書は
@@ -71,12 +72,15 @@ build scriptを持つ依存はホストにクロスCツールチェーンが無�
 3. **OSファイルIDは常時 `None`** (`gento_platform::os_file_id_of`):
     Windows file ID (NTFS FILE_ID_128 / ReFS) の提供は未実装。
     衝突トークンはsize+mtimeで機能するが同一性検証は弱い
-    (WP-18以降の課題)。**起動掃除への影響 (FG-WP17-1)**: 掃除の削除
-    条件は「op recordの所有パス**かつ**作成時 `(dev, ino)` とのfd同一性」
-    の両方のため、Windowsでは全recordがID無し (=fail-closed) となり
-    **掃除は削除を行わず残留報告のみ** (api-contract §41参照。
+    (WP-18以降の課題)。**起動掃除への影響 (FG-WP17-1/17-2)**: 掃除の
+    削除条件は「op recordの所有パス**かつ**作成時 `(dev, ino)` とのfd
+    同一性**かつ** unlinkat直前の `fstatat(AT_SYMLINK_NOFOLLOW)` 最終
+    再検査一致」の全てのため、Windowsでは全recordがID無し (=fail-closed)
+    となり**掃除は削除を行わず残留報告のみ** (api-contract §41参照。
     fd歩行自体は`OutputDir`の非unixフォールバックで動作するが、
-    削除ゲートを通らない)。
+    削除ゲートを通らない。削除直前再検査 `stat_name_id_nofollow` は
+    unix実装のみで非unixは `Unsupported` エラー=削除せず残置 — ただし
+    非unixはID無しfail-closedが先に効くため到達しない)。
 4. **パスのDB符号化はUTF-8固定** (`gento-db/src/paths.rs`
    `encode_path`): 非UTF-8表現のWindowsパス (ワイルドカード・
    予約名等を含む一部レガシー表現) はlossy変換される。
