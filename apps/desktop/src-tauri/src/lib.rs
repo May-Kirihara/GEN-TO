@@ -572,6 +572,30 @@ pub fn run() {
                     if let Some(backup) = &state.backup {
                         backup.shutdown();
                     }
+                    // WP-16 F2: 全サービス停止後・DB close前にWALを本体へ
+                    // 書き戻して切り詰める (クリーン終了後も252MBのWALが
+                    // 残るのを防ぐ。auto checkpointは持続的writer負荷下では
+                    // 発火/完了が保証されないため明示的に実行する)。
+                    if let Some(db_state) = &state.db {
+                        if let Some(db) = &db_state.db {
+                            match db.checkpoint_wal_truncate() {
+                                Ok((busy, log, checkpointed)) => {
+                                    tracing::info!(
+                                        busy,
+                                        log,
+                                        checkpointed,
+                                        "shutdown wal checkpoint complete"
+                                    );
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        error = %err,
+                                        "shutdown wal checkpoint failed"
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
         });

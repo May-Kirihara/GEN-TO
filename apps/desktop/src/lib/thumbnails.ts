@@ -151,7 +151,8 @@ export class ThumbnailStore {
     this.notify();
   }
 
-  /** 全カタログをBackground優先度で一括登録。 */
+  /** 全カタログをBackground優先度で一括登録 (WP-16 F1: キュー上限分は
+   * バックログへ繰延され、残りも完了駆動で生成される)。 */
   async generateAll(sizeClass: string): Promise<boolean> {
     try {
       const accepted = await this.ipc.invoke<RequestAccepted>(
@@ -162,6 +163,9 @@ export class ThumbnailStore {
       this.lastNotice =
         `受付: キュー ${accepted.queued} / 重複 ${accepted.rejected_dup}` +
         ` / ヒット ${accepted.cache_hits} / 読込不能 ${accepted.skipped_unreadable}` +
+        (accepted.deferred > 0
+          ? ` / 繰延 ${accepted.deferred} (順次投入)`
+          : "") +
         (accepted.rejected_full > 0 ? ` / 満杯拒否 ${accepted.rejected_full}` : "");
       await this.refreshStats();
       return true;

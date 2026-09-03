@@ -327,16 +327,21 @@ pub fn prune_orphan_docs(conn: &Connection) -> Result<u64, RepoError> {
 /// 軽量な件数照合 (expected, actual)。走査後の保守フック用で、
 /// 全文書再構築による内容比較は行わない (fts_integrityを使う)。
 pub fn fts_counts(conn: &Connection) -> Result<(u64, u64), RepoError> {
-    let expected: i64 = conn
+    // 2つのCOUNTは**単一SELECT文** (単一の暗黙readトランザクション = 同一
+    // snapshot) で実行しなければならない。別々に実行するとwriterのcommitを
+    // 跨いだ瞬間に偽の不整合が常態化し、ensure_fts_after_scanがwriter接続で
+    // 無駄なfts_repair (全走査整合解析) を連発する (50k投入で3,300+回/runを
+    // 実測。writer競合を激化させる。WP-16 F3)。回帰テスト:
+    // fts_counts_is_snapshot_consistent_under_concurrent_writes。
+    let (expected, actual): (i64, i64) = conn
         .query_row(
-            "SELECT count(DISTINCT asset_id) FROM files \
-             WHERE scan_state = 'present' AND asset_id IS NOT NULL",
+            "SELECT \
+               (SELECT count(DISTINCT asset_id) FROM files \
+                WHERE scan_state = 'present' AND asset_id IS NOT NULL), \
+               (SELECT count(*) FROM asset_docs)",
             [],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .map_err(map_err)?;
-    let actual: i64 = conn
-        .query_row("SELECT count(*) FROM asset_docs", [], |r| r.get(0))
         .map_err(map_err)?;
     Ok((expected.max(0) as u64, actual.max(0) as u64))
 }
@@ -2094,5 +2099,84 @@ mod tests {
                 );
             }
         });
+    }
+
+    // ===== WP-16 F3: fts_countsのsnapshot一貫性 =====
+
+    /// 並行書き込み下の `fts_counts` は常に一貫していなければならない。
+    ///
+    /// 2つのCOUNTが別々の暗黙readトランザクションで走ると、writerの
+    /// commitを跨いだ瞬間に `expected != actual` の**偽不整合**が高頻度で
+    /// 発生する。実アプリではこれがハッシュ進行中のほぼ全snapshot変更で
+    /// `ensure_fts_after_scan` → `fts_repair` (writer接続での全走査解析。
+    /// 50k投入で3,300+回/run) を誘発しwriter競合を激化させていた
+    /// (WP-16 F3診断。docs/dev/measurements/wp16-baselines.md §14)。
+    ///
+    /// 検証: writerがlink_file (assets+files+asset_docsを同時commit) を
+    /// 連続実行する間、readerでfts_countsを繰り返し、常に expected==actual
+    /// であること。コミット境界の状態は常に一貫 (linkとdoc構築が同一tx) の
+    /// ため、単一snapshotなら不整合は発生し得ない。
+    #[test]
+    fn fts_counts_is_snapshot_consistent_under_concurrent_writes() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let tmp = TempDir::new("ftsrace");
+        let db_path = tmp.path().join("db.sqlite3");
+        let db = Arc::new(crate::Db::open(&db_path).unwrap());
+
+        // COUNTがms級になる規模の初期行 (race窓を広げる)
+        let root_id = db
+            .with_writer(|repos| repos.add_root(Path::new("/data/race")).map(|r| r.id))
+            .unwrap();
+        db.with_writer(|repos| {
+            for i in 0..10_000 {
+                let asset = make_asset(repos, &format!("race{i:05}"));
+                link_file(repos, root_id, &format!("race{i:05}.png"), asset);
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        // writer: link_fileを連続commit (各commitでexpected/actualが同時に+1)
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer_db = Arc::clone(&db);
+        let writer_stop = Arc::clone(&stop);
+        let writer = std::thread::spawn(move || {
+            let mut i = 0u64;
+            while !writer_stop.load(AtomicOrdering::Relaxed) {
+                let asset = writer_db
+                    .with_writer(|repos| {
+                        let asset = make_asset(repos, &format!("w{i:05}"));
+                        Ok(asset)
+                    })
+                    .unwrap();
+                writer_db
+                    .with_writer(|repos| {
+                        link_file(repos, root_id, &format!("w{i:05}.png"), asset);
+                        Ok(())
+                    })
+                    .unwrap();
+                i += 1;
+            }
+            i
+        });
+
+        // reader: 1.5秒間fts_countsを連打し、偽不整合がないことを検証
+        let deadline = Instant::now() + Duration::from_millis(1_500);
+        let mut checks = 0u32;
+        while Instant::now() < deadline {
+            let (expected, actual) = db.with_reader(|repos| fts_counts(repos.conn())).unwrap();
+            assert_eq!(
+                expected, actual,
+                "並行書き込み下で偽の不整合を検出した (snapshot非一貫)"
+            );
+            checks += 1;
+        }
+        stop.store(true, AtomicOrdering::Relaxed);
+        let linked = writer.join().unwrap();
+        assert!(checks > 50, "検証に十分な反復回数: {checks}");
+        assert!(linked > 0, "writerが少なくとも1件commitしていること");
     }
 }

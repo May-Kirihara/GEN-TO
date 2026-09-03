@@ -8,7 +8,7 @@
 //!
 //! 契約: docs/dev/api-contract.md §7以降。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use gento_core::{AssetId, Priority, SizeClass};
 use gento_image::cache::{asset_fingerprint, cache_key, CacheLookup, ThumbnailCache};
-use gento_image::pool::{OutcomeSummary, PoolConfig, WorkerPool};
+use gento_image::pool::{OutcomeSummary, PoolConfig, SubmitError, WorkerPool};
 use gento_image::stats::ThumbStats;
 #[cfg(any(debug_assertions, feature = "devtools"))]
 use gento_image::thumbnail::FailureInjection;
@@ -37,6 +37,12 @@ const EVENT_BATCH_MAX: usize = 20;
 const EVENT_BATCH_WINDOW: Duration = Duration::from_millis(100);
 /// 完了イベント集計ログの間隔 (イベント嵐対策のinfoログ)。
 const EMITTER_SUMMARY_EVERY: u64 = 500;
+/// backlog再投入の空きマージン (capacity - depth がこれ未満なら再投入しない)。
+/// library.rsのハッシュ再提出 (HASH_RESUBMIT_MARGIN) と同じ値・同じ意図
+/// (backlogがキューを埋め尽くしてUI由来了のheadroomを奪わない)。
+const BACKLOG_SUBMIT_MARGIN: usize = 64;
+/// 1回の起床で纏めて再投入する件数上限 (ハッシュ再提出と同じ値)。
+const BACKLOG_SUBMIT_BATCH: usize = 256;
 
 /// `thumb:ready` の項目。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -83,12 +89,49 @@ pub struct RequestAccepted {
     /// 既存ジョブへの統合 (2回目以降の同一キー要求)。
     pub rejected_dup: u64,
     pub rejected_full: u64,
+    /// キュー満杯でbacklogへ繰延された件数 (generate_allのみ。完了駆動で
+    /// 空きができ次第投入される。WP-16 F1)。
+    pub deferred: u64,
     /// キャッシュヒット (即時ready。キューに入らない)。
     pub cache_hits: u64,
     /// state != Ready のレコード。
     pub skipped_unreadable: u64,
     /// カタログに存在しないID。
     pub skipped_unknown: u64,
+}
+
+/// 1アセット分の投入結果 ([`ThumbnailService::request`] とbacklog feederの
+/// 共通経路 [`ThumbnailCore::enqueue_asset`] の戻り値)。
+#[derive(Debug)]
+enum EnqueueOutcome {
+    /// 新規ジョブとして投入された。
+    Queued,
+    /// 既存ジョブへの統合 (dedup)。
+    Merged,
+    /// キャッシュヒット (即時ready。呼び出し側で `ImmediateReady` へ集約)。
+    CacheHit(ThumbReadyItem),
+    /// キュー満杯。
+    Full,
+    /// プール停止済み。
+    Shutdown,
+}
+
+/// 全件生成のbacklog項目 (キュー上限で入れ切れなかった残り)。
+#[derive(Debug, Clone)]
+struct BacklogItem {
+    asset: AssetSnapshot,
+    size_class: SizeClass,
+    priority: Priority,
+}
+
+/// backlogの状態 (drain報告用カウンタ込み)。
+#[derive(Debug, Default)]
+struct BacklogState {
+    items: VecDeque<BacklogItem>,
+    /// 現在の要求で繰延された総数 (報告用。置換時にリセット)。
+    deferred_total: u64,
+    /// 現在の要求でbacklogから処理 (投入・統合・フィード時ヒット) した数。
+    processed: u64,
 }
 
 /// エミッタスレッドへのメッセージ。
@@ -114,8 +157,8 @@ struct PendingRequest {
     size_class: String,
 }
 
-/// サムネイル生成サービス。AppStateへArcで保持する。
-pub struct ThumbnailService {
+/// 要求受け付けの共通状態 (サービス本体とbacklog feederスレッドで共有)。
+struct ThumbnailCore {
     cache: Arc<ThumbnailCache>,
     pool: Arc<WorkerPool>,
     stats: Arc<ThumbStats>,
@@ -126,13 +169,105 @@ pub struct ThumbnailService {
     #[cfg(any(debug_assertions, feature = "devtools"))]
     injection: Arc<FailureInjection>,
     emitter_tx: Sender<EmitterMsg>,
+}
+
+impl ThumbnailCore {
+    fn cache_generation(&self) -> u64 {
+        self.cache_generation.load(Ordering::SeqCst)
+    }
+
+    /// 1アセットの要求経路: ヒットは即時ready、ミスはジョブ投入 (dedup)。
+    /// [`ThumbnailService::request`] (UI由来・満杯は即時拒否) とbacklog
+    /// feeder (満杯は再延期) の共通本体。
+    fn enqueue_asset(
+        &self,
+        asset: &AssetSnapshot,
+        size_class: SizeClass,
+        priority: Priority,
+    ) -> EnqueueOutcome {
+        let fingerprint = asset_fingerprint(&asset.source_path, asset.byte_size, asset.mtime_ms);
+        let key = cache_key(&fingerprint, size_class);
+        let version = content_version_of(&fingerprint);
+        match self.cache.lookup(&key) {
+            CacheLookup::Hit(_) => {
+                self.stats.record_hit();
+                EnqueueOutcome::CacheHit(ThumbReadyItem {
+                    asset_id: asset.id,
+                    size_class: size_class.ipc_name().to_string(),
+                    cache_generation: self.cache_generation(),
+                    version,
+                })
+            }
+            CacheLookup::Miss => {
+                // registryを先に更新してからsubmitする (完了通知との競合を防ぐ)。
+                // submit結果が拒否なら同じロック内で取り消す。
+                let attempt = {
+                    let mut registry = lock_registry(&self.registry);
+                    let entry = registry.entry(key.hex.clone()).or_default();
+                    entry.assets.push(asset.id);
+                    entry.generation = self.cache_generation();
+                    entry.version = version;
+                    entry.size_class = size_class.ipc_name().to_string();
+                    let job = Arc::new(ThumbnailJob {
+                        source: asset.source_path.clone(),
+                        fingerprint: fingerprint.clone(),
+                        size_class,
+                        cache: Arc::clone(&self.cache),
+                        stats: Arc::clone(&self.stats),
+                        #[cfg(any(debug_assertions, feature = "devtools"))]
+                        injection: Arc::clone(&self.injection),
+                    });
+                    match self.pool.submit(&key.hex, priority, job) {
+                        Ok(submitted) => Ok(submitted),
+                        Err(err) => {
+                            // 拒否: 台帳からこの要求を巻き戻す
+                            let entry = registry.get_mut(&key.hex).expect("inserted above");
+                            entry.assets.pop();
+                            if entry.assets.is_empty() {
+                                registry.remove(&key.hex);
+                            }
+                            Err(err)
+                        }
+                    }
+                };
+                match attempt {
+                    Ok(submitted) => {
+                        if submitted.is_merged() {
+                            EnqueueOutcome::Merged
+                        } else {
+                            self.stats.record_miss();
+                            EnqueueOutcome::Queued
+                        }
+                    }
+                    Err(SubmitError::QueueFull) => EnqueueOutcome::Full,
+                    Err(SubmitError::Shutdown) => EnqueueOutcome::Shutdown,
+                }
+            }
+        }
+    }
+}
+
+/// サムネイル生成サービス。AppStateへArcで保持する。
+pub struct ThumbnailService {
+    core: Arc<ThumbnailCore>,
+    /// 全件生成の繰延残り (キュー空きを完了通知で待つ。WP-16 F1)。
+    backlog: Arc<Mutex<BacklogState>>,
+    /// feeder起床チャネルの複製 (backlog積み上げ直後の即時排液用)。
+    feeder_wake: Sender<()>,
+    feeder_stop: Arc<AtomicBool>,
+    feeder: Mutex<Option<JoinHandle<()>>>,
     emitter_stop: Arc<AtomicBool>,
     emitter: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl ThumbnailService {
     pub fn new(cache_root: PathBuf, events: Box<dyn ThumbEvents + Send>) -> io::Result<Arc<Self>> {
-        Self::new_with_limit(cache_root, gento_image::cache::DEFAULT_MAX_BYTES, events)
+        Self::new_impl(
+            cache_root,
+            gento_image::cache::DEFAULT_MAX_BYTES,
+            PoolConfig::default(),
+            events,
+        )
     }
 
     /// キャッシュ上限を指定して開く (WP-15: 設定 `cache.thumbs_max_bytes`
@@ -142,64 +277,102 @@ impl ThumbnailService {
         max_bytes: u64,
         events: Box<dyn ThumbEvents + Send>,
     ) -> io::Result<Arc<Self>> {
+        Self::new_impl(cache_root, max_bytes, PoolConfig::default(), events)
+    }
+
+    /// 共通構築。テストはプールキュー上限を縮小してbacklog経路を検証する。
+    fn new_impl(
+        cache_root: PathBuf,
+        max_bytes: u64,
+        pool_config: PoolConfig,
+        events: Box<dyn ThumbEvents + Send>,
+    ) -> io::Result<Arc<Self>> {
         let stats = Arc::new(ThumbStats::new());
         let cache = Arc::new(ThumbnailCache::open_with_limit(
             cache_root,
             max_bytes,
             Arc::clone(&stats),
         )?);
-        let (pool, pool_rx) = WorkerPool::new(PoolConfig::default());
+        let (pool, pool_rx) = WorkerPool::new(pool_config);
         let (emitter_tx, emitter_rx) = mpsc::channel();
+        let (feeder_wake_tx, feeder_wake_rx) = mpsc::channel::<()>();
         let registry: Arc<Mutex<HashMap<String, PendingRequest>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
-        // プール完了チャネル → エミッタチャネルの橋渡し (単一チャネルでバッチングするため)
+        let core = Arc::new(ThumbnailCore {
+            cache: Arc::clone(&cache),
+            pool: Arc::clone(&pool),
+            stats: Arc::clone(&stats),
+            registry: Arc::clone(&registry),
+            cache_generation: AtomicU64::new(1),
+            #[cfg(any(debug_assertions, feature = "devtools"))]
+            injection: Arc::new(FailureInjection::new()),
+            emitter_tx: emitter_tx.clone(),
+        });
+
+        // プール完了チャネル → エミッタチャネルの橋渡し (単一チャネルでバッチングするため)。
+        // 完了 = キュー空きでもあるため、backlog feederの起床信号を併送する。
         {
             let bridge_tx = emitter_tx.clone();
+            let bridge_wake = feeder_wake_tx.clone();
             std::thread::spawn(move || {
                 for completion in pool_rx {
                     let _ = bridge_tx.send(EmitterMsg::JobDone {
                         key: completion.key,
                         outcome: completion.outcome,
                     });
+                    let _ = bridge_wake.send(());
                 }
             });
         }
+
+        let backlog = Arc::new(Mutex::new(BacklogState::default()));
+        let feeder_stop = Arc::new(AtomicBool::new(false));
+        let feeder = spawn_backlog_feeder(
+            Arc::clone(&core),
+            Arc::clone(&backlog),
+            feeder_wake_rx,
+            Arc::clone(&feeder_stop),
+        );
 
         let emitter_stop = Arc::new(AtomicBool::new(false));
         let emitter = spawn_emitter(
             emitter_rx,
             events,
-            Arc::clone(&registry),
-            Arc::clone(&stats),
-            Arc::clone(&cache),
+            registry,
+            stats,
+            cache,
             Arc::clone(&emitter_stop),
         );
 
         Ok(Arc::new(Self {
-            cache,
-            pool,
-            stats,
-            registry,
-            cache_generation: AtomicU64::new(1),
-            #[cfg(any(debug_assertions, feature = "devtools"))]
-            injection: Arc::new(FailureInjection::new()),
-            emitter_tx,
+            core,
+            backlog,
+            feeder_wake: feeder_wake_tx,
+            feeder_stop,
+            feeder: Mutex::new(Some(feeder)),
             emitter_stop,
             emitter: Mutex::new(Some(emitter)),
         }))
     }
 
     pub fn cache_generation(&self) -> u64 {
-        self.cache_generation.load(Ordering::SeqCst)
+        self.core.cache_generation()
     }
 
     /// プロトコルハンドラからのキャッシュ参照 (WP-4)。
     pub fn cache(&self) -> &Arc<ThumbnailCache> {
-        &self.cache
+        &self.core.cache
+    }
+
+    /// backlog残件数 (テスト・診断用)。
+    pub fn backlog_len(&self) -> usize {
+        lock_backlog(&self.backlog).items.len()
     }
 
     /// 要求: ヒットは即時ready、ミスはジョブ投入 (dedup)。
+    /// UI由来の要求は満杯を即時拒否する (backlogへ繰延しない — 表示要求は
+    /// 時効性が高く、拒否を呼び出し側へ見せる方が正しい)。
     pub fn request(
         &self,
         assets: &[AssetSnapshot],
@@ -213,72 +386,74 @@ impl ThumbnailService {
                 counters.skipped_unreadable += 1;
                 continue;
             }
-            let fingerprint =
-                asset_fingerprint(&asset.source_path, asset.byte_size, asset.mtime_ms);
-            let key = cache_key(&fingerprint, size_class);
-            let version = content_version_of(&fingerprint);
-            match self.cache.lookup(&key) {
-                CacheLookup::Hit(_) => {
-                    self.stats.record_hit();
+            match self.core.enqueue_asset(asset, size_class, priority) {
+                EnqueueOutcome::Queued => counters.queued += 1,
+                EnqueueOutcome::Merged => counters.rejected_dup += 1,
+                EnqueueOutcome::CacheHit(item) => {
                     counters.cache_hits += 1;
-                    immediate.push(ThumbReadyItem {
-                        asset_id: asset.id,
-                        size_class: size_class.ipc_name().to_string(),
-                        cache_generation: self.cache_generation(),
-                        version,
-                    });
+                    immediate.push(item);
                 }
-                CacheLookup::Miss => {
-                    // registryを先に更新してからsubmitする (完了通知との競合を防ぐ)。
-                    // submit結果が拒否なら同じロック内で取り消す。
-                    let outcome = {
-                        let mut registry = lock_registry(&self.registry);
-                        let entry = registry.entry(key.hex.clone()).or_default();
-                        entry.assets.push(asset.id);
-                        entry.generation = self.cache_generation();
-                        entry.version = version;
-                        entry.size_class = size_class.ipc_name().to_string();
-                        let job = Arc::new(ThumbnailJob {
-                            source: asset.source_path.clone(),
-                            fingerprint: fingerprint.clone(),
-                            size_class,
-                            cache: Arc::clone(&self.cache),
-                            stats: Arc::clone(&self.stats),
-                            #[cfg(any(debug_assertions, feature = "devtools"))]
-                            injection: Arc::clone(&self.injection),
-                        });
-                        match self.pool.submit(&key.hex, priority, job) {
-                            Ok(submitted) => Some(submitted),
-                            Err(_) => {
-                                // 拒否: 台帳からこの要求を巻き戻す
-                                let entry = registry.get_mut(&key.hex).expect("inserted above");
-                                entry.assets.pop();
-                                if entry.assets.is_empty() {
-                                    registry.remove(&key.hex);
-                                }
-                                None
-                            }
-                        }
-                    };
-                    match outcome {
-                        Some(submitted) => {
-                            if submitted.is_merged() {
-                                counters.rejected_dup += 1;
-                            } else {
-                                counters.queued += 1;
-                                self.stats.record_miss();
-                            }
-                        }
-                        None => counters.rejected_full += 1,
-                    }
+                EnqueueOutcome::Full | EnqueueOutcome::Shutdown => {
+                    counters.rejected_full += 1;
                 }
             }
         }
-        if !immediate.is_empty() {
-            let _ = self
-                .emitter_tx
-                .send(EmitterMsg::ImmediateReady { items: immediate });
+        send_immediate(&self.core.emitter_tx, immediate);
+        counters
+    }
+
+    /// 全件生成 (WP-16 F1): キュー上限で入れ切れなかった分は破棄せず
+    /// backlogへ繰延し、プール完了駆動で空きができ次第投入する
+    /// (library.rsのハッシュ再提出と同一の需要駆動方式)。返し値の
+    /// `deferred` が繰延件数。既存のbacklogは新しいスナップショットで
+    /// 置換され、排液完了・置換・終了時の残数はログで報告される。
+    pub fn request_all(&self, assets: &[AssetSnapshot], size_class: SizeClass) -> RequestAccepted {
+        {
+            let mut backlog = lock_backlog(&self.backlog);
+            if !backlog.items.is_empty() {
+                tracing::info!(
+                    replaced = backlog.items.len(),
+                    deferred_total = backlog.deferred_total,
+                    processed = backlog.processed,
+                    "generate-all backlog replaced by a new request"
+                );
+            }
+            *backlog = BacklogState::default();
         }
+        let mut counters = RequestAccepted::default();
+        let mut immediate = Vec::new();
+        for asset in assets {
+            if !asset.readable {
+                counters.skipped_unreadable += 1;
+                continue;
+            }
+            match self
+                .core
+                .enqueue_asset(asset, size_class, Priority::Background)
+            {
+                EnqueueOutcome::Queued => counters.queued += 1,
+                EnqueueOutcome::Merged => counters.rejected_dup += 1,
+                EnqueueOutcome::CacheHit(item) => {
+                    counters.cache_hits += 1;
+                    immediate.push(item);
+                }
+                EnqueueOutcome::Full => {
+                    let mut backlog = lock_backlog(&self.backlog);
+                    backlog.items.push_back(BacklogItem {
+                        asset: asset.clone(),
+                        size_class,
+                        priority: Priority::Background,
+                    });
+                    backlog.deferred_total += 1;
+                    counters.deferred += 1;
+                }
+                EnqueueOutcome::Shutdown => counters.rejected_full += 1,
+            }
+        }
+        send_immediate(&self.core.emitter_tx, immediate);
+        // backlogを積んだ直後にすでに空きがある場合へ備えfeederを即時起床
+        // させる (完了通知のみを待つと出発が遅れる)。
+        let _ = self.feeder_wake.send(());
         counters
     }
 
@@ -299,7 +474,7 @@ impl ThumbnailService {
                 asset_fingerprint(&asset.source_path, asset.byte_size, asset.mtime_ms);
             let key = cache_key(&fingerprint, size_class);
             use gento_image::pool::ReprioritizeOutcome;
-            match self.pool.reprioritize(&key.hex, priority) {
+            match self.core.pool.reprioritize(&key.hex, priority) {
                 ReprioritizeOutcome::Updated => result.updated += 1,
                 ReprioritizeOutcome::Unchanged => result.not_updated += 1,
                 ReprioritizeOutcome::NotFound => result.not_found += 1,
@@ -320,7 +495,7 @@ impl ThumbnailService {
                 asset_fingerprint(&asset.source_path, asset.byte_size, asset.mtime_ms);
             let key = cache_key(&fingerprint, size_class);
             use gento_image::pool::CancelOutcome;
-            match self.pool.cancel_job(&key.hex) {
+            match self.core.pool.cancel_job(&key.hex) {
                 CancelOutcome::CancelledQueued => result.cancelled_queued += 1,
                 CancelOutcome::CancelRequested => result.cancel_requested += 1,
                 CancelOutcome::NotFound => result.not_found += 1,
@@ -332,8 +507,8 @@ impl ThumbnailService {
     /// 統計スナップショット (command DTO)。プロトコル統計は
     /// `with_proto` でcommand層が上書きする (ここではゼロ初期化)。
     pub fn stats_dto(&self) -> ThumbnailStatsDto {
-        let snapshot = self.stats.snapshot();
-        let depths = self.pool.queue_depths_by_priority();
+        let snapshot = self.core.stats.snapshot();
+        let depths = self.core.pool.queue_depths_by_priority();
         ThumbnailStatsDto {
             generated: snapshot.generated,
             hits: snapshot.cache_hits,
@@ -341,7 +516,7 @@ impl ThumbnailService {
             hit_rate: snapshot.hit_rate,
             failures: snapshot.failures,
             evictions: snapshot.evictions,
-            queue_depth: self.pool.queue_depth(),
+            queue_depth: self.core.pool.queue_depth(),
             queue_depths: QueueDepthsDto {
                 interactive: depths[Priority::Interactive.as_u8() as usize],
                 viewport: depths[Priority::Viewport.as_u8() as usize],
@@ -349,15 +524,15 @@ impl ThumbnailService {
                 overscan: depths[Priority::Overscan.as_u8() as usize],
                 background: depths[Priority::Background.as_u8() as usize],
             },
-            cache_bytes: self.cache.total_bytes(),
+            cache_bytes: self.core.cache.total_bytes(),
             p50_ms: snapshot.p50_ms,
             p95_ms: snapshot.p95_ms,
             p99_ms: snapshot.p99_ms,
-            paused: self.pool.is_paused(),
+            paused: self.core.pool.is_paused(),
             #[cfg(any(debug_assertions, feature = "devtools"))]
-            injection_mode: self.injection.mode().as_str().to_string(),
+            injection_mode: self.core.injection.mode().as_str().to_string(),
             #[cfg(any(debug_assertions, feature = "devtools"))]
-            injection_rate: self.injection.rate(),
+            injection_rate: self.core.injection.rate(),
             proto_requests: 0,
             proto_ok: 0,
             proto_bytes_sent: 0,
@@ -371,25 +546,36 @@ impl ThumbnailService {
     /// devtoolsビルドのみ (WP-0)。
     #[cfg(any(debug_assertions, feature = "devtools"))]
     pub fn set_injection(&self, mode: InjectionMode, rate: f64) {
-        self.injection.set(mode, rate);
+        self.core.injection.set(mode, rate);
         tracing::info!(mode = mode.as_str(), rate, "failure injection updated");
     }
 
     pub fn set_paused(&self, paused: bool) {
-        self.pool.set_paused(paused);
+        self.core.pool.set_paused(paused);
     }
 
     /// 待機中ジョブを全キャンセルし、キャッシュを全削除してgenerationを進める。
     /// 実行中ジョブの書き込みはclear後にコミットされる場合がある
     /// (内容はキーに対応する正当なサムネイルのため無害)。
     pub fn clear_cache(&self) -> io::Result<ClearCacheResult> {
-        // 台帳に残るキー = 未完了ジョブ。全てキャンセルする。
-        let keys: Vec<String> = lock_registry(&self.registry).keys().cloned().collect();
-        for key in keys {
-            self.pool.cancel_job(&key);
+        // backlogも全件生成の継続意図ごと破棄する (削除直後に再生成が
+        // 再開されるのを防ぐ — キャッシュ全削除は明示的な中止指示)。
+        let dropped = {
+            let mut backlog = lock_backlog(&self.backlog);
+            let dropped = backlog.items.len();
+            *backlog = BacklogState::default();
+            dropped
+        };
+        if dropped > 0 {
+            tracing::info!(dropped, "generate-all backlog dropped by cache clear");
         }
-        let outcome = self.cache.clear()?;
-        let generation = self.cache_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        // 台帳に残るキー = 未完了ジョブ。全てキャンセルする。
+        let keys: Vec<String> = lock_registry(&self.core.registry).keys().cloned().collect();
+        for key in keys {
+            self.core.pool.cancel_job(&key);
+        }
+        let outcome = self.core.cache.clear()?;
+        let generation = self.core.cache_generation.fetch_add(1, Ordering::SeqCst) + 1;
         Ok(ClearCacheResult {
             removed_files: outcome.removed_files,
             removed_bytes: outcome.removed_bytes,
@@ -397,12 +583,20 @@ impl ThumbnailService {
         })
     }
 
-    /// プールとエミッタを停止する (アプリ終了時。UIスレッドから呼ぶ)。
+    /// backlog feeder・プール・エミッタを停止する (アプリ終了時。UIスレッドから呼ぶ)。
     pub fn shutdown(&self) {
-        self.pool.shutdown();
+        // feederを先に停止する (プール停止後のsubmitでアイテムが滞留しない。
+        // 残りはfeeder側でログ報告される)。
+        self.feeder_stop.store(true, Ordering::SeqCst);
+        let _ = self.feeder_wake.send(());
+        if let Some(handle) = self.feeder.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            let _ = handle.join();
+        }
+        self.core.pool.shutdown();
         self.emitter_stop.store(true, Ordering::SeqCst);
         // エミッタのrecvを即時起床させるためダミーメッセージを送る
         let _ = self
+            .core
             .emitter_tx
             .send(EmitterMsg::ImmediateReady { items: Vec::new() });
         if let Some(handle) = self
@@ -422,6 +616,113 @@ fn lock_registry(
     registry
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_backlog(backlog: &Mutex<BacklogState>) -> std::sync::MutexGuard<'_, BacklogState> {
+    backlog
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 即時readyアイテムをエミッタへ送る (投入経路の共通末尾)。
+fn send_immediate(emitter_tx: &Sender<EmitterMsg>, items: Vec<ThumbReadyItem>) {
+    if !items.is_empty() {
+        let _ = emitter_tx.send(EmitterMsg::ImmediateReady { items });
+    }
+}
+
+/// backlog feeder: プール完了通知 (または紛失通知保険の200ms) で起床し、
+/// キューの空きぶんだけbacklogから再投入する。満杯に当たったアイテムは
+/// 先頭へ戻して次の完了で再試行する (ハッシュパイプラインの再提出と同一)。
+fn spawn_backlog_feeder(
+    core: Arc<ThumbnailCore>,
+    backlog: Arc<Mutex<BacklogState>>,
+    wake: Receiver<()>,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("thumb-backlog-feeder".into())
+        .spawn(move || loop {
+            if stop.load(Ordering::SeqCst) {
+                let remaining = lock_backlog(&backlog).items.len();
+                if remaining > 0 {
+                    tracing::info!(
+                        remaining,
+                        "thumbnail generate-all backlog dropped at shutdown"
+                    );
+                }
+                return;
+            }
+            match wake.recv_timeout(Duration::from_millis(200)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+            drain_backlog(&core, &backlog, &stop);
+        })
+        .expect("failed to spawn thumb backlog feeder")
+}
+
+/// backlogをキュー空きぶんだけ投入する (1起床で空きが尽きるまで繰り返す)。
+fn drain_backlog(core: &ThumbnailCore, backlog: &Mutex<BacklogState>, stop: &AtomicBool) {
+    let capacity = core.pool.queue_capacity();
+    let margin = BACKLOG_SUBMIT_MARGIN.min(capacity / 4);
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let free = capacity
+            .saturating_sub(core.pool.queue_depth())
+            .saturating_sub(margin);
+        if free == 0 {
+            return;
+        }
+        let mut taken = 0usize;
+        let mut immediate = Vec::new();
+        let mut hit_full = false;
+        while taken < free.min(BACKLOG_SUBMIT_BATCH) {
+            let item = lock_backlog(backlog).items.pop_front();
+            let Some(item) = item else {
+                break;
+            };
+            taken += 1;
+            match core.enqueue_asset(&item.asset, item.size_class, item.priority) {
+                EnqueueOutcome::Queued | EnqueueOutcome::Merged => {
+                    lock_backlog(backlog).processed += 1;
+                }
+                EnqueueOutcome::CacheHit(hit) => {
+                    lock_backlog(backlog).processed += 1;
+                    immediate.push(hit);
+                }
+                EnqueueOutcome::Full => {
+                    // 他の投入と競合して満杯: 先頭へ戻して次の完了で再試行
+                    lock_backlog(backlog).items.push_front(item);
+                    hit_full = true;
+                    break;
+                }
+                EnqueueOutcome::Shutdown => {
+                    // プール停止: 以降の再投入は無意味 (残りは停止時報告)
+                    lock_backlog(backlog).items.push_front(item);
+                    return;
+                }
+            }
+        }
+        send_immediate(&core.emitter_tx, immediate);
+        {
+            let mut b = lock_backlog(backlog);
+            if b.items.is_empty() && (b.deferred_total > 0 || b.processed > 0) {
+                tracing::info!(
+                    deferred = b.deferred_total,
+                    processed = b.processed,
+                    "generate-all backlog drained"
+                );
+                b.deferred_total = 0;
+                b.processed = 0;
+            }
+        }
+        if hit_full || taken == 0 {
+            return;
+        }
+    }
 }
 
 /// fingerprintからURLバージョンを計算する (キャッシュキー計算と同一入力から
@@ -759,9 +1060,9 @@ pub fn generate_all_thumbnails(
         .parse()
         .map_err(|e: gento_core::ParseSizeClassError| e.to_string())?;
     let assets = snapshot_all(&state);
-    Ok(state
-        .thumbnails()
-        .request(&assets, size_class, Priority::Background))
+    // キュー上限を超えた分はbacklogへ繰延され完了駆動で投入される
+    // (WP-16 F1。かつての黙示打切りは廃止)。
+    Ok(state.thumbnails().request_all(&assets, size_class))
 }
 
 #[tauri::command]
@@ -961,6 +1262,140 @@ mod tests {
 
     fn service(dir: &TestDir, events: SharedEvents) -> Arc<ThumbnailService> {
         ThumbnailService::new(dir.path().join("cache"), Box::new(events)).unwrap()
+    }
+
+    /// プールキュー上限を縮小したサービス (WP-16 F1のbacklog経路検証用)。
+    fn service_with_queue_capacity(
+        dir: &TestDir,
+        events: SharedEvents,
+        queue_capacity: usize,
+    ) -> Arc<ThumbnailService> {
+        let pool_config = PoolConfig {
+            worker_count: 2,
+            queue_capacity,
+        };
+        ThumbnailService::new_impl(
+            dir.path().join("cache"),
+            gento_image::cache::DEFAULT_MAX_BYTES,
+            pool_config,
+            Box::new(events),
+        )
+        .unwrap()
+    }
+
+    /// backlogが空になるまで待つ (feederの排液は完了通知駆動のため非同期)。
+    fn wait_backlog_drained(svc: &ThumbnailService) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while svc.backlog_len() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for backlog to drain (remaining={})",
+                svc.backlog_len()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    // ===== WP-16 F1: 全件生成のキュー上限繰延 (backlog) =====
+
+    /// 1回のrequest_allで上限超過分も含め全件が生成される (黙示打切りの回帰)。
+    #[test]
+    fn generate_all_defers_overflow_and_drains_all_beyond_queue_capacity() {
+        let dir = TestDir::new("backlog-drain");
+        let events = SharedEvents::default();
+        let svc = service_with_queue_capacity(&dir, events.clone(), 4);
+        svc.set_paused(true); // 決定的にキューを埋める (ワーカーに消費させない)
+        let assets: Vec<AssetSnapshot> = (0..12)
+            .map(|i| {
+                asset(
+                    u64::try_from(i).unwrap() + 1,
+                    &dir.write_png(&format!("g{i:02}.png"), 64, 64),
+                    true,
+                )
+            })
+            .collect();
+
+        let accepted = svc.request_all(&assets, SizeClass::S256);
+        assert_eq!(accepted.queued, 4, "capacity=4に達するまで投入");
+        assert_eq!(accepted.deferred, 8, "残りは黙示破棄ではなく繰延");
+        assert_eq!(accepted.rejected_full, 0);
+        assert_eq!(svc.backlog_len(), 8);
+
+        svc.set_paused(false);
+        // 再投入なしの1回のrequest_allで全12件が生成される
+        let ready = events.wait_ready_count(12);
+        assert_eq!(ready.len(), 12);
+        wait_backlog_drained(&svc);
+        let dto = svc.stats_dto();
+        assert_eq!(dto.generated, 12);
+        assert_eq!(dto.queue_depth, 0);
+        svc.shutdown();
+    }
+
+    /// UI由来了のrequestは満杯をbacklogにせず即時拒否する (需要駆動ensure整合)。
+    #[test]
+    fn request_rejects_full_without_backlog() {
+        let dir = TestDir::new("backlog-none");
+        let events = SharedEvents::default();
+        let svc = service_with_queue_capacity(&dir, events.clone(), 2);
+        svc.set_paused(true);
+        let assets: Vec<AssetSnapshot> = (0..3)
+            .map(|i| {
+                asset(
+                    u64::try_from(i).unwrap() + 1,
+                    &dir.write_png(&format!("r{i}.png"), 64, 64),
+                    true,
+                )
+            })
+            .collect();
+        let counters = svc.request(&assets, SizeClass::S256, Priority::Viewport);
+        assert_eq!(counters.queued, 2);
+        assert_eq!(counters.rejected_full, 1);
+        assert_eq!(counters.deferred, 0);
+        assert_eq!(svc.backlog_len(), 0, "requestはbacklogへ積まない");
+        svc.shutdown();
+    }
+
+    /// キャッシュ全削除はbacklogも破棄し、shutdownは残りを残したまま完了する。
+    #[test]
+    fn generate_all_backlog_dropped_on_clear_cache_and_reports_at_shutdown() {
+        let dir = TestDir::new("backlog-drop");
+        let events = SharedEvents::default();
+        let svc = service_with_queue_capacity(&dir, events.clone(), 2);
+        svc.set_paused(true);
+        let assets: Vec<AssetSnapshot> = (0..6)
+            .map(|i| {
+                asset(
+                    u64::try_from(i).unwrap() + 1,
+                    &dir.write_png(&format!("d{i}.png"), 64, 64),
+                    true,
+                )
+            })
+            .collect();
+        let accepted = svc.request_all(&assets, SizeClass::S256);
+        assert_eq!(accepted.queued, 2);
+        assert_eq!(accepted.deferred, 4);
+
+        // clear_cache: 未完了ジョブのキャンセル + backlog破棄
+        svc.clear_cache().unwrap();
+        assert_eq!(svc.backlog_len(), 0, "キャッシュ全削除でbacklogも破棄");
+        svc.set_paused(false);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            events.ready_items().is_empty(),
+            "キャンセル済みジョブ・破棄backlogからは生成されない"
+        );
+
+        // 再度繰延を作った状態でshutdown: 残り報告の上で停止完了する
+        svc.set_paused(true); // 決定的に繰延を作る (ワーカーに消費させない)
+        let accepted2 = svc.request_all(&assets, SizeClass::S256);
+        assert_eq!(accepted2.deferred, 4);
+        svc.shutdown();
+        assert_eq!(
+            svc.backlog_len(),
+            4,
+            "shutdown時点の残りは報告 (ログ) のうえ投入されずに残る"
+        );
     }
 
     #[test]

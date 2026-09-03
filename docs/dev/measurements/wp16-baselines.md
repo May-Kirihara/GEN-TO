@@ -106,7 +106,9 @@ microbench (同一DBコピーで `hash_and_link_file` 0.6-14ms/件) と大幅に
 前段の低速帯があり、詳細原因は未特定 (WAL急膨張と同時発生。§12リスク参照)。
 後続の再起動で残り1,417ファイル分は自動補完された (reconciliation正常動作)。
 
-※5 クリーン終了後もWALが残る (次回起動時にリカバリ)。VACUUM INTOバックアップ
+※5 計測時点 (FG-WP16-1前) ではクリーン終了後もWALが残った (次回起動時に
+リカバリ)。**FG-WP16-1 F2でgraceful shutdown時の明示checkpoint (TRUNCATE)
+を追加**し、以後の終了時WALは0バイトになる (§14)。VACUUM INTOバックアップ
 は54.1MBに縮む (§8)。
 
 ※6 2ワーカーハッシュ+プローブ+WebThumbnail並走時。低スペックでの頭打ち
@@ -321,15 +323,27 @@ smaps_rollup (s8_cached_reload run3・アイドル・キャッシュ済み):
 
 ## 12. 発見とリスク (PMへの申し送り)
 
+> 2026-09-03 FG-WP16-1にて1-3を対応 (§14参照)。以下は当時の申し送り
+> 原文に対応状況を併記したもの。
+
 1. **`generate_all_thumbnails` の5万件スケール制限** — 1回の投入がサムネイル
-   プールキュー (4,096) 分しか入らず、残りは**黙って破棄**される
-   (再投入で回復)。利用者が「全件生成」を押した際の期待と異なる可能性。
-   対応候補: 生成完了駆動の再投入、または投入し切れなかった件数のUI表示。
+    プールキュー (4,096) 分しか入らず、残りは**黙って破棄**される
+    (再投入で回復)。利用者が「全件生成」を押した際の期待と異なる可能性。
+    対応候補: 生成完了駆動の再投入、または投入し切れなかった件数のUI表示。
+    → **修正済み (FG-WP16-1 F1)**: 溢れはbacklogへ繰延され、プール完了
+    駆動で空きができ次第投入される (ハッシュ再提出と同一の需要駆動方式)。
+    `deferred` フィールドで残数を応答。§14参照。
 2. **50kハッシュ初段の低速帯 (~6/sが約11分)** — microbench (0.6-14ms/件) と
-   の乖離。WAL 252MBへの急膨張と同時発生。スループット設計 (2ワーカー) 自体は
-   問題なく、低速帯の原因特定は残課題。5万件初期投入の実用時間は21.5分。
+    の乖離。WAL 252MBへの急膨張と同時発生。スループット設計 (2ワーカー) 自体は
+    問題なく、低速帯の原因特定は残課題。5万件初期投入の実用時間は21.5分。
+    → **診断完了・構造的につき申し送り維持 (FG-WP16-1 F3)**。§14に
+    診断結果 (計測ドライバ・数値付き)。副産品としてfts_countsのsnapshot
+    非一貫性 (偽不整合→writer上の無駄なfts_repair連発) を修正。
 3. **WALがクリーン終了後も252MBのまま残る** — 次回起動でリカバリはされるが、
-   ディスク使用と初回起動時間への影響。終了時checkpointの検討価値あり。
+    ディスク使用と初回起動時間への影響。終了時checkpointの検討価値あり。
+    → **修正済み (FG-WP16-1 F2)**: graceful shutdownで全サービス停止後・
+    DB close前に `PRAGMA wal_checkpoint(TRUNCATE)` を明示実行。
+    実機50k計測でWAL 225.6MB → **0バイト** を確認 (§14)。
 4. **100MP表示方針** — §4の通り現行は保護的拒否。実カメラの100MP写真を
    サムネ/preview対象にするにはWP-3上限の見直しが必要 (PM判断)。
 5. **AVIF probeがdav1dフルデコードで最大69ms/件** (WP-3設計) — ハッシュ
@@ -360,3 +374,123 @@ python3 docs/dev/measurements/drivers/wp16_s7_embed.py     # 要: .local-models
 python3 docs/dev/measurements/drivers/wp16_s9_kill.py
 python3 docs/dev/measurements/drivers/wp16_s10_soak.py 38
 ```
+
+## 14. FG-WP16-1: 申し送り1-3の対応 (2026-09-03)
+
+基盤: WP-16完了時点 + F1/F2/F3-副修正 (cargo 902 / vitest 527)。
+対象: baselines §12の申し送り1-3。
+
+### F1: 全件生成のキュー上限黙示打切り → 修正
+
+- 修正: `generate_all_thumbnails` の溢れ (キュー上限4,096超) は**backlogへ
+  繰延**し、プール完了通知駆動で空きができ次第投入 (ハッシュパイプラインの
+  再提出 `resubmit_ready` と同一の需要駆動方式。マージン64・バッチ256も
+  同一値)。`RequestAccepted.deferred` が繰延件数。UI側は未投入分を
+  投げっぱなしだが開発パネル通知に「繰延 N (順次投入)」表示。
+  再押下は既存backlogを置換 (残数ログ報告)、キャッシュ全削除・終了時は
+  backlogを破棄し残数をログ報告。`request_thumbnails` (表示由来) は
+  従来どおり満杯即時拒否のまま (backlogにしない)。
+- テスト (red→green): `generate_all_defers_overflow_and_drains_all_beyond_queue_capacity`
+  (容量4で12件→queued=4/deferred=8、再投入なしの1回呼び出しで全12件生成)、
+  `request_rejects_full_without_backlog`、
+  `generate_all_backlog_dropped_on_clear_cache_and_reports_at_shutdown`、
+  vitest `generateAllの繰延件数は通知に表示する`。
+- 旧挙動の実証: 当時のs2 phase1.logで generate_all 1回押下後 gen=4,163
+  (≈4,096+30) で凍結・以降生成なし = 黙示打切りが発生していた。
+
+### F2: クリーン終了時のWAL残留 → 修正
+
+- 修正: `gento_db::Db::checkpoint_wal_truncate` を追加
+  (`PRAGMA wal_checkpoint(TRUNCATE)` をwriter接続で実行)。RunEvent::Exit
+  で全サービス (thumbnail/library/AI/embedding/vector/backup) 停止後・
+  DB close前に実行。失敗はwarnで継続 (終了を止めない)。
+- テスト (red→green): `wal_checkpoint_truncate_resets_wal_after_bulk_writes`
+  (600txn×8KB書込→WAL>0→checkpoint→WAL==0・busy=0・600行読取可能)。
+- 実機確認 (F3ドライバの終了フェーズ): 50k投入 (WAL 225.6MB) →
+  SIGTERM graceful終了 → **WAL 0バイト**・`quick_check=ok`・
+  アプリログ `shutdown wal checkpoint complete busy=0`。8kでも同様。
+
+### F3: 50kハッシュ初段低速帯 → 診断完了 (構造的・申し送り維持)
+
+計測ドライバ: `docs/dev/measurements/drivers/wp16_f3_hashdiag.py`
+(1s周期で hashed数・WAL/mainサイズ・/proc io・CPU・fts repairログ件数を
+採取。Xephyr :6。WM無し環境では `xdotool windowactivate` でなく
+`windowfocus` が必要 — EWMHが無いため)。
+
+**再現性**: 50kで3/3再現 (旧WP-16実績 + 再計測2走)。**8kでは不再現**
+(8,000件を19.1s = 約416件/s で哈切。WAL最大56MB)。スケール依存。
+
+**50k再計測 (修正前バイナリ、FTS修正前)**:
+
+| 指標 | 値 |
+|---|---|
+| 登録→ハッシュ完了 | 1,197.2s (旧実績1,288.9sと同形) |
+| 低速帯 | ~6件/s (一定) × ~540s → 速度回復 (~100-160件/s・時々1件/sの間欠停滞) |
+| 回復タイミング | hashed≈4,400件 (旧実績でも約4,000件で回復) |
+| WAL | 低速帯中に単調増加 → **225.61MBで凍結** (回復後は増えない) |
+| アプリCPU | 低速帯 約250% (2.5コア) / 高速帯 約200% |
+| アプリ書込 | 低速帯 約1.17MB/s = **約200KB/件** (高速帯 約4KB/件の50倍) |
+| fts repair嵐 | "fts index repaired rebuilt=0 removed=0" 3,327回 (旧実績3,918回) |
+
+**50k再計測 (fts_counts修正後のクリーン再走)**:
+
+| 指標 | 値 |
+|---|---|
+| fts repair | **0回** (修正が完全に効いている) |
+| 低速帯 | **~5件/s が40分の計測上限まで持続** (15,201/47,797件でキャップ。回復なし) |
+| WAL | ~234-236MBで凍結後も低速持続 → **WALサイズ自体は速度制限因子でない** |
+| graceful終了 | WAL 236.25MB → **0バイト** (F2実機再確認) ・quick_check ok |
+
+→ fts嵐の除去でwriter上の無駄トランザクションは消えたが低速帯はむしろ
+長期化した。fts嵐は (少なくとも嵐ありの走で観測された) 回復とも相関が
+あるが、低速帯の生成・維持には非依存 — 嵐は症状 (同じemitパスから誘発
+される) であり原因ではないことが確定。
+
+**切り分け結果**:
+
+1. **サムネIL競合説は否定** — 低速帯中サムネイル生成は未稼働
+   (gen=30・q=0で不変。旧実績ログでも同一)。
+2. **fts repair嵐は症状であって原因ではない** — 原因特定: `fts_counts` の
+   2つのCOUNTが**別々の暗黙readトランザクション**で走り、writerのcommitを
+   跨ぐと偽の不整合がほぼ常態化 → ハッシュ中のほぼ全snapshot変更で
+   `ensure_fts_after_scan` がwriter接続上で `fts_repair` (全走査整合解析) を
+   実行していた。**単一SELECT文化 (snapshot一貫) で修正**し100%消滅を確認
+   (回帰テスト: `fts_counts_is_snapshot_consistent_under_concurrent_writes`、
+   red→green)。**しかし低速帯自体は変わらず持続** → 原因は別。
+3. **低速帯の実体** — 2つのハッシュワーカーが**各100% CPU** (IO待ち・
+   ロック待ちでなくCPU実行)。同時に:
+   - 1ハッシュemit (100ms間引き・最大10/s) のたびに **O(ライブラリ规模)**
+     の作業がハッシュワーカースレッド上で同期実行される:
+     `build_library_snapshot` (list_present_joined 50k行JOIN —
+     実測**約76ms/回**) + レコード構築 + カタログ置換 + fts_counts (約14ms)。
+     2ワーカー× (emit ~150ms + 次emit待ち) のサイクルは ~5-8件/sと
+     定量的に整合する。
+   - 低速帯の書込増幅 (約200KB/件) は50k規模のB-tree/FTS5索引tail再編と
+     一致。WALは低速帯中に増加し~230MB前後で凍結するが、**凍結後も低速が
+     持続する走がある** (fts修正後クリーン再走) ためWALサイズは速度の
+     直接制限因子ではない。
+   - 回復の有無・タイミングは走により不定 (fts嵐あり: 4.4k/9.4k件で回復・
+     なし: 40分間回復なし) — フィードバック dominan の性能現象。
+4. **8kでは帯が無い**のはNが約6分の1で emit O(N) コスト・索引増幅が
+   効かないためと整合。
+
+**結論**: 低速帯の直接原因は (a) ハッシュemitパイプラインのO(N)同期作業
+(スナップショット再構築・FTS保守がワーカー上で最大10/s) と (b) 持続的
+writer+reader負荷下でのWAL checkpoint飢餓による読み/書き増幅の複合。
+いずれも設定・順序の小修正では解消できず (emitの間引き・スナップショット
+増分化・checkpointer分離などの構造変更が必要)、WP指示に従い
+**申し送り維持 (文書化のみ)** とする。fts_counts修正は独立の実欠陥
+(偽不整合→writer上の無駄トランザクション3,300+回/run) として実施済み。
+後続の構造対応候補 (いずれも別WPで設計判断が必要): emitのハッシュワーカー
+からの分離 (専用スレッド/タスク化)・スナップショットの増分適用・
+`ensure_fts_after_scan` の走査完了時限定起動。
+
+### テスト・検証 (FG-WP16-1)
+
+- cargo: **902 passed / 0 failed** (`cargo test --workspace`、基準897+5)
+- vitest: **527 passed / 45 files** (基準526+1)、`svelte-check` 0 error
+- `cargo fmt --all -- --check` / clippy (workspace dev + 触ったcrateの
+  release。workspace release `--all-targets` は基盤コミットから
+  `gento_ai::testserver` (devtools-gated) の既知compile errorで不可 —
+  本WP無関係)
+- F1/F2とも単体red→green、F2は実機graceful終了でもWAL 0バイトを確認

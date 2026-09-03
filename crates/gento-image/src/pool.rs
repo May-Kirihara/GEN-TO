@@ -355,6 +355,11 @@ impl WorkerPool {
         self.worker_count
     }
 
+    /// 未開始ジョブのキュー上限 (再投入側の空き判定に使用)。
+    pub fn queue_capacity(&self) -> usize {
+        self.queue_capacity
+    }
+
     /// 未開始ジョブ数。
     pub fn queue_depth(&self) -> usize {
         lock(&self.inner.queue).queued_count

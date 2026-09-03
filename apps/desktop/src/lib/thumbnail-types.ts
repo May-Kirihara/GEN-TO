@@ -59,6 +59,9 @@ export type RequestAccepted = {
   queued: number;
   rejected_dup: number;
   rejected_full: number;
+  /** キュー満杯で繰延された件数 (generate_allのみ。バックログへ入り
+   * 完了駆動で投入される。WP-16 F1)。 */
+  deferred: number;
   cache_hits: number;
   skipped_unreadable: number;
   skipped_unknown: number;

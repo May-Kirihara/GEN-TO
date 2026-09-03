@@ -271,6 +271,8 @@ type RequestAccepted = {
   queued: number;          // 新規投入
   rejected_dup: number;    // 既存ジョブへ統合 (完了時にまとめて通知される)
   rejected_full: number;   // キュー満杯 (4096) で拒否。UIは再要求しない設計
+  deferred: number;        // キュー満杯でbacklogへ繰延 (generate_allのみ。
+                           // 完了駆動で空きができ次第投入される。WP-16 F1)
   cache_hits: number;      // キャッシュ済みのため即時ready
   skipped_unreadable: number; // state != ready のレコード
   skipped_unknown: number;    // カタログに存在しないID
@@ -306,6 +308,10 @@ invoke<RequestAccepted>("generate_all_thumbnails", { sizeClass: SizeClassId })
 ```
 
 - 表示中カタログ全体を `background` 優先度で一括登録 (受け入れ条件2/5の検証用)。
+- キュー上限 (4096) を超えた分は**破棄されずbacklogへ繰延**され
+  (`deferred` に件数)、プール完了駆動で空きができ次第投入される
+  (WP-16 F1。ライブラリのハッシュ再提出と同一の需要駆動方式)。
+  排液完了・再要求による置換・終了/キャッシュ全削除での残数はログで報告。
 
 ### `get_thumbnail_stats`
 

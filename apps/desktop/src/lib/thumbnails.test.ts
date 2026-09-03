@@ -193,6 +193,7 @@ describe("ThumbnailStore", () => {
       queued: 1615,
       rejected_dup: 0,
       rejected_full: 0,
+      deferred: 0,
       cache_hits: 0,
       skipped_unreadable: 0,
       skipped_unknown: 0,
@@ -203,6 +204,26 @@ describe("ThumbnailStore", () => {
       { command: "generate_all_thumbnails", args: { sizeClass: "s256" } },
     ]);
     expect(store.lastNotice).toContain("1615");
+    expect(store.lastNotice).not.toContain("繰延");
+    dispose();
+  });
+
+  it("generateAllの繰延件数は通知に表示する (WP-16 F1)", async () => {
+    const { store, ipc, dispose } = await initStore();
+    ipc.enqueue("generate_all_thumbnails", {
+      queued: 4096,
+      rejected_dup: 0,
+      rejected_full: 0,
+      deferred: 45321,
+      cache_hits: 0,
+      skipped_unreadable: 0,
+      skipped_unknown: 0,
+    });
+    const ok = await store.generateAll("s256");
+    expect(ok).toBe(true);
+    expect(store.lastNotice).toContain("繰延 45321");
+    expect(store.lastNotice).toContain("順次投入");
+    expect(store.lastNotice).not.toContain("満杯拒否");
     dispose();
   });
 

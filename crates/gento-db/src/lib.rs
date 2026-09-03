@@ -234,6 +234,25 @@ impl Db {
         &self.path
     }
 
+    /// WALをcheckpointして `-wal` ファイルを0バイトへ切り詰める
+    /// (WP-16 F2: graceful shutdown用。auto checkpointの発火に依らない)。
+    ///
+    /// writer接続で `PRAGMA wal_checkpoint(TRUNCATE)` を実行する
+    /// (readerはquery_onlyのため書けない)。全サービス停止後・DB close前に
+    /// 呼ぶこと。戻り値は SQLiteの (busy, log, checkpointed):
+    /// busy=1はreader等が古いread markを保持していて全フレームを切り詰め
+    /// られなかったことを示す (部分成功でもWALは縮む)。
+    pub fn checkpoint_wal_truncate(&self) -> Result<(i64, i64, i64), DbError> {
+        let conn = self
+            .writer
+            .lock()
+            .map_err(|_| DbError::Query("writer lock poisoned".to_string()))?;
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .map_err(|e| DbError::Query(format!("wal_checkpoint(TRUNCATE): {e}")))
+    }
+
     /// 現在のschema version (`PRAGMA user_version`)。
     pub fn schema_version(&self) -> Result<i32, DbError> {
         self.with_reader(|repos| {
@@ -560,6 +579,52 @@ mod tests {
     fn default_backup_dir_is_sibling() {
         let p = Path::new("/x/data/library.sqlite3");
         assert_eq!(default_backup_dir(p), PathBuf::from("/x/data/db-backups"));
+    }
+
+    // ===== WP-16 F2: 終了時WAL checkpoint (TRUNCATE) =====
+
+    #[test]
+    fn wal_checkpoint_truncate_resets_wal_after_bulk_writes() {
+        let tmp = TempDir::new("waltrunc");
+        let db_path = tmp.path().join("db.sqlite3");
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+        {
+            let db = Db::open(&db_path).unwrap();
+            db.with_writer(|repos| {
+                let conn = repos.conn();
+                conn.execute(
+                    "CREATE TABLE walprobe (id INTEGER PRIMARY KEY, blob BLOB)",
+                    [],
+                )
+                .map_err(|e| RepoError::Db(e.to_string()))?;
+                // 個別txで大量書き込み → WALが伸びる (auto checkpointは
+                // 1000 page閾値だがreader次第で切り詰められない)
+                for _ in 0..600 {
+                    conn.execute("INSERT INTO walprobe (blob) VALUES (randomblob(8192))", [])
+                        .map_err(|e| RepoError::Db(e.to_string()))?;
+                }
+                Ok(())
+            })
+            .unwrap();
+            let before = wal_path.metadata().map(|m| m.len()).unwrap_or(0);
+            assert!(before > 0, "大量書き込みでWALが伸びている (got {before})");
+
+            let (busy, _log, _checkpointed) = db.checkpoint_wal_truncate().unwrap();
+            assert_eq!(busy, 0, "競合reader無しなのでbusyにならない");
+            let after = wal_path.metadata().map(|m| m.len()).unwrap_or(0);
+            assert_eq!(after, 0, "TRUNCATE後はWALファイルが0バイト (got {after})");
+
+            // checkpoint後もデータは完全に読める
+            db.with_reader(|repos| {
+                let n: i64 = repos
+                    .conn()
+                    .query_row("SELECT count(*) FROM walprobe", [], |r| r.get(0))
+                    .map_err(|e| RepoError::Db(e.to_string()))?;
+                assert_eq!(n, 600);
+                Ok(())
+            })
+            .unwrap();
+        }
     }
 
     #[test]
