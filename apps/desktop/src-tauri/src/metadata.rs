@@ -1085,17 +1085,8 @@ mod tests {
                         mtime_ms: mtime_ns / 1_000_000,
                         mtime_ns,
                         scan_state: gento_core::repo::ScanState::Present,
-                        os_file_id: {
-                            #[cfg(unix)]
-                            {
-                                use std::os::unix::fs::MetadataExt;
-                                Some(gento_core::repo::OsFileId::new(stat.dev(), stat.ino()))
-                            }
-                            #[cfg(not(unix))]
-                            {
-                                None
-                            }
-                        },
+                        // OS差実装の正本はgento-platform (WP-17-1集約)
+                        os_file_id: gento_platform::os_file_id_of(&stat),
                         detach_asset: false,
                     })
                 })

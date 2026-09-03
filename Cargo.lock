@@ -1864,6 +1864,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "gento-core",
+ "gento-platform",
  "gento-search",
  "rusqlite",
  "serde",
@@ -1878,8 +1879,8 @@ version = "0.1.0"
 dependencies = [
  "cxx",
  "gento-core",
+ "gento-platform",
  "gento-search",
- "libc",
  "ndarray",
  "ort",
  "reqwest",

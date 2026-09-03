@@ -60,6 +60,55 @@ pub fn os_file_id_of(_md: &fs::Metadata) -> Option<OsFileId> {
     None
 }
 
+/// metadataのmtime (ナノ秒精度のu64)。UNIX_EPOCH以前は飽和。
+/// WP-17-1: fileops.rs・backup.rsに散在していた同一実装の集約
+/// (Windows file ID相当の提供は今後課題 — platform-notes参照)。
+pub fn mtime_ns_of(md: &fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let secs: u64 = md.mtime().try_into().unwrap_or(u64::MAX);
+        let nanos: u32 = md.mtime_nsec().try_into().unwrap_or(0);
+        secs.saturating_mul(1_000_000_000)
+            .saturating_add(nanos as u64)
+    }
+    #[cfg(not(unix))]
+    {
+        md.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    }
+}
+
+/// ディレクトリの属するファイルシステムの空き容量 (bytes)。
+/// unix: `statvfs(2)` の `f_bavail * f_bsize` (一般ユーザーが使える領域)。
+/// 非unix: 常に `None` (呼び出し側は確認skip — fail-open)。
+/// WP-17-1: tauri fileops.rs (unix全体) とembedding download.rs
+/// (linux限定) に散在していた実装の集約。集約によりmacOSでも
+/// 空き容量確認が有効になる (それ以前のdownload側はlinuxのみ)。
+pub fn dir_free_bytes(dir: &Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let c_path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
+        // SAFETY: statvfs(2)はpath文字列を読み、out構造体へ書くだけ。
+        // 全フィールドが整数のC構造体のためゼロ埋めは有効。
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: 同上。
+        let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+        if rc != 0 {
+            return None;
+        }
+        Some((stat.f_bavail as u64).saturating_mul(stat.f_bsize as u64))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
 /// [`rename_noreplace`] の失敗分類。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenameNoReplaceError {

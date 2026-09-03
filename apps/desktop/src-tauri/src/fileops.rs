@@ -738,22 +738,8 @@ fn io_error(path: &Path, err: &std::io::Error) -> FsOpError {
 }
 
 fn mtime_ns_of(md: &std::fs::Metadata) -> u64 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let secs: u64 = md.mtime().try_into().unwrap_or(u64::MAX);
-        let nanos: u32 = md.mtime_nsec().try_into().unwrap_or(0);
-        secs.saturating_mul(1_000_000_000)
-            .saturating_add(nanos as u64)
-    }
-    #[cfg(not(unix))]
-    {
-        md.modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0)
-    }
+    // WP-17-1: OS差実装はgento-platformへ集約 (backup.rs等と共通化)
+    gento_platform::mtime_ns_of(md)
 }
 
 impl FileOpsFs for RealFileOps {
@@ -806,13 +792,26 @@ impl FileOpsFs for RealFileOps {
         // 安全原則4: テンポラリ (厳密形式。呼び出し側が命名・所有権記録)
         // へ書き込み→fsync→NOREPLACEで最終名へ確定。
         // テンポラリは最終名と同じディレクトリ (renameの原子性)。
+        //
+        // FG-WP16-6申し送り (WP-17-1適用): tmpは**排他create_new**で作り、
+        // 失敗経路 (キャンセル・書き込み失敗・最終配置失敗) で**unlink
+        // しない** — pathnameによる削除は行わない (作成直後のtmp entryも、
+        // 失敗までの間に他actorが差し替えていれば自分のものではないため)。
+        // tmp名は呼び出し側が厳密形式 (自己識別的dotfile) で命名し
+        // result.tmpに記録するため、失敗時の残留を許容する (成功時は
+        // renameがtmpを消費。起動時の所有権検証付き掃除の対象)。
         let result = (|| -> Result<(), FsOpError> {
             let mut src = std::fs::File::open(from).map_err(|e| io_error(from, &e))?;
-            let mut dst = std::fs::File::create(tmp).map_err(|e| io_error(tmp, &e))?;
+            // 排他create: tmp名の事前占有 (EEXIST) は失敗扱いで既存entryは不接触
+            let mut dst = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(tmp)
+                .map_err(|e| io_error(tmp, &e))?;
             let mut buf = vec![0u8; 512 * 1024];
             loop {
                 if cancel.load(Ordering::Relaxed) {
-                    let _ = std::fs::remove_file(tmp);
+                    // tmpは残留させる (unlinkしない — 上コメント参照)
                     return Err(FsOpError {
                         kind: FsOpErrorKind::Cancelled,
                         message: "コピーをキャンセルしました".to_string(),
@@ -832,19 +831,9 @@ impl FileOpsFs for RealFileOps {
             dst.sync_all().map_err(|e| io_error(tmp, &e))?;
             Ok(())
         })();
-        match result {
-            Ok(()) => {
-                // 最終配置はNOREPLACE (上書きTOCTOU排除)。宛先が出現して
-                // いた場合は失敗し、テンポラリを掃除する。
-                self.rename_noreplace(tmp, to).inspect_err(|_| {
-                    let _ = std::fs::remove_file(tmp);
-                })
-            }
-            Err(err) => {
-                let _ = std::fs::remove_file(tmp);
-                Err(err)
-            }
-        }
+        // 成功時のみ最終配置へ (NOREPLACE — 上書きTOCTOU排除)。宛先が
+        // 出現していた場合は失敗し、tmpは残留させる (unlinkしない)。
+        result.and_then(|()| self.rename_noreplace(tmp, to))
     }
 
     fn remove_file(&self, path: &Path) -> Result<(), FsOpError> {
@@ -883,25 +872,14 @@ impl FileOpsFs for RealFileOps {
     }
 
     fn free_bytes(&self, dir: &Path) -> Result<u64, FsOpError> {
-        #[cfg(unix)]
-        {
-            let c_path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes())
-                .map_err(|e| FsOpError::new(FsOpErrorKind::Io, e.to_string()))?;
-            let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-            let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
-            if rc != 0 {
-                return Err(FsOpError::new(
-                    FsOpErrorKind::Io,
-                    format!("{}: statvfs failed", dir.display()),
-                ));
-            }
-            Ok((stat.f_bavail as u64).saturating_mul(stat.f_bsize as u64))
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = dir;
-            Ok(u64::MAX)
-        }
+        // WP-17-1: statvfs実装はgento-platformへ集約。非unixはNone
+        // (確認skip — fail-open。書き込み失敗時に通常のIOエラーで落ちる)。
+        gento_platform::dir_free_bytes(dir).ok_or_else(|| {
+            FsOpError::new(
+                FsOpErrorKind::Io,
+                format!("{}: statvfs failed", dir.display()),
+            )
+        })
     }
 
     fn hash_file(&self, path: &Path, cancel: &AtomicBool) -> Result<String, FsOpError> {
@@ -1429,20 +1407,7 @@ mod tests {
         fn stat(&self, path: &Path) -> Result<FileStat, FsOpError> {
             let md = std::fs::symlink_metadata(path)
                 .map_err(|e| FsOpError::not_found(format!("{}: {e}", path.display())))?;
-            #[cfg(unix)]
-            let ns = {
-                use std::os::unix::fs::MetadataExt;
-                (md.mtime() as u64)
-                    .saturating_mul(1_000_000_000)
-                    .saturating_add(md.mtime_nsec() as u64)
-            };
-            #[cfg(not(unix))]
-            let ns = md
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0);
+            let ns = gento_platform::mtime_ns_of(&md);
             Ok(FileStat {
                 byte_size: md.len(),
                 mtime_ms: ns / 1_000_000,
@@ -1995,6 +1960,9 @@ mod tests {
     }
 
     /// 最終配置はNOREPLACE: 宛先が既に存在する場合は上書きせず失敗。
+    /// FG-WP16-6申し送り (WP-17-1適用): 失敗経路でtmpを**unlinkしない**
+    /// (所有確認→unlink型TOCTOUの全廃。残留は自己識別的dotfileとして
+    /// 許容 — 起動時の所有権検証付き掃除対象)。
     #[test]
     fn real_file_ops_copy_refuses_existing_destination() {
         let dir = TestDir::new("real-copy-exists");
@@ -2008,11 +1976,30 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err.kind, FsOpErrorKind::AlreadyExists), "{err}");
         assert_eq!(std::fs::read(&dst).unwrap(), b"existing", "上書きされない");
-        assert!(!tmp.exists(), "テンポラリは掃除される");
+        assert!(tmp.exists(), "失敗時のtmp残留を許容 (unlinkしない)");
+    }
+
+    /// tmp名の事前占有 (EEXIST攻撃): 排他createのため失敗扱いとなり、
+    /// **自分が作っていない既存entryは不接触** (切り詰めも削除もされない)。
+    #[test]
+    fn real_file_ops_copy_tmp_preoccupation_keeps_existing_entry_intact() {
+        let dir = TestDir::new("real-copy-eexist");
+        let src = dir.write("r.png", b"new-content");
+        let dst = dir.0.join("out.png");
+        let tmp =
+            gento_core::file_ops::tmp_path_for(&dst, "01234567-89ab-cdef-0123-456789abcdef", 0);
+        std::fs::write(&tmp, b"ATTACKER-OWNED").unwrap();
+        let err = RealFileOps
+            .copy_file(&src, &dst, &tmp, &AtomicBool::new(false))
+            .unwrap_err();
+        assert!(matches!(err.kind, FsOpErrorKind::AlreadyExists), "{err}");
+        // 事前占有entryは無傷
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"ATTACKER-OWNED");
+        assert!(!dst.exists(), "最終名へは配置されない");
     }
 
     #[test]
-    fn real_file_ops_cancel_mid_copy_removes_tmp() {
+    fn real_file_ops_cancel_mid_copy_leaves_tmp_residue() {
         let dir = TestDir::new("real-cancel");
         let src = dir.write("big.png", &[7u8; 4 * 1024 * 1024]);
         let dst = dir.0.join("cancelled.png");
@@ -2024,10 +2011,9 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err.kind, FsOpErrorKind::Cancelled), "{err}");
         assert!(!dst.exists());
-        for entry in std::fs::read_dir(&dir.0).unwrap().flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            assert!(!name.contains(".gento-tmp-"), "キャンセルでtmp掃除: {name}");
-        }
+        // キャンセルでもunlinkしない — 残留は自己識別的dotfile
+        // (起動時掃除の所有権検証対象。result.tmpに記録される)
+        assert!(tmp.exists(), "キャンセル時のtmp残留を許容 (unlinkしない)");
     }
 
     #[test]

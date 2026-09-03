@@ -1,7 +1,7 @@
 # GEN-TO IPC API契約 (Phase 2 / WP-2時点)
 
 - 作成日: 2026-08-28 (WP-2)
-- 最終更新: 2026-09-03 (**FG-WP13-2: §47 改訂 — rel_path symlink規約を全コンポーネント歩行へ強化・列挙fail-closed・durability境界明記** / FG-WP13-1: §47 改訂 — トークン束縛された確定plan適用・rel_pathパス検証規約・digest manifest完全性・フルDB原子公開 / WP-13 (MVP): §47 バックアップと復元のcommand群・`.gento`バックアップ形式追加 / 2026-09-02 WP-12 §46 / WP-11 §45 / WP-10 §44 / WP-9 §43 / WP-8 §42 / WP-7 §39-41 / WP-6 §34-38 / WP-5 §31-33 / WP-4 §26-33 / WP-3 §22-24 / WP-2 §17-21 / WP-1 §1/§16 / WP-0 §0/§1/§14/§15)
+- 最終更新: 2026-09-04 (**WP-17-1: §41 改訂 — copy_fileのnever-unlink・排他create_new / §47 改訂 — 中間symlink保護のプラットフォーム対応表・plan→差し替え→execute検知の実証記載 / §49 改訂 — scrub_paths非ASCII成分政策** / FG-WP13-2: §47 改訂 — rel_path symlink規約を全コンポーネント歩行へ強化・列挙fail-closed・durability境界明記 / FG-WP13-1: §47 改訂 — トークン束縛された確定plan適用・rel_pathパス検証規約・digest manifest完全性・フルDB原子公開 / WP-13 (MVP): §47 バックアップと復元のcommand群・`.gento`バックアップ形式追加 / 2026-09-02 WP-12 §46 / WP-11 §45 / WP-10 §44 / WP-9 §43 / WP-8 §42 / WP-7 §39-41 / WP-6 §34-38 / WP-5 §31-33 / WP-4 §26-33 / WP-3 §22-24 / WP-2 §17-21 / WP-1 §1/§16 / WP-0 §0/§1/§14/§15)
 - 目的: Tauri command・イベント・ローカル画像プロトコルの形状をWP-3〜6の契約基準として固定する。
 - 整合性情報: 本書の型は `crates/gento-core/src/catalog.rs`、`apps/desktop/src-tauri/src/catalog.rs`
   (ページDTOのversion拡張もここ)、
@@ -1635,6 +1635,13 @@ type FileOpsProgressEvent = {
   `.{最終名}.gento-tmp-{op_uuid}-{seq}` のテンポラリ名で書き込み・fsync後
   にNOREPLACEで最終名へ確定してからDB反映。走査 (is_image_entry) も名前中
   の `.gento-tmp-` を画像扱いしないため、異常終了残骸も一覧・DBに現れない。
+- **copy_fileのnever-unlink (WP-17-1 — FG-WP16-6申し送り適用)**:
+  テンポラリは**排他create_new**で作り (tmp名の事前占有=EEXISTは失敗扱い
+  で既存entryは不接触 — 切り詰めも削除もしない)、**失敗経路 (キャンセル・
+  書き込み失敗・最終配置のDestinationExists) でtmpをunlinkしない**
+  (export.rs/diagnostics.rsの出版パターンと同一化)。失敗時の残留は
+  自己識別的dotfile (厳密形式・result.tmpに記録) として許容し、成功時は
+  renameがtmpを消費、起動時の所有権検証付き掃除が回収する。
 - **一時ファイル掃除の所有権** (FG-WP7): 起動掃除は (a) file_operationsの
   request/result JSONに記録された所有tmpパス、(b) 厳密正規表現一致
   (uuid形式検証含む) かつ登録ルート配下、のみ削除。それ以外の
@@ -2278,6 +2285,13 @@ score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
   脱出 (`root/linked-dir/image.png` 型) を構造的に遮断し、開いたfdの
   fstatが正本になる (経路は一度だけ解決)。検証不能・非通常ファイルは
   登録しない。
+  **中間symlink成分への保護手段のプラットフォーム対応表 (WP-17-1)**:
+
+  | プラットフォーム | `open_regular_beneath` の解決手段 | 保護の性質 |
+  |------|-----------------------------------|-----------|
+  | Linux (≥5.6) | `openat2(2)` `RESOLVE_BENEATH\|RESOLVE_NO_SYMLINKS` (単一原子syscall) | 構造的 (race-free) |
+  | Linux (旧カーネル) / その他unix (macOS等) | ルートfdを `O_DIRECTORY\|O_NOFOLLOW` でピン留めし `openat` 成分歩行 (fd毎ステップ入れ替え) | 構造的 (歩行中の差し替えから独立) |
+  | Windows | 各prefixの `symlink_metadata` 字句検査 + `canonicalize` 結果の `is_lexically_beneath` 包含検証 (`\\?\`前置・ドライブ/UNC・大小同一視・区切り`\`/`/`両対応の純関数 — Linux上でユニットテスト実証) | **best-effort** (TOCTOU窓が残る。`docs/dev/platform-notes.md` 参照) |
 - **復元は2フェーズ + トークン束縛された確定plan**:
   (a) `backup_restore_plan` = dry-run。マッチング優先度は
   **UUID完全一致 → content_hash一致 → rel_path一致**。差分
@@ -2293,12 +2307,22 @@ score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
      一致することを確認して**トークンを消費**する。
   2. 消費済みトークンが保証する確定planを適用する。適用は**単一writer
      トランザクション内**で現状からplanを再計算し、ダイジェストが再び
-     一致する場合のみ行われる (手順1と適用の間のDB変化は
-     `RestoreError::PlanChanged` =「確認の後にライブラリの状態が変化
-     しました」で中止。トランザクションはロールバックされDBは無変更)。
+     一致する場合のみ行われる (手順1と適用の間のDB変化 **およびディスク
+     実体の差し替え** — 再計算は `open_and_hash_regular_file`
+     (fd歩行) によるディスク内容ハッシュを含むため、plan後にファイルが
+     差し替われば意図が変化する — は `RestoreError::PlanChanged` =
+     「確認の後にライブラリの状態が変化しました」で中止。
+     トランザクションはロールバックされDBは無変更)。
      表示用フィールド (reason/display_name/on_disk) は意図ダイジェストの
      同値判定から意図的に除外する (適用に影響する実体状態は適用tx内で
-     改めて検証される)。
+     改めて検証される: PathAddの適用は**挿入直前にも**fd歩行で実体を
+     開き直してhash一致を確認し、検証不能・不一致ならfile行を作らず
+     スキップ報告する — tx内再計算とINSERTの間の競合窓の第二防御)。
+     決定論テスト: `execute_restore_detects_content_swap_after_plan` /
+     `execute_restore_detects_symlink_swap_after_plan`
+     (WP-13申し送りのWP-17-1実証 — plan後に別内容へ差し替え・
+     同一内容twinへの最終成分symlink差し替え・中間dirのsymlink差し替え
+     の3攻撃がいずれもPlanChangedで検知・DB無変更となる)。
 - **推測して適用しない**: 曖昧マッチ (同一内容が現DBで複数箇所) と
   行方不明 (バックアップにのみ存在し現DBにもディスクにも無い/不明) は
   スキップして結果に報告する。復元は現DBのデータを**削除しない**
@@ -2588,11 +2612,17 @@ score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
     対象**。**空白を挟んで後に区切り (`/` `\`) が続くトークンはパス候補
     として丸ごと** scrubする (`/home/u/My Photos/x.png` 等。誤爆<漏れの
     方針。URLは `:` が継続を打ち切るため保持 — FG-WP16-3 B4)。
-    **既知の限界 (WP-17申し送り — FG-WP16-4で文書化)**: ①パス構成文字の
-    判定がASCII範囲のみのため、部分scrub後の非ASCII成分
-    (例: `/home/利用者/file.png` の `利用者/…` 部分) は漏れ得る
-    ②空白継続heuristicは後に区切りが続く散文を過剰scrubし得る
-    (「漏れ<誤爆」方針の既知の代償)。
+    **非ASCII成分 (WP-17-1政策決定 — 旧限界①の解消)**: パス候補に
+    **直接連結** (区切り・空白を挟まない) する非ASCII字句 (日本語
+    ディレクトリ名等) と、空白継続内の非ASCII字句はパスの延長とみなして
+    丸ごとscrubする (`/home/山田/写真/画像.png`・`C:\Users\名前\写真.png`
+    等)。誤検知は過剰scrub側に倒す安全側。**パス候補に連結しない通常文
+    の非ASCIIは無傷** (`スキャン完了: 3件` 等)。
+    **残る既知の限界**: ①空白継続heuristicは後に区切りが続く散文を
+    過剰scrubし得る (「漏れ<誤爆」方針の既知の代償 — 非ASCII字句も
+    同一扱い) ②パス直後に区切りを挟まず接続した非ASCII通常文
+    (`/tmp/x.pngです` 等) はパスの延長とみなされ過剰scrubされる
+    (同一方針の代償)。
   - `MetadataColumns`/`AssetMetadataParsed` のDebugを手動実装 (GPS列は
     `<gps>`、rawスロットはバイト数要約に伏せる — `{:?}` 混入時の防護)。
   - AIジョブ失敗時のwarnログ (scrub通し)。panic payloadのscrub。

@@ -123,26 +123,13 @@ fn proxy_from_env() -> Option<reqwest::Proxy> {
     None
 }
 
-/// ディレクトリの空き容量 (bytes)。Linux: statvfs。その他のOS・失敗時は
-/// None (確認skip — fail-open。書き込み失敗時に通常のIOエラーで落ちる)。
+/// ディレクトリの空き容量 (bytes)。unix: statvfs (gento-platform集約実装)。
+/// その他のOS・失敗時は None (確認skip — fail-open。書き込み失敗時に
+/// 通常のIOエラーで落ちる)。
+/// WP-17-1: linux限定の自前実装からgento-platformへ集約 — macOSでも
+/// 空き容量確認が有効になった (旧実装はlinuxのみでmacOSはskip扱い)。
 pub fn available_bytes(path: &Path) -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        use std::ffi::CString;
-        let c_path = CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
-        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-        let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
-        if rc != 0 {
-            return None;
-        }
-        // 型はplatform差があるためu64へ飽和変換
-        Some((stat.f_bavail as u64) * (stat.f_frsize as u64))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = path;
-        None
-    }
+    gento_platform::dir_free_bytes(path)
 }
 
 /// 既定のユーザーエージェント。

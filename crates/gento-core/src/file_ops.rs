@@ -2416,13 +2416,16 @@ mod tests {
         }
 
         fn mtime_ns_of(md: &std::fs::Metadata) -> u64 {
+            // coreはgento-platformへ依存できないため同名ローカル実装
+            // (正本はgento-platform。WP-17-1集約時は秒→ns変換の欠落を
+            // 修正 — 旧実装は秒+ナノの加算でns値を返していなかった)
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
-                md.mtime()
-                    .try_into()
-                    .unwrap_or(u64::MAX)
-                    .saturating_add(md.mtime_nsec().try_into().unwrap_or(0))
+                let secs: u64 = md.mtime().try_into().unwrap_or(u64::MAX);
+                let nanos: u32 = md.mtime_nsec().try_into().unwrap_or(0);
+                secs.saturating_mul(1_000_000_000)
+                    .saturating_add(nanos as u64)
             }
             #[cfg(not(unix))]
             {

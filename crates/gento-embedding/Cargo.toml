@@ -17,6 +17,8 @@ path = "src/bin/worker.rs"
 
 [dependencies]
 gento-core = { workspace = true }
+# WP-17-1: 空き容量確認 (statvfs) のOS差実装の正本 (platform差隔離)
+gento-platform = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 ort = { workspace = true }
@@ -32,8 +34,7 @@ tracing = { workspace = true }
 # モデルDL (進捗・キャンセル・Range再開・プロキシ環境変数尊重)。
 # gento-aiと分離したClientインスタンスとして使用 (dependency-notes参照)。
 reqwest = { workspace = true }
-# DL前の空き容量確認 (statvfs)。Linuxのみ実パス、他OSはskip。
-libc = "0.2"
+# DL前の空き容量確認はgento-platform (statvfs。WP-17-1集約)。
 # workerバイナリのstderrログ (本体libでは未使用 → binのみ。cargoは
 # bin/lib共通の[dependencies]しか持てないためlib側に余分にリンクされる
 # が、workspace既存crateで新規導入なし)

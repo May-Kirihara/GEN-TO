@@ -17,8 +17,9 @@
 //!   コンポーネントを `O_NOFOLLOW` で開く。fdは毎ステップ入れ替わる
 //!   ため、歩行中にパスが差し替えられても既に開いたfdの外へは出られない。
 //! - 非unix (Windows): 各prefixを `symlink_metadata` で字句検査する
-//!   フォールバック。race-freeではない (構造的保証はunix実装のみ。
-//!   Windows本対応はWP-17で再検討)。
+//!   フォールバック + [`is_lexically_beneath`] によるcanonicalize包含
+//!   検証 (WP-17-1。race-freeではない — 構造的保証はunix実装のみ。
+//!   制限は `docs/dev/platform-notes.md` 参照)。
 //!
 //! 経路は**一度だけ**解決される — 開いたfdとそのfstatが正本のため、
 //! 「検査時statとopen後fstatの突き合わせ」のような二重解決のpin比較は
@@ -282,7 +283,15 @@ fn validate_components(components: &[OsString]) -> io::Result<()> {
 
 /// 字句的フォールバック (非unix)。各prefixの `symlink_metadata` で
 /// symlink成分を弾いてから開く — TOCTOU窓が残る (構造的保証はunix
-/// 実装のみ。WP-17のWindows対応で再検討)。
+/// 実装のみ)。
+///
+/// Windows ([`cfg(windows)`]) は追加で `std::fs::canonicalize` による
+/// 包含検証を重ねる: 両辺の正規化実パスが [`is_lexically_beneath`]
+/// (ドライブ文字・UNC・`\\?\`前置・大小同一視・区切り`\`/`/`両対応の
+/// 純関数) を満たさなければ拒否する。symlink解決結果が包含を破る
+/// (中間成分の差し替え等) 場合の追加防御 — canonicalizeとopenは別々の
+/// 経路解決のため依然TOCTOU窓があり、best-effortである
+/// (`docs/dev/platform-notes.md` の既知制限参照)。
 #[cfg(not(unix))]
 fn walk_open_regular_beneath(
     root: &Path,
@@ -306,12 +315,129 @@ fn walk_open_regular_beneath(
             return Err(invalid("intermediate component is not a directory"));
         }
     }
+    #[cfg(windows)]
+    {
+        let root_canon = std::fs::canonicalize(root)?;
+        let final_canon = std::fs::canonicalize(&cur)?;
+        if !is_lexically_beneath(
+            &final_canon.to_string_lossy(),
+            &root_canon.to_string_lossy(),
+        ) {
+            return Err(invalid("resolved path is not beneath the root"));
+        }
+    }
     let file = std::fs::File::open(&cur)?;
     let md = file.metadata()?;
     if !md.is_file() {
         return Err(invalid("not a regular file"));
     }
     Ok((file, md))
+}
+
+// ===== Windows字句的包含判定 (WP-17-1) =====
+//
+// 以下は**純関数**として全platformでコンパイルされる (cfg外)。
+// Windows実機でテストを実行できないため、Linux上のユニットテストで
+// 字句判定ロジックを実証する (`\\?\C:\` 形式を含む)。
+
+/// Windowsパスの種別 (包含判定は種別一致が前提)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsPathKind {
+    /// `C:\…` (ドライブ文字は小文字正規化済み)。
+    Drive(char),
+    /// `\\server\share\…` (server/shareは成分列の先頭2要素)。
+    Unc,
+    /// 相対パス (包含の錨になれないため常に不一致扱い)。
+    Relative,
+}
+
+/// Windowsパスを (種別, 小文字正規化成分列) へ分解する。
+///
+/// 正規化: `\\?\` / `\\?\UNC\` 前置の除去、区切り `/`・`\` の統一、
+/// 大文字小文字の同一視 (NT名前空間はcase-insensitive)、`.` 成分の
+/// 除去、`..` の字句的解決 (ルートより上はclamp — Windowsの実解決に
+/// 合わせたbest-effort)。空成分 (重複区切り・末尾区切り) は無視。
+fn parse_windows_path(input: &str) -> (WindowsPathKind, Vec<String>) {
+    let lower = input.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return (WindowsPathKind::Relative, Vec::new());
+    }
+    let (kind, body) = if let Some(rest) = lower.strip_prefix(r"\\?\unc\") {
+        // \\?\UNC\server\share → \\server\share (UNCへ戻す)
+        (WindowsPathKind::Unc, format!(r"\\{rest}"))
+    } else if let Some(rest) = lower.strip_prefix(r"\\?\") {
+        parse_windows_body(rest)
+    } else {
+        parse_windows_body(&lower)
+    };
+    let mut comps: Vec<String> = body
+        .split(['/', '\\'])
+        .filter(|c| !c.is_empty() && *c != ".")
+        .map(str::to_string)
+        .collect();
+    // `..` の字句的解決 (ルートより上はclamp)
+    let mut resolved: Vec<String> = Vec::with_capacity(comps.len());
+    for c in comps.drain(..) {
+        if c == ".." {
+            resolved.pop();
+        } else {
+            resolved.push(c);
+        }
+    }
+    (kind, resolved)
+}
+
+/// `\\?\` を除去した本体の先頭から種別を判定する。
+/// `C:` / `C:\…` / `C:/…` はドライブ (裸の`C:`もドライブルート扱い —
+/// best-effort)、`\\…` はUNC、それ以外は相対。
+fn parse_windows_body(body: &str) -> (WindowsPathKind, String) {
+    let bytes = body.as_bytes();
+    if bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes.len() == 2 || bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        // ドライブ文字は成分列から除き種別へ格納する
+        return (
+            WindowsPathKind::Drive(bytes[0] as char),
+            body[2..].to_string(),
+        );
+    }
+    if let Some(rest) = body.strip_prefix(r"\\") {
+        return (WindowsPathKind::Unc, format!(r"\\{rest}"));
+    }
+    (WindowsPathKind::Relative, body.to_string())
+}
+
+/// `path` が `root` 配下 (root自身を含む) に字句的に収まるか
+/// (Windowsセマンティクス: 大小同一視・区切り`\`/`/`両対応・
+/// `\\?\` verbatim前置の透過的除去・`..`の字句的解決)。
+///
+/// - ドライブ文字 (`C:` vs `D:`) とUNC server/share は完全一致が必須。
+/// - 相対パスは錨になれないため、いずれかの辺が相対ならfalse。
+/// - 等値 (path == root) は包含扱い (包含検証の用途上、境界を含む)。
+///
+/// 制限 (best-effort・`docs/dev/platform-notes.md` 参照): 8.3短縮名・
+/// 末尾ドット/空白のWin32正規化・NTFSストリーム構文は解釈しない。
+/// この関数は**字句判定のみ**であり、いかなるTOCTOU耐性も提供しない。
+pub fn is_lexically_beneath(path: &str, root: &str) -> bool {
+    let (path_kind, path_comps) = parse_windows_path(path);
+    let (root_kind, root_comps) = parse_windows_path(root);
+    if !matches!(path_kind, WindowsPathKind::Drive(_) | WindowsPathKind::Unc)
+        || !matches!(root_kind, WindowsPathKind::Drive(_) | WindowsPathKind::Unc)
+    {
+        return false;
+    }
+    if path_kind != root_kind {
+        return false;
+    }
+    if path_comps.len() < root_comps.len() {
+        return false;
+    }
+    root_comps
+        .iter()
+        .zip(path_comps.iter())
+        .all(|(r, p)| r == p)
 }
 
 // ===== 出力側包含 (FG-WP16-3 B1) =====
@@ -628,12 +754,14 @@ impl OutputDir {
             let parent = std::os::unix::io::AsRawFd::as_raw_fd(&self.fd);
             let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC;
             // SAFETY: openat(2)。O_CREAT付きのためmode (0o644) を渡す。
+            // modeはvariadic引数のためc_uintで渡す (Linuxのmode_t=u32と
+            // 一致。darwinのmode_t=u16は可変長引数で昇格必須 — E0617)。
             let rc = unsafe {
                 libc::openat(
                     parent,
                     os_cstring(name)?.as_ptr(),
                     flags,
-                    0o644 as libc::mode_t,
+                    0o644 as libc::c_uint,
                 )
             };
             if rc < 0 {
@@ -943,7 +1071,11 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn intermediate_symlink_directory_is_not_traversed() {
-        // ルート外の実体を指す中間symlinkを辿らない (blockerの本体)
+        // ルート外の実体を指す中間symlinkを辿らない (blockerの本体)。
+        // macOSではopenat2が存在しないため open_regular_beneath は常に
+        // fd歩行 (walk_open_regular_beneath) へ落ちる — このテストは
+        // 公開APIと歩行関数の双方を同じ攻撃面で検証することで、
+        // macOS経路 (=歩行のみ) の保護も接続確認する (WP-17-1)。
         let tmp = TestDir::new("symdir");
         let outside = tmp.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
@@ -1053,6 +1185,76 @@ mod tests {
         let err =
             open_regular_beneath(&tmp.path().join("root"), &comps(&["gone.png"])).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+    }
+
+    // ===== WP-17-1: Windows字句的包含判定 (純関数 — Linux上で実証) =====
+
+    #[test]
+    fn lexical_beneath_matches_case_insensitive_and_both_separators() {
+        assert!(is_lexically_beneath(r"C:\Users\name\img.png", r"C:\Users"));
+        assert!(is_lexically_beneath("C:/users/name/img.png", r"C:\Users"));
+        assert!(is_lexically_beneath(r"c:\USERS\name", r"C:\users\"));
+        // 大文字小文字混在も同一視
+        assert!(is_lexically_beneath(
+            r"C:\Users\Name\IMG.png",
+            r"c:\users\NAME"
+        ));
+    }
+
+    #[test]
+    fn lexical_beneath_strips_verbatim_and_unc_prefixes() {
+        // canonicalize出力 (\\?\前置) と通常表現の相互運用
+        assert!(is_lexically_beneath(
+            r"\\?\C:\Users\name\img.png",
+            r"C:\Users"
+        ));
+        assert!(is_lexically_beneath(
+            r"C:\Users\name\img.png",
+            r"\\?\C:\Users"
+        ));
+        // UNCのverbatim形 (\\?\UNC\server\share ↔ \\server\share)
+        assert!(is_lexically_beneath(
+            r"\\?\UNC\server\share\p\img.png",
+            r"\\server\share"
+        ));
+        assert!(is_lexically_beneath(
+            r"\\server\share\p\img.png",
+            r"\\?\UNC\server\share"
+        ));
+        // ドライブルート直下
+        assert!(is_lexically_beneath(r"\\?\C:\x.png", r"C:\"));
+    }
+
+    #[test]
+    fn lexical_beneath_rejects_cross_drive_unc_and_prefix_boundary() {
+        // ドライブ不一致
+        assert!(!is_lexically_beneath(r"D:\Users\name", r"C:\Users"));
+        // UNC server/share不一致
+        assert!(!is_lexically_beneath(r"\\other\share\p", r"\\server\share"));
+        assert!(!is_lexically_beneath(
+            r"\\?\UNC\other\share\p",
+            r"\\server\share"
+        ));
+        // 文字列接頭で切らない (成分境界)
+        assert!(!is_lexically_beneath(r"C:\Users Warfare\x", r"C:\Users"));
+        // .. は字句解決される (C:\evil への脱出は拒否)
+        assert!(!is_lexically_beneath(
+            r"C:\Users\name\..\..\evil",
+            r"C:\Users"
+        ));
+        assert!(is_lexically_beneath(r"C:\Users\name\..\other", r"C:\Users"));
+    }
+
+    #[test]
+    fn lexical_beneath_equal_is_contained_and_relative_never_matches() {
+        // 等値は包含扱い (境界を含む)
+        assert!(is_lexically_beneath(r"C:\Users", r"C:\Users"));
+        // ドライブのみroot
+        assert!(is_lexically_beneath(r"C:\x", r"C:"));
+        // 相対パスは錨になれない
+        assert!(!is_lexically_beneath(r"Users\name", r"C:\Users"));
+        assert!(!is_lexically_beneath(r"C:\Users\name", r"Users"));
+        assert!(!is_lexically_beneath("", r"C:\"));
     }
 
     // ===== FG-WP16-3 B1: 出力側包含 =====

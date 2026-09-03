@@ -7,6 +7,8 @@ edition.workspace = true
 [dependencies]
 gento-core = { workspace = true }
 gento-search = { workspace = true }
+# WP-17-1: mtime・OSファイルIDのOS差実装の正本 (platform差隔離)
+gento-platform = { workspace = true }
 rusqlite = { workspace = true }
 uuid = { workspace = true }
 serde = { workspace = true }

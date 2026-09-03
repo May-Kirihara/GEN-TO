@@ -2392,26 +2392,13 @@ fn apply_restore_tx(
                     if hash != asset.content_hash {
                         continue;
                     }
-                    #[cfg(unix)]
-                    let (mtime_ms, mtime_ns, os_file_id) = {
-                        use std::os::unix::fs::MetadataExt;
-                        let mtime_ns = md
-                            .mtime()
-                            .saturating_mul(1_000_000_000)
-                            .saturating_add(md.mtime_nsec());
-                        let os = gento_core::repo::OsFileId::new(md.dev(), md.ino());
-                        (mtime_ns / 1_000_000, mtime_ns, Some(os.to_bytes().to_vec()))
-                    };
-                    #[cfg(not(unix))]
-                    let (mtime_ms, mtime_ns, os_file_id) = {
-                        let ns = md
-                            .modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_nanos() as i64)
-                            .unwrap_or(0);
-                        (ns / 1_000_000, ns, None)
-                    };
+                    // OS差 (mtime・ファイルID) はgento-platformへ集約した実装
+                    // (WP-17-1。fileops.rs等と共通化)
+                    let mtime_ns = gento_platform::mtime_ns_of(&md);
+                    let (mtime_ms, os_file_id) = (
+                        mtime_ns / 1_000_000,
+                        gento_platform::os_file_id_of(&md).map(|id| id.to_bytes().to_vec()),
+                    );
                     let file_uuid = if uuid_free(tx, "files", &f.uuid) {
                         f.uuid.clone()
                     } else {
@@ -3540,6 +3527,113 @@ mod tests {
         assert_eq!(e.action, RestoreAction::Add);
         assert!(e.files[0].on_disk);
         assert_eq!(plan.summary.add, 1);
+    }
+
+    /// WP-13申し送り (WP-17-1実証): plan計算後に対象ファイルが**差し替え**
+    /// られた攻撃の決定論テスト。実行はwriterトランザクション内で
+    /// planを再計算するが、その再計算はディスク実体の内容ハッシュ
+    /// ([`open_and_hash_regular_file`] = `open_regular_beneath` のfd歩行)
+    /// を含むため、意図digestが変化して [`RestoreError::PlanChanged`]
+    /// として検知・ロールバックされる。
+    #[test]
+    fn execute_restore_detects_content_swap_after_plan() {
+        let fx = Fixture::new("swap");
+        let (root_id, _) = seed_library(&fx.src_db, &fx.root_dir, "a.png", 1);
+        let backup_path = fx.backup(root_id);
+        let backup = open_portable_backup(&backup_path).unwrap();
+        fx.register_target_root();
+
+        // plan: PathAdd (現DB空・ディスクに同一内容)
+        let plan = build_restore_plan(&fx.cur_db, &backup, None).unwrap();
+        assert_eq!(plan.entries[0].matched, RestoreMatch::PathAdd);
+        let digest = restore_intent_digest(&backup, &plan);
+
+        // 攻撃: plan計算後にディスク実体を別内容へ差し替え
+        std::fs::write(fx.root_dir.join("a.png"), b"attacker-swapped-content").unwrap();
+
+        // 検知: 実行時plan再計算の意図digest不一致 → PlanChanged
+        let err = execute_restore(&fx.cur_db, &backup, &plan, &digest).unwrap_err();
+        assert!(matches!(&err, RestoreError::PlanChanged { .. }), "{err}");
+        // DBは無変更 (トランザクションごと中止)
+        let (assets, files): (i64, i64) = fx
+            .cur_db
+            .with_reader(|repos| {
+                let conn = repos.conn();
+                let q = |sql: &str| {
+                    conn.query_row(sql, [], |r| r.get(0))
+                        .map_err(|e| RepoError::Db(e.to_string()))
+                };
+                Ok((
+                    q("SELECT count(*) FROM assets")?,
+                    q("SELECT count(*) FROM files")?,
+                ))
+            })
+            .unwrap();
+        assert_eq!((assets, files), (0, 0));
+    }
+
+    /// 差し替えが「同一内容の実体へのsymlink」でも検知される —
+    /// `open_regular_beneath` の全コンポーネント `O_NOFOLLOW` 歩行が
+    /// symlink経路をNone (行方不明) にするため、マッチングが
+    /// PathAdd→Missingへ変化し意図digestが変わる (ハッシュ一致で
+    /// 紛れ込む経路を構造的に塞ぐ)。中間ディレクトリをsymlinkへ
+    /// 差し替える攻撃も同経路で遮断される。
+    #[test]
+    #[cfg(unix)]
+    fn execute_restore_detects_symlink_swap_after_plan() {
+        let fx = Fixture::new("symswap");
+        let (root_id, _) = seed_library(&fx.src_db, &fx.root_dir, "sub/b.png", 2);
+        let backup_path = fx.backup(root_id);
+        let backup = open_portable_backup(&backup_path).unwrap();
+        fx.register_target_root();
+
+        // plan: PathAdd
+        let plan = build_restore_plan(&fx.cur_db, &backup, None).unwrap();
+        assert_eq!(plan.entries[0].matched, RestoreMatch::PathAdd);
+        let digest = restore_intent_digest(&backup, &plan);
+
+        // 攻撃1: 最終成分を「同一内容の外部実体へのsymlink」へ差し替え
+        // (followすればhash一致 — symlink拒否が本体)
+        let twin = fx.tmp().join("twin.png");
+        std::fs::write(&twin, vec![2u8; 64]).unwrap();
+        std::fs::remove_file(fx.root_dir.join("sub/b.png")).unwrap();
+        std::os::unix::fs::symlink(&twin, fx.root_dir.join("sub/b.png")).unwrap();
+        let err = execute_restore(&fx.cur_db, &backup, &plan, &digest).unwrap_err();
+        assert!(
+            matches!(&err, RestoreError::PlanChanged { .. }),
+            "{err}: 最終成分symlink"
+        );
+
+        // 攻撃2: 中間ディレクトリを外部実ディレクトリへのsymlinkへ差し替え
+        // (外部に同一内容を置き、経路全体をすり替える)
+        let outside = fx.tmp().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("b.png"), vec![2u8; 64]).unwrap();
+        std::fs::remove_file(fx.root_dir.join("sub/b.png")).unwrap();
+        std::fs::remove_dir(fx.root_dir.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&outside, fx.root_dir.join("sub")).unwrap();
+        let err = execute_restore(&fx.cur_db, &backup, &plan, &digest).unwrap_err();
+        assert!(
+            matches!(&err, RestoreError::PlanChanged { .. }),
+            "{err}: 中間ディレクトリsymlink"
+        );
+
+        // DBは無変更
+        let (assets, files): (i64, i64) = fx
+            .cur_db
+            .with_reader(|repos| {
+                let conn = repos.conn();
+                let q = |sql: &str| {
+                    conn.query_row(sql, [], |r| r.get(0))
+                        .map_err(|e| RepoError::Db(e.to_string()))
+                };
+                Ok((
+                    q("SELECT count(*) FROM assets")?,
+                    q("SELECT count(*) FROM files")?,
+                ))
+            })
+            .unwrap();
+        assert_eq!((assets, files), (0, 0));
     }
 
     #[test]

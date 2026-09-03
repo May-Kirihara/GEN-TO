@@ -314,6 +314,11 @@ fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// の連続の中にさらに区切りが現れる場合はパスが続いているとみなし、
 /// 空白ごと丸ごと対象にする (`/home/u/My Photos/x.png` 等。過剰scrubの
 /// 誤爆 < 漏れ、の方針 — URLは `:` が連続を打ち切るため保持される)。
+/// **非ASCII成分** (WP-17-1政策): パス候補に直接連結する非ASCII字句
+/// (日本語ディレクトリ名等) と空白継続内の非ASCII字句はパスの延長と
+/// みなして丸ごと対象にする (`C:\Users\名前\Pictures\写真.png` 等。
+/// 誤検知は過剰scrub側に倒す安全側。パス候補に連結しない通常文の
+/// 非ASCIIは無傷)。
 pub fn scrub_paths(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = String::with_capacity(input.len());
@@ -349,6 +354,15 @@ fn is_path_sep(b: u8) -> bool {
     b == b'/' || b == b'\\'
 }
 
+/// 非ASCIIバイト (UTF-8の多バイト断片 — 日本語等の非ASCII成分)。
+/// WP-17-1政策: パス候補へ**直接連結** (区切り・空白を挟まない) する
+/// 非ASCII字句、および空白継続内の非ASCII字句はパスの延長とみなして
+/// 丸ごとscrubする (誤検知は過剰scrub側に倒す安全側。通常文の非ASCII
+/// はパス候補の外では一切対象にしない)。
+fn is_non_ascii(b: u8) -> bool {
+    (b & 0x80) != 0
+}
+
 /// `i` が絶対パス候補の開始ならその終端 (末尾の区切り・空白を除く) を
 /// 返す。候補でなければNone。
 fn path_candidate_end(bytes: &[u8], i: usize) -> Option<usize> {
@@ -379,12 +393,29 @@ fn path_candidate_end(bytes: &[u8], i: usize) -> Option<usize> {
         while end < bytes.len() && (is_path_char(bytes[end]) || is_path_sep(bytes[end])) {
             end += 1;
         }
-        // 空白継続判定: 続く (パス文字|区切り|空白) 連続の中に区切りが
-        // さらに現れれば、パスが空白を挟んで続いているとみなす
+        // 非ASCII字句の直接連結: 区切り・空白を挟まず続く非ASCII連続は
+        // パス成分とみなす (C:\Users\名前\Pictures\… 等。字句内に区切りが
+        // あればその先まで含む。過剰scrub許容)
+        if end < bytes.len() && is_non_ascii(bytes[end]) {
+            let mut j = end;
+            while j < bytes.len()
+                && (is_non_ascii(bytes[j]) || is_path_char(bytes[j]) || is_path_sep(bytes[j]))
+            {
+                j += 1;
+            }
+            end = j;
+            continue;
+        }
+        // 空白継続判定: 続く (パス文字|区切り|空白|非ASCII) 連続の中に
+        // 区切りがさらに現れれば、パスが空白を挟んで続いているとみなす
+        // (非ASCII成分を含む空白混入パス — 「/home/u/マイ 写真/x.png」)
         if end < bytes.len() && bytes[end] == b' ' {
             let mut j = end;
             while j < bytes.len()
-                && (is_path_char(bytes[j]) || is_path_sep(bytes[j]) || bytes[j] == b' ')
+                && (is_path_char(bytes[j])
+                    || is_path_sep(bytes[j])
+                    || bytes[j] == b' '
+                    || is_non_ascii(bytes[j]))
             {
                 j += 1;
             }
@@ -394,7 +425,9 @@ fn path_candidate_end(bytes: &[u8], i: usize) -> Option<usize> {
                 // "/home/u/My Photos/x.png ignored" の "ignored")
                 let last_sep = bytes[end..j].iter().rposition(|&b| is_path_sep(b)).unwrap() + end;
                 let mut k = last_sep + 1;
-                while k < bytes.len() && (is_path_char(bytes[k]) || is_path_sep(bytes[k])) {
+                while k < bytes.len()
+                    && (is_path_char(bytes[k]) || is_path_sep(bytes[k]) || is_non_ascii(bytes[k]))
+                {
                     k += 1;
                 }
                 end = k;
@@ -599,5 +632,57 @@ mod tests {
         // 時刻表現・区切り付き本文はドライブ扱いしない
         let casual = "at 10:00:00 done, ratio 3:4 ok";
         assert_eq!(scrub_paths(casual), casual);
+    }
+
+    /// WP-17-1: 非ASCII (日本語等) パス成分をパス候補の延長として
+    /// 丸ごとscrubする (政策決定: 誤検知は過剰scrub側に倒す安全側。
+    /// api-contract §49の限界更新に対応)。
+    #[test]
+    fn scrub_paths_covers_non_ascii_path_components() {
+        // unix絶対 + 日本語成分 (区切りを挟んだ続きも延長扱い)
+        let raw = "cannot stat /home/山田/写真/画像.png skipped";
+        let scrubbed = scrub_paths(raw);
+        assert!(!scrubbed.contains("山田"), "{scrubbed}");
+        assert!(!scrubbed.contains("画像"), "{scrubbed}");
+        assert!(
+            scrubbed.contains("cannot stat <path> skipped"),
+            "{scrubbed}"
+        );
+
+        // Windowsドライブ + 日本語成分 (C:\Users\名前\形式)
+        let win = r"failed to read C:\Users\名前\Pictures\写真.png (denied)";
+        let scrubbed = scrub_paths(win);
+        assert!(!scrubbed.contains("名前"), "{scrubbed}");
+        assert!(!scrubbed.contains("写真"), "{scrubbed}");
+        assert!(scrubbed.contains("<path>"), "{scrubbed}");
+        assert!(scrubbed.contains("(denied)"), "{scrubbed}");
+
+        // UNC共有名の非ASCII
+        let unc = "load \\\\server\\共有\\img.png failed";
+        let scrubbed = scrub_paths(unc);
+        assert!(!scrubbed.contains("共有"), "{scrubbed}");
+        assert!(scrubbed.contains("failed"), "{scrubbed}");
+
+        // 空白混入 + 非ASCII成分 (マイ 写真 — 空白継続も非ASCIIを含む)
+        let spaced = "cannot stat /home/u/マイ 写真/x.png ignored";
+        let scrubbed = scrub_paths(spaced);
+        assert!(!scrubbed.contains("マイ"), "{scrubbed}");
+        assert!(!scrubbed.contains("写真"), "{scrubbed}");
+        assert!(
+            scrubbed.contains("cannot stat <path> ignored"),
+            "{scrubbed}"
+        );
+    }
+
+    /// 非ASCII通常文はパス候補へ連結しない限り無傷 (過剰scrubは
+    /// 「絶対パス候補への連結」に限定される)。
+    #[test]
+    fn scrub_paths_leaves_non_ascii_prose_alone() {
+        let prose = "スキャン完了: 3件、警告 2件";
+        assert_eq!(scrub_paths(prose), prose);
+        // パス直後の日本語通常文 (空白後に区切りが続かない) は含めない
+        let after = "/tmp/x.png 保存しました";
+        let scrubbed = scrub_paths(after);
+        assert!(scrubbed.contains("<path> 保存しました"), "{scrubbed}");
     }
 }
