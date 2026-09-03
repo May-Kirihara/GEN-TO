@@ -104,6 +104,7 @@
   import DeleteForeverDialog from "./lib/ui/DeleteForeverDialog.svelte";
   // WP-13: バックアップと復元
   import BackupDialog from "./lib/ui/BackupDialog.svelte";
+  import ExportDialog from "./lib/ui/ExportDialog.svelte";
   import RestoreDialog from "./lib/ui/RestoreDialog.svelte";
   type TriageKeyAction = import("./lib/triage-keys").TriageKeyAction;
   import ContextMenu, { type MenuAction } from "./lib/ui/ContextMenu.svelte";
@@ -305,6 +306,64 @@
   let restoreOpen = $state(false);
   /** フルDBバックアップ実行中。 */
   let fullDbBusy = $state(false);
+
+  // ===== SD学習用エクスポート (WP-14) =====
+
+  /** エクスポートダイアログ中の入力 (解決済みasset id列 + 表示ラベル)。 */
+  let exportFor = $state<{ assetIds: string[]; sourceLabel: string } | null>(null);
+
+  /** 選択項目をエクスポート導線へ (stable AssetIdを持つ項目のみ)。 */
+  function startExportForSelection(items: ImageListItem[]): void {
+    const ids = items
+      .filter((entry) => entry.dbState === "asset")
+      .map((entry) => entry.id);
+    if (ids.length === 0) {
+      showMetaNotice("エクスポート対象がありません (確定済みの画像を選択してください)");
+      return;
+    }
+    exportFor = {
+      assetIds: ids,
+      sourceLabel: `選択 (${ids.length.toLocaleString()}件)`,
+    };
+  }
+
+  /** 表示中コレクションの全項目を解決してエクスポート導線へ。 */
+  async function startExportForCollection(collection: CollectionDto): Promise<void> {
+    try {
+      const ids: string[] = [];
+      if (collection.kind === "manual") {
+        let offset = 0;
+        for (;;) {
+          const page = await collectionsStore.items(collection.id, offset, 500);
+          ids.push(...page.items.map((item) => item.asset_id));
+          offset += page.items.length;
+          if (offset >= page.total || page.items.length === 0) {
+            break;
+          }
+        }
+      } else {
+        let offset = 0;
+        for (;;) {
+          const page = await collectionsStore.smartItems(collection.id, offset, 500);
+          ids.push(...page.asset_ids);
+          offset += page.asset_ids.length;
+          if (offset >= page.total || page.asset_ids.length === 0) {
+            break;
+          }
+        }
+      }
+      if (ids.length === 0) {
+        collectionNotice = "コレクションが空のためエクスポートできません";
+        return;
+      }
+      exportFor = {
+        assetIds: ids,
+        sourceLabel: `コレクション「${collection.name}」`,
+      };
+    } catch (error) {
+      collectionNotice = error instanceof Error ? error.message : String(error);
+    }
+  }
 
   async function runFullDbBackup(): Promise<void> {
     if (fullDbBusy) {
@@ -1973,6 +2032,17 @@
           collectionPickerFor = items.map((entry) => entry.id);
         },
       });
+      // SD学習用エクスポート (WP-14。stable AssetIdが必要なためLibrary系表示のみ)
+      actions.push({
+        id: "export-sd",
+        label:
+          items.length > 1
+            ? `SD学習用にエクスポート… (${items.length.toLocaleString()}件)`
+            : "SD学習用にエクスポート…",
+        run: async () => {
+          startExportForSelection(items);
+        },
+      });
     }
     if (inManualCollection) {
       actions.push({
@@ -2743,7 +2813,16 @@
           </span>
         {/if}
         {#if activeCollection !== null}
-          <button class="export-entry" disabled title="エクスポートはWP-14で実装予定です">
+          <button
+            class="export-entry"
+            title="このコレクションの画像と.txtをSD学習用データセットとして書き出します"
+            onclick={() => {
+              const collection = activeCollection;
+              if (collection !== null) {
+                void startExportForCollection(collection);
+              }
+            }}
+          >
             エクスポート…
           </button>
         {/if}
@@ -3218,6 +3297,15 @@
 
 {#if restoreOpen}
   <RestoreDialog roots={libraryRoots} onClose={() => (restoreOpen = false)} />
+{/if}
+
+{#if exportFor !== null}
+  <ExportDialog
+    assetIds={exportFor.assetIds}
+    sourceLabel={exportFor.sourceLabel}
+    roots={libraryRoots}
+    onClose={() => (exportFor = null)}
+  />
 {/if}
 
 {#if retryReport !== null}

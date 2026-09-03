@@ -2986,6 +2986,19 @@ mod tests {
                 .collect())
         }
 
+        fn list_files_of_asset(&self, asset_id: i64) -> Result<Vec<FileRecord>, RepoError> {
+            let mut files: Vec<FileRecord> = self
+                .files
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|f| f.asset_id == Some(asset_id))
+                .cloned()
+                .collect();
+            files.sort_by_key(|f| f.id);
+            Ok(files)
+        }
+
         fn delete_file(&self, file_id: i64) -> Result<(), RepoError> {
             let mut files = self.files.lock().unwrap();
             let before = files.len();

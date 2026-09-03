@@ -697,6 +697,20 @@ impl FileRepo for SqliteRepos<'_> {
         Ok(rows)
     }
 
+    fn list_files_of_asset(&self, asset_id: i64) -> Result<Vec<FileRecord>, RepoError> {
+        let sql = format!(
+            "SELECT {FILE_COLUMNS} FROM files
+             WHERE asset_id = ?1 ORDER BY id"
+        );
+        let mut stmt = self.conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map([asset_id], map_file)
+            .map_err(map_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_err)?;
+        Ok(rows)
+    }
+
     fn delete_file(&self, file_id: i64) -> Result<(), RepoError> {
         let tx = self
             .conn
@@ -1318,6 +1332,73 @@ mod tests {
     }
 
     // ===== FileRepo =====
+
+    #[test]
+    fn list_files_of_asset_returns_id_ascending() {
+        with_repos("files-of-asset", |repos| {
+            let root = repos.add_root(Path::new("/data/p")).unwrap();
+            let mk = |rel: &str| {
+                repos
+                    .upsert_file(FileUpsert {
+                        root_id: root.id,
+                        rel_path: PathBuf::from(rel),
+                        display_name: Path::new(rel)
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                        byte_size: 10,
+                        mtime_ms: 1,
+                        mtime_ns: 1_000,
+                        scan_state: ScanState::Present,
+                        os_file_id: None,
+                        detach_asset: false,
+                    })
+                    .unwrap()
+            };
+            let f1 = mk("dir/a.png");
+            let f2 = mk("other/b.png");
+            let f3 = mk("c.png");
+            let asset = repos
+                .create_asset(NewAsset {
+                    content_hash: "blake3:aa".to_string(),
+                    hash_algorithm: "blake3".to_string(),
+                    byte_size: 10,
+                    mime_type: None,
+                    width: None,
+                    height: None,
+                    has_alpha: None,
+                    is_animated: None,
+                    frame_count: None,
+                })
+                .unwrap();
+            // リンク順をid順とあえて逆にして (f3→f2→f1) ソートがid基準であることを確認
+            repos.link_file(f3.id, asset.id).unwrap();
+            repos.link_file(f2.id, asset.id).unwrap();
+            repos.link_file(f1.id, asset.id).unwrap();
+            let files = repos.list_files_of_asset(asset.id).unwrap();
+            assert_eq!(
+                files.iter().map(|f| f.id).collect::<Vec<_>>(),
+                vec![f1.id, f2.id, f3.id],
+                "id昇順 (WP-14代表file選択の決定論)"
+            );
+            // リンクなし → 空
+            let asset2 = repos
+                .create_asset(NewAsset {
+                    content_hash: "blake3:bb".to_string(),
+                    hash_algorithm: "blake3".to_string(),
+                    byte_size: 10,
+                    mime_type: None,
+                    width: None,
+                    height: None,
+                    has_alpha: None,
+                    is_animated: None,
+                    frame_count: None,
+                })
+                .unwrap();
+            assert!(repos.list_files_of_asset(asset2.id).unwrap().is_empty());
+        });
+    }
 
     #[test]
     fn upsert_file_without_asset_and_update() {

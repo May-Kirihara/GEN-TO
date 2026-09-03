@@ -15,6 +15,7 @@ pub mod db;
 #[cfg(any(debug_assertions, feature = "devtools"))]
 pub mod devtools;
 pub mod embedding;
+pub mod export;
 pub mod fileops;
 pub mod fsview;
 pub mod library;
@@ -249,7 +250,10 @@ pub fn run() {
         backup::backup_restore_plan,
         backup::backup_restore_execute,
         backup::backup_settings_get,
-        backup::backup_settings_set
+        backup::backup_settings_set,
+        export::export_preview,
+        export::export_execute,
+        export::export_cancel
     ]);
     #[cfg(not(any(debug_assertions, feature = "devtools")))]
     let builder = builder.invoke_handler(tauri::generate_handler![
@@ -351,7 +355,10 @@ pub fn run() {
         backup::backup_restore_plan,
         backup::backup_restore_execute,
         backup::backup_settings_get,
-        backup::backup_settings_set
+        backup::backup_settings_set,
+        export::export_preview,
+        export::export_execute,
+        export::export_cancel
     ]);
     builder
         .setup(move |app| {
@@ -486,6 +493,15 @@ pub fn run() {
                         );
                         backup_service.start_auto_loop();
                         state.backup = Some(backup_service);
+                        // WP-14: SD学習用エクスポートサービス (書き込みは
+                        // 出力先のみ。DBはreader経由のみ)。
+                        let export_service = crate::export::ExportService::new(
+                            std::sync::Arc::clone(&db),
+                            std::sync::Arc::new(crate::export::TauriExportHost {
+                                app: app.handle().clone(),
+                            }),
+                        );
+                        state.export = Some(export_service);
                         controller.enqueue_scan_all();
                         state.library = Some(controller);
                     }

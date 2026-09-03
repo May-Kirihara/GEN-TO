@@ -2372,3 +2372,105 @@ score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
   「DBバックアップ」(既定先へ即時作成)。
 - 復元実行ボタンは `planHasWork` (更新/追加/コレクション作業あり) で
   ゲーティング。衝突・行方不明・曖昧は警告領域に列挙。
+
+## 48. WP-14: SD学習用エクスポート
+
+### 概要 (設計判断の記録)
+
+- **入力は解決済みasset id列** (10進文字列。フロントエンドで選択/検索結果/
+  コレクションcontentsから解決)。サーバー側で重複排除 (**1 asset = 1出力**)
+  し、asset uuid辞書順で処理順を固定する (命名割当の決定論)。
+  `parse_stable_asset_ids` と同一ガード (Library系表示 + 仮ID拒否)。
+- **代表file選択の決定論**: 同一assetに複数file (重複登録) がある場合は
+  `scan_state='present'` の最小file id (presentが無ければ全体の最小id) を
+  代表にする。present優先は「移動で旧経路がmissingになった直後」に
+  実在する複製へフォールバックするための解釈 (PM決定「file id最小」の
+  精緻化 — 反証条件: 手動タグ順序UI等の要望が出た場合に再検討)。
+- **`.txt`内容**: 現行caption (`current=1`) があれば本文をそのまま。
+  複数kindの解釈は **`sd_tags` 現行 → `description` 現行 → タグ列** の
+  優先順 (SD学習用途に特化したkindを先頭に。仮定として記録 — 反証条件:
+  ユーザーがkind選択UIを求めた場合)。タグ列は `list_asset_tags` 契約と
+  同一の `normalized_name ASC` 順で display_name を `", "` 結合
+  (「SDタグ列の順序を維持」= GEN-TOが生成する順序を壊さず決定論的に)。
+  caption・タグとも無い場合は**空の`.txt`** を出力し、manifestの
+  `caption_source: "none"` で記録する (件数から除外しない)。
+- **命名**: 出力ファイル名 = 代表fileの `display_name` (拡張子含む)。
+  同一dir内で異なるassetが同名になる場合は、uuid昇順で先頭がbase名を
+  維持し、以降 `{stem}-{n}.{ext}` (n=1,2,…。拡張子無しは `{stem}-{n}`)。
+  割当は「そのexport実行内でのみ使用される名前集合」に対して行う
+  (既存ファイルは割当に考慮しない — 冪等再実行で同一割当を保証するため)。
+  `.txt`名は最終画像名から導出 (`stem + ".txt"`。先頭dotのみの名前は
+  拡張子無し扱い)。フロントエンド (`lib/export.ts` の `txtNameFor` /
+  `collisionSuffixName`) は同一規則の薄い表示ミラー。
+- **元ファイル・DBは完全不変**: ソース読取はすべて
+  `gento_core::open_regular_beneath` (登録ルートfdから全コンポーネント歩行。
+  FG-WP13-2)。DB参照は `with_reader` (reader接続は `PRAGMA query_only` で
+  書き込みSQLを構造的に拒否)。ソースは読み取り専用openのためmtimeも不変。
+- **無断上書き厳禁 (既存出力との衝突)**: 出力先に同名ファイルがある場合、
+  サイズ一致ならBLAKE3ストリーム比較し、**内容一致 = 「既に書き出し済み」
+  でskip (冪等)**、不一致 = skip + 衝突報告 (manifestと結果DTOに記録)。
+  比較の正本は**ソース実体** (open_regular_beneathで開いたfdの内容) で
+  あり、DBの content_hash ではない (スキャン後の変化に強い)。
+  新規書き出しは tmp書き (`.{名前}.gento-tmp-{32hex}-{6桁seq}` —
+  WP-7 fileopsと同一の厳密形式。出力先が登録ルート内なら起動時掃除の
+  対象) → `sync_all` → `gento_platform::rename_noreplace` による原子公開。
+  上書き競合 (renameのDestinationExists) は失敗として扱う。
+- **フォルダ構造**: `preserve` = 代表fileのrel_path親dir構造を出力先に再現
+  (成分は `Component::Normal` のみ許可 — `..` 等は構造的に拒否して
+  plan失敗扱い)。`flat` = 全て直下 (衝突はsuffixで解決)。
+- **dry-run → 実行の2段**: `export_preview` は書き込み一切なし
+  (出力先が存在しなくても成立し、作成もしない)。既存衝突分類
+  (`none|identical|conflict`) とcaption先頭80文字を返す。UIは
+  dry-runを1回取得しないと実行不可 (`canExecute`。構造変更でdry-runは
+  無効化)。実行は計画を組み直してから項目単位で処理 (クライアント由来の
+  planは信頼しない — fileops/WP-13と同一規約)。
+- **部分失敗・キャンセル**: 単一項目の失敗 (ソース不在・書込エラー) は
+  続行し manifest に記録。キャンセル (`export_cancel` → AtomicBool) は
+  per-item境界で確認し、中断時もそれまでの成果 + manifestは残す
+  (`cancelled: true` + 未処理件数)。実行排他は1件 (2件目の同時実行は
+  「別のエクスポートが実行中です」)。実行中のpanicで排他状態が残留した
+  場合は以後のエクスポートを拒否し続ける (安全側 — 再起動で回復)。
+- **manifest** (`export-manifest.json` を出力dirへ): tmp書き→sync→
+  原子renameで出版。**GEN-TO自身の成果物のため再実行での置換は許容**
+  (最新runの記録が残る。ユーザーファイルの無断上書き規約の対象外)。
+  snake_case (backup artifactと同一規約)。内容: format_version / created_at /
+  cancelled / structure / dest_dir / asset_count / summary (exported,
+  identical, conflict, failed, planning_errors, cancelled) / entries[]
+  (asset_id, asset_uuid, display_name, source_display, output_rel,
+  caption_source, image ("written|identical|conflict|failed") + error,
+  txt + error) / errors[] (plan失敗)。
+
+### Commands (preview/executeはasync + spawn_blocking。DTOはcamelCase)
+
+- `export_preview(assetIds, destDir, structure)` →
+  `{destDir, structure, entries[], summary}`。
+  entries[]: `{assetId, assetUuid, displayName, sourcePath, outputRelPath,
+  txtRelPath, imageExisting ("none|identical|conflict|n/a"), txtExisting,
+  captionSource ("caption_sd_tags|caption_description|tags|none"),
+  captionPreview (先頭80文字), error (plan失敗理由。成功時null)}`。
+  summary: `{total, toWrite, alreadyExported, conflict, error}`。
+- `export_execute(assetIds, destDir, structure)` →
+  `{manifestPath, cancelled, summary, failures[], conflicts[], issuesTruncated}`。
+  summary: `{total, exported, identical, conflict, failed, planningErrors,
+  cancelled}` (total = 処理済み + plan失敗 + キャンセル未処理)。
+  failures[]/conflicts[]: `{assetUuid, displayName, outputRelPath, reason}`
+  (各々先頭100件まで。全量はmanifest)。
+  `structure` は `"preserve" | "flat"`。
+- `export_cancel()` → void (協調キャンセル。per-item境界で効く)。
+
+### Events
+
+- `export:progress` — 実行中、項目ごとに
+  `{processed, total, assetUuid, status}` (status は
+  `"exported" | "identical" | "conflict" | "failed"`)。
+
+### UI統合
+
+- グリッド選択のコンテキストメニュー「SD学習用にエクスポート…」
+  (stable AssetIdを持つ項目 = Library系表示のみ)。
+- コレクション表示中のツールバー「エクスポート…」(表示中コレクションの
+  全項目をmanual/smartそれぞれのitems APIからページング解決)。
+- ExportDialog: 入力源表示 + 出力先 (テキスト入力+フォルダツリー —
+  BackupDialogと同一規約) + 構造toggle + dry-runプレビュー表
+  (出力パス/.txt/既存分類/caption先頭) + 実行・キャンセル + 結果サマリ
+  (失敗・衝突・manifestパス表示)。

@@ -426,6 +426,10 @@ pub trait FileRepo {
     /// ハッシュ処理の再開 (resume) 判定に使用。
     fn list_files_without_asset(&self, root_id: i64) -> Result<Vec<FileRecord>, RepoError>;
 
+    /// AssetにリンクされたFile一覧 (id昇順。WP-14エクスポートの代表file
+    /// 選択 = 重複登録の決定的排除に使用)。
+    fn list_files_of_asset(&self, asset_id: i64) -> Result<Vec<FileRecord>, RepoError>;
+
     /// File行を削除する (WP-7。ファイル操作の上書き・再配置で経路を明け
     /// 渡すときのDB側整合。AssetはRESTRICTで残る)。存在しないIDは
     /// [`RepoError::NotFound`]。

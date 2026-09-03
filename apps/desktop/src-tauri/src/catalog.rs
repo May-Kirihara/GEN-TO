@@ -52,6 +52,8 @@ pub struct AppState {
     pub vector_index: Option<Arc<crate::vectorindex::VectorIndexService>>,
     /// バックアップサービス (WP-13)。DBが開けている場合のみ生成。
     pub backup: Option<Arc<crate::backup::BackupService>>,
+    /// SD学習用エクスポートサービス (WP-14)。DBが開けている場合のみ生成。
+    pub export: Option<Arc<crate::export::ExportService>>,
     /// 計測ブリッジ (devtest) の有効フラグ (FG-1)。devtoolsビルドのみ存在
     /// (WP-0)。起動時に環境変数 `GENTO_DEV_BRIDGE` (値は厳密に "1") から
     /// 確定し以後不変。危険コマンド (set_failure_injection / devtest_report /
@@ -203,6 +205,7 @@ impl AppState {
             embedding: None,
             vector_index: None,
             backup: None,
+            export: None,
             #[cfg(any(debug_assertions, feature = "devtools"))]
             dev_bridge: AtomicBool::new(crate::devtools::dev_bridge_enabled_strict()),
         }
