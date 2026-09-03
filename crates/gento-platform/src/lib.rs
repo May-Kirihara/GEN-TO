@@ -84,10 +84,17 @@ pub fn mtime_ns_of(md: &fs::Metadata) -> u64 {
 
 /// ディレクトリの属するファイルシステムの空き容量 (bytes)。
 /// unix: `statvfs(2)` の `f_bavail * f_bsize` (一般ユーザーが使える領域)。
-/// 非unix: 常に `None` (呼び出し側は確認skip — fail-open)。
+/// 非unix: 常に `None` (Windowsの `GetDiskFreeSpaceExW` 実装は未対応 —
+/// `docs/dev/platform-notes.md` §2参照)。
 /// WP-17-1: tauri fileops.rs (unix全体) とembedding download.rs
 /// (linux限定) に散在していた実装の集約。集約によりmacOSでも
 /// 空き容量確認が有効になる (それ以前のdownload側はlinuxのみ)。
+///
+/// FG-WP17-1: `None` (非unixまたはstatvfs失敗) は呼び出し側で `Err` へ
+/// 変換されるが、現行の唯一の呼び出し経路 (gento-core `plan_file_op` の
+/// `disk_shortfall_bytes` 計算) は `Err` を `.ok()` で打ち切るため
+/// **容量確認skip = fail-open** として働く (事前確認は警告のみで実行阻止
+/// しない二重防護。最終防御は実行時の書き込み失敗/DiskFullエラー)。
 pub fn dir_free_bytes(dir: &Path) -> Option<u64> {
     #[cfg(unix)]
     {

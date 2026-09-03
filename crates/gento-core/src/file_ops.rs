@@ -141,21 +141,28 @@ pub fn tmp_owner_uuid_simple(file_name: &str) -> Option<String> {
     Some(uuid_part.to_string())
 }
 
-/// file_operations行からGEN-TOが所有する一時ファイルパスを抽出する
-/// (起動掃除の削除候補。FG-WP7)。
+/// file_operations行からGEN-TOが所有する一時ファイルの登録情報
+/// (パス + 作成時のOSファイルID) を抽出する (起動掃除の削除候補。
+/// FG-WP7 + FG-WP17-1: fd同一性検証用にIDを含む)。
 ///
-/// - 完了済み (result JSONあり): `steps[].tmp` に記録されたパス。
+/// - 完了済み (result JSONあり): `steps[].tmp` に記録されたパスと
+///   `steps[].tmp_file_id`。
 /// - executing残留 (result JSONなし): request JSONの `files[].to` (計画時
-///   宛先) + 行uuid + step indexから決定論的に再構築。
-///   (keep_both代替名・undo経路のtmpは宛先が異なるため再構築から漏れるが、
-///   厳密形式 (uuid検証) の正規表現掃除が補完する。)
-pub fn owned_tmp_paths_of(record: &FileOpRecord) -> Vec<PathBuf> {
+///   宛先) + 行uuid + step indexから決定論的に再構築。**OSファイルIDは
+///   記録されていない**ため `None` (掃除はfail-closedとして残留報告)。
+///   (keep_both代替名・undo経由のtmpは宛先が異なるため再構築から漏れる
+///   が、それらもrecord所有権+ID検証が無ければ削除されない。)
+pub fn owned_tmp_registry_of(record: &FileOpRecord) -> Vec<(PathBuf, Option<OsFileId>)> {
     if let Some(outcome) = record
         .result_json
         .as_deref()
         .and_then(|json| serde_json::from_str::<FileOpOutcome>(json).ok())
     {
-        return outcome.steps.iter().filter_map(|s| s.tmp.clone()).collect();
+        return outcome
+            .steps
+            .iter()
+            .filter_map(|s| s.tmp.clone().map(|tmp| (tmp, s.tmp_file_id)))
+            .collect();
     }
     let Ok(request) = serde_json::from_str::<serde_json::Value>(&record.request_json) else {
         return Vec::new();
@@ -169,7 +176,7 @@ pub fn owned_tmp_paths_of(record: &FileOpRecord) -> Vec<PathBuf> {
         .filter_map(|(index, file)| {
             file["to"]
                 .as_str()
-                .map(|to| tmp_path_for(Path::new(to), &record.uuid, index))
+                .map(|to| (tmp_path_for(Path::new(to), &record.uuid, index), None))
         })
         .collect()
 }
@@ -446,12 +453,21 @@ pub trait FileOpsFs: Send + Sync {
     fn rename_noreplace(&self, from: &Path, to: &Path) -> Result<(), FsOpError>;
     /// コピー (テンポラリ`tmp`へ書き込み→NOREPLACEで`to`へ確定。
     /// 既存の`to`は置換**しない** — AlreadyExists失敗)。
+    ///
+    /// `tmp_file_id` は**出力引数**: この呼び出しがtmpを作成した場合、
+    /// 作成fdのfstatから `(dev, ino)` (OSファイルID) を設定する
+    /// (FG-WP17-1: 起動掃除のfd同一性検証用。成功・失敗を問わず、
+    /// tmpを作成した時点で設定する — 失敗残留こそ掃除対象のため)。
+    /// OSファイルIDを取得できない環境 (Windows) は設定しない
+    /// (= `None` のまま — 掃除はfail-closedとして残留報告)。
+    /// 呼び出し側は事前に `None` へ初期化して渡すこと。
     fn copy_file(
         &self,
         from: &Path,
         to: &Path,
         tmp: &Path,
         cancel: &AtomicBool,
+        tmp_file_id: &mut Option<OsFileId>,
     ) -> Result<(), FsOpError>;
     /// 完全削除 (ゴミ箱を経由しない。DeleteForever専用)。
     fn remove_file(&self, path: &Path) -> Result<(), FsOpError>;
@@ -644,9 +660,17 @@ pub struct StepResult {
     #[serde(default)]
     pub warning: Option<String>,
     /// このステップが使用した一時ファイルのパス (所有権記録。
-    /// 起動掃除はこの記録と厳密形式検証のみを削除対象にする)。
+    /// 起動掃除は `tmp_file_id` との組でこの記録を削除条件にする)。
     #[serde(default)]
     pub tmp: Option<PathBuf>,
+    /// 一時ファイル作成時のOSファイルID (`(dev, ino)`)。
+    /// FG-WP17-1: 起動掃除はrecordのpath所有権**かつ**この同一性検証の
+    /// 両方が一致する場合のみ削除する (差し替え攻撃の検出)。
+    /// 作成fdのfstat由来のため pathname再解決のTOCTOUを含まない。
+    /// 旧世代record (本フィールド無し) は `None` に復元され、掃除は
+    /// 削除せず残留報告する (fail-closed)。
+    #[serde(default)]
+    pub tmp_file_id: Option<OsFileId>,
     /// 逆操作の列 (上書きステップは複合)。実行順 = 記録順。
     #[serde(default)]
     pub undo: Vec<UndoAction>,
@@ -1009,6 +1033,7 @@ pub fn execute_file_op(
                 )),
                 warning: None,
                 tmp: None,
+                tmp_file_id: None,
                 undo: Vec::new(),
             });
             continue;
@@ -1132,6 +1157,7 @@ fn execute_step(
         error: None,
         warning: None,
         tmp: None,
+        tmp_file_id: None,
         undo: Vec::new(),
     };
     if let Some(err) = &step.plan_error {
@@ -1243,6 +1269,9 @@ fn execute_step(
     } else {
         PathBuf::new()
     };
+    // tmp作成時に実装が報告するOSファイルID (作成fdのfstat由来 —
+    // FG-WP17-1: 掃除のfd同一性検証用。成功・失敗両経路で記録する)
+    let mut tmp_file_id: Option<OsFileId> = None;
 
     /// 配置結果 (moveの跨界フォールバックでsrc削除失敗があった場合の
     /// 警告を運ぶ — 宛先完成済みのため成功扱い)。
@@ -1255,10 +1284,17 @@ fn execute_step(
     }
     let placement: Result<Placement, FsOpError> = match kind {
         FileOpKind::Copy => fs
-            .copy_file(&step.src, &effective_dst, &tmp, cancel)
+            .copy_file(&step.src, &effective_dst, &tmp, cancel, &mut tmp_file_id)
             .map(|_| Placement::Placed),
         FileOpKind::Move | FileOpKind::Rename => {
-            match move_file(fs, &step.src, &effective_dst, &tmp, cancel) {
+            match move_file(
+                fs,
+                &step.src,
+                &effective_dst,
+                &tmp,
+                cancel,
+                &mut tmp_file_id,
+            ) {
                 Ok(MoveOutcome::Completed) => Ok(Placement::Placed),
                 Ok(MoveOutcome::CompletedWithWarning(warning)) => {
                     result.warning = Some(warning);
@@ -1276,6 +1312,7 @@ fn execute_step(
         FileOpKind::DeleteForever => fs.remove_file(&step.src).map(|_| Placement::Removed),
         FileOpKind::Mkdir => fs.mkdir(&effective_dst).map(|_| Placement::DirCreated),
     };
+    result.tmp_file_id = tmp_file_id;
 
     match placement {
         Ok(Placement::Placed) => {
@@ -1358,18 +1395,21 @@ enum MoveOutcome {
 /// 移動: 同一FSはNOREPLACEリネーム、跨界 (EXDEV) はcopy+noreplace配置+
 /// src削除へフォールバック。src削除失敗は警告付き成功
 /// (「宛先完成済みならstepをwarning付き成功扱い」)。
+/// `tmp_file_id` はフォールバックcopyがtmpを作成した際に設定される
+/// ( [`FileOpsFs::copy_file`] の出力引数をそのまま透過)。
 fn move_file(
     fs: &dyn FileOpsFs,
     src: &Path,
     dst: &Path,
     tmp: &Path,
     cancel: &AtomicBool,
+    tmp_file_id: &mut Option<OsFileId>,
 ) -> Result<MoveOutcome, FsOpError> {
     match fs.rename_noreplace(src, dst) {
         Ok(()) => Ok(MoveOutcome::Completed),
         // 同一FSでの失敗のうち跨界のみフォールバック (権限等は伝播)。
         Err(err) if is_cross_device(&err) => {
-            fs.copy_file(src, dst, tmp, cancel)?;
+            fs.copy_file(src, dst, tmp, cancel, tmp_file_id)?;
             match fs.remove_file(src) {
                 Ok(()) => Ok(MoveOutcome::Completed),
                 Err(e) => Ok(MoveOutcome::CompletedWithWarning(format!(
@@ -1562,6 +1602,7 @@ pub fn execute_mkdir(
             error: Some(error),
             warning: None,
             tmp: None,
+            tmp_file_id: None,
             undo: Vec::new(),
         }],
     };
@@ -1599,6 +1640,7 @@ pub fn execute_mkdir(
         error: None,
         warning: None,
         tmp: None,
+        tmp_file_id: None,
         undo: Vec::new(),
     };
     let status = match fs.mkdir(&dst) {
@@ -1704,7 +1746,7 @@ impl UndoRefusal {
 pub struct UndoCandidate {
     pub op_id: i64,
     /// file_operations行のuuid (undo実行が一時ファイルを作る場合の
-    /// 所有権記録に使用 — 厳密形式の掃除対象)。
+    /// 命名に使用 — 残留時はfail-closed報告対象。FG-WP17-1)。
     pub op_uuid: String,
     pub kind: FileOpKind,
     pub status: FileOpStatus,
@@ -2015,9 +2057,20 @@ fn execute_undo_action(
                 )));
             }
             // 跨界undo (元の移動が跨界だった場合) に備えフォールバック付き。
-            // 一時名は元操作と同じuuid空間 + 専用seq帯 (所有権掃除対象)。
+            // 一時名は元操作と同じuuid空間 + 専用seq帯。FG-WP17-1: undoの
+            // tmpはrecordへpath/IDを登録しないため、残留した場合は掃除の
+            // 所有権検証で削除されずfail-closed報告となる (自己識別的
+            // dotfile。厳密形式一致のみでの削除はレビューで禁止済み)。
             let tmp = tmp_path_for(to, op_uuid, UNDO_TMP_SEQ_BASE + index);
-            let outcome = match move_file(fs, from, to, &tmp, &AtomicBool::new(false)) {
+            let mut undo_tmp_file_id = None;
+            let outcome = match move_file(
+                fs,
+                from,
+                to,
+                &tmp,
+                &AtomicBool::new(false),
+                &mut undo_tmp_file_id,
+            ) {
                 Ok(outcome) => outcome,
                 Err(err) => return Err(Box::new((err, None))),
             };
@@ -2522,6 +2575,7 @@ mod tests {
             to: &Path,
             tmp: &Path,
             _cancel: &AtomicBool,
+            tmp_file_id: &mut Option<OsFileId>,
         ) -> Result<(), FsOpError> {
             if let Some(msg) = self.copy_fail.lock().unwrap().get(from) {
                 return Err(FsOpError::new(FsOpErrorKind::PermissionDenied, msg.clone()));
@@ -2533,11 +2587,22 @@ mod tests {
                     format!("copy {} -> {}: {e}", from.display(), to.display()),
                 )
             })?;
+            // 作成済みtmpのOSファイルIDを報告 (FG-WP17-1: 掃除のfd同一性
+            // 検証用 — RealFileOpsは作成fdのfstatから出すが、fakeは
+            // 書き込み後のstatで代用 (テスト用のため等価))
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if let Ok(md) = std::fs::symlink_metadata(tmp) {
+                    *tmp_file_id = Some(OsFileId::new(md.dev(), md.ino()));
+                }
+            }
             if let Some(hook) = self.on_tmp_created.lock().unwrap().as_ref() {
                 hook(tmp);
             }
             if std::fs::symlink_metadata(to).is_ok() {
-                let _ = std::fs::remove_file(tmp);
+                // FG-WP17-1: 失敗経路でtmpをunlinkしない (RealFileOpsの
+                // never-unlink規約と同一化 — 残留は掃除の所有権検証対象)
                 return Err(FsOpError::new(
                     FsOpErrorKind::AlreadyExists,
                     format!("{} already exists", to.display()),

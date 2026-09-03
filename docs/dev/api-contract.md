@@ -1,7 +1,7 @@
 # GEN-TO IPC API契約 (Phase 2 / WP-2時点)
 
 - 作成日: 2026-08-28 (WP-2)
-- 最終更新: 2026-09-04 (**WP-17-1: §41 改訂 — copy_fileのnever-unlink・排他create_new / §47 改訂 — 中間symlink保護のプラットフォーム対応表・plan→差し替え→execute検知の実証記載 / §49 改訂 — scrub_paths非ASCII成分政策** / FG-WP13-2: §47 改訂 — rel_path symlink規約を全コンポーネント歩行へ強化・列挙fail-closed・durability境界明記 / FG-WP13-1: §47 改訂 — トークン束縛された確定plan適用・rel_pathパス検証規約・digest manifest完全性・フルDB原子公開 / WP-13 (MVP): §47 バックアップと復元のcommand群・`.gento`バックアップ形式追加 / 2026-09-02 WP-12 §46 / WP-11 §45 / WP-10 §44 / WP-9 §43 / WP-8 §42 / WP-7 §39-41 / WP-6 §34-38 / WP-5 §31-33 / WP-4 §26-33 / WP-3 §22-24 / WP-2 §17-21 / WP-1 §1/§16 / WP-0 §0/§1/§14/§15)
+- 最終更新: 2026-09-04 (**FG-WP17-1: §41 改訂 — 起動掃除の所有権+fd同一性モデル (名前文法一致のみの削除禁止・旧record fail-closed・fd歩行/unlinkat・残存窓の明記) / §47 改訂 — `is_lexically_beneath` のverbatim trailing space/dot保存・mix形式拒否・verbatim `/` 非区切り・malformed UNC構造検証・ASCII-only folding明記 / §49 改訂 — scrub_paths終端spaced成分の拡張** / WP-17-1: §41 改訂 — copy_fileのnever-unlink・排他create_new / §47 改訂 — 中間symlink保護のプラットフォーム対応表・plan→差し替え→execute検知の実証記載 / §49 改訂 — scrub_paths非ASCII成分政策 / FG-WP13-2: §47 改訂 — rel_path symlink規約を全コンポーネント歩行へ強化・列挙fail-closed・durability境界明記 / FG-WP13-1: §47 改訂 — トークン束縛された確定plan適用・rel_pathパス検証規約・digest manifest完全性・フルDB原子公開 / WP-13 (MVP): §47 バックアップと復元のcommand群・`.gento`バックアップ形式追加 / 2026-09-02 WP-12 §46 / WP-11 §45 / WP-10 §44 / WP-9 §43 / WP-8 §42 / WP-7 §39-41 / WP-6 §34-38 / WP-5 §31-33 / WP-4 §26-33 / WP-3 §22-24 / WP-2 §17-21 / WP-1 §1/§16 / WP-0 §0/§1/§14/§15)
 - 目的: Tauri command・イベント・ローカル画像プロトコルの形状をWP-3〜6の契約基準として固定する。
 - 整合性情報: 本書の型は `crates/gento-core/src/catalog.rs`、`apps/desktop/src-tauri/src/catalog.rs`
   (ページDTOのversion拡張もここ)、
@@ -1642,10 +1642,37 @@ type FileOpsProgressEvent = {
   (export.rs/diagnostics.rsの出版パターンと同一化)。失敗時の残留は
   自己識別的dotfile (厳密形式・result.tmpに記録) として許容し、成功時は
   renameがtmpを消費、起動時の所有権検証付き掃除が回収する。
-- **一時ファイル掃除の所有権** (FG-WP7): 起動掃除は (a) file_operationsの
-  request/result JSONに記録された所有tmpパス、(b) 厳密正規表現一致
-  (uuid形式検証含む) かつ登録ルート配下、のみ削除。それ以外の
-  `.gento-tmp-` 類似ファイルは残置しログで通知。
+- **一時ファイル掃除の所有権とfd同一性 (FG-WP7 → FG-WP17-1改訂 —
+  レビューblocker対応)**: 起動掃除の削除条件は「op recordによるpath
+  所有権」**かつ**「fd同一性検証」の**両方**を満たす場合のみ:
+  - **所有権**: file_operationsのrequest/result JSONに記録されたtmp
+    パス (`steps[].tmp` / request再構築) に一致すること。厳密tmp文法
+    (`.{名前}.gento-tmp-{32桁hex}-{6桁seq}`・uuid検証) への**名前一致
+    のみでは削除しない** (文法は `.gento-tmp-` 類似ファイルの**報告
+    フィルタ**としてのみ使用)。
+  - **fd同一性**: `copy_file` はtmp作成時 (排他create_new直後) に
+    作成fdのfstatから `(dev, ino)` を `steps[].tmp_file_id` として
+    result JSONへ記録 (成功・失敗両経路 — 失敗残留こそ掃除対象)。
+    掃除は `O_NOFOLLOW` で開いたfdのfstatがrecordと一致する場合のみ
+    削除する (pathname差し替え攻撃の検出。不一致は残留+報告)。
+  - **旧世代recordの扱い (fail-closed)**: `tmp_file_id` を記録しない
+    世代のrecord (本改訂前のresult JSON・executing残留のrequest再構築
+    分・OSファイルIDを取得できない環境=Windows) は**削除せず残留
+    報告**する (DBスキーマ変更を要しないJSON拡張領域での段階設計。
+    旧recordのtmpは自己識別的dotfileかつ走査対象外のため残留は無害)。
+  - **traversalと削除の構造**: 登録ルートを `O_DIRECTORY|O_NOFOLLOW`
+    でピン留めし、サブディレクトリも `openat(O_NOFOLLOW|O_DIRECTORY)`
+    で開き直すfd歩行 (dir→symlink差し替えで登録ルート外に出ない)。
+    削除は親fd相対の `unlinkat` (no-follow)。削除対象は `O_NOFOLLOW`
+    で開いたfdが通常ファイルであることをfstat確認した後のみ。
+    **既知の残存窓**: fstat確認→unlinkat間のナノ秒オーダー窓は
+    構造的に除去不可 (Linuxにfd基準の削除APIが存在しないため)。
+  - **掃除が覆わない残留 (正直な限界)**: ①プロセス死亡でstep結果が
+    result JSONへ確定する前に残ったtmp (executing残留のrequest再構築
+    分 — ino記録が存在しないためfail-closed残留報告) ②undo経由の
+    tmp (recordへpath/IDを登録しない — 同様にfail-closed報告)。
+    いずれも `.gento-tmp-` 類似名として毎起動ログ通知される。
+    それ以外の `.gento-tmp-` 類似ファイルも同様に残置しログで通知。
 - **移動の原子性**: 同一FSはNOREPLACEリネーム。跨界 (EXDEV) は
   copy+fsync+NOREPLACE配置→元削除へフォールバック (元削除失敗は
   warning付き成功 — 宛先完成済みのため)。
@@ -2291,7 +2318,7 @@ score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
   |------|-----------------------------------|-----------|
   | Linux (≥5.6) | `openat2(2)` `RESOLVE_BENEATH\|RESOLVE_NO_SYMLINKS` (単一原子syscall) | 構造的 (race-free) |
   | Linux (旧カーネル) / その他unix (macOS等) | ルートfdを `O_DIRECTORY\|O_NOFOLLOW` でピン留めし `openat` 成分歩行 (fd毎ステップ入れ替え) | 構造的 (歩行中の差し替えから独立) |
-  | Windows | 各prefixの `symlink_metadata` 字句検査 + `canonicalize` 結果の `is_lexically_beneath` 包含検証 (`\\?\`前置・ドライブ/UNC・大小同一視・区切り`\`/`/`両対応の純関数 — Linux上でユニットテスト実証) | **best-effort** (TOCTOU窓が残る。`docs/dev/platform-notes.md` 参照) |
+  | Windows | 各prefixの `symlink_metadata` 字句検査 + `canonicalize` 結果の `is_lexically_beneath` 包含検証 (`\\?\`前置・ドライブ/UNC・**ASCIIのみの**大小同一視 (Unicodeケース相違は不一致=拒否側)・区切り`\`/`/`両対応 (verbatim (`\\?\`) 中は `\` のみ — `/` はNT名前空間では名前の一部)・**verbatim根系のtrailing space/dotは保存**・非verbatimはWin32相当に成分末尾space/dotを剥す・**正規化形式 (verbatim vs 非verbatim) が両辺で不一致なら拒否 (fail-closed)** — FG-WP17-1改訂。Linux上でユニットテスト実証) | **best-effort** (TOCTOU窓が残る。`docs/dev/platform-notes.md` 参照) |
 - **復元は2フェーズ + トークン束縛された確定plan**:
   (a) `backup_restore_plan` = dry-run。マッチング優先度は
   **UUID完全一致 → content_hash一致 → rel_path一致**。差分
@@ -2618,11 +2645,21 @@ score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
     丸ごとscrubする (`/home/山田/写真/画像.png`・`C:\Users\名前\写真.png`
     等)。誤検知は過剰scrub側に倒す安全側。**パス候補に連結しない通常文
     の非ASCIIは無傷** (`スキャン完了: 3件` 等)。
+    **終端spaced成分 (FG-WP17-1 — レビュー指摘の漏れ解消)**: パス候補末尾
+    の空白入り字句は、後続separatorの有無にかかわらず**終端まで拡張
+    scrub**する (`/home/山田/マイ 写真.png` の「写真.png」等)。判定は
+    空白トークン単位: ドットを含むトークン (拡張子らしいファイル名断片)
+    または「経路側が非ASCIIを含む場合の非ASCIIトークン」(ドット無し
+    日本語ファイル名) まで延長し、**最後の該当トークンで打ち切る**ため
+    後続の通常語 (`...x.png ignored` の `ignored`) は保持する
+    (`/tmp/x.png 保存しました` の日本語通常文も従来どおり保持 —
+    ASCII-only経路+非ASCII通常文は延長しない)。
     **残る既知の限界**: ①空白継続heuristicは後に区切りが続く散文を
     過剰scrubし得る (「漏れ<誤爆」方針の既知の代償 — 非ASCII字句も
     同一扱い) ②パス直後に区切りを挟まず接続した非ASCII通常文
     (`/tmp/x.pngです` 等) はパスの延長とみなされ過剰scrubされる
-    (同一方針の代償)。
+    (同一方針の代償) ③空白を挟みドットも非ASCIIも持たない終端成分
+    (`my file` 等の拡張子なしスペース入り名) は検出不能 (残る限界)。
   - `MetadataColumns`/`AssetMetadataParsed` のDebugを手動実装 (GPS列は
     `<gps>`、rawスロットはバイト数要約に伏せる — `{:?}` 混入時の防護)。
   - AIジョブ失敗時のwarnログ (scrub通し)。panic payloadのscrub。

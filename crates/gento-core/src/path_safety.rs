@@ -287,8 +287,11 @@ fn validate_components(components: &[OsString]) -> io::Result<()> {
 ///
 /// Windows ([`cfg(windows)`]) は追加で `std::fs::canonicalize` による
 /// 包含検証を重ねる: 両辺の正規化実パスが [`is_lexically_beneath`]
-/// (ドライブ文字・UNC・`\\?\`前置・大小同一視・区切り`\`/`/`両対応の
-/// 純関数) を満たさなければ拒否する。symlink解決結果が包含を破る
+/// (ドライブ文字・UNC・`\\?\`前置・**ASCIIのみの**大小同一視・
+/// 区切り`\`/`/`両対応の純関数) を満たさなければ拒否する。
+/// canonicalize出力は両辺ともverbatim (`\\?\`) 形式で一致するため、
+/// 字句判定の「正規化形式不一致は拒否 (fail-closed)」規則が実運用の
+/// 呼び出しを妨げることはない。symlink解決結果が包含を破る
 /// (中間成分の差し替え等) 場合の追加防御 — canonicalizeとopenは別々の
 /// 経路解決のため依然TOCTOU窓があり、best-effortである
 /// (`docs/dev/platform-notes.md` の既知制限参照)。
@@ -334,7 +337,7 @@ fn walk_open_regular_beneath(
     Ok((file, md))
 }
 
-// ===== Windows字句的包含判定 (WP-17-1) =====
+// ===== Windows字句的包含判定 (WP-17-1 / FG-WP17-1改訂) =====
 //
 // 以下は**純関数**として全platformでコンパイルされる (cfg外)。
 // Windows実機でテストを実行できないため、Linux上のユニットテストで
@@ -347,49 +350,148 @@ enum WindowsPathKind {
     Drive(char),
     /// `\\server\share\…` (server/shareは成分列の先頭2要素)。
     Unc,
-    /// 相対パス (包含の錨になれないため常に不一致扱い)。
+    /// 相対パス・不正形式 (包含の錨になれないため常に不一致扱い)。
     Relative,
 }
 
-/// Windowsパスを (種別, 小文字正規化成分列) へ分解する。
-///
-/// 正規化: `\\?\` / `\\?\UNC\` 前置の除去、区切り `/`・`\` の統一、
-/// 大文字小文字の同一視 (NT名前空間はcase-insensitive)、`.` 成分の
-/// 除去、`..` の字句的解決 (ルートより上はclamp — Windowsの実解決に
-/// 合わせたbest-effort)。空成分 (重複区切り・末尾区切り) は無視。
-fn parse_windows_path(input: &str) -> (WindowsPathKind, Vec<String>) {
-    let lower = input.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return (WindowsPathKind::Relative, Vec::new());
+/// [`parse_windows_path`] の結果。
+struct ParsedWindowsPath {
+    kind: WindowsPathKind,
+    comps: Vec<String>,
+    /// `\\?\` / `\\?\UNC\` verbatim形式か (NT名前空間 — Win32文字列解析無効)。
+    verbatim: bool,
+}
+
+/// 常に不一致扱いの無効parse結果。
+fn invalid_windows_path() -> ParsedWindowsPath {
+    ParsedWindowsPath {
+        kind: WindowsPathKind::Relative,
+        comps: Vec::new(),
+        verbatim: false,
     }
-    let (kind, body) = if let Some(rest) = lower.strip_prefix(r"\\?\unc\") {
-        // \\?\UNC\server\share → \\server\share (UNCへ戻す)
-        (WindowsPathKind::Unc, format!(r"\\{rest}"))
-    } else if let Some(rest) = lower.strip_prefix(r"\\?\") {
-        parse_windows_body(rest)
-    } else {
-        parse_windows_body(&lower)
-    };
-    let mut comps: Vec<String> = body
-        .split(['/', '\\'])
-        .filter(|c| !c.is_empty() && *c != ".")
-        .map(str::to_string)
-        .collect();
-    // `..` の字句的解決 (ルートより上はclamp)
-    let mut resolved: Vec<String> = Vec::with_capacity(comps.len());
-    for c in comps.drain(..) {
-        if c == ".." {
-            resolved.pop();
+}
+
+/// Windowsパスを (種別, 小文字正規化成分列, verbatim形式か) へ分解する。
+///
+/// FG-WP17-1 (レビューblocker対応): **入力をtrimしない** — verbatim
+/// (`\\?\`) 根系のtrailing space/dotはNT名前空間で保存されるため、
+/// trimは包含bypass (`\\?\C:\safe ` 根への `\\?\C:\safe\evil`) を生む。
+///
+/// 正規化は形式ごとに正確な意味論を適用する:
+/// - **verbatim** (`\\?\` / `\\?\UNC\` 前置): 区切りは `\` のみ (`/` は
+///   NT名前空間では名前の一部)。成分末尾のspace/dotは**保存**。
+///   `.`/`..` 成分は解釈されない (リテラル名として存在不能) ため
+///   不正形式扱いで拒否。
+/// - **非verbatim** (Win32形式): 区切りは `\` と `/` 両方 (Win32正規化が
+///   `/` を `\` へ変換するため)。各成分末尾のspace/dotは剥す (Win32が
+///   実解決時に剥すののbest-effort模倣)。`.` 成分は除去、`..` は字句的
+///   解決 (ルートより上はclamp)。
+///
+/// 大文字小文字の同一視は**ASCIIのみ** (Unicodeケース相違は不一致=
+/// 拒否側に倒す — 過小一致を包含bypassにしないためのfail-closed)。
+/// UNCはserver+shareの2成分が必須 (不完全なら不正形式)。
+/// ドライブ相対 (`C:x` — CWD依存) や先頭空白入りは不正形式扱い。
+fn parse_windows_path(input: &str) -> ParsedWindowsPath {
+    let lower = input.to_ascii_lowercase();
+    if lower.is_empty() {
+        return invalid_windows_path();
+    }
+    if let Some(rest) = lower.strip_prefix(r"\\?\unc\") {
+        let Some(comps) = split_verbatim_comps(rest) else {
+            return invalid_windows_path();
+        };
+        return if comps.len() >= 2 {
+            ParsedWindowsPath {
+                kind: WindowsPathKind::Unc,
+                comps,
+                verbatim: true,
+            }
         } else {
-            resolved.push(c);
+            invalid_windows_path()
+        };
+    }
+    if let Some(rest) = lower.strip_prefix(r"\\?\") {
+        let (kind, body) = parse_windows_body(rest);
+        return finish_parse(kind, body, true);
+    }
+    let (kind, body) = parse_windows_body(&lower);
+    finish_parse(kind, body, false)
+}
+
+/// verbatim本体の成分分割: 区切りは `\` のみ・空成分は除去。
+/// `.`/`..` 成分を含む場合は `None` (解釈不能のためfail-closed拒否)。
+fn split_verbatim_comps(body: &str) -> Option<Vec<String>> {
+    let mut comps = Vec::new();
+    for raw in body.split('\\') {
+        if raw.is_empty() {
+            continue;
+        }
+        if raw == "." || raw == ".." {
+            return None;
+        }
+        comps.push(raw.to_string());
+    }
+    Some(comps)
+}
+
+/// 本体の種別判定と成分列への分割 (非verbatim: Win32正規化模倣)。
+fn finish_parse(kind: WindowsPathKind, body: String, verbatim: bool) -> ParsedWindowsPath {
+    match kind {
+        WindowsPathKind::Relative => invalid_windows_path(),
+        WindowsPathKind::Drive(_) | WindowsPathKind::Unc => {
+            let comps = if verbatim {
+                match split_verbatim_comps(&body) {
+                    Some(c) => c,
+                    None => return invalid_windows_path(),
+                }
+            } else {
+                match split_win32_comps(&body) {
+                    Some(c) => c,
+                    None => return invalid_windows_path(),
+                }
+            };
+            if matches!(kind, WindowsPathKind::Unc) && comps.len() < 2 {
+                // UNCはserver+shareの2成分が必須 (malformedは拒否)
+                return invalid_windows_path();
+            }
+            ParsedWindowsPath {
+                kind,
+                comps,
+                verbatim,
+            }
         }
     }
-    (kind, resolved)
+}
+
+/// 非verbatim (Win32) の成分分割: `\`/`/` 両区切り、`.` 除去、`..` は
+/// 字句解決 (ルートより上はclamp)、各成分末尾のspace/dotは剥す。
+/// 剥して空になる成分 (全ドット/空白) は不正形式として `None`。
+fn split_win32_comps(body: &str) -> Option<Vec<String>> {
+    let mut resolved: Vec<String> = Vec::new();
+    for raw in body.split(['/', '\\']) {
+        if raw.is_empty() {
+            continue;
+        }
+        if raw == ".." {
+            resolved.pop();
+            continue;
+        }
+        if raw == "." {
+            continue;
+        }
+        let stripped = raw.trim_end_matches([' ', '.']);
+        if stripped.is_empty() {
+            return None;
+        }
+        resolved.push(stripped.to_string());
+    }
+    Some(resolved)
 }
 
 /// `\\?\` を除去した本体の先頭から種別を判定する。
 /// `C:` / `C:\…` / `C:/…` はドライブ (裸の`C:`もドライブルート扱い —
-/// best-effort)、`\\…` はUNC、それ以外は相対。
+/// best-effort)。`\\…` はUNC、それ以外 (ドライブ相対 `C:x` 等を含む) は
+/// 相対 (= 不正錨として拒否)。
 fn parse_windows_body(body: &str) -> (WindowsPathKind, String) {
     let bytes = body.as_bytes();
     if bytes.len() >= 2
@@ -410,33 +512,45 @@ fn parse_windows_body(body: &str) -> (WindowsPathKind, String) {
 }
 
 /// `path` が `root` 配下 (root自身を含む) に字句的に収まるか
-/// (Windowsセマンティクス: 大小同一視・区切り`\`/`/`両対応・
-/// `\\?\` verbatim前置の透過的除去・`..`の字句的解決)。
+/// (Windowsセマンティクス: ASCII大小同一視・区切りは形式別
+/// `\`/`/`・verbatim前置の透過的扱い・`..`の字句的解決)。
 ///
 /// - ドライブ文字 (`C:` vs `D:`) とUNC server/share は完全一致が必須。
-/// - 相対パスは錨になれないため、いずれかの辺が相対ならfalse。
+/// - 相対パス・malformed UNC は錨になれないため、いずれかの辺が該当
+///   すればfalse。
+/// - **正規化形式 (verbatim vs 非verbatim) が両辺で一致しない場合は
+///   拒否** (fail-closed): 片側だけtrailing space/dotの保存/剥除が
+///   入り込むため字句比較では決定不能。Windows実機のcanonicalize検証
+///   (呼び出し側 `walk_open_regular_beneath` が両辺canonicalize出力で
+///   呼ぶ — 実運用では両辺verbatimで一致する) に委ねる設計。
 /// - 等値 (path == root) は包含扱い (包含検証の用途上、境界を含む)。
 ///
 /// 制限 (best-effort・`docs/dev/platform-notes.md` 参照): 8.3短縮名・
-/// 末尾ドット/空白のWin32正規化・NTFSストリーム構文は解釈しない。
-/// この関数は**字句判定のみ**であり、いかなるTOCTOU耐性も提供しない。
+/// NTFSストリーム構文は解釈しない。Unicode大小同一視はしない
+/// (不一致=拒否側)。この関数は**字句判定のみ**であり、いかなる
+/// TOCTOU耐性も提供しない。
 pub fn is_lexically_beneath(path: &str, root: &str) -> bool {
-    let (path_kind, path_comps) = parse_windows_path(path);
-    let (root_kind, root_comps) = parse_windows_path(root);
-    if !matches!(path_kind, WindowsPathKind::Drive(_) | WindowsPathKind::Unc)
-        || !matches!(root_kind, WindowsPathKind::Drive(_) | WindowsPathKind::Unc)
-    {
+    let parsed_path = parse_windows_path(path);
+    let parsed_root = parse_windows_path(root);
+    if !matches!(
+        parsed_path.kind,
+        WindowsPathKind::Drive(_) | WindowsPathKind::Unc
+    ) || !matches!(
+        parsed_root.kind,
+        WindowsPathKind::Drive(_) | WindowsPathKind::Unc
+    ) {
         return false;
     }
-    if path_kind != root_kind {
+    if parsed_path.kind != parsed_root.kind || parsed_path.verbatim != parsed_root.verbatim {
         return false;
     }
-    if path_comps.len() < root_comps.len() {
+    if parsed_path.comps.len() < parsed_root.comps.len() {
         return false;
     }
-    root_comps
+    parsed_root
+        .comps
         .iter()
-        .zip(path_comps.iter())
+        .zip(parsed_path.comps.iter())
         .all(|(r, p)| r == p)
 }
 
@@ -469,7 +583,10 @@ impl std::error::Error for RenameAtNoReplaceError {}
 /// - unix: ピン留めされたdirectory fd (`O_DIRECTORY|O_NOFOLLOW` で開いた
 ///   実ディレクトリ)。配下への操作はすべてfd相対 (`openat`/`mkdirat`/
 ///   `unlinkat`/`renameat2`) のため、パス名の差し替え競合から構造的に独立。
-/// - 非unix: 字句検査 (`symlink_metadata`) 付きのパジス操作フォールバック
+///   FG-WP17-1: 配下の列挙 ([`OutputDir::entries`]) も同じfd基準のため、
+///   ディレクトリ→symlink差し替えでtraversalが登録ルート外へ出る余地が
+///   無い (起動掃除のwalk機構として使用)。
+/// - 非unix: 字句検査 (`symlink_metadata`) 付きのパス操作フォールバック
 ///   (TOCTOU窓が残る — 構造的保証はunix実装のみ。WP-17のWindows対応で再検討)。
 ///
 /// `display` はエラー報告用の表示パス (lossy)。
@@ -744,6 +861,97 @@ impl OutputDir {
         }
     }
 
+    /// 配下のエントリ一覧を (名前, ディレクトリか) で返す
+    /// (FG-WP17-1: 起動掃除のfd歩行用)。**symlinkは辿らない** —
+    /// symlinkエントリは `is_dir=false` で返る (`open_existing_subdir` の
+    /// `O_NOFOLLOW` と組み合わせることで、ディレクトリ差し替えによる
+    /// 登録ルート外へのtraversal脱出を構造的に防ぐ)。
+    ///
+    /// unix: ピン留めされたdir fdを `fdopendir` で列挙する (d_type不明は
+    /// `fstatat(AT_SYMLINK_NOFOLLOW)` で補完)。非unix: `read_dir` による
+    /// パス基準の列挙 (d_type由来のためsymlinkを辿らない点は同じ)。
+    pub fn entries(&self) -> io::Result<Vec<(OsString, bool)>> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+
+            // SAFETY: fd読み取りのみ (dupは新しいfd記述子を作る)。
+            let dup = unsafe { libc::dup(std::os::unix::io::AsRawFd::as_raw_fd(&self.fd)) };
+            if dup < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: fdopendir(3)は渡されたfdの所有権をDIR*へ移す。
+            let dir = unsafe { libc::fdopendir(dup) };
+            if dir.is_null() {
+                let err = io::Error::last_os_error();
+                // SAFETY: 失敗時はfd所有権が戻ってくるため手動で解放。
+                unsafe { libc::close(dup) };
+                return Err(err);
+            }
+            let stream = DirStream(dir);
+            // dupは元fdとopen file description (offset) を共有するため、
+            // 前回列挙の末尾位置からにならないよう先頭へ巻き戻す。
+            // SAFETY: rewinddir(3)はDIR*の状態を初期化するだけ。
+            unsafe { libc::rewinddir(stream.0) };
+            let mut out = Vec::new();
+            loop {
+                // readdirのエラーとEOFを区別するため、呼び出し前にerrnoを
+                // クリアする (readdirはエラー時もNULLを返す)。
+                clear_errno();
+                // SAFETY: readdir(3)はDIR*を読み、direntへのポインタを
+                // 返す (ポインタは次のreaddirまで有効 — すぐコピーする)。
+                let ent = unsafe { libc::readdir(stream.0) };
+                if ent.is_null() {
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error().is_some_and(|c| c != 0) {
+                        return Err(err);
+                    }
+                    break;
+                }
+                // SAFETY: entは有効なdirent (readdir成功時)。d_nameはNUL終端。
+                let name_bytes =
+                    unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) }.to_bytes();
+                if name_bytes == b"." || name_bytes == b".." {
+                    continue;
+                }
+                let name: OsString = std::os::unix::ffi::OsStringExt::from_vec(name_bytes.to_vec());
+                // SAFETY: d_typeフィールドの読み取り。
+                let d_type = unsafe { (*ent).d_type };
+                let is_dir = if d_type == libc::DT_UNKNOWN {
+                    // SAFETY: fstatat(2)はdirfd相対でpath文字列を読むだけ。
+                    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                    let c_name = std::ffi::CString::new(name.as_bytes()).map_err(|e| {
+                        io::Error::new(io::ErrorKind::InvalidInput, format!("entries: {e}"))
+                    })?;
+                    // SAFETY: 全整数フィールドのC構造体。ゼロ埋めは有効。
+                    let rc = unsafe {
+                        libc::fstatat(
+                            std::os::unix::io::AsRawFd::as_raw_fd(&self.fd),
+                            c_name.as_ptr(),
+                            &mut st,
+                            libc::AT_SYMLINK_NOFOLLOW,
+                        )
+                    };
+                    rc == 0 && ((st.st_mode & libc::S_IFMT) == libc::S_IFDIR)
+                } else {
+                    d_type == libc::DT_DIR
+                };
+                out.push((name, is_dir));
+            }
+            Ok(out)
+        }
+        #[cfg(not(unix))]
+        {
+            let mut out = Vec::new();
+            for entry in std::fs::read_dir(&self.path)? {
+                let entry = entry?;
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                out.push((entry.file_name(), is_dir));
+            }
+            Ok(out)
+        }
+    }
+
     /// 配下へ排他作成 (`O_CREAT|O_EXCL` — tmp書き出し用。既存名や
     /// symlink名とは決して衝突しない)。
     pub fn create_exclusive_at(&self, name: &OsStr) -> io::Result<File> {
@@ -857,6 +1065,41 @@ impl OutputDir {
 
 fn err_io(e: io::Error) -> RenameAtNoReplaceError {
     RenameAtNoReplaceError::Io(e.to_string())
+}
+
+/// `readdir` のエラー/EOF区別用にerrnoをゼロクリアする
+/// (readdirはエラー時もNULLを返すため、呼び出し前にクリアして
+/// 呼び出し後にerrnoが立っていればエラーと判定する)。
+/// errnoシンボルはlibc実装ごとに異なるためplatform分岐
+/// (未対応platformはクリアしない — 誤エラー時は列挙をErrで打ち切る
+/// fail-closed側に倒れる)。
+#[cfg(unix)]
+fn clear_errno() {
+    #[cfg(target_os = "linux")]
+    // SAFETY: __errno_locationはerrnoの保存位置を返すだけ。
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
+    #[cfg(target_os = "macos")]
+    // SAFETY: __errorはdarwinのerrno保存位置を返すだけ。
+    unsafe {
+        *libc::__error() = 0;
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {}
+}
+
+/// `readdir` 用のDIR*ラッパ (Dropでclosedir — fd所有権はfdopendirで
+/// DIR*へ移されているため手動解放は不可)。
+#[cfg(unix)]
+struct DirStream(*mut libc::DIR);
+
+#[cfg(unix)]
+impl Drop for DirStream {
+    fn drop(&mut self) {
+        // SAFETY: closedir(3)はDIR*とその内部fdを解放する。
+        unsafe { libc::closedir(self.0) };
+    }
 }
 
 /// 表示パスの結合 (エラー報告用)。
@@ -1199,30 +1442,161 @@ mod tests {
             r"C:\Users\Name\IMG.png",
             r"c:\users\NAME"
         ));
+        // 同一形式内のverbatim相互運用 (canonicalize出力同士)
+        assert!(is_lexically_beneath(
+            r"\\?\C:\Users\name\img.png",
+            r"\\?\C:\Users"
+        ));
+        assert!(is_lexically_beneath(
+            r"\\?\UNC\server\share\p\img.png",
+            r"\\?\UNC\server\share"
+        ));
+        assert!(is_lexically_beneath(r"\\?\C:\x.png", r"\\?\C:\"));
     }
 
+    /// FG-WP17-1 B2: verbatim (`\\?\`) 根系のtrailing space/dotは保存される
+    /// (NT名前空間は正規化しない)。trim/剥離すると `\\?\C:\safe ` 根が
+    /// `\\?\C:\safe` へ潰れ、`\\?\C:\safe\evil` が包含判定をbypassする。
     #[test]
-    fn lexical_beneath_strips_verbatim_and_unc_prefixes() {
-        // canonicalize出力 (\\?\前置) と通常表現の相互運用
-        assert!(is_lexically_beneath(
+    fn lexical_beneath_verbatim_root_trailing_space_and_dot_are_significant() {
+        // レビュー指摘のbypass本体: trailing space根の下にはない
+        assert!(!is_lexically_beneath(r"\\?\C:\safe\evil", r"\\?\C:\safe "));
+        assert!(!is_lexically_beneath(r"\\?\C:\safe\evil", r"\\?\C:\safe."));
+        // 同じtrailing space/dotを持つ成分は一致 (保存される)
+        assert!(is_lexically_beneath(r"\\?\C:\safe \evil", r"\\?\C:\safe "));
+        assert!(is_lexically_beneath(r"\\?\C:\safe.\evil", r"\\?\C:\safe."));
+        // path側のtrailing space/dot成分も保存 (根と一致しなければ拒否)
+        assert!(!is_lexically_beneath(r"\\?\C:\safe\x", r"\\?\C:\safe "));
+        // verbatim中間成分のtrailing spaceも保存
+        assert!(!is_lexically_beneath(r"\\?\C:\a\b\c.png", r"\\?\C:\a \b"));
+        assert!(is_lexically_beneath(r"\\?\C:\a \b\c.png", r"\\?\C:\a \b"));
+    }
+
+    /// FG-WP17-1 B2: 非verbatimはWin32が成分末尾のspace/dotを剥す。
+    /// 両辺非verbatimなら剥した比較で一致する (実解決のbest-effort模倣)。
+    #[test]
+    fn lexical_beneath_win32_form_strips_trailing_space_and_dot_per_component() {
+        assert!(is_lexically_beneath(r"C:\safe\x", r"C:\safe. "));
+        assert!(is_lexically_beneath(r"C:\safe \x", r"C:\safe"));
+        assert!(is_lexically_beneath(r"C:\safe.\x", r"C:\safe"));
+        // path側の末尾space/dotも剥して比較
+        assert!(is_lexically_beneath(r"C:\safe\x ", r"C:\safe\x. "));
+    }
+
+    /// FG-WP17-1 B2: 正規化形式が一致しない組み合わせ (verbatim vs 非verbatim)
+    /// は字句一致を信用せず拒否 (fail-closed)。片側だけtrailing space/dotの
+    /// 保存/剥除が混在するため字句的に決定不能 — Windows実機のcanonicalize
+    /// 検証に委ねる設計。
+    #[test]
+    fn lexical_beneath_rejects_mixed_verbatim_and_win32_forms() {
+        assert!(!is_lexically_beneath(
             r"\\?\C:\Users\name\img.png",
             r"C:\Users"
         ));
-        assert!(is_lexically_beneath(
+        assert!(!is_lexically_beneath(
             r"C:\Users\name\img.png",
             r"\\?\C:\Users"
         ));
-        // UNCのverbatim形 (\\?\UNC\server\share ↔ \\server\share)
-        assert!(is_lexically_beneath(
+        assert!(!is_lexically_beneath(
             r"\\?\UNC\server\share\p\img.png",
             r"\\server\share"
         ));
-        assert!(is_lexically_beneath(
+        assert!(!is_lexically_beneath(
             r"\\server\share\p\img.png",
             r"\\?\UNC\server\share"
         ));
-        // ドライブルート直下
-        assert!(is_lexically_beneath(r"\\?\C:\x.png", r"C:\"));
+        assert!(!is_lexically_beneath(r"\\?\C:\x.png", r"C:\"));
+        assert!(!is_lexically_beneath(r"C:\x.png", r"\\?\C:\"));
+    }
+
+    /// FG-WP17-1 B2: verbatim (`\\?\`) では `/` は区切りではない (Win32の
+    /// 文字列解析無効化によりNT名前空間へそのまま渡るため、`/`は名前の
+    /// 一部)。`/`を区切りとして解釈すると過大一致 (bypass方向) になる
+    /// ため、verbatim中の `/` 入り成分は一致しない。
+    #[test]
+    fn lexical_beneath_verbatim_slash_is_not_a_separator() {
+        // 非verbatimでは `/` は区切り (Win32正規化)
+        assert!(is_lexically_beneath(
+            r"\\server/share/p/img.png",
+            r"\\server\share"
+        ));
+        assert!(is_lexically_beneath(r"C:/safe/x", r"C:\safe"));
+        // verbatim UNC + `/` → `/` は成分名の一部 (server/share ≠ server\share)
+        assert!(!is_lexically_beneath(
+            r"\\?\UNC\server/share\x",
+            r"\\?\UNC\server\share"
+        ));
+        // verbatim drive + `/`
+        assert!(!is_lexically_beneath(r"\\?\C:/safe/x", r"\\?\C:\safe"));
+        assert!(is_lexically_beneath(r"\\?\C:\safe\x", r"\\?\C:\safe"));
+    }
+
+    /// FG-WP17-1 B2: root clamping (`..` の字句解決はルートより上に出ない)
+    /// と、verbatimの `..` (NT名前空間は解釈しないためfail-closed拒否)。
+    #[test]
+    fn lexical_beneath_root_clamping_and_verbatim_dotdot() {
+        // 非verbatim: ルートより上の `..` はclamp
+        assert!(is_lexically_beneath(r"C:\..\..\x", r"C:\"));
+        assert!(is_lexically_beneath(r"C:\a\..\..\x", r"C:\"));
+        assert!(is_lexically_beneath(
+            r"\\server\share\sub\..\x",
+            r"\\server\share"
+        ));
+        // share境界を越える `..` (\\server\x 相当) は別幹のため拒否
+        assert!(!is_lexically_beneath(
+            r"\\server\share\..\x",
+            r"\\server\share"
+        ));
+        // clampしても別幹には一致しない
+        assert!(!is_lexically_beneath(r"C:\a\..\..\other\x", r"C:\safe"));
+        // verbatim: `.`/`..` は解釈されない (リテラル名として存在不能) → 拒否
+        assert!(!is_lexically_beneath(r"\\?\C:\safe\..\x", r"\\?\C:\safe"));
+        assert!(!is_lexically_beneath(r"\\?\C:\safe\.\x", r"\\?\C:\safe"));
+    }
+
+    /// FG-WP17-1 B2: malformed UNC (server/share不完全) は錨にも経路にも
+    /// ならない (構造検証 — 共有名まで含む2成分が必須)。
+    #[test]
+    fn lexical_beneath_malformed_unc_never_matches() {
+        // serverのみ (share無し) は不正な錨
+        assert!(!is_lexically_beneath(r"\\server\x", r"\\server"));
+        assert!(!is_lexically_beneath(r"\\server\share\x", r"\\server"));
+        assert!(!is_lexically_beneath(
+            r"\\?\UNC\server\x",
+            r"\\?\UNC\server"
+        ));
+        // path側がserverのみ
+        assert!(!is_lexically_beneath(r"\\server", r"\\server\share"));
+        // 両辺malformedでも一致扱いにしない
+        assert!(!is_lexically_beneath(r"\\server", r"\\server"));
+        assert!(!is_lexically_beneath(r"\\?\UNC\server", r"\\?\UNC\server"));
+        // `//` 始まりのUNCは非対応 (fail-closed拒否 — 実解決はできないと
+        // 保証できないため)
+        assert!(!is_lexically_beneath(
+            r"\\server\share\x",
+            r"//server/share"
+        ));
+        assert!(!is_lexically_beneath(
+            r"//server/share\x",
+            r"\\server\share"
+        ));
+    }
+
+    /// FG-WP17-1 B2 (B4): 大小同一視はASCIIのみ。Unicodeケース違いは
+    /// 不一致 (=拒否側) に倒す — 過小一致をbypassにしないためのfail-closed。
+    #[test]
+    fn lexical_beneath_case_folding_is_ascii_only_and_fails_closed() {
+        // ASCII範囲は同一視
+        assert!(is_lexically_beneath(r"C:\Users\NAME", r"c:\users\name"));
+        // Unicodeケース違い (şaşon vs ŞAŞON) は一致しない → 拒否
+        assert!(!is_lexically_beneath("C:\\şaşon\\x.png", "c:\\ŞAŞON"));
+        assert!(!is_lexically_beneath(
+            r"\\?\UNC\server\şare\x",
+            r"\\?\UNC\server\ŞARE"
+        ));
+        // ドライブ相対 (C:x — CWD依存) は錨にならない
+        assert!(!is_lexically_beneath(r"C:\a\x", r"C:a"));
+        assert!(!is_lexically_beneath(r"C:a\x", r"C:a"));
     }
 
     #[test]
@@ -1233,7 +1607,7 @@ mod tests {
         assert!(!is_lexically_beneath(r"\\other\share\p", r"\\server\share"));
         assert!(!is_lexically_beneath(
             r"\\?\UNC\other\share\p",
-            r"\\server\share"
+            r"\\?\UNC\server\share"
         ));
         // 文字列接頭で切らない (成分境界)
         assert!(!is_lexically_beneath(r"C:\Users Warfare\x", r"C:\Users"));
@@ -1249,12 +1623,21 @@ mod tests {
     fn lexical_beneath_equal_is_contained_and_relative_never_matches() {
         // 等値は包含扱い (境界を含む)
         assert!(is_lexically_beneath(r"C:\Users", r"C:\Users"));
+        assert!(is_lexically_beneath(r"\\?\C:\Users", r"\\?\C:\Users"));
+        assert!(is_lexically_beneath(
+            r"\\?\UNC\server\share",
+            r"\\?\UNC\server\share"
+        ));
         // ドライブのみroot
         assert!(is_lexically_beneath(r"C:\x", r"C:"));
+        assert!(is_lexically_beneath(r"\\?\C:\x", r"\\?\C:"));
         // 相対パスは錨になれない
         assert!(!is_lexically_beneath(r"Users\name", r"C:\Users"));
         assert!(!is_lexically_beneath(r"C:\Users\name", r"Users"));
         assert!(!is_lexically_beneath("", r"C:\"));
+        // 先頭空白入りは錨にも経路にもならない (trimしない — fail-closed)
+        assert!(!is_lexically_beneath(" C:\\x", r"C:\"));
+        assert!(!is_lexically_beneath(r"C:\x", " C:\\"));
     }
 
     // ===== FG-WP16-3 B1: 出力側包含 =====
@@ -1434,5 +1817,42 @@ mod tests {
         let fd = open_root_fd(path).unwrap();
         // SAFETY: fd所有権をFileへ。
         unsafe { File::from_raw_fd(fd) }
+    }
+
+    /// FG-WP17-1: `OutputDir::entries` — fd基準の列挙。`.`/`..`除外・
+    /// ディレクトリ判定・symlinkはディレクトリ扱いしない・再呼び出しも
+    /// 先頭から (rewind)。非unixはread_dir基準で同じ契約。
+    #[test]
+    fn output_dir_entries_lists_names_dirs_and_ignores_symlinks() {
+        let tmp = TestDir::new("entries");
+        std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
+        std::fs::write(tmp.path().join("a.png"), b"x").unwrap();
+        std::fs::write(tmp.path().join("sub/b.png"), b"x").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(tmp.path().join("sub"), tmp.path().join("link-to-sub")).unwrap();
+
+        let dir = OutputDir::open_existing_root(tmp.path()).unwrap();
+        let mut entries = dir.entries().unwrap();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec![
+                (OsString::from("a.png"), false),
+                (OsString::from("link-to-sub"), false), // symlinkは辿らない
+                (OsString::from("sub"), true),
+            ]
+        );
+        // 2回目の呼び出しも先頭から列挙される (rewind)
+        let again = dir.entries().unwrap();
+        assert_eq!(again.len(), entries.len(), "rewind: 再列挙も全件");
+
+        // ピン留めfd基準: 親パスの名前を差し替えられても列挙は元dirのまま
+        #[cfg(unix)]
+        {
+            let renamed = tmp.path().with_extension("moved");
+            std::fs::rename(tmp.path(), &renamed).unwrap();
+            let still = dir.entries().unwrap();
+            assert_eq!(still.len(), 3, "パス名差し替え後もfd基準で列挙");
+        }
     }
 }

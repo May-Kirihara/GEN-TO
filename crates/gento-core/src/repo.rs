@@ -13,6 +13,8 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 /// ファイルの走査状態 (data-model §2.2)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanState {
@@ -155,7 +157,9 @@ impl std::error::Error for RepoError {}
 /// Linuxでは `stat` の `st_dev + st_ino`。同一ファイルシステム内で
 /// リネーム・移動しても不変のため、外部移動・改名の再発見に使う。
 /// DBには16バイトリトルエンディアンBLOB (dev, ino の順) で格納する。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// FG-WP17-1: result JSON (file_operations) のtmp同一性記録にも用いる
+/// ため serde 対応 (JSON表現は `{"dev":..,"ino":..}`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct OsFileId {
     pub dev: u64,
     pub ino: u64,

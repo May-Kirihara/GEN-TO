@@ -433,6 +433,35 @@ fn path_candidate_end(bytes: &[u8], i: usize) -> Option<usize> {
                 end = k;
                 continue;
             }
+            // FG-WP17-1 B3: 後続separatorが無い**終端**spaced成分 (例:
+            // "/home/山田/マイ 写真.png" の「写真.png」) を取り込む。
+            // 空白トークン単位で判定し、ドットを含むトークン (拡張子
+            // らしきファイル名断片) または「経路側が非ASCIIを含む場合の
+            // 非ASCIIトークン」(ドット無し日本語ファイル名) まで延長する。
+            // 最後の該当トークンで打ち切るため、後続の通常語
+            // ("...x.png ignored" の "ignored") は保持される
+            // (誤検知は過剰scrub側に倒す安全側 — 既存政策と同一)。
+            let path_has_non_ascii = bytes[i..end].iter().any(|&b| is_non_ascii(b));
+            let mut extend_to: Option<usize> = None;
+            let mut tok_start = end;
+            for pos in end..=j {
+                if pos < j && bytes[pos] != b' ' {
+                    continue;
+                }
+                if pos > tok_start {
+                    let tok = &bytes[tok_start..pos];
+                    let has_dot = tok.contains(&b'.');
+                    let has_non_ascii = tok.iter().any(|&b| is_non_ascii(b));
+                    if has_dot || (has_non_ascii && path_has_non_ascii) {
+                        extend_to = Some(pos);
+                    }
+                }
+                tok_start = pos + 1;
+            }
+            if let Some(pos) = extend_to {
+                end = pos;
+                continue;
+            }
         }
         break;
     }
@@ -684,5 +713,69 @@ mod tests {
         let after = "/tmp/x.png 保存しました";
         let scrubbed = scrub_paths(after);
         assert!(scrubbed.contains("<path> 保存しました"), "{scrubbed}");
+    }
+
+    /// FG-WP17-1 B3: 終端成分に空白を含むパス (後続separatorが無いため
+    /// 旧実装は空白継続を打ち切っていた) を終端までscrubする。
+    /// レビュー指摘の本体: `/home/山田/マイ 写真.png` は `マイ` までしか
+    /// scrubされず `写真.png` が漏れていた。
+    #[test]
+    fn scrub_paths_covers_terminal_spaced_non_ascii_component() {
+        let raw = "cannot stat /home/山田/マイ 写真.png skipped";
+        let scrubbed = scrub_paths(raw);
+        assert!(!scrubbed.contains("マイ"), "{scrubbed}");
+        assert!(!scrubbed.contains("写真"), "{scrubbed}");
+        assert!(!scrubbed.contains(".png"), "{scrubbed}");
+        assert!(
+            scrubbed.contains("cannot stat <path> skipped"),
+            "{scrubbed}"
+        );
+    }
+
+    /// FG-WP17-1 B3: 終端spaced ASCIIファイル名 (拡張子ドットを手がかり
+    /// に終端成分まで含める)。
+    #[test]
+    fn scrub_paths_covers_terminal_spaced_ascii_component() {
+        let raw = "open /home/u/my file.png ok";
+        let scrubbed = scrub_paths(raw);
+        assert!(!scrubbed.contains("my file"), "{scrubbed}");
+        assert!(!scrubbed.contains("file.png"), "{scrubbed}");
+        assert!(
+            scrubbed.contains("open <path> ok"),
+            "ドット付き終端成分のみ取り込み、後続通常語 (ok) は保持: {scrubbed}"
+        );
+
+        // 複数トークンのspaced名: 最後のドット付きトークンまで
+        let multi = "stat /home/u/my photo album v2.png done";
+        let scrubbed = scrub_paths(multi);
+        assert!(!scrubbed.contains("album"), "{scrubbed}");
+        assert!(scrubbed.contains("done"), "{scrubbed}");
+    }
+
+    /// FG-WP17-1 B3: 句点多めのUnicode終端ファイル名。
+    #[test]
+    fn scrub_paths_covers_punctuation_heavy_unicode_terminal_name() {
+        let raw = "read /home/山田/私の..資料..メモ.png failed";
+        let scrubbed = scrub_paths(raw);
+        assert!(!scrubbed.contains("私の"), "{scrubbed}");
+        assert!(!scrubbed.contains("資料"), "{scrubbed}");
+        assert!(!scrubbed.contains("メモ"), "{scrubbed}");
+        assert!(scrubbed.contains("failed"), "{scrubbed}");
+
+        // ドット無し・非ASCIIの終端spaced成分: 経路側が非ASCIIを含む
+        // 場合は延長とみなす (非ASCIIパス利用環境の文件名)。一方で
+        // ASCII-only経路+日本語通常文 (既存ポリシー) は保持される。
+        let noext = "cannot stat /home/山田/マイ 写真 skipped";
+        let scrubbed = scrub_paths(noext);
+        assert!(!scrubbed.contains("マイ"), "{scrubbed}");
+        assert!(!scrubbed.contains("写真"), "{scrubbed}");
+        assert!(scrubbed.contains("skipped"), "{scrubbed}");
+
+        let prose = "/tmp/x.png 保存しました";
+        let scrubbed = scrub_paths(prose);
+        assert!(
+            scrubbed.contains("<path> 保存しました"),
+            "ASCII-only経路+非ASCII通常文は従来どおり保持: {scrubbed}"
+        );
     }
 }

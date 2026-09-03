@@ -1,6 +1,7 @@
 # プラットフォーム別既知制限と検証状況 (WP-17-1 / WP-17-2)
 
-最終更新: 2026-09-04 (WP-17-2: §6-§10追記)
+最終更新: 2026-09-04 (FG-WP17-1: §2改訂 — 字句包含判定の意味論改訂・
+起動掃除のfd同一性モデルに伴うWindows挙動・installer targets設定)
 
 GEN-TO MVPの正規開発・検証環境はLinux (x86_64) のみ。本書は
 WP-17-1/WP-17-2時点で判明しているプラットフォーム差・制限・検証
@@ -52,14 +53,30 @@ build scriptを持つ依存はホストにクロスCツールチェーンが無�
    **TOCTOU耐性は無くbest-effort** — unix実装 (openat2 / O_NOFOLLOW
    fd歩行) の構造的保証と同等ではない。検査とopenの間の中間成分
    差し替えを検出できる保証は無い。
-2. **`is_lexically_beneath` の字句判定限界**: 8.3短縮名
-   (`PROGRA~1`)、末尾ドット/空白のWin32正規化、NTFS alternate data
-   stream (`file.png:stream`) は解釈しない。`..` は字句解決
-   (ルート以上はclamp)。
+2. **`is_lexically_beneath` の字句判定限界 (FG-WP17-1改訂)**:
+    8.3短縮名 (`PROGRA~1`) とNTFS alternate data stream
+    (`file.png:stream`) は解釈しない。`..` は非verbatim形式でのみ
+    字句解決 (ルート以上はclamp) — verbatim (`\\?\`) 中の `.`/`..` は
+    NT名前空間で解釈されないため**拒否** (fail-closed)。
+    **意味論 (FG-WP17-1 — trailing space/dot bypass修正後)**:
+    verbatim根系のtrailing space/dotは**保存**して比較し (`\\?\C:\safe `
+    根への `\\?\C:\safe\evil` は拒否)、非verbatimはWin32相当に成分末尾の
+    space/dotを剥して比較する。**両辺の正規化形式 (verbatim vs
+    非verbatim) が不一致なら字句一致を信用せず拒否**する (Windows実機の
+    canonicalize検証に委ねる — 実運用の呼び出しは両辺canonicalize出力
+    =verbatim同士のため影響なし)。verbatim中の `/` は区切りではない
+    (名前の一部)。大小同一視は**ASCIIのみ** (Unicodeケース相違は不一致
+    =拒否側に倒す)。malformed UNC (server/share不完全) は錨にも経路に
+    ならない。
 3. **OSファイルIDは常時 `None`** (`gento_platform::os_file_id_of`):
-   Windows file ID (NTFS FILE_ID_128 / ReFS) の提供は未実装。
-   衝突トークンはsize+mtimeで機能するが同一性検証は弱い
-   (WP-18以降の課題)。
+    Windows file ID (NTFS FILE_ID_128 / ReFS) の提供は未実装。
+    衝突トークンはsize+mtimeで機能するが同一性検証は弱い
+    (WP-18以降の課題)。**起動掃除への影響 (FG-WP17-1)**: 掃除の削除
+    条件は「op recordの所有パス**かつ**作成時 `(dev, ino)` とのfd同一性」
+    の両方のため、Windowsでは全recordがID無し (=fail-closed) となり
+    **掃除は削除を行わず残留報告のみ** (api-contract §41参照。
+    fd歩行自体は`OutputDir`の非unixフォールバックで動作するが、
+    削除ゲートを通らない)。
 4. **パスのDB符号化はUTF-8固定** (`gento-db/src/paths.rs`
    `encode_path`): 非UTF-8表現のWindowsパス (ワイルドカード・
    予約名等を含む一部レガシー表現) はlossy変換される。
@@ -68,8 +85,12 @@ build scriptを持つ依存はホストにクロスCツールチェーンが無�
    非unix分岐): keyringが実質常に利用可能なため到達しにくいが、
    フォールバック時のファイル保護は「書き込みのみ」。
    Windows ACL (所有者限定) 付与は未検証・未実装。
-6. **`dir_free_bytes` は常時 `None`** (確認skip・fail-open)。
-   `GetDiskFreeSpaceExW` 実装は未対応。
+6. **`dir_free_bytes` は常時 `None`** (FG-WP17-1: 呼び出し側挙答の
+    明文化 — `None` は `Err` へ変換されるが、唯一の呼び出し経路である
+    gento-core `plan_file_op` の容量事前確認は `Err` を `.ok()` で打ち
+    切るため**実質fail-open (確認skip)**。事前確認は警告のみで実行阻止
+    しない二重防護であり、最終防御は実行時の書き込み失敗/DiskFull)。
+    `GetDiskFreeSpaceExW` 実装は未対応。
 7. ゴミ箱・資格情報ストア (keyring)・外部アプリ起動 (opener plugin)・
    WebView2挙動はWindows実機での未検証 (OS別挙動の実装裏付けは§7.4/§7.5、
    利用者検証手順は§8チェックリスト)。
@@ -352,8 +373,13 @@ MVP受け入れ (計画書§25「LinuxとWindowsで主要MVPフローを完了�
   不在なら https://developer.microsoft.com/microsoft-edge/webview2/
   のEvergreen Bootstrapperで導入。
 - インストーラ: `pnpm --dir apps/desktop tauri build` のWindows
-  実行でNSIS (`.exe`) / MSI (`.msi`) を生成 (tauri.conf.json
-  bundle.targetsに`nsis`, `msi`追加が必要 — Linux側では未設定)。
+  実行でNSIS (`.exe`) / MSI (`.msi`) を生成。**FG-WP17-1:
+  `tauri.conf.json` の`bundle.targets`に`nsis`, `msi`を追加済み**
+  (Linuxから設定可能な範囲で設定完了。`icons/icon.ico`もPNG埋め込み
+  形式で追加 — Windows実機でのbundle生成検証は未実施)。
+  `webviewInstallMode`等は明示設定せず**Tauri v2既定値**
+  (nsis/msiとも `downloadBootstrapper` — WebView2不在時に
+  ブートストラッパ経由でDL・インストール) を使用する。
 - **署名はMVPでは自己署名 (無署名) で可**: SmartScreen警告は
   「詳細情報→実行」で迂回。正式署名はリリース工程 (WP-18以降)。
 - アンインストール時のデータ保持: アプリデータdir

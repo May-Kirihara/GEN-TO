@@ -19,12 +19,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use gento_core::file_ops::{
-    execute_file_op, execute_mkdir, owned_tmp_paths_of, plan_file_op, undo_candidate_of,
+    execute_file_op, execute_mkdir, owned_tmp_registry_of, plan_file_op, undo_candidate_of,
     verify_undo, ConflictInfo, ConflictResolution, FileOpFile, FileOpKind, FileOpOutcome,
     FileOpPlan, FileOpProgress, FileOpsFs, FileOpsRepo, FileRootRef, FileStat, FsOpError,
     FsOpErrorKind, ResolutionSpec, StepStatus, UndoOutcome,
 };
-use gento_core::repo::{AssetRepo, FileRepo, LibraryRootRepo, RepoError};
+use gento_core::path_safety::OutputDir;
+use gento_core::repo::{AssetRepo, FileRepo, LibraryRootRepo, OsFileId, RepoError};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
@@ -587,11 +588,11 @@ impl FileOpsService {
     /// (1) `executing` 残留操作を `failed` で確定 (FSが正本のため、再スキャンで
     ///     DBは最終状態へ収束する。「安全な再開」= 失敗項目のUI再試行)。
     /// (2) GEN-TO所有の一時ファイル (厳形式 `.{名前}.gento-tmp-{op_uuid}-{seq}`)
-    ///     を掃除 (コピー途中の不完全実体)。削除は以下に限定する (FG-WP7:
-    ///     外部作成の類似名ファイルを誤削除しない):
-    ///     (a) file_operationsのrequest/result JSONに記録された所有tmpパス
-    ///     (b) 厳密正規表現一致 (uuid形式検証含む) **かつ登録ルート配下**
-    ///     それ以外の `.gento-tmp-` 類似ファイルは**残置**しログで通知する。
+    ///     を掃除 (コピー途中の不完全実体)。FG-WP17-1: 削除は
+    ///     **「op recordによるpath所有権」かつ「fd同一性検証」の両方**を
+    ///     満たす場合のみ (`sweep_tmp_files` 参照)。厳密形式への名前一致
+    ///     (uuid検証含む) だけでは削除しない — その場合の文件は残置して
+    ///     ログで通知する。
     /// 戻り値は検出した未完了操作の説明 (UIの案内表示用)。
     pub fn recover_at_startup(&self) -> Vec<String> {
         let mut notices = Vec::new();
@@ -614,9 +615,9 @@ impl FileOpsService {
                 record.operation_type, record.id
             ));
         }
-        // 所有tmp掃除 (所有権検証付き)
+        // 所有tmp掃除 (所有権+fd同一性検証付き)
         if let Ok(roots) = self.roots() {
-            let owned = self.collect_owned_tmp_paths(&interrupted);
+            let owned = self.collect_owned_tmp_registry(&interrupted);
             for root in roots {
                 let (removed, skipped) = sweep_tmp_files(&root.root_path, &owned);
                 if removed > 0 {
@@ -626,10 +627,9 @@ impl FileOpsService {
                         root.root_path.display()
                     ));
                 }
-                for name in skipped {
+                for msg in skipped {
                     tracing::warn!(
-                        "所有権を確認できない .gento-tmp- 類似ファイルを残置しました: {}",
-                        root.root_path.join(&name).display()
+                        ".gento-tmp- 類似ファイルを残置しました (所有権検証で削除対象外): {msg}"
                     );
                 }
             }
@@ -637,70 +637,134 @@ impl FileOpsService {
         notices
     }
 
-    /// GEN-TOが所有する一時ファイルパスの集合。
-    /// (a) 完了操作のresult JSONに記録された `steps[].tmp`
+    /// GEN-TOが所有する一時ファイルの登録簿 (パス → 作成時OSファイルID)。
+    /// (a) 完了操作のresult JSONに記録された `steps[].tmp` + `tmp_file_id`
     /// (b) executing残留行から再構築 (request JSONの `files[].to` + 行uuid
-    ///     + step index — tmp命名は決定論的)。
-    fn collect_owned_tmp_paths(
+    ///     + step index — tmp命名は決定論的。**OSファイルIDは記録されて
+    ///     いないためNone** = fail-closed残留報告対象)。
+    /// 同一パスへ複数recordが登録される場合はID付き (Some) を優先する。
+    fn collect_owned_tmp_registry(
         &self,
         executing: &[gento_core::file_ops::FileOpRecord],
-    ) -> std::collections::HashSet<PathBuf> {
-        let mut owned = std::collections::HashSet::new();
+    ) -> HashMap<PathBuf, Option<OsFileId>> {
+        let mut owned: HashMap<PathBuf, Option<OsFileId>> = HashMap::new();
         let records = self
             .db
             .with_reader(|repos| repos.list_recent_operations(u32::MAX))
             .unwrap_or_default();
         for record in records.iter().chain(executing) {
-            owned.extend(owned_tmp_paths_of(record));
+            for (path, file_id) in owned_tmp_registry_of(record) {
+                match owned.get(&path) {
+                    Some(Some(_)) => {} // 既にID付きで登録済み (優先)
+                    _ => {
+                        owned.insert(path, file_id);
+                    }
+                }
+            }
         }
         owned
     }
 }
 
-/// ディレクトリ再帰でGEN-TO所有の一時ファイルのみを掃除する
-/// (シンボリックリンクは辿らない)。戻り値: (削除件数, 残置した類似名)。
+/// ディレクトリ再帰でGEN-TO所有の一時ファイルのみを掃除する。
+/// FG-WP17-1 (レビューblocker対応): 削除は以下の**両方**を満たす場合のみ。
 ///
-/// 削除基準 (いずれか):
-/// - `owned` (request/result JSONに記録された所有パス) に一致
-/// - 厳密形式 `.{名前}.gento-tmp-{32桁hex}-{6桁seq}` (uuid形式検証含む)
-///   ※呼び出し側が登録ルート配下に対して呼ぶため「登録ルート配下」は保証済み
+/// 1. **op recordによるpath所有権**: 走査中のパスが
+///    `owned` (request/result JSONに記録された所有パス) に一致すること。
+///    厳密tmp文法 (`is_owned_tmp_name`) への名前一致だけで削除しない
+///    (文法は `.gento-tmp-` 類似文件の**報告フィルタ**としてのみ使用)。
+/// 2. **fd同一性検証**: 所有recordが作成時の `(dev, ino)` を記録して
+///    いる (`Some`) 場合、`O_NOFOLLOW` で開いたfdのfstatが一致すること。
+///    不一致 (差し替え攻撃) は残留+報告。recordにIDが無い (`None`:
+///    旧世代record・executing再構築分) も**削除せず残留報告**
+///    (fail-closed — Windows等OSファイルID不可な環境は常にこちら)。
 ///
-/// 旧形式 (`.gento-tmp-`接頭辞・uuid無し) や不正な形式のファイルは
-/// **削除せず**名前を返す (呼び出し側がログ通知する)。
-fn sweep_tmp_files(root: &Path, owned: &std::collections::HashSet<PathBuf>) -> (u64, Vec<String>) {
+/// traversalはfd歩行 (`OutputDir`: O_NOFOLLOW|O_DIRECTORY のピン留め +
+/// `unlinkat` 相対削除) のため、ディレクトリ→symlink差し替えで登録ルート
+/// 外へ出ない。削除対象はO_NOFOLLOWで開いたfdが通常ファイルであることを
+/// fstatで確認した後のみ。**既知の残存窓**: fstat確認→unlinkat間の
+/// ナノ秒オーダー窓は残る (Linuxにfd基準の削除APIが存在しないため —
+/// 原子性の限界として文書化。api-contract §41参照)。
+///
+/// 戻り値: (削除件数, 残置した `.gento-tmp-` 類似文件の説明メッセージ)。
+fn sweep_tmp_files(root: &Path, owned: &HashMap<PathBuf, Option<OsFileId>>) -> (u64, Vec<String>) {
     let mut removed = 0u64;
     let mut skipped = Vec::new();
-    let Ok(entries) = std::fs::read_dir(root) else {
+    let Ok(root_dir) = OutputDir::open_existing_root(root) else {
         return (0, skipped);
     };
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
+    sweep_tmp_dir(&root_dir, root, owned, &mut removed, &mut skipped);
+    (removed, skipped)
+}
+
+/// [`sweep_tmp_files`] の再帰部 (fd歩行)。
+fn sweep_tmp_dir(
+    dir: &OutputDir,
+    dir_path: &Path,
+    owned: &HashMap<PathBuf, Option<OsFileId>>,
+    removed: &mut u64,
+    skipped: &mut Vec<String>,
+) {
+    let Ok(entries) = dir.entries() else {
+        return;
+    };
+    for (name, is_dir) in entries {
+        let path = dir_path.join(&name);
+        if is_dir {
+            // サブディレクトリもO_NOFOLLOW|O_DIRECTORYで開き直す —
+            // 開けない (symlink差し替え・権限等) 場合はその先へ進まない
+            if let Ok(sub) = dir.open_existing_subdir(&[name]) {
+                sweep_tmp_dir(&sub, &path, owned, removed, skipped);
+            }
+            continue;
+        }
+        // 報告フィルタ: tmp文法に似た名前のみ通知対象 (削除可否とは無関係)
+        let Some(name_str) = name.to_str() else {
             continue;
         };
-        if file_type.is_dir() {
-            let (sub_removed, sub_skipped) = sweep_tmp_files(&entry.path(), owned);
-            removed += sub_removed;
-            skipped.extend(sub_skipped);
+        if !name_str.contains(gento_core::file_ops::TMP_FILE_MARKER) {
             continue;
         }
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+        let Some(recorded_id) = owned.get(&path) else {
+            skipped.push(format!(
+                "{} (操作記録に所有権が無い — 削除せず残置)",
+                path.display()
+            ));
             continue;
         };
-        let is_gento_tmp_like = name.contains(".gento-tmp-");
-        if !is_gento_tmp_like {
+        let Some(expect) = recorded_id else {
+            skipped.push(format!(
+                "{} (旧世代の操作記録のためfd同一性を検証できず — 削除せず残置)",
+                path.display()
+            ));
             continue;
-        }
-        let deletable =
-            owned.contains(&entry.path()) || gento_core::file_ops::is_owned_tmp_name(&name);
-        if deletable && std::fs::remove_file(entry.path()).is_ok() {
-            removed += 1;
-            continue;
-        }
-        if !deletable {
-            skipped.push(name);
+        };
+        // O_NOFOLLOWで開き、fd上のfstatで通常ファイル+同一性を確認
+        match dir.open_regular_at(&name) {
+            Ok((_file, md)) => {
+                let actual = gento_platform::os_file_id_of(&md);
+                if !md.is_file() || actual != Some(*expect) {
+                    skipped.push(format!(
+                        "{} (記録とのfd同一性不一致 — 差し替えの可能性。削除せず残置)",
+                        path.display()
+                    ));
+                    continue;
+                }
+                // 親fd相対のunlinkat (no-follow)。fstat→unlinkat間の
+                // ナノ秒窓は構造的に除去不可 (doc参照)
+                match dir.remove_file_at(&name) {
+                    Ok(()) => *removed += 1,
+                    Err(e) => skipped.push(format!("{} (削除失敗: {e})", path.display())),
+                }
+            }
+            Err(e) => {
+                skipped.push(format!(
+                    "{} (O_NOFOLLOWで開けず — symlink等の可能性。削除せず残置: {e})",
+                    path.display()
+                ));
+            }
         }
     }
-    (removed, skipped)
 }
 
 // ===== 実FS実装 =====
@@ -788,6 +852,7 @@ impl FileOpsFs for RealFileOps {
         to: &Path,
         tmp: &Path,
         cancel: &AtomicBool,
+        tmp_file_id: &mut Option<OsFileId>,
     ) -> Result<(), FsOpError> {
         // 安全原則4: テンポラリ (厳密形式。呼び出し側が命名・所有権記録)
         // へ書き込み→fsync→NOREPLACEで最終名へ確定。
@@ -800,6 +865,12 @@ impl FileOpsFs for RealFileOps {
         // tmp名は呼び出し側が厳密形式 (自己識別的dotfile) で命名し
         // result.tmpに記録するため、失敗時の残留を許容する (成功時は
         // renameがtmpを消費。起動時の所有権検証付き掃除の対象)。
+        //
+        // FG-WP17-1: 作成fdのfstatからOSファイルID (dev, ino) を
+        // `tmp_file_id` へ出力する (成功・失敗を問わず作成時点で —
+        // 失敗残留こそ掃除のfd同一性検証対象のため。pathnameの再statは
+        // 差し替え競合を含むため使わない)。非unix (OSファイルID不可) は
+        // Noneのまま (= 掃除はfail-closed残留報告)。
         let result = (|| -> Result<(), FsOpError> {
             let mut src = std::fs::File::open(from).map_err(|e| io_error(from, &e))?;
             // 排他create: tmp名の事前占有 (EEXIST) は失敗扱いで既存entryは不接触
@@ -808,6 +879,10 @@ impl FileOpsFs for RealFileOps {
                 .create_new(true)
                 .open(tmp)
                 .map_err(|e| io_error(tmp, &e))?;
+            // 作成fd自身のfstat (作成直後 = 差し替え窓なし)
+            if let Ok(md) = dst.metadata() {
+                *tmp_file_id = gento_platform::os_file_id_of(&md);
+            }
             let mut buf = vec![0u8; 512 * 1024];
             loop {
                 if cancel.load(Ordering::Relaxed) {
@@ -872,8 +947,11 @@ impl FileOpsFs for RealFileOps {
     }
 
     fn free_bytes(&self, dir: &Path) -> Result<u64, FsOpError> {
-        // WP-17-1: statvfs実装はgento-platformへ集約。非unixはNone
-        // (確認skip — fail-open。書き込み失敗時に通常のIOエラーで落ちる)。
+        // WP-17-1: statvfs実装はgento-platformへ集約。非unix (または
+        // statvfs失敗) はNone → Err。FG-WP17-1: このErrはgento-core
+        // plan_file_opの `.ok()` で打ち切られるため、容量事前確認は
+        // skip = fail-openとして働く (事前確認は警告のみ・実行阻止なし。
+        // 最終防御は実行時の書き込み失敗/DiskFull)。
         gento_platform::dir_free_bytes(dir).ok_or_else(|| {
             FsOpError::new(
                 FsOpErrorKind::Io,
@@ -1385,22 +1463,46 @@ mod tests {
         Arc<RecordingHost>,
         PathBuf,
     ) {
+        let (dir, db, service, host, trash, _stub) = service_with_stub(tag);
+        (dir, db, service, host, trash)
+    }
+
+    /// [`service_with_db`] と同じ構成に加え、注入FSのハンドルを返す
+    /// (FG-WP17-1: 配置失敗注入などのテスト操作用)。
+    fn service_with_stub(
+        tag: &str,
+    ) -> (
+        TestDir,
+        Arc<gento_db::Db>,
+        Arc<FileOpsService>,
+        Arc<RecordingHost>,
+        PathBuf,
+        Arc<StubFs>,
+    ) {
         let dir = TestDir::new(tag);
         let trash = dir.mkdir(".trash");
         let db = Arc::new(gento_db::Db::open(dir.0.join("db.sqlite3")).unwrap());
         let host = RecordingHost::new();
-        let fs: Arc<dyn FileOpsFs> = Arc::new(StubFs {
+        let stub = Arc::new(StubFs {
             trash_dir: StdMutex::new(trash.clone()),
             trashed: StdMutex::new(HashMap::new()),
+            fail_placement: StdMutex::new(Vec::new()),
         });
-        let service = FileOpsService::with_fs(Arc::clone(&db), host.clone(), fs);
-        (dir, db, service, host, trash)
+        let service = FileOpsService::with_fs(
+            Arc::clone(&db),
+            host.clone(),
+            stub.clone() as Arc<dyn FileOpsFs>,
+        );
+        (dir, db, service, host, trash, stub)
     }
 
     /// テスト用FS (std + trash退避)。
     struct StubFs {
         trash_dir: StdMutex<PathBuf>,
         trashed: StdMutex<HashMap<PathBuf, PathBuf>>,
+        /// 配置 (NOREPLACE確定) を意図的に失敗させる宛先パス
+        /// (FG-WP17-1: tmp残留を残す失敗経路の再現用)。
+        fail_placement: StdMutex<Vec<PathBuf>>,
     }
 
     impl FileOpsFs for StubFs {
@@ -1444,9 +1546,29 @@ mod tests {
             to: &Path,
             tmp: &Path,
             _c: &AtomicBool,
+            tmp_file_id: &mut Option<OsFileId>,
         ) -> Result<(), FsOpError> {
             std::fs::copy(from, tmp)
                 .map_err(|e| FsOpError::new(FsOpErrorKind::Io, format!("{e}")))?;
+            // FG-WP17-1: 作成済みtmpのOSファイルIDを報告 (本物は作成fdの
+            // fstatから出すが、stubは書き込み後のstatで代用)
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if let Ok(md) = std::fs::symlink_metadata(tmp) {
+                    *tmp_file_id = Some(OsFileId::new(md.dev(), md.ino()));
+                }
+            }
+            // 配置失敗の注入 (NOREPLACE失敗相当 — tmp残留を残す)
+            if self.fail_placement.lock().unwrap().iter().any(|p| p == to) {
+                return Err(FsOpError::new(
+                    FsOpErrorKind::AlreadyExists,
+                    format!(
+                        "{} already exists (injected placement failure)",
+                        to.display()
+                    ),
+                ));
+            }
             self.rename_noreplace(tmp, to)
         }
         fn remove_file(&self, path: &Path) -> Result<(), FsOpError> {
@@ -1746,10 +1868,12 @@ mod tests {
         .unwrap();
         // 外部作成の .gento-tmp- 風ファイル (uuid形式なし) — 残置される
         dir.write(".gento-tmp-xxx-a.png", b"external lookalike");
-        // GEN-TO所有の厳密形式tmp (uuid検証OK) — 掃除される
-        dir.write(
+        // 厳密形式tmpだが**操作記録に所有権が無い** — FG-WP17-1: 名前文法
+        // 一致のみでは削除しない (レビューblocker対応。旧実装は削除して
+        // いたため、新不変条件では残置+報告になる)
+        let unrecorded = dir.write(
             ".a.png.gento-tmp-0123456789abcdef0123456789abcdef-000001",
-            b"ours",
+            b"grammar-only",
         );
         dir.write("keep.png", b"keep");
 
@@ -1761,12 +1885,10 @@ mod tests {
         assert!(ops.is_empty());
         let history = service.history(10).unwrap();
         assert_eq!(history[0].status, "failed");
-        // 所有tmpは掃除・外部類似名は残置・正規ファイルは無傷
+        // 所有権のない文法一致ファイルも残置・外部類似名も残置・正規ファイルは無傷
         assert!(
-            !dir.0
-                .join(".a.png.gento-tmp-0123456789abcdef0123456789abcdef-000001")
-                .exists(),
-            "所有tmpは掃除される"
+            unrecorded.exists(),
+            "記録に無い厳密形式tmpは削除しない (所有権+fd同一性が必須)"
         );
         assert!(
             dir.0.join(".gento-tmp-xxx-a.png").exists(),
@@ -1777,21 +1899,26 @@ mod tests {
     }
 
     /// 完了操作のresult JSONに記録された所有tmpパスも掃除される
-    /// (記録経由の所有権確認)。
+    /// (記録経由の所有権確認)。FG-WP17-1: 作成時OSファイルIDの記録が
+    /// 併せて必要 (ID無しの旧世代recordはfail-closed残置)。
     #[test]
     fn recovery_sweeps_tmp_recorded_in_result_json() {
         let (dir, db, service, _host, _trash) = service_with_db("svc-recovery-owned");
         let root = db.with_writer(|repos| repos.add_root(&dir.0)).unwrap();
         let _ = root;
         // コピーを実行して記録されたtmp…は完了時に残らないため、意図的に
-        // result JSONにtmpパスを記録した行を仕込み、そのパスのファイルを置く
+        // result JSONにtmpパス+作成時IDを記録した行を仕込み、そのパスの
+        // ファイルを置く
         let recorded_tmp = dir
             .0
             .join(".x.png.gento-tmp-0123456789abcdef0123456789abcdef-000002");
         std::fs::write(&recorded_tmp, b"crashed leftover").unwrap();
+        let recorded_id = file_id_of(&recorded_tmp).expect("unixではID取得可");
         let outcome_json = format!(
-            r#"{{"op_id":1,"kind":"copy","status":"done","undoable":false,"steps":[{{"file_id":1,"from":"/r/x.png","to":"/r/x.png","status":"done","resolution":null,"error":null,"warning":null,"tmp":"{}","undo":[]}}]}}"#,
-            recorded_tmp.display().to_string().replace('\\', "\\\\")
+            r#"{{"op_id":1,"kind":"copy","status":"done","undoable":false,"steps":[{{"file_id":1,"from":"/r/x.png","to":"/r/x.png","status":"done","resolution":null,"error":null,"warning":null,"tmp":"{}","tmp_file_id":{{"dev":{},"ino":{}}},"undo":[]}}]}}"#,
+            recorded_tmp.display().to_string().replace('\\', "\\\\"),
+            recorded_id.dev,
+            recorded_id.ino
         );
         db.with_writer(|repos| {
             let record = repos
@@ -1805,8 +1932,33 @@ mod tests {
             repos.update_operation(record.id, FileOpStatus::Done, Some(&outcome_json), false)
         })
         .unwrap();
+        // 対照: ID無し (旧世代record) の記録パスはfail-closed残置
+        let legacy_tmp = dir
+            .0
+            .join(".y.png.gento-tmp-0123456789abcdef0123456789abcdef-000003");
+        std::fs::write(&legacy_tmp, b"old generation leftover").unwrap();
+        let legacy_json = format!(
+            r#"{{"op_id":2,"kind":"copy","status":"done","undoable":false,"steps":[{{"file_id":2,"from":"/r/y.png","to":"/r/y.png","status":"done","resolution":null,"error":null,"warning":null,"tmp":"{}","undo":[]}}]}}"#,
+            legacy_tmp.display().to_string().replace('\\', "\\\\")
+        );
+        db.with_writer(|repos| {
+            let record = repos
+                .insert_operation(gento_core::file_ops::NewFileOp {
+                    operation_type: FileOpKind::Copy,
+                    status: FileOpStatus::Done,
+                    undoable: false,
+                    request_json: "{}".to_string(),
+                })
+                .unwrap();
+            repos.update_operation(record.id, FileOpStatus::Done, Some(&legacy_json), false)
+        })
+        .unwrap();
         service.recover_at_startup();
-        assert!(!recorded_tmp.exists(), "記録された所有tmpは掃除される");
+        assert!(!recorded_tmp.exists(), "記録+ID一致の所有tmpは掃除される");
+        assert!(
+            legacy_tmp.exists(),
+            "ID記録の無い旧世代recordのtmpは削除しない (fail-closed)"
+        );
     }
 
     #[test]
@@ -1944,7 +2096,7 @@ mod tests {
         let tmp =
             gento_core::file_ops::tmp_path_for(&dst, "01234567-89ab-cdef-0123-456789abcdef", 0);
         RealFileOps
-            .copy_file(&src, &dst, &tmp, &AtomicBool::new(false))
+            .copy_file(&src, &dst, &tmp, &AtomicBool::new(false), &mut None)
             .unwrap();
         assert_eq!(std::fs::read(&dst).unwrap(), b"real-copy-content");
         assert_eq!(
@@ -1972,7 +2124,7 @@ mod tests {
         let tmp =
             gento_core::file_ops::tmp_path_for(&dst, "01234567-89ab-cdef-0123-456789abcdef", 0);
         let err = RealFileOps
-            .copy_file(&src, &dst, &tmp, &AtomicBool::new(false))
+            .copy_file(&src, &dst, &tmp, &AtomicBool::new(false), &mut None)
             .unwrap_err();
         assert!(matches!(err.kind, FsOpErrorKind::AlreadyExists), "{err}");
         assert_eq!(std::fs::read(&dst).unwrap(), b"existing", "上書きされない");
@@ -1990,7 +2142,7 @@ mod tests {
             gento_core::file_ops::tmp_path_for(&dst, "01234567-89ab-cdef-0123-456789abcdef", 0);
         std::fs::write(&tmp, b"ATTACKER-OWNED").unwrap();
         let err = RealFileOps
-            .copy_file(&src, &dst, &tmp, &AtomicBool::new(false))
+            .copy_file(&src, &dst, &tmp, &AtomicBool::new(false), &mut None)
             .unwrap_err();
         assert!(matches!(err.kind, FsOpErrorKind::AlreadyExists), "{err}");
         // 事前占有entryは無傷
@@ -2006,14 +2158,19 @@ mod tests {
         let cancel = AtomicBool::new(true); // 最初のチャンク読み出し前に中断
         let tmp =
             gento_core::file_ops::tmp_path_for(&dst, "01234567-89ab-cdef-0123-456789abcdef", 0);
+        let mut captured_id = None;
         let err = RealFileOps
-            .copy_file(&src, &dst, &tmp, &cancel)
+            .copy_file(&src, &dst, &tmp, &cancel, &mut captured_id)
             .unwrap_err();
         assert!(matches!(err.kind, FsOpErrorKind::Cancelled), "{err}");
         assert!(!dst.exists());
         // キャンセルでもunlinkしない — 残留は自己識別的dotfile
-        // (起動時掃除の所有権検証対象。result.tmpに記録される)
+        // (起動時掃除の所有権検証対象。result.tmpに記録される)。
+        // FG-WP17-1: 失敗経路でも作成時のOSファイルIDが報告される
+        // (fd同一性検証は失敗残留こそ対象のため)
         assert!(tmp.exists(), "キャンセル時のtmp残留を許容 (unlinkしない)");
+        #[cfg(unix)]
+        assert!(captured_id.is_some(), "キャンセル時もtmp_file_idを報告");
     }
 
     #[test]
@@ -2130,6 +2287,7 @@ mod tests {
                 error: None,
                 warning: None,
                 tmp: None,
+                tmp_file_id: None,
                 undo: vec![UndoAction::MoveBack {
                     from: PathBuf::from("/r/new.png"),
                     to: PathBuf::from("/r/old.png"),
@@ -2628,5 +2786,181 @@ mod tests {
             digest(&[1], "/a", "b|c", &[]),
             "フィールド境界の曖昧一致なし"
         );
+    }
+
+    // ===== FG-WP17-1 B1: 起動掃除の所有権・fd同一性モデル =====
+
+    /// 厳密形式tmp名 (検証用uuid・seq=0) を組み立てる。
+    fn strict_tmp_name(final_name: &str) -> String {
+        gento_core::file_ops::tmp_path_for(
+            &Path::new("/r").join(final_name),
+            "01234567-89ab-cdef-0123-456789abcdef",
+            0,
+        )
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+    }
+
+    fn file_id_of(path: &Path) -> Option<OsFileId> {
+        std::fs::symlink_metadata(path)
+            .ok()
+            .and_then(|md| gento_platform::os_file_id_of(&md))
+    }
+
+    /// (a) 厳密tmp文法に一致するユーザーファイル (操作記録に所有権が無い)
+    /// はsweep後も生存する。名前文法一致のみでの削除を禁止する不変条件。
+    #[test]
+    fn sweep_keeps_unrecorded_strict_grammar_file() {
+        let dir = TestDir::new("sweep-grammar");
+        let victim = dir.write(&strict_tmp_name("photo.png"), b"user-owned");
+        let owned = HashMap::new();
+        let (removed, skipped) = sweep_tmp_files(&dir.0, &owned);
+        assert_eq!(removed, 0, "記録に無い文法一致ファイルは削除しない");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"user-owned",
+            "ユーザーファイルは無傷"
+        );
+        assert_eq!(skipped.len(), 1, "残置を報告: {skipped:?}");
+        assert!(skipped[0].contains("所有権"), "{skipped:?}");
+    }
+
+    /// (b) recordの所有パスが差し替えられていた場合 (fd同一性不一致)、
+    /// その場のファイルは削除せず残留報告する。
+    #[test]
+    fn sweep_keeps_swapped_file_with_mismatched_ino() {
+        let dir = TestDir::new("sweep-swap");
+        // recordはvictimパスを所有しているが、記録された (dev, ino) は
+        // 別ファイルのもの (= 作成後に差し替えられた状況)
+        let bystander = dir.write("other.png", b"innocent");
+        let victim = dir.write(&strict_tmp_name("photo.png"), b"attacker-swapped");
+        let recorded = file_id_of(&bystander).expect("unixではID取得可");
+        assert_ne!(file_id_of(&victim), Some(recorded), "前提: 別ファイル");
+        let owned = HashMap::from([(victim.clone(), Some(recorded))]);
+        let (removed, skipped) = sweep_tmp_files(&dir.0, &owned);
+        assert_eq!(removed, 0, "ino不一致は削除しない");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"attacker-swapped",
+            "差し替え後の実体は無傷"
+        );
+        assert_eq!(skipped.len(), 1, "不一致を報告: {skipped:?}");
+        assert!(skipped[0].contains("同一性"), "{skipped:?}");
+        // 対照: bystanderも巻き込まれない
+        assert_eq!(std::fs::read(&bystander).unwrap(), b"innocent");
+    }
+
+    /// (c) ディレクトリ→symlink差し替えでtraversalが登録ルート外に出ない
+    /// (fd歩行: サブディレクトリはO_NOFOLLOW|O_DIRECTORYで開き直すため、
+    /// symlink先は歩かれない)。
+    #[test]
+    #[cfg(unix)]
+    fn sweep_traversal_does_not_escape_via_dir_symlink() {
+        let dir = TestDir::new("sweep-symlink");
+        let outside = dir.mkdir("outside");
+        let outside_loot = {
+            let p = outside.join(strict_tmp_name("loot.png"));
+            std::fs::write(&p, b"outside-user-file").unwrap();
+            p
+        };
+        let root = dir.mkdir("root");
+        // root/sub → outside (ディレクトリへのsymlink)
+        std::os::unix::fs::symlink(&outside, root.join("sub")).unwrap();
+        // root直下にも文法一致ファイル (通常の報告対象)
+        let inside_victim = {
+            let p = root.join(strict_tmp_name("inside.png"));
+            std::fs::write(&p, b"inside-user-file").unwrap();
+            p
+        };
+        let owned = HashMap::new();
+        let (removed, skipped) = sweep_tmp_files(&root, &owned);
+        assert_eq!(removed, 0);
+        assert!(
+            outside_loot.exists(),
+            "symlink先のファイルは無傷 (traversal脱出なし)"
+        );
+        assert_eq!(std::fs::read(&outside_loot).unwrap(), b"outside-user-file");
+        assert_eq!(
+            std::fs::read(&inside_victim).unwrap(),
+            b"inside-user-file",
+            "ルート内も所有権が無ければ無傷"
+        );
+        assert_eq!(skipped.len(), 1, "ルート内の未記録分のみ報告: {skipped:?}");
+    }
+
+    /// (d) 正規record (所有パス+作成時OSファイルID一致) のtmpは削除される。
+    /// サブディレクトリ内もfd歩行で到達する。ID記録の無いrecord
+    /// (旧世代・executing再構築) はfail-closedとして削除しない。
+    #[test]
+    fn sweep_removes_recorded_tmp_with_matching_ino() {
+        let dir = TestDir::new("sweep-owned");
+        let sub = dir.mkdir("sub");
+        let residue = {
+            let p = sub.join(strict_tmp_name("photo.png"));
+            std::fs::write(&p, b"partial-copy").unwrap();
+            p
+        };
+        let id = file_id_of(&residue).expect("unixではID取得可");
+        let owned = HashMap::from([(residue.clone(), Some(id))]);
+        let (removed, skipped) = sweep_tmp_files(&dir.0, &owned);
+        assert_eq!(removed, 1, "skipped={skipped:?}");
+        assert!(!residue.exists(), "所有権+同一性一致の残留は削除");
+
+        // 旧世代record (ino無し) は削除しない (fail-closed)
+        let legacy = {
+            let p = dir.0.join(strict_tmp_name("legacy.png"));
+            std::fs::write(&p, b"old-generation").unwrap();
+            p
+        };
+        let owned_old = HashMap::from([(legacy.clone(), None)]);
+        let (removed2, skipped2) = sweep_tmp_files(&dir.0, &owned_old);
+        assert_eq!(removed2, 0, "ino記録の無いrecordは削除しない");
+        assert!(legacy.exists());
+        assert_eq!(skipped2.len(), 1, "旧世代残留を報告: {skipped2:?}");
+        assert!(skipped2[0].contains("旧世代"), "{skipped2:?}");
+    }
+
+    /// E2E: 配置失敗で残留したtmp (result JSONにtmp+作成時IDが記録される)
+    /// は、次回起動の回復 ([`FileOpsService::recover_at_startup`]) で
+    /// 所有権+fd同一性検証を通って掃除される。
+    #[test]
+    fn recover_at_startup_sweeps_recorded_failed_step_residue() {
+        let (dir, db, service, _host, _trash, stub) = service_with_stub("sweep-recover");
+        let root = db.with_writer(|repos| repos.add_root(&dir.0)).unwrap();
+        let src = dir.write("f.png", b"data");
+        add_root_file(&db, root.id, "f.png", b"data");
+        let dest = dir.mkdir("dest");
+        // 実行時のみ判明する配置失敗 (NOREPLACE失敗) を注入 → tmp残留
+        let dst = dest.join("f.png");
+        stub.fail_placement.lock().unwrap().push(dst.clone());
+        let outcome = service
+            .execute(
+                FileOpKind::Copy,
+                &[src],
+                Some(&dest),
+                None,
+                ResolutionSpec::default(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(outcome.status, FileOpStatus::Failed);
+        let tmp = outcome.steps[0].tmp.clone().expect("tmp記録");
+        assert!(tmp.exists(), "配置失敗のtmp残留");
+        assert!(
+            outcome.steps[0].tmp_file_id.is_some(),
+            "recordに作成時OSファイルIDが記録される"
+        );
+        // 起動回復が残留を掃除する
+        let notices = service.recover_at_startup();
+        assert!(!tmp.exists(), "所有権+同一性一致の残留は掃除: {notices:?}");
+        assert!(
+            notices.iter().any(|n| n.contains("掃除しました")),
+            "notices={notices:?}"
+        );
+        // ソースは無傷・宛先は未配置
+        assert!(dir.0.join("f.png").exists());
+        assert!(!dst.exists());
     }
 }
