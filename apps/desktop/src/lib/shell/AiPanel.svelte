@@ -16,7 +16,6 @@
     apiKeyForSave,
     apiKeyPlaceholder,
     apiKeyStoreLabel,
-    endpointIsLocal,
     jobCancellable,
     jobStatusLabel,
     jobTypeLabel,
@@ -29,6 +28,7 @@
     type AiTestKind,
     type AiTestReport,
   } from "../ai";
+  import { classifyEndpoint as endpointClass, endpointClassLabel } from "../settings";
   import type { LibraryRoot } from "../library";
   import {
     EmbeddingStore,
@@ -530,9 +530,13 @@
                 <li class="profile-row" data-testid="ai-profile">
                   <div class="profile-main">
                     <strong>{profile.displayName}</strong>
-                    <span class="profile-url" class:local={endpointIsLocal(profile.baseUrl)}>
+                    <span
+                      class="profile-url"
+                      class:local={endpointClass(profile.baseUrl) === "local"}
+                      class:external={endpointClass(profile.baseUrl) === "external"}
+                    >
                       {profile.baseUrl} · {profile.model}
-                      {endpointIsLocal(profile.baseUrl) ? " (ローカル)" : " (外部)"}
+                      ({endpointClassLabel(endpointClass(profile.baseUrl))})
                     </span>
                     <span class="profile-key">
                       {apiKeyStoreLabel(profile.apiKeyStore)}
@@ -1055,6 +1059,10 @@
 
   .profile-url.local {
     color: light-dark(#1a7f37, #3fb950);
+  }
+
+  .profile-url.external {
+    color: light-dark(#bc4c00, #d29922);
   }
 
   .profile-key {

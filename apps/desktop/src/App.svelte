@@ -106,6 +106,7 @@
   import BackupDialog from "./lib/ui/BackupDialog.svelte";
   import ExportDialog from "./lib/ui/ExportDialog.svelte";
   import RestoreDialog from "./lib/ui/RestoreDialog.svelte";
+  import SettingsDialog from "./lib/ui/SettingsDialog.svelte";
   type TriageKeyAction = import("./lib/triage-keys").TriageKeyAction;
   import ContextMenu, { type MenuAction } from "./lib/ui/ContextMenu.svelte";
   import FolderTree from "./lib/shell/FolderTree.svelte";
@@ -116,7 +117,7 @@
   import DevDrawer from "./lib/shell/DevDrawer.svelte";
   // WP-10: AI統合 (プロファイル・ジョブキュー・自動処理)
   import AiPanel from "./lib/shell/AiPanel.svelte";
-  import { AiStore, type AiRun } from "./lib/ai";
+  import { AiStore, type AiProfile, type AiRun } from "./lib/ai";
 
   // ===== IPC・ストア (既存資産) =====
 
@@ -304,6 +305,30 @@
   let backupFor = $state<LibraryRoot | null>(null);
   /** 復元ダイアログ。 */
   let restoreOpen = $state(false);
+  // WP-15: 設定ダイアログ (ヘッダー歯車から)
+  let settingsOpen = $state(false);
+  let settingsProfiles = $state<AiProfile[]>([]);
+  const settingsDisplayInfo = $derived.by(() => {
+    const prefs = folderStore.load();
+    const sortKey = currentFolder ?? LIBRARY_SORT_KEY;
+    const sort = prefs.sorts[sortKey] ?? "name";
+    const sortLabel = sort === "date_desc" ? "撮影日降順" : sort === "size_desc" ? "サイズ降順" : "名前順";
+    return {
+      lastFolder: currentFolder,
+      expandedCount: tree.expandedPaths().length,
+      sortLabel,
+    };
+  });
+
+  async function openSettings(): Promise<void> {
+    settingsOpen = true;
+    // AI タブ表示用にプロファイルを一度だけ取得 (短命モーダル規約)
+    try {
+      settingsProfiles = await invoke<AiProfile[]>("ai_profile_list");
+    } catch {
+      settingsProfiles = [];
+    }
+  }
   /** フルDBバックアップ実行中。 */
   let fullDbBusy = $state(false);
 
@@ -2633,6 +2658,14 @@
     >
       AI
     </button>
+    <button
+      class:active={settingsOpen}
+      onclick={() => void openSettings()}
+      title="設定・診断 (WP-15)"
+      data-testid="settings-button"
+    >
+      ⚙ 設定
+    </button>
     {#if devBridgeActive}
       <button class:active={devPanelOpen} onclick={() => (devPanelOpen = !devPanelOpen)}>
         開発パネル
@@ -3297,6 +3330,15 @@
 
 {#if restoreOpen}
   <RestoreDialog roots={libraryRoots} onClose={() => (restoreOpen = false)} />
+{/if}
+
+{#if settingsOpen}
+  <SettingsDialog
+    roots={libraryRoots}
+    profiles={settingsProfiles}
+    displayInfo={settingsDisplayInfo}
+    onClose={() => (settingsOpen = false)}
+  />
 {/if}
 
 {#if exportFor !== null}

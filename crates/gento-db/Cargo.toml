@@ -14,6 +14,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # WP-13: バックアップdigest・復元時内容ハッシュ (workspace既存pinの直付け)。
 blake3 = { workspace = true }
+# WP-15: 設定破損時のwarnログ (workspace既存pinの直付け。新規外部依存ではない)。
+tracing = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

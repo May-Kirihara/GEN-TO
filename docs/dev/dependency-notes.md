@@ -611,3 +611,20 @@
     (WP-11 ort / WP-12 usearchと同じ「1ファイル隔離」規約)。
     非unix (Windows) は字句的symlink検査のフォールバックで、構造的
     (race-free) 保証はunix実装のみ (WP-17で再検討)。
+
+## WP-15 設定・診断・プライバシー (2026-09-03)
+
+- **新規外部依存なし**。以下はworkspace既存pinのcrate間付替え (lock変化なし):
+  - **`tracing` =0.1.44** (gento-db、通常依存)
+    - 用途: 設定値破損時に既定値へフォールバックした事実のwarnログ
+      (`settings` module。WP-15受け入れ「設定破損時に安全な既定値で起動」
+      の可視化)。それまでgento-dbはログ出力を持たなかったが、破損を黙って
+      吸収すると診断 (settingsCorruptCount) と実挙動が繋がらなくなるため
+      付替えを判断した。
+    - 入手元: crates.io (tokio-rs/tracing)。ライセンス: MIT。
+      gento-tauri / gento-image / gento-ai / gento-embeddingが利用中の
+      同一crateのため新規外部依存ではない。
+  - **`tracing-subscriber` =0.3.23 (env-filter feature付き・既定)**:
+    reload handle (`reload::Layer`) はfeature追加なしで利用可能
+    (確認済み)。ログring (MakeWriter実装) もstdのみで実装し、
+    tracing-appender等の追加は不要。

@@ -537,12 +537,17 @@ pub async fn fts_rebuild(
     let started = Instant::now();
     let app_for_job = app.clone();
     let rebuilt = tauri::async_runtime::spawn_blocking(move || {
-        db.with_writer(|repos| {
-            gento_db::fts_rebuild(repos.conn(), &mut |done, total| {
-                let _ =
-                    app_for_job.emit("fts:rebuild_progress", FtsProgressPayload { done, total });
+        let rebuilt = db
+            .with_writer(|repos| {
+                gento_db::fts_rebuild(repos.conn(), &mut |done, total| {
+                    let _ = app_for_job
+                        .emit("fts:rebuild_progress", FtsProgressPayload { done, total });
+                })
             })
-        })
+            .map_err(|e| e.to_string())?;
+        // 診断 (WP-15) のため最終再構築時刻を記録
+        gento_db::set_fts_last_rebuild_now(&db).map_err(|e| e.to_string())?;
+        Ok::<u64, String>(rebuilt)
     })
     .await
     .map_err(|e| format!("索引再構築が失敗しました: {e}"))?
@@ -561,7 +566,11 @@ pub async fn fts_repair(state: State<'_, AppState>) -> Result<FtsMaintenanceDto,
     let db = db_of(&state)?;
     let started = Instant::now();
     let (rebuilt, removed) = tauri::async_runtime::spawn_blocking(move || {
-        db.with_writer(|repos| gento_db::fts_repair(repos.conn()))
+        let (rebuilt, removed) = db
+            .with_writer(|repos| gento_db::fts_repair(repos.conn()))
+            .map_err(|e| e.to_string())?;
+        gento_db::set_fts_last_rebuild_now(&db).map_err(|e| e.to_string())?;
+        Ok::<(u64, u64), String>((rebuilt, removed))
     })
     .await
     .map_err(|e| format!("索引修復に失敗しました: {e}"))?
@@ -825,6 +834,8 @@ pub fn ensure_fts_after_scan(app: &AppHandle) {
         FTS_MAINTENANCE_RUNNING.store(false, Ordering::Relaxed);
         match outcome {
             Ok((rebuilt, removed)) => {
+                // 診断 (WP-15) のため最終再構築時刻を記録 (best-effort)
+                let _ = gento_db::set_fts_last_rebuild_now(&db);
                 tracing::info!(rebuilt, removed, "fts index repaired after scan");
             }
             Err(error) => {

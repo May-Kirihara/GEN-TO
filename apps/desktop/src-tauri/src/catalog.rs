@@ -40,6 +40,8 @@ pub struct AppState {
     /// SQLite DB状態 (WP-1)。setupで生成。開けなくてもアプリは続行
     /// (通常ファイラー機能はDB非依存のため)。
     pub db: Option<crate::db::DbState>,
+    /// アプリディレクトリ解決結果 (WP-15診断bundleのパスredaction用)。
+    pub app_dirs: Option<gento_core::AppDirs>,
     /// 登録ルート制御 (WP-2)。DBが開けている場合のみ生成。
     pub library: Option<Arc<crate::library::LibraryController>>,
     /// ファイル操作サービス (WP-7)。DBとlibraryが開けている場合のみ生成。
@@ -199,6 +201,7 @@ impl AppState {
             thumbnails: None,
             proto_stats: Arc::new(crate::protocol::ProtoStats::new()),
             db: None,
+            app_dirs: None,
             library: None,
             file_ops: None,
             ai: None,

@@ -2474,3 +2474,97 @@ score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
   BackupDialogと同一規約) + 構造toggle + dry-runプレビュー表
   (出力パス/.txt/既存分類/caption先頭) + 実行・キャンセル + 結果サマリ
   (失敗・衝突・manifestパス表示)。
+
+## 49. WP-15: 設定・診断・プライバシー
+
+### 設計判断 (PM決定の記録)
+
+- **設定はDB migrationなし**: `app_settings` キー値テーブルに名前空間付き
+  キー (`general.*` / `cache.*` / `search.*` / `backup.*` 既存) で保存する。
+  schema version相当は `settings.version` 値のみ (PM決定「migration禁止」)。
+  新規キーの値はJSON直列化 (`"warn"` / `2147483648`)。既存backup系キー
+  (`backup.auto_full_db`=`off` 等の素の文字列) は既存コマンド互換のため
+  素の形式のまま受け入れる (accessorは両形式を解析)。
+- **破損値は既定値 + warnログで継続** (受け入れ「設定破損時に安全な既定値
+  で起動」)。破損検知件数・キー一覧は `diagnostics_snapshot` の
+  `db.settingsCorruptCount` と `settings_get` の `corruptKeys` から観測。
+- **既定値は現状挙動と同値**: `cache.thumbs_max_bytes` 既定 = 2 GiB
+  (gento-image `cache::DEFAULT_MAX_BYTES` と同値。値はgento-db側に重複
+  定義され、tauri層テスト `dto_defaults_and_cross_crate_default_pin` で
+  同値を固定)。
+- **サムネイルキャッシュ**: 上限変更は即時適用 (`ThumbnailCache::
+  set_max_bytes`。縮小時はその場で目標容量95%までLRU prune)。削除
+  (`clear_thumbnail_cache` 既存) は**通常ファイルのみ** (symlinkは辿ら
+  ない・削除もしない — リンク先の実体を絶対に触らない)。起動時回復も
+  symlinkを台帳登録しない。再構築は需要駆動再生成で担保 (既存テスト)。
+- **診断は全てread-only**。`PRAGMA quick_check` のみFTS5整合性検査の内部
+  書き込みが必要なため例外的にwriter接続で実行 (`Db::diagnose` と同一理由)。
+
+### 秘密・GPS・パスのredaction規約 (最重要)
+
+- 監査結果: APIキー・GPSの既存泄漏経路は無し (ApiKeyのDebug/Display伏せ字、
+  SecretStoreエラー文の鍵不含、AiErrorがAuthorization値を整形しない、
+  request_summaryの鍵除外 — いずれも構造的)。WP-15は以下の**構造的防護を
+  追加**した:
+  - `gento_core::redact`: `redact_key` (先頭4字+マスク)、`scrub_text`
+    (Bearer/Authorization/sk-系/api_key=/GPS座標らしい高精度小数5桁以上の
+    除外)、`scrub_paths` (絶対パス→`<path>`)。
+  - `MetadataColumns`/`AssetMetadataParsed` のDebugを手動実装 (GPS列は
+    `<gps>`、rawスロットはバイト数要約に伏せる — `{:?}` 混入時の防護)。
+  - AIジョブ失敗時のwarnログ (scrub通し)。panic payloadのscrub。
+- **診断bundle** (`diagnostics_bundle_create`): ユーザー指定dirへJSON 1ファイル
+  (tmp書き→sync→原子rename)。内容: format/app/api/schema version、設定
+  (鍵素材は構造的に不含。プロファイル・鍵参照も対象外)、診断スナップショット、
+  直近ログ末尾100行 (メモリringから)。**出力前に**: (1) 全文字列をscrub_text、
+  (2) 既知dirを実パス→プレースホルダ (`<root:N>`/`<db>`/`<data>`/`<cache>`/
+  `<log>`/`<thumbnails>`/`<models>`/`<home>`、長い順)、(3) 残る絶対パスを
+  `scrub_paths` で `<path>`。APIキー・GPS座標・実パス・画像内容 (base64
+  data URL) が一度も出現しないことはテストで実証
+  (`bundle_excludes_secrets_gps_and_real_paths` — 鍵・GPS・実パスを
+  意図的に混入した状態で生成)。
+- **ログ**: stdout形式は従来どおり (計測ドライバ互換)。加えて直近512行の
+  メモリring (bundle専用)。ログレベルは `general.log_level` 設定で実行時
+  変更 (tracing reload handle。起動時は `GENTO_LOG` env優先)。
+
+### Commands (DTOはcamelCase)
+
+- `settings_get()` → `{schemaVersion, corruptKeys[], general:{logLevel},
+  cache:{thumbsMaxBytes, usedBytes, maxBytes}}`。DB未接続でも既定値で応答。
+- `settings_set_log_level(level)` → SettingsDto。levelは error|warn|info|debug。
+  永続化 + tracing reload (即時反映)。
+- `settings_set_thumbs_max_bytes(bytes)` → SettingsDto。範囲 64MiB〜1TiB
+  (範囲外は拒否)。永続化 + キャッシュへ即時適用。
+- `diagnostics_snapshot()` → 5領域:
+  `{db:{dbOpen, integrityCheck, schemaVersion, dbBytes, walBytes,
+  settingsCorruptCount, dbPath}, fts:{expectedDocs, actualDocs, missingDocs,
+  orphanDocs, duplicateDocs, staleContents, consistent, lastRebuildAt},
+  usearch:{model, indexedCount, sqliteCount, stale, dimensions, ready,
+  building, lastError}, models:{enabled, packages[{modelId, state,
+  embeddingDim, license}], workerPhase, workerRestarts, workerLastError,
+  loadedModel}, jobs:{byType[{jobType, status, count}],
+  oldestPendingAgeSeconds}}`。
+- `diagnostics_bundle_create(destDir)` → `{path}`。
+  ファイル名 `gento-diagnostics-{RFC3339}.json` (衝突時-連番)。
+- 既存 `clear_thumbnail_cache` / `backup_settings_get` / `backup_settings_set`
+  はそのまま (SettingsDialogのキャッシュ・バックアップタブから利用)。
+
+### FTS最終再構築時刻
+
+- `fts_rebuild` / `fts_repair` コマンドと走査後自動修復が成功時に
+  `fts.last_rebuild_at` 設定 (RFC3339) を記録する。診断の
+  `fts.lastRebuildAt` から読む (未実施 = null)。
+
+### AI endpoint識別 (フロントエンド実装)
+
+- `classifyEndpoint(baseUrl)` (lib/settings.ts): host分類
+  `local` (localhost/127.0.0.1/::1) / `private` (RFC1918 + 169.254/16 +
+  IPv6 link-local/ULA) / `external` / `invalid`。SettingsDialogのAIタブと
+  AiPanelのプロファイル行に表示。ルート毎の ai_enabled/send_exif/send_gps
+  はSettingsDialog AIタブに行列で可視化 (読み取り専用。初期状態は全オフ =
+  `RootSettings::default` 回帰テストで固定済み)。
+
+### UI統合
+
+- ヘッダー歯車「⚙ 設定」→ SettingsDialog (タブ: 一般/表示/キャッシュ/
+  AI/検索/バックアップ/診断)。表示タブは既存pref (folder-prefs) の現状値
+  の表示のみ。診断タブは5領域 + 更新ボタン + bundle生成 (出力先dir入力)。

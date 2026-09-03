@@ -14,14 +14,17 @@ pub mod collections;
 pub mod db;
 #[cfg(any(debug_assertions, feature = "devtools"))]
 pub mod devtools;
+pub mod diagnostics;
 pub mod embedding;
 pub mod export;
 pub mod fileops;
 pub mod fsview;
 pub mod library;
+pub mod logging;
 pub mod metadata;
 pub mod protocol;
 pub mod search;
+pub mod settings;
 pub mod thumbnails;
 pub mod vectorindex;
 
@@ -31,7 +34,6 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use catalog::AppState;
 use gento_core::{AppDirs, HealthInfo, GENTO_API_VERSION};
 use tauri::{Manager, RunEvent, State};
-use tracing_subscriber::EnvFilter;
 
 use crate::thumbnails::ThumbnailService;
 
@@ -106,6 +108,9 @@ fn install_panic_hook(app_dirs: &AppDirs) {
         } else {
             "<non-string panic payload>".to_string()
         };
+        // panic messageに秘密っぽいパターン (Bearer等) が混入していた場合の
+        // 最終防護 (WP-15)。panic.logは診断共有され得るため。
+        let payload = gento_core::redact::scrub_text(&payload);
         let line = format!(
             "panic version={} api_version={} os={} location={} payload={}\n",
             env!("CARGO_PKG_VERSION"),
@@ -253,7 +258,12 @@ pub fn run() {
         backup::backup_settings_set,
         export::export_preview,
         export::export_execute,
-        export::export_cancel
+        export::export_cancel,
+        settings::settings_get,
+        settings::settings_set_log_level,
+        settings::settings_set_thumbs_max_bytes,
+        diagnostics::diagnostics_snapshot,
+        diagnostics::diagnostics_bundle_create
     ]);
     #[cfg(not(any(debug_assertions, feature = "devtools")))]
     let builder = builder.invoke_handler(tauri::generate_handler![
@@ -358,12 +368,17 @@ pub fn run() {
         backup::backup_settings_set,
         export::export_preview,
         export::export_execute,
-        export::export_cancel
+        export::export_cancel,
+        settings::settings_get,
+        settings::settings_set_log_level,
+        settings::settings_set_thumbs_max_bytes,
+        diagnostics::diagnostics_snapshot,
+        diagnostics::diagnostics_bundle_create
     ]);
     builder
         .setup(move |app| {
             let app_dirs = resolve_app_dirs();
-            init_tracing();
+            let _log_ring = logging::init();
             install_panic_hook(&app_dirs);
             install_termination_signals(app.handle().clone());
             let dataset_path = resolve_dataset_path(&args);
@@ -388,10 +403,25 @@ pub fn run() {
             if let Some(err) = &db_state.open_error {
                 tracing::warn!(error = %err, "database unavailable; continuing without DB");
             }
+            // WP-15: 起動時設定適用 (ログレベル。GENTO_LOG env優先)。
+            if let Some(db) = db_state.db.as_ref() {
+                logging::apply_startup_setting(db);
+            }
             let events = Box::new(thumbnails::TauriThumbEvents {
                 app: app.handle().clone(),
             });
-            let service = match ThumbnailService::new(thumbnail_root, events) {
+            // WP-15: サムネイルキャッシュ上限は設定 `cache.thumbs_max_bytes`
+            // (破損・未設定は既定 = 従来の2GiB。読み取り失敗でも起動する)。
+            let thumbs_max = db_state
+                .db
+                .as_ref()
+                .map(|db| gento_db::load_app_settings(db).cache.thumbs_max_bytes)
+                .unwrap_or(gento_db::DEFAULT_THUMBS_MAX_BYTES);
+            let service = match ThumbnailService::new_with_limit(
+                thumbnail_root,
+                thumbs_max,
+                events,
+            ) {
                 Ok(service) => service,
                 Err(err) => {
                     // キャッシュ初期化失敗では起動を続行できない (サムネイル機能が
@@ -403,6 +433,7 @@ pub fn run() {
             let mut state = AppState::new(dataset_path);
             state.thumbnails = Some(service);
             state.db = Some(db_state);
+            state.app_dirs = Some(app_dirs.clone());
             // WP-2: 登録ルート制御。DBが開けている場合のみ生成し、
             // 有効ルートの監視を開始して初回スキャンを非同期投入する
             // (UIブロックなし。再起動復元はスナップショット生成で担保)。
@@ -546,20 +577,8 @@ pub fn run() {
         });
 }
 
-/// `GENTO_LOG` (tracing EnvFilter書式、既定 `info`) でstdoutへログを出す。
-///
-/// 形式はtracing-subscriber fmtの既定: `TIMESTAMP LEVEL TARGET: message`
-/// (例: `2026-08-30T… INFO gento_tauri_lib: dataset resolved`)。
-/// 計測ドライバは `devtest:` (target) と `scan metrics` (メッセージ冒頭) を
-/// grepして採取するため、この形式を変える場合はドライバ側の追従が必要。
-fn init_tracing() {
-    let filter = EnvFilter::try_from_env("GENTO_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stdout)
-        .init();
-}
-
+/// ログ初期化は [`crate::logging::init`] (WP-15: stdout tee + メモリring +
+/// 実行時レベル変更。GENTO_LOG env書式・既定infoは従来どおり)。
 /// アプリケーションディレクトリを解決する (WP-0)。
 ///
 /// - data_dir: `dirs::data_dir()/gento-spike` — MVP-WP-1のSQLite DBはここへ置く

@@ -28,7 +28,7 @@
 use crate::repo::{FileRecord, RepoError};
 
 /// 正規化済みメタデータ列 (NULL = 未知/不存在。data-model §6)。
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub struct MetadataColumns {
     /// 撮影日時 (RFC3339 `YYYY-MM-DDTHH:MM:SS`。タイムゾーン情報はEXIFに
     /// 依存し通常は不含のためローカル時刻として保持)。
@@ -59,7 +59,7 @@ pub struct MetadataColumns {
 }
 
 /// 1 parserの解析結果 (`asset_metadata` 1行分)。
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub struct AssetMetadataParsed {
     /// parser名 (例: "exif", "png-text", "sd-params", "comfy", "nai")。
     pub parser_name: String,
@@ -72,6 +72,60 @@ pub struct AssetMetadataParsed {
     pub raw_iptc: Option<String>,
     pub raw_png_metadata: Option<String>,
     pub raw_workflow: Option<String>,
+}
+
+/// GPS列を伏せたDebug (WP-15)。GPS座標は個人情報のため、構造体が
+/// `{:?}` でログ・エラー文字列へ混入した場合にも値を出さない
+/// (「APIキーとGPSがログへ出ない」の構造的防護。値が必要な呼び出し側は
+/// フィールドを明示的に読む)。
+impl std::fmt::Debug for MetadataColumns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let gps = if self.gps_latitude.is_some() || self.gps_longitude.is_some() {
+            "Some(<gps>)"
+        } else {
+            "None"
+        };
+        f.debug_struct("MetadataColumns")
+            .field("taken_at", &self.taken_at)
+            .field("camera_make", &self.camera_make)
+            .field("camera_model", &self.camera_model)
+            .field("lens", &self.lens)
+            .field("gps_latitude", &gps)
+            .field("gps_longitude", &self.gps_longitude.map(|_| "<gps>"))
+            .field("orientation", &self.orientation)
+            .field("generator", &self.generator)
+            .field("generation_model", &self.generation_model)
+            .field("vae", &self.vae)
+            .field("sampler", &self.sampler)
+            .field("scheduler", &self.scheduler)
+            .field("steps", &self.steps)
+            .field("cfg_scale", &self.cfg_scale)
+            .field("seed", &self.seed)
+            .field("positive_prompt", &self.positive_prompt)
+            .field("negative_prompt", &self.negative_prompt)
+            .field("generation_extra", &self.generation_extra)
+            .finish()
+    }
+}
+
+/// rawスロットを要約表示するDebug (WP-15)。raw_exif/raw_iptc等の生JSONは
+/// GPS座標 (DMS形式) を含み得るため、バイト数要約のみ出す。
+impl std::fmt::Debug for AssetMetadataParsed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let summarize = |raw: &Option<String>| match raw {
+            Some(s) => format!("Some(<{} bytes>)", s.len()),
+            None => "None".to_string(),
+        };
+        f.debug_struct("AssetMetadataParsed")
+            .field("parser_name", &self.parser_name)
+            .field("parser_version", &self.parser_version)
+            .field("columns", &self.columns)
+            .field("raw_exif", &summarize(&self.raw_exif))
+            .field("raw_iptc", &summarize(&self.raw_iptc))
+            .field("raw_png_metadata", &summarize(&self.raw_png_metadata))
+            .field("raw_workflow", &summarize(&self.raw_workflow))
+            .finish()
+    }
 }
 
 impl MetadataColumns {

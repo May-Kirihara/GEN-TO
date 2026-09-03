@@ -132,8 +132,22 @@ pub struct ThumbnailService {
 
 impl ThumbnailService {
     pub fn new(cache_root: PathBuf, events: Box<dyn ThumbEvents + Send>) -> io::Result<Arc<Self>> {
+        Self::new_with_limit(cache_root, gento_image::cache::DEFAULT_MAX_BYTES, events)
+    }
+
+    /// キャッシュ上限を指定して開く (WP-15: 設定 `cache.thumbs_max_bytes`
+    /// の起動時適用。上限の実行時変更は `cache().set_max_bytes`)。
+    pub fn new_with_limit(
+        cache_root: PathBuf,
+        max_bytes: u64,
+        events: Box<dyn ThumbEvents + Send>,
+    ) -> io::Result<Arc<Self>> {
         let stats = Arc::new(ThumbStats::new());
-        let cache = Arc::new(ThumbnailCache::open(cache_root, Arc::clone(&stats))?);
+        let cache = Arc::new(ThumbnailCache::open_with_limit(
+            cache_root,
+            max_bytes,
+            Arc::clone(&stats),
+        )?);
         let (pool, pool_rx) = WorkerPool::new(PoolConfig::default());
         let (emitter_tx, emitter_rx) = mpsc::channel();
         let registry: Arc<Mutex<HashMap<String, PendingRequest>>> =

@@ -60,6 +60,7 @@ mod paths;
 mod repos;
 mod schema;
 mod search;
+mod settings;
 
 /// AIプロファイル・実行履歴 (WP-10)。
 pub use ai::{AiProfileRecord, AiRunRecord, AssetSource, NewAiProfile};
@@ -93,6 +94,14 @@ pub use search::{
     build_asset_doc, build_search_doc_input, fts_counts, fts_integrity, fts_rebuild, fts_repair,
     keyword_ranked_asset_ids, prune_orphan_docs, rebuild_docs_for_assets, search_asset_ids,
     search_evidence, AssetDoc, DocField, FieldEvidence, FtsIntegrityReport, SearchScope,
+};
+/// アプリ設定の型付きaccessor (WP-15)。
+pub use settings::{
+    load_app_settings, set_fts_last_rebuild_now, set_log_level, set_thumbs_max_bytes,
+    AppSettingsSnapshot, BackupSettingsView, CacheSettings, GeneralSettings, LogLevel,
+    DEFAULT_THUMBS_MAX_BYTES, MAX_THUMBS_MAX_BYTES, MIN_THUMBS_MAX_BYTES, SETTINGS_SCHEMA_VERSION,
+    SETTING_CACHE_THUMBS_MAX_BYTES, SETTING_FTS_LAST_REBUILD, SETTING_GENERAL_LOG_LEVEL,
+    SETTING_SETTINGS_VERSION,
 };
 
 /// 既定のbusy_timeout (ms)。PM計画§6-2。

@@ -185,10 +185,14 @@ struct CacheInner {
     /// 生成中の一時ファイルパス (clearから保護する)。
     pinned_tmp: HashSet<PathBuf>,
     tmp_seq: u64,
+    /// 上限バイト数 (WP-15: 実行時変更可。設定 `cache.thumbs_max_bytes`)。
+    max_bytes: u64,
+    /// 上限超過時にここまで削減する (maxの95%)。
+    target_bytes: u64,
 }
 
 impl CacheInner {
-    fn new() -> Self {
+    fn new(max_bytes: u64) -> Self {
         Self {
             ledger: HashMap::new(),
             bytes_total: 0,
@@ -197,6 +201,8 @@ impl CacheInner {
             pinned: HashMap::new(),
             pinned_tmp: HashSet::new(),
             tmp_seq: 0,
+            target_bytes: max_bytes - max_bytes / 20, // 95%
+            max_bytes,
         }
     }
 }
@@ -204,9 +210,6 @@ impl CacheInner {
 /// ディスクキャッシュ。`Arc` で共有してワーカーから使う。
 pub struct ThumbnailCache {
     root: PathBuf,
-    max_bytes: u64,
-    /// 上限超過時にここまで削減する (maxの95%)。
-    target_bytes: u64,
     stats: Arc<ThumbStats>,
     inner: Mutex<CacheInner>,
 }
@@ -232,13 +235,10 @@ impl ThumbnailCache {
     ) -> io::Result<Self> {
         let root = root.into();
         fs::create_dir_all(&root)?;
-        let target_bytes = max_bytes - max_bytes / 20; // 95%
         let cache = Self {
             root,
-            max_bytes,
-            target_bytes,
             stats,
-            inner: Mutex::new(CacheInner::new()),
+            inner: Mutex::new(CacheInner::new(max_bytes)),
         };
         {
             let mut inner = lock(&cache.inner);
@@ -253,7 +253,16 @@ impl ThumbnailCache {
     }
 
     pub fn max_bytes(&self) -> u64 {
-        self.max_bytes
+        lock(&self.inner).max_bytes
+    }
+
+    /// 上限を変更する (WP-15: 設定 `cache.thumbs_max_bytes` の即時適用)。
+    /// 縮小時は即座に目標容量 (新上限の95%) までLRU pruneする。
+    pub fn set_max_bytes(&self, max_bytes: u64) {
+        let mut inner = lock(&self.inner);
+        inner.target_bytes = max_bytes - max_bytes / 20;
+        inner.max_bytes = max_bytes;
+        self.enforce_limit_locked(&mut inner);
     }
 
     /// 会計上の合計容量 (最終ファイル + 生成中一時ファイル)。
@@ -325,6 +334,9 @@ impl ThumbnailCache {
     }
 
     /// 全削除。ピン済み (生成中) の一時ファイルは残す。
+    /// **通常ファイルのみ削除する** (WP-15: symlinkは辿らない・削除も
+    /// しない — キャッシュdir内に植えられたリンクの先 (ライブラリ実体等)
+    /// を絶対に触らないため。DirEntryのfile_typeはリンクを追跡しない)。
     pub fn clear(&self) -> io::Result<ClearOutcome> {
         let mut inner = lock(&self.inner);
         let protected: HashSet<PathBuf> = inner.pinned_tmp.iter().cloned().collect();
@@ -343,7 +355,13 @@ impl ThumbnailCache {
                             if protected.contains(&child_path) {
                                 continue;
                             }
-                            if let Ok(md) = fs::metadata(&child_path) {
+                            // no-follow: symlinkは対象外 (サイズ集計もしない)
+                            let is_regular =
+                                child.file_type().map(|t| t.is_file()).unwrap_or(false);
+                            if !is_regular {
+                                continue;
+                            }
+                            if let Ok(md) = child.metadata() {
                                 removed_bytes += md.len();
                             }
                             if fs::remove_file(&child_path).is_ok() {
@@ -357,8 +375,8 @@ impl ThumbnailCache {
                 }
                 // 空になったシェルドディレクトリは削除する (保護ファイルが残る場合は失敗する)
                 let _ = fs::remove_dir(&path);
-            } else if !protected.contains(&path) {
-                if let Ok(md) = fs::metadata(&path) {
+            } else if !protected.contains(&path) && ft.is_file() {
+                if let Ok(md) = fs::symlink_metadata(&path) {
                     removed_bytes += md.len();
                 }
                 if fs::remove_file(&path).is_ok() {
@@ -376,6 +394,8 @@ impl ThumbnailCache {
 
     /// 起動時回復: 孤立一時ファイルの削除と、既存ファイルの台帳登録
     /// (未登録ファイルはmtime順のアクセス連番で登録 = mtime順退避)。
+    /// symlinkは登録対象外 (no-follow。リンク先の実体を会計・削除の
+    /// 対象にしない — WP-15)。
     fn recover_startup_locked(&self, inner: &mut CacheInner) -> io::Result<()> {
         let mut discovered: Vec<(PathBuf, u64, u64)> = Vec::new(); // (path, bytes, mtime_ms)
         for shard in fs::read_dir(&self.root)? {
@@ -396,7 +416,12 @@ impl ThumbnailCache {
                 if !name.ends_with(".webp") {
                     continue;
                 }
-                match fs::metadata(&path) {
+                // DirEntry::metadataはsymlinkを追跡しない (lstat相当)。
+                // file_typeで正規ファイルのみを登録する。
+                if !file.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    continue;
+                }
+                match file.metadata() {
                     Ok(md) if md.is_file() => {
                         let mtime_ms = md
                             .modified()
@@ -438,7 +463,7 @@ impl ThumbnailCache {
     fn enforce_limit_locked(&self, inner: &mut CacheInner) {
         loop {
             let total = inner.bytes_total + inner.inflight_bytes;
-            if total <= self.max_bytes {
+            if total <= inner.max_bytes {
                 return;
             }
             let victim = inner
@@ -450,7 +475,7 @@ impl ThumbnailCache {
             let Some((path, entry)) = victim else {
                 tracing::warn!(
                     total,
-                    max = self.max_bytes,
+                    max = inner.max_bytes,
                     "cache over limit but no evictable entry (all pinned?)"
                 );
                 return;
@@ -466,10 +491,10 @@ impl ThumbnailCache {
                 path = %path.display(),
                 bytes = entry.bytes,
                 remaining = inner.bytes_total,
-                target = self.target_bytes,
+                target = inner.target_bytes,
                 "cache evicted"
             );
-            if inner.bytes_total + inner.inflight_bytes <= self.target_bytes {
+            if inner.bytes_total + inner.inflight_bytes <= inner.target_bytes {
                 return;
             }
         }
@@ -523,7 +548,7 @@ impl TempWriter {
             let mut inner = lock(&self.cache.inner);
             inner.inflight_bytes += len;
             self.cache.enforce_limit_locked(&mut inner);
-            if inner.bytes_total + inner.inflight_bytes > self.cache.max_bytes {
+            if inner.bytes_total + inner.inflight_bytes > inner.max_bytes {
                 // 退避し切れない (実行中ジョブのピンだらけ等)。予約を巻き戻して
                 // この書き込みを諦める。ジョブはfailedとなりバックプレッシャーとして
                 // 働く (実運用の同時書き込みはワーカー数=4×サムネイル上限64MiBで
@@ -1064,4 +1089,99 @@ mod tests {
         let f = File::options().write(true).open(&path).unwrap();
         f.set_modified(time).unwrap();
     }
+
+    // ===== WP-15: 実行時上限変更・symlink安全 =====
+
+    #[test]
+    fn set_max_bytes_prunes_to_new_target_immediately() {
+        let dir = TestDir::new("setmax");
+        let c = cache(&dir, 1 << 20);
+        let keys: Vec<CacheKey> = (0..4)
+            .map(|i| cache_key(&fp(&format!("/x/{i}.png"), i, i), SizeClass::S256))
+            .collect();
+        for key in &keys {
+            commit(&c, key, &[0u8; 100]);
+        }
+        assert_eq!(c.total_bytes(), 400);
+        // 上限を縮小 → 即時にLRU prune (target = 150の95% = 142 → 1件残る)
+        c.set_max_bytes(150);
+        assert!(c.total_bytes() <= 150, "{}", c.total_bytes());
+        assert_eq!(c.entry_count(), 1);
+        assert_eq!(c.max_bytes(), 150);
+        // 拡大はpruneなし
+        c.set_max_bytes(1 << 20);
+        assert_eq!(c.entry_count(), 1);
+        assert_eq!(c.total_bytes(), 100);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clear_removes_regular_files_only_and_never_touches_symlink_targets() {
+        use std::os::unix::fs::symlink;
+        let dir = TestDir::new("clear-symlink");
+        let c = cache(&dir, 1 << 20);
+        let k1 = cache_key(&fp("/x/1.png", 1, 1), SizeClass::S256);
+        commit(&c, &k1, &[1u8; 40]);
+        // shard内に外部ファイルへのsymlinkを植える (攻撃/事故模擬)
+        let outside = dir
+            .path()
+            .parent()
+            .unwrap()
+            .join("gento-cache-outside-target.bin");
+        fs::write(&outside, b"precious-library-file").unwrap();
+        let shard = dir.path().join(&k1.hex[..2]);
+        let link = shard.join("deadbeef-0-2.webp");
+        symlink(&outside, &link).unwrap();
+
+        let outcome = c.clear().unwrap();
+        // 通常ファイルのみ削除対象
+        assert_eq!(outcome.removed_files, 1);
+        assert_eq!(outcome.removed_bytes, 40);
+        // symlinkは辿らないし削除もしない (リンク先の実体は無傷)
+        assert!(link.exists(), "symlink自体は残す (通常ファイルのみ削除)");
+        assert_eq!(
+            fs::read_to_string(&outside).unwrap(),
+            "precious-library-file",
+            "リンク先の実体を読み書きしていない"
+        );
+        let _ = fs::remove_file(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_recovery_ignores_symlinked_shard_entries() {
+        use std::os::unix::fs::symlink;
+        let dir = TestDir::new("startup-symlink");
+        // shardに `*.webp` という名の外部ファイルへのsymlinkを植える
+        let outside = dir
+            .path()
+            .parent()
+            .unwrap()
+            .join("gento-cache-outside-webp.bin");
+        fs::write(&outside, [7u8; 500]).unwrap();
+        let shard = dir.path().join("ab");
+        fs::create_dir_all(&shard).unwrap();
+        symlink(&outside, shard.join("ab-0-2.webp")).unwrap();
+        // 正規ファイルも1件 (会計の対照)
+        let k = cache_key(&fp("/x/ok.png", 1, 1), SizeClass::S256);
+        fs::create_dir_all(dir.path().join(&k.relative).parent().unwrap()).unwrap();
+        fs::write(dir.path().join(&k.relative), [0u8; 60]).unwrap();
+
+        let c = cache(&dir, 1 << 20);
+        // symlink分 (500バイト) は会計・台帳に入らない
+        assert_eq!(c.total_bytes(), 60, "symlinkは登録しない");
+        assert_eq!(c.entry_count(), 1);
+        assert!(matches!(c.lookup(&k), CacheLookup::Hit(_)));
+        // 上限pruneが走ってもリンク先の実体は無傷 (対象は正規ファイルのみ)
+        c.set_max_bytes(MIN_SETTABLE_FOR_TEST);
+        assert!(fs::read(&outside).unwrap() == [7u8; 500], "実体は無傷");
+        assert!(
+            shard.join("ab-0-2.webp").exists(),
+            "symlink自体もprune対象にしない"
+        );
+        let _ = fs::remove_file(&outside);
+    }
+
+    /// 上記テスト用の小さい上限 (set_max_bytesのprune発火用)。
+    const MIN_SETTABLE_FOR_TEST: u64 = 1;
 }

@@ -7,6 +7,8 @@
  *   vitestで単体テスト対象 (ai.test.ts)
  */
 
+import { classifyEndpoint } from "./settings";
+
 export type AiIpc = {
   invoke: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
   listen: <T>(event: string, handler: (event: { payload: T }) => void) => Promise<() => void>;
@@ -217,17 +219,9 @@ export function apiKeyStoreLabel(store: string | null): string {
 
 /** 接続先がローカルか (spec §16「接続先がローカルか外部かを分かりやすく」)。 */
 export function endpointIsLocal(baseUrl: string): boolean {
-  try {
-    const url = new URL(baseUrl);
-    return (
-      url.hostname === "localhost" ||
-      url.hostname === "127.0.0.1" ||
-      url.hostname === "::1" ||
-      url.hostname === "[::1]"
-    );
-  } catch {
-    return false;
-  }
+  // WP-15: 3値分類 (lib/settings.ts) へ委譲。従来の「ローカル判定」は
+  // localhost/127.0.0.1/::1 のまま (RFC1918は「プライベート」で区別)。
+  return classifyEndpoint(baseUrl) === "local";
 }
 
 /** テスト4種の実行順序と表示名。 */

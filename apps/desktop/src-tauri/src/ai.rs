@@ -382,6 +382,17 @@ fn run_one_job(
             let _ = db.with_writer(|repos| repos.complete_job(claimed.id));
         }
         Err((retryable, error)) => {
+            // 失敗の可視化ログ (WP-15)。errorはAiError由来で鍵・GPSを含む
+            // 経路が構造的に無いが、自由文は最終防護としてscrubを通す
+            // (debugレベル含む出力でも鍵素材/座標が出ないことは
+            // ai_failure_log_never_contains_api_key_or_gps で実証)。
+            tracing::warn!(
+                job_id = claimed.id,
+                asset_id = claimed.target_id,
+                retryable,
+                error = %gento_core::redact::scrub_text(&error),
+                "ai job failed"
+            );
             if retryable {
                 // network/5xx/timeout: backoff付きで再試行待機へ
                 let jitter = pseudo_jitter();
@@ -2301,5 +2312,131 @@ mod tests {
         let body = server.log.last_body.lock().unwrap().clone();
         assert!(body.contains("35.681236"), "GPS座標が送信される: {body}");
         service.shutdown();
+    }
+
+    /// WP-15受け入れ「APIキーとGPSがログへ出ない」の実証:
+    /// 鍵を登録したプロファイル + GPSメタデータ + ルートsend_gps=ONで
+    /// AIリクエストが**失敗**したとき、失敗ログ (warn) を含む
+    /// 全ログ出力が **debugレベル** でも鍵素材・GPS座標を含まない。
+    /// (座標がendpointへ送信されたことはmockの受信記録で正面から証明し、
+    /// 「送っていないから出ない」の空振りを排除する。)
+    #[test]
+    fn ai_failure_log_never_contains_api_key_or_gps_even_at_debug() {
+        // プロセスglobal capture subscriber (thread-local set_defaultは
+        // 並行テストでcallsite interestが競合しイベントが落るため不使用)
+        let capture = crate::logging::test_capture();
+
+        const KEY: &str = "sk-wp15-secret-key-abcdef123456";
+        const GPS_LAT: f64 = 35.681236;
+        const GPS_LON: f64 = 139.767125;
+
+        // mock: Bearer検証 (鍵が実際に送られたことの証明) + 500で失敗注入
+        let server = MockServer::start(MockBehavior {
+            expected_bearer: Some(KEY.to_string()),
+            chat_status: 500,
+            ..MockBehavior::default()
+        });
+        let (tmp, db, root, asset_id) = fixture("redact");
+        let profile_id = add_profile(&db, &server.base_url);
+
+        // APIキーを保存してプロファイルへ紐付け (fileフォールバックで確定的)
+        let stored = gento_ai::SecretStore::file_only(&tmp.0)
+            .save(
+                "00000000-0000-7000-8000-0000000000ff",
+                &ApiKey::new(KEY.to_string()),
+            )
+            .unwrap();
+        db.with_writer(|repos| {
+            repos.set_ai_profile_api_key_ref(profile_id, Some(&stored.as_ref_string()))
+        })
+        .unwrap();
+
+        // GPS列を持つメタデータ + ルート/プロファイルともsend系ON (送信される)
+        db.with_writer(|repos| {
+            repos.save_asset_metadata(
+                asset_id,
+                &[AssetMetadataParsed {
+                    parser_name: "exif".to_string(),
+                    parser_version: "1".to_string(),
+                    columns: MetadataColumns {
+                        gps_latitude: Some(GPS_LAT),
+                        gps_longitude: Some(GPS_LON),
+                        ..MetadataColumns::default()
+                    },
+                    raw_exif: None,
+                    raw_iptc: None,
+                    raw_png_metadata: None,
+                    raw_workflow: None,
+                }],
+            )?;
+            repos.set_root_settings(
+                root,
+                RootSettings {
+                    watch_enabled: true,
+                    ai_enabled: false,
+                    send_exif: true,
+                    send_gps: true,
+                },
+            )?;
+            let record = repos.get_ai_profile(profile_id)?.expect("profile");
+            repos.update_ai_profile_settings(&gento_db::AiProfileRecord {
+                extra_json: Some(r#"{"send_exif":true,"send_gps":true}"#.to_string()),
+                ..record
+            })
+        })
+        .unwrap();
+
+        // 1ジョブを決定的に実行 (run_one_job直呼び — warn失敗ログを含む経路)
+        let payload = json!({"profile_id": profile_id, "asset_id": asset_id}).to_string();
+        db.with_writer(|repos| {
+            repos.enqueue_job(JOB_TYPE_AI_CAPTION_TAGS, "asset", asset_id, 5, &payload)
+        })
+        .unwrap();
+        let in_flight = StdMutex::new(HashMap::new());
+        let (change_tx, change_rx) = std::sync::mpsc::sync_channel(64);
+        let ran = run_one_job(&db, &tmp.0, &AtomicBool::new(false), &in_flight, &change_tx);
+        assert!(ran, "ジョブは実行された");
+        while change_rx.try_recv().is_ok() {}
+        assert!(
+            wait_until(5_000, || {
+                job_status(&db)
+                    .iter()
+                    .any(|(_, s)| s == "retry_waiting" || s == "failed")
+            }),
+            "ジョブは失敗した: {:?}",
+            job_status(&db)
+        );
+
+        let text = capture.my_lines().join("\n");
+        // 失敗ログそのものは出ている (空振りでない証明)
+        assert!(
+            text.contains("ai job failed"),
+            "失敗ログが出力された: {text}"
+        );
+        assert!(text.contains("500"), "endpoint 500の文脈: {text}");
+        // 鍵素材・GPS座標は一切出ない (debug込み)
+        assert!(!text.contains(KEY), "APIキー漏出: {text}");
+        assert!(
+            !text.contains("secret-key-abcdef"),
+            "APIキー部分文字列: {text}"
+        );
+        assert!(!text.contains("35.681236"), "GPS緯度漏出: {text}");
+        assert!(!text.contains("139.767125"), "GPS経度漏出: {text}");
+
+        // 正面証明: 鍵付きリクエストが送信され、GPS座標はendpointへ届いた
+        assert_eq!(
+            server.log.unauthorized.load(Ordering::SeqCst),
+            0,
+            "Bearer検証を通過"
+        );
+        let body = server.log.last_body.lock().unwrap().clone();
+        assert!(
+            body.contains("35.681236"),
+            "GPSはendpointへ送信された: {body}"
+        );
+        assert!(
+            body.contains("139.767125"),
+            "GPSはendpointへ送信された: {body}"
+        );
     }
 }

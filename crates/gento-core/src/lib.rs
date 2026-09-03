@@ -10,6 +10,7 @@ pub mod jobs;
 pub mod library;
 pub mod metadata;
 pub mod path_safety;
+pub mod redact;
 pub mod repo;
 
 pub use assetmeta::{
