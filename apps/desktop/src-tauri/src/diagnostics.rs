@@ -568,15 +568,44 @@ fn write_bundle_atomic(dest_dir: &Path, value: &Value) -> Result<PathBuf, String
         uuid::Uuid::now_v7().simple(),
         std::process::id()
     ));
+    write_bundle_at(dest_dir, &tmp_path, &stamp, value)
+}
+
+/// [`write_bundle_atomic`] の実体。tmp名を注入可能にしてある (テストが
+/// tmp名を事前占有して排他createのEEXIST経路を決定論的に再現できる
+/// ようにする — FG-WP16-6。export.rs `publish_manifest_file_at` と
+/// 同一の切り出し理由)。
+///
+/// FG-WP16-6 I2: **失敗経路でtmpをunlinkしない** — pathnameによる削除は
+/// 一切行わない (排他createの失敗が「名前を自分が作っていない」ことを
+/// 示すほか、失敗までの間に他actorが差し替えていれば自分のものではない
+/// ため)。tmp名はstamp+uuid+PIDで一意かつ自己識別的 (`.` 始まり +
+/// `.tmp-` 含む) なため、失敗時のdotfile残留を許容する (成功時はrename
+/// がtmpを消費する)。
+fn write_bundle_at(
+    dest_dir: &Path,
+    tmp_path: &Path,
+    stamp: &str,
+    value: &Value,
+) -> Result<PathBuf, String> {
+    use std::io::Write as _;
     let body = serde_json::to_string_pretty(value)
         .map_err(|e| format!("診断bundleの直列化に失敗しました: {e}"))?;
-    let write = std::fs::write(&tmp_path, body.as_bytes()).and_then(|()| {
-        std::fs::File::open(&tmp_path)?.sync_all()?;
+    // 排他create: 事前占有があればEEXISTで失敗する (旧実装のfs::writeは
+    // O_TRUNCで占有entryを切り詰めていた)。syncも書き込みと同一handleで
+    // (pathnameで開き直さない)。
+    let write = (|| -> std::io::Result<()> {
+        let mut out = std::fs::File::create_new(tmp_path)?;
+        out.write_all(body.as_bytes())?;
+        out.sync_all()?;
+        drop(out);
         Ok(())
-    });
+    })();
     if let Err(e) = write {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(format!("診断bundleの書き込みに失敗しました: {e}"));
+        return Err(format!(
+            "診断bundleの書き込みに失敗しました: {} ({e})",
+            tmp_path.display()
+        ));
     }
     // no-replaceで出版。同一stampの先任者がいれば連番で回避する
     // (exists()+renameのTOCTOU窓を排する)。
@@ -588,7 +617,7 @@ fn write_bundle_atomic(dest_dir: &Path, value: &Value) -> Result<PathBuf, String
             format!("gento-diagnostics-{stamp}-{suffix}.json")
         };
         let final_path = dest_dir.join(&name);
-        match gento_platform::rename_noreplace(&tmp_path, &final_path) {
+        match gento_platform::rename_noreplace(tmp_path, &final_path) {
             Ok(()) => {
                 // 親ディレクトリのエントリ反映 (best-effort)
                 if let Ok(handle) = std::fs::File::open(dest_dir) {
@@ -601,7 +630,7 @@ fn write_bundle_atomic(dest_dir: &Path, value: &Value) -> Result<PathBuf, String
                 continue;
             }
             Err(e) => {
-                let _ = std::fs::remove_file(&tmp_path);
+                // unlinkしない (FG-WP16-6 I2) — tmp残留は自己識別的dotfile
                 return Err(format!("診断bundleの公開に失敗しました: {e}"));
             }
         }
@@ -979,6 +1008,80 @@ mod tests {
         // 2回目も衝突しない
         let second = build_bundle(&sources, None, &out_dir).unwrap();
         assert_ne!(result.path, second.path);
+    }
+
+    // ===== FG-WP16-6 I2: failure経路のunlink全廃 (never-unlink) =====
+
+    /// tmp名の事前占有 (排他createのEEXIST) でも既存entryを削除しない —
+    /// 旧実装はwrite失敗のcleanupで `remove_file(&tmp_path)` を呼び、
+    /// **自分が作っていないentryを消しうる** (export.rs FG-WP16-5と同一
+    /// TOCTOU)。旧実装の `fs::write` は排他でないため事前占有entryを
+    /// 切り詰めて上書きしてもいた。失敗はエラー報告のみで、既存entryは
+    /// 不変・正規名も作らない。
+    #[test]
+    fn bundle_tmp_name_eexist_never_deletes_preexisting_entry() {
+        let tmp = TempDir::new("eexist");
+        let out_dir = tmp.path().join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let stamp = "2026-09-03T00-00-00-000Z";
+        let tmp_path = out_dir.join(format!(
+            ".gento-diagnostics-{stamp}-0123456789abcdef0123456789abcdef.tmp-1"
+        ));
+        std::fs::write(&tmp_path, b"preexisting sentinel").unwrap();
+
+        let err = write_bundle_at(&out_dir, &tmp_path, stamp, &json!({})).unwrap_err();
+        assert!(
+            err.contains("診断bundleの書き込みに失敗"),
+            "tmp名が報告される: {err}"
+        );
+        assert!(err.contains(".tmp-"), "残留tmpの特定に必要: {err}");
+
+        // 既存entryは不変 (unlinkされない)
+        assert_eq!(
+            std::fs::read(&tmp_path).unwrap(),
+            b"preexisting sentinel",
+            "EEXIST失敗で事前占有entryを削除してはならない"
+        );
+        // 正規名・連番回避名とも作られない
+        assert!(!out_dir
+            .join(format!("gento-diagnostics-{stamp}.json"))
+            .exists());
+        assert!(!out_dir
+            .join(format!("gento-diagnostics-{stamp}-1.json"))
+            .exists());
+    }
+
+    /// 出版失敗 (renameの非EEXISTエラー) でもtmpをunlinkしない — 残留は
+    /// 自己識別的dotfile (`.` 始まり + `.tmp-` 含む) として許容される
+    /// (成功時はrenameがtmpを消費するため残らない)。注入方法: stampに
+    /// 区切り文字を含めるとfinal名の親dirが不存在になりrenameはENOENTで
+    /// 失敗する (DestinationExistsではないため連番回避せずエラー確定。
+    /// file→既存dirのrenameはLinuxではEEXIST扱いになり回避されるため
+    /// 使えない)。
+    #[test]
+    fn bundle_publish_failure_leaves_self_identifying_tmp_residue() {
+        let tmp = TempDir::new("pubfail");
+        let out_dir = tmp.path().join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let stamp = "x/y";
+        let tmp_path = out_dir.join(".gento-diagnostics-x-0123456789abcdef0123456789abcdef.tmp-1");
+
+        let err = write_bundle_at(&out_dir, &tmp_path, stamp, &json!({})).unwrap_err();
+        assert!(err.contains("診断bundleの公開に失敗"), "{err}");
+
+        // tmpは残留するが自己識別的 (dot + 厳密形式)
+        assert!(tmp_path.is_file(), "失敗時のtmp残留を許容 (unlinkしない)");
+        let name = tmp_path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with('.') && name.contains(".tmp-"),
+            "自己識別的: {name}"
+        );
+        // 出版物は存在しない (out_dirにはtmp残留のみ)
+        let entries: Vec<String> = std::fs::read_dir(&out_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec![name], "out_dirにはtmp残留のみ");
     }
 
     /// FG-WP16-3 N4: 並行bundle生成は実行lock + no-replace rename + 連番で

@@ -276,6 +276,10 @@ type RequestAccepted = {
   cache_hits: number;      // キャッシュ済みのため即時ready
   skipped_unreadable: number; // state != ready のレコード
   skipped_unknown: number;    // カタログに存在しないID
+  superseded: number;      // より新しいgenerate_all要求で置換され、この呼で
+                           // は未処理に終わった件数 (FG-WP16-5 I1。投入・
+                           // 繰延は行われない — 旧呼は新呼に取って代わられる
+                           // のが正しい挙動)
 };
 ```
 
@@ -302,8 +306,10 @@ invoke<{ cancelled_queued, cancel_requested, cancelled_backlog, not_found,
 - 未開始=即時除去 (イベントは出ない)。実行中=協調キャンセル要求
   (ジョブがデコード前/リサイズ前/エンコード前で検査)。
 - `cancelled_backlog` (FG-WP16-3 B2 / FG-WP16-4 R1): プールに**未投入**の
-  generate-all繰延分 (backlog) から破棄した件数。対象はdeque内のentryと
-  **feederがpop直後・まだプールへ投入していないitem (inflight) の両方**。
+  generate-all繰延分 (backlog) から破棄した**entry数** (同一キーが複数
+  entryに現れた場合はその数を数える。キー単位の重複抑制は `not_found` 側
+  の集計 — FG-WP16-5 N)。対象はdeque内のentryと**feederがpop直後・まだ
+  プールへ投入していないitem (inflight) の両方**。
   feederのpop→投入はbacklogロックで守られた2区間 (pop時にinflight登録 →
   cancel消費/世代検査/プール投入を同一ロック内で完結) で行われ、cancelも
   同じロック内で (a) deque内の一致key破棄 (b) inflightの一致key破棄を
@@ -322,15 +328,20 @@ invoke<RequestAccepted>("generate_all_thumbnails", { sizeClass: SizeClassId })
   (`deferred` に件数)、プール完了駆動で空きができ次第投入される
   (WP-16 F1。ライブラリのハッシュ再提出と同一の需要駆動方式)。
   排液完了・再要求による置換・終了/キャッシュ全削除での残数はログで報告。
-- **置換の世代規約 (FG-WP16-3 B3 / FG-WP16-4 R2)**: 各 `generate_all` 呼び出しは単調
-  増加のgeneration tokenを取得する。呼び出し開始時にbacklogは即座に
-  新世代へ置換され、繰延分は**単一ロック+世代検査で一括install**される
-  (より新しい呼び出しが開始済みなら破棄)。このためbacklogは常に
-  **最新の要求の資産のみ**を含む (並行押下・排液中の再押下で混入しない)。
-  feederもpop済みitemの世代をプール投入**前**にbacklogロック内で検査する
-  ため、**より新しい `generate_all` 開始後に旧世代itemがプールへ投入される
-  経路は存在しない**。ただし**プールへ既に投入済み**の旧世代jobは取り消され
-  ず、その完了は**冪等なキャッシュ書き込みのため許容**する (内容はキーに
+- **置換の世代規約 (FG-WP16-3 B3 / FG-WP16-4 R2 / FG-WP16-5 I1)**:
+  世代トークンの**割当てと自世代への置換設置はbacklogロック内で単調に**
+  行う (ロックを先に取った呼が必ず小さい世代を得る — 「古い呼が新しい呼
+  の設置を上書きする」経路は構造的に存在しない。clear_thumbnail_cache
+  でもトークン供給はリセットしない)。**直接投入もバッチ毎に世代検査と
+  投入を同一ロック区間で**行い、検査時に自分より新しい呼び出しの設置が
+  済んでいたら残り全件を破棄して `superseded` として報告する (過去の
+  世代になった呼は新しい呼に取って代わられるのが正しい挙動)。このため
+  backlogは常に**最新の要求の資産のみ**を含み (並行押下・排液中の再押下
+  で混入しない)、**より新しい `generate_all` 開始後に旧世代の作業が
+  プールへ投入される経路は直接投入・feeder投入のいずれにも存在しない**
+  (feederもpop済みitemの世代をプール投入**前**にbacklogロック内で検査
+  する)。ただし**プールへ既に投入済み**の旧世代jobは取り消されず、
+  その完了は**冪等なキャッシュ書き込みのため許容**する (内容はキーに
   対応する正当なサムネイル。cancelで明示的に止めることは可能)。
   満杯でbacklogへ戻る場合も同一ロック内の世代検査で破棄される
   (再投入されない)。
@@ -2454,6 +2465,12 @@ score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
   WP-7 fileopsと同一の厳密形式。出力先が登録ルート内なら起動時掃除の
   対象) → `sync_all` → no-clobber rename による原子公開。
   上書き競合 (renameのDestinationExists) は失敗として扱う。
+  **failure経路でtmpをpathname unlinkしない (FG-WP16-5 I2)** — tmp名は
+  run uuid+seqで一意かつ自己識別的なため、失敗時のdotfile残留を許容
+  する (成功時はrenameがtmpを消費)。これにより「create_exclusiveの
+  EEXIST失敗で他人の同名entryを消す」「rename失敗後に差し替えられた
+  entryを消す」いずれのTOCTOUも構造的に存在しない (export.rsには
+  unlink系呼び出しが一切無いことがgrepで検証可能)。
 - **フォルダ構造**: `preserve` = 代表fileのrel_path親dir構造を出力先に再現
   (成分は `Component::Normal` のみ許可 — `..` 等は構造的に拒否して
   plan失敗扱い)。`flat` = 全て直下 (衝突はsuffixで解決)。
@@ -2479,10 +2496,13 @@ score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
   **既存ファイルは所有者を問わず (GEN-TO自身の旧manifestも含め) 一切
   削除・上書きしない** (FG-WP16-4 R3 — 「所有確認→unlink」間に他actorが
   差し替えたユーザーファイルを消しうるTOCTOUを、unlink自体をなくす
-  方針で解消)。正規名 `export-manifest.json` が空きならそこへ出版し、
-  占有されていれば回避名 `export-manifest-{run uuid}.json` へNOREPLACE
-  出版する (既存は不接触。応答の `manifestPath` が実際のパスを報告 —
-  再実行のたびに回避名のmanifestが蓄積するのはこの方針の帰結)。
+  方針で解消)。**failure経路のtmp unlinkも全廃** (FG-WP16-5 I2) —
+  create_exclusiveのEEXIST失敗・rename失敗のいずれでもtmpを削除せず、
+  残留は自己識別的dotfileとして許容する。正規名 `export-manifest.json`
+  が空きならそこへ出版し、占有されていれば回避名
+  `export-manifest-{run uuid}.json` へNOREPLACE出版する (既存は不接触。
+  応答の `manifestPath` が実際のパスを報告 — 再実行のたびに回避名の
+  manifestが蓄積するのはこの方針の帰結)。
   snake_case (backup artifactと同一規約)。内容: format_version / created_at /
   cancelled / structure / dest_dir / **asset_count (処理済み + plan失敗 +
   キャンセル未処理 = 要求した一意asset数。DTOの `total` と同一定義 —
@@ -2577,7 +2597,11 @@ score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
     `<gps>`、rawスロットはバイト数要約に伏せる — `{:?}` 混入時の防護)。
   - AIジョブ失敗時のwarnログ (scrub通し)。panic payloadのscrub。
 - **診断bundle** (`diagnostics_bundle_create`): ユーザー指定dirへJSON 1ファイル
-  (tmp書き→sync→原子rename)。内容: format/app/api/schema version、設定
+  (tmp書き→sync→原子rename)。tmpは排他create (`File::create_new`) で、
+  **失敗経路のunlinkは全廃** (FG-WP16-6 — 事前占有entryの切り詰め/削除を
+  構造的に排除。失敗時の残留は自己識別的dotfile `.gento-diagnostics-*`
+  として許容し、成功時はrenameがtmpを消費)。内容: format/app/api/schema
+  version、設定
   (鍵素材は構造的に不含。プロファイル・鍵参照も対象外)、診断スナップショット、
   直近ログ末尾100行 (メモリringから)。**出力前に**: (1) 全文字列をscrub_text、
   (2) 既知dirを実パス→プレースホルダ (`<root:N>`/`<db>`/`<data>`/`<cache>`/

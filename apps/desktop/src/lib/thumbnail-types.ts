@@ -65,6 +65,10 @@ export type RequestAccepted = {
   cache_hits: number;
   skipped_unreadable: number;
   skipped_unknown: number;
+  /** より新しいgenerate_all要求で置換され、この呼では未処理に終わった件数
+   * (FG-WP16-5 I1 — 旧呼は新呼に取って代わられるのが正しい挙動。
+   * 投入・繰延は行われない)。 */
+  superseded: number;
 };
 
 /** thumb:ready イベントの項目。 */

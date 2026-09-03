@@ -16,6 +16,11 @@
 //!   (上書き競合は失敗扱い)。tmp名は fileops (WP-7) と同一の厳密形式
 //!   `.{名前}.gento-tmp-{32hex}-{6桁seq}` — 出力先が登録ルート内だった
 //!   場合に起動時掃除の対象となり、クラッシュ残骸が片付く。
+//!   **failure経路でtmpをpathname unlinkしない** (FG-WP16-5 I2) —
+//!   失敗時の残留は自己識別的なdotfileとして許容し、成功時はrenameが
+//!   tmpを消費する (create_exclusiveのEEXIST失敗で他人のentryを消す・
+//!   rename失敗後に差し替えられたentryを消す、いずれのTOCTOUも構造的
+//!   に存在しない)。
 //! - **出力経路の包含 (FG-WP16-3 B1)**: 出力rootは `O_DIRECTORY|O_NOFOLLOW`
 //!   でfd固定 (root最終成分がsymlinkなら拒否)。サブディレクトリは
 //!   `openat(O_NOFOLLOW)` 成分歩行 + `mkdirat` 競合安全作成、書き出し
@@ -31,9 +36,11 @@
 //!   tmp→sync→`renameat2 NOREPLACE` で出版。**既存ファイルは所有者を
 //!   問わず (GEN-TO自身の旧manifestも含め) 一切削除・上書きしない**
 //!   (FG-WP16-4 R3: 所有確認→unlink間の差し替え競合でユーザーファイル
-//!   を消しうるTOCTOUを、unlink自体をなくす方針で解消)。正規名が占有
-//!   されていれば回避名 `export-manifest-{run uuid}.json` へ出版し、
-//!   結果DTOの `manifestPath` が実際のパスを報告する。
+//!   を消しうるTOCTOUを、unlink自体をなくす方針で解消。FG-WP16-5 I2:
+//!   failure経路のtmp unlinkも全廃 — 失敗時のtmp残留は自己識別的
+//!   dotfileとして許容)。正規名が占有されていれば回避名
+//!   `export-manifest-{run uuid}.json` へ出版し、結果DTOの `manifestPath`
+//!   が実際のパスを報告する。
 //!   キャンセル・部分失敗も含めた全エントリを記録する。
 //! - キャンセルは協調 ([`ExportService::cancel`] → AtomicBool、per-item境界)。
 //!   キャンセル時もそれまでの成果 + manifestは残す。
@@ -353,7 +360,13 @@ fn publish_bytes_at(
 }
 
 /// 公共のtmp書き→sync→no-clobber rename。上書き競合
-/// (DestinationExists) はConflict、その他失敗はFailed。失敗時tmpは掃除。
+/// (DestinationExists) はConflict、その他失敗はFailed。
+/// FG-WP16-5 I2: **失敗経路でtmpをunlinkしない** — pathnameによる削除は
+/// 一切行わない (作成直後のtmp entryも、失敗までの間に他actorが差し替え
+/// ていれば自分のものではないため)。tmp名はrun uuid+seqで一意かつ自己
+/// 識別的 (`.{名前}.gento-tmp-{32hex}-{6桁seq}`) なため、失敗時の
+/// dotfile残留を許容する (成功時はrenameがtmpを消費。出力先が登録
+/// ルート内なら起動時掃除の対象)。
 fn publish_at(
     dir: &gento_core::OutputDir,
     final_name: &OsStr,
@@ -363,25 +376,20 @@ fn publish_at(
 ) -> FileOutcome {
     let tmp = tmp_name_for(final_name, run_uuid, seq);
     let result = (|| -> Result<(), PublishIssue> {
-        let cleanup_tmp = |issue: PublishIssue| -> PublishIssue {
-            let _ = dir.remove_file_at(&tmp);
-            issue
-        };
+        // create失敗 (tmp名の事前占有を含む) はそのまま失敗 — 既存entryは不接触
         let mut out = dir
             .create_exclusive_at(&tmp)
             .map_err(PublishIssue::Failed)?;
         let written = write(&mut out);
         let synced = written.and_then(|()| out.sync_all());
         drop(out);
-        synced.map_err(|e| cleanup_tmp(PublishIssue::Failed(e)))?;
+        synced.map_err(PublishIssue::Failed)?;
         match dir.rename_noreplace_at(&tmp, final_name) {
             Ok(()) => Ok(()),
             Err(gento_core::RenameAtNoReplaceError::DestinationExists) => {
-                Err(cleanup_tmp(PublishIssue::DestinationExists))
+                Err(PublishIssue::DestinationExists)
             }
-            Err(e) => Err(cleanup_tmp(PublishIssue::Failed(std::io::Error::other(
-                e.to_string(),
-            )))),
+            Err(e) => Err(PublishIssue::Failed(std::io::Error::other(e.to_string()))),
         }
     })();
     match result {
@@ -874,17 +882,30 @@ fn publish_manifest(run: &ExportRun, created_at: &str) -> Result<PathBuf, String
 /// FG-WP16-4 R3: **既存ファイルは所有者を問わず一切削除・上書きしない**
 /// (GEN-TO自身の旧manifestも含む — 「所有確認→unlink」間の差し替え競合で
 /// ユーザーファイルを消しうるTOCTOUを、unlink自体をなくす方針で解消)。
+/// FG-WP16-5 I2: failure経路のtmp unlinkも行わない (失敗時のtmp残留は
+/// 自己識別的dotfileとして許容。成功時はrenameがtmpを消費)。
 /// 正規名 `export-manifest.json` が空きならそこへ出版。占有されていれば
 /// 回避名 `export-manifest-{run uuid}.json` へNOREPLACE出版し (既存は
 /// 不接触) 、実パスを呼び出し側へ返す (結果DTOの `manifestPath`)。
 fn publish_manifest_file(dest_dir: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    let run_uuid = Uuid::now_v7().simple().to_string();
+    publish_manifest_file_at(dest_dir, bytes, &run_uuid)
+}
+
+/// [`publish_manifest_file`] の実体。tmp名を決定するrun uuidを注入可能に
+/// してある (テストがtmp名を事前占有してcreate_exclusiveのEEXIST経路を
+/// 決定論的に再現できるようにする — FG-WP16-5 I2)。
+fn publish_manifest_file_at(
+    dest_dir: &Path,
+    bytes: &[u8],
+    run_uuid: &str,
+) -> Result<PathBuf, String> {
     let root = gento_core::OutputDir::open_root(dest_dir).map_err(|e| {
         format!(
             "出力先ディレクトリを開けません: {} ({e})",
             dest_dir.display()
         )
     })?;
-    let run_uuid = Uuid::now_v7().simple().to_string();
     let tmp = OsString::from(format!(
         ".{EXPORT_MANIFEST_FILE}.gento-tmp-{run_uuid}-000001"
     ));
@@ -899,10 +920,10 @@ fn publish_manifest_file(dest_dir: &Path, bytes: &[u8]) -> Result<PathBuf, Strin
         drop(out);
         Ok(())
     })();
-    if let Err(e) = write {
-        let _ = root.remove_file_at(&tmp);
-        return Err(e);
-    }
+    // FG-WP16-5 I2: 失敗経路でtmpをunlinkしない (create_exclusiveの
+    // EEXIST失敗時に自分が作っていないentryを消しうるため。残留は
+    // 自己識別的dotfileとして許容)。
+    write?;
     let final_name = OsString::from(EXPORT_MANIFEST_FILE);
     match root.rename_noreplace_at(&tmp, &final_name) {
         Ok(()) => {
@@ -918,23 +939,15 @@ fn publish_manifest_file(dest_dir: &Path, bytes: &[u8]) -> Result<PathBuf, Strin
                     sync_dir_best_effort(dest_dir);
                     Ok(dest_dir.join(alt.to_string_lossy().into_owned()))
                 }
-                Err(gento_core::RenameAtNoReplaceError::DestinationExists) => {
-                    let _ = root.remove_file_at(&tmp);
-                    Err(format!(
-                        "manifestの出版先が決定できません: {}",
-                        dest_dir.display()
-                    ))
-                }
-                Err(e) => {
-                    let _ = root.remove_file_at(&tmp);
-                    Err(format!("manifestの公開に失敗しました: {e}"))
-                }
+                // いずれの失敗経路でもtmpはunlinkしない (FG-WP16-5 I2)
+                Err(gento_core::RenameAtNoReplaceError::DestinationExists) => Err(format!(
+                    "manifestの出版先が決定できません: {}",
+                    dest_dir.display()
+                )),
+                Err(e) => Err(format!("manifestの公開に失敗しました: {e}")),
             }
         }
-        Err(e) => {
-            let _ = root.remove_file_at(&tmp);
-            Err(format!("{}/{}: {e}", root.display(), EXPORT_MANIFEST_FILE))
-        }
+        Err(e) => Err(format!("{}/{}: {e}", root.display(), EXPORT_MANIFEST_FILE)),
     }
 }
 
@@ -2498,6 +2511,85 @@ mod tests {
             })
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    // ===== FG-WP16-5 I2: failure経路のunlink全廃 (never-unlink) =====
+
+    /// create_exclusiveのEEXIST失敗 (tmp名を第三者が事前占有) でも既存
+    /// entryを削除しない — 旧実装はwrite失敗のcleanupで
+    /// `remove_file_at(&tmp)` を呼び、**自分が作っていないentryを消した**
+    /// (r3 reject指摘)。失敗はエラー報告のみで、既存entryは不変。
+    #[test]
+    fn manifest_tmp_name_eexist_never_deletes_preexisting_entry() {
+        let dir = TestDir::new("meexist");
+        let uuid = "0123456789abcdef0123456789abcdef";
+        let tmp = dir
+            .0
+            .join(format!(".{EXPORT_MANIFEST_FILE}.gento-tmp-{uuid}-000001"));
+        std::fs::write(&tmp, b"preexisting sentinel").unwrap();
+
+        let err = publish_manifest_file_at(&dir.0, b"{}", uuid).unwrap_err();
+        assert!(err.contains("gento-tmp"), "tmp名が報告される: {err}");
+
+        // 既存entryは不変 (unlinkされない)
+        assert_eq!(
+            std::fs::read(&tmp).unwrap(),
+            b"preexisting sentinel",
+            "EEXIST失敗で事前占有entryを削除してはならない"
+        );
+        // 正規名・回避名とも作られない
+        assert!(!dir.0.join(EXPORT_MANIFEST_FILE).exists());
+        assert!(!dir.0.join(format!("export-manifest-{uuid}.json")).exists());
+    }
+
+    /// 出版競合 (最終名占有) の失敗経路でもtmpをunlinkしない — 残留は
+    /// 自己識別的dotfile `.{名前}.gento-tmp-{32hex}-{6桁seq}` として
+    /// 許容される (成功時はrenameがtmpを消費するため残らない。出力先が
+    /// 登録ルート内なら起動時掃除の対象)。
+    #[test]
+    fn publish_conflict_leaves_self_identifying_tmp_residue() {
+        let dir = TestDir::new("pubconflict");
+        let root = gento_core::OutputDir::open_root(&dir.0).unwrap();
+        std::fs::write(dir.0.join("img.png"), b"occupied").unwrap();
+        let uuid = "0123456789abcdef0123456789abcdef";
+        let mut seq: u32 = 0;
+        let outcome =
+            publish_bytes_at(&root, OsStr::new("img.png"), b"new content", uuid, &mut seq);
+        assert_eq!(outcome, FileOutcome::Conflict);
+        // 既存の最終名entryは不変
+        assert_eq!(std::fs::read(dir.0.join("img.png")).unwrap(), b"occupied");
+        // tmpは残留するが自己識別的 (dot + 厳密形式)
+        let tmp = dir
+            .0
+            .join(".img.png.gento-tmp-0123456789abcdef0123456789abcdef-000000");
+        assert!(tmp.exists(), "失敗時のtmp残留を許容 (unlinkしない)");
+        let name = tmp.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with('.') && name.contains(".gento-tmp-"),
+            "自己識別的: {name}"
+        );
+    }
+
+    /// 画像/.txt出版でもtmp名の事前占有 (create_exclusiveのEEXIST) で
+    /// 既存entryを削除しない — Failedとして報告し、最終名も作らない。
+    #[test]
+    fn publish_tmp_name_eexist_never_deletes_preexisting_entry() {
+        let dir = TestDir::new("pubeexist");
+        let root = gento_core::OutputDir::open_root(&dir.0).unwrap();
+        let uuid = "0123456789abcdef0123456789abcdef";
+        let tmp = dir
+            .0
+            .join(".img.png.gento-tmp-0123456789abcdef0123456789abcdef-000000");
+        std::fs::write(&tmp, b"sentinel").unwrap();
+        let mut seq: u32 = 0;
+        let outcome = publish_bytes_at(&root, OsStr::new("img.png"), b"data", uuid, &mut seq);
+        assert!(matches!(outcome, FileOutcome::Failed(_)), "{outcome:?}");
+        assert_eq!(
+            std::fs::read(&tmp).unwrap(),
+            b"sentinel",
+            "EEXIST失敗で事前占有entryを削除してはならない"
+        );
+        assert!(!dir.0.join("img.png").exists(), "最終名は作られない");
     }
 
     // ===== サービス排他 =====
