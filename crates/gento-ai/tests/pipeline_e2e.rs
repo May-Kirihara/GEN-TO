@@ -8,6 +8,11 @@
 //! - APIキーがDBへ平文保存されない (acceptance 4のDB側)
 //! - Bearer認証: 鍵がAuthorizationヘッダで送られる (mockが検証)
 //! - 接続失敗は再試行可能エラーとして扱われる
+//!
+//! 依存するtestserver (mock) はWP-0規約でコンパイル隔離された開発専用
+//! 機能のため、本ファイル全体も同ゲートで囲む (通常releaseビルドでは空)。
+
+#![cfg(any(debug_assertions, feature = "devtools"))]
 
 use std::path::PathBuf;
 use std::sync::Arc;

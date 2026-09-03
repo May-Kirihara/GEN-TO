@@ -1286,8 +1286,9 @@ pub(crate) fn tauri_event_sink(app: AppHandle) -> Arc<EventSink> {
 }
 
 // ===== テスト (サービスレベルE2E: mock OpenAI互換endpoint相手) =====
-
-#[cfg(test)]
+// 依存testserver (mock) はWP-0規約でコンパイル隔離された開発専用機能の
+// ため、本モジュールも同ゲートで囲む (通常releaseビルドでは空)。
+#[cfg(all(test, any(debug_assertions, feature = "devtools")))]
 mod tests {
     use super::*;
     use gento_ai::testserver::{MockBehavior, MockServer};
