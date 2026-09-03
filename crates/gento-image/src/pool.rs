@@ -3,6 +3,7 @@
 //!
 //! 設計契約 (PM計画 §3、WP-3委任仕様):
 //! - 固定ワーカー数 = min(4, available_parallelism)
+//!   (WP-16: 環境変数 `GENTO_THUMB_WORKERS` で上書き可。計測用ノブ)
 //! - 優先度: gento_core::Priority (値が小さいほど優先)。同一優先度内は単調seqでFIFO
 //! - 再優先度化: キー指定で未開始ジョブの優先度更新
 //!   (停滞ヒープエントリはlive_entry照合でpop時に無効化)
@@ -160,10 +161,36 @@ impl Default for PoolConfig {
             .map(|n| n.get())
             .unwrap_or(1);
         Self {
-            worker_count: parallelism.min(4),
+            worker_count: worker_count_from_env(parallelism),
             queue_capacity: 4096,
         }
     }
+}
+
+/// 既定ワーカー数の決定 (WP-16 低スペック計測ノブ)。
+/// 環境変数 `GENTO_THUMB_WORKERS` が1..=32の整数なら既定
+/// `min(4, available_parallelism)` を上書きする。未設定・範囲外・非数値は
+/// 無視して既定へ戻る (起動時のみ読み、実行中の変更は反映しない)。
+fn worker_count_from_env(parallelism: usize) -> usize {
+    let parsed = parse_worker_override(
+        std::env::var_os("GENTO_THUMB_WORKERS")
+            .as_deref()
+            .and_then(|v| v.to_str()),
+    );
+    if let Some(n) = parsed {
+        tracing::info!(workers = n, "GENTO_THUMB_WORKERS override active");
+        n
+    } else {
+        parallelism.min(4)
+    }
+}
+
+/// [`worker_count_from_env`] の純粋解析部 (envに触れないので並行テスト安全)。
+fn parse_worker_override(value: Option<&str>) -> Option<usize> {
+    value?
+        .parse::<usize>()
+        .ok()
+        .filter(|n| (1..=32).contains(n))
 }
 
 /// 待機スロット: 完了時に全待機者へ通知する。
@@ -640,6 +667,36 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    /// WP-16: GENTO_THUMB_WORKERS の解析 (純粋関数なのでenv競合なし)。
+    #[test]
+    fn worker_override_parses_only_bounded_positive_ints() {
+        assert_eq!(parse_worker_override(Some("1")), Some(1));
+        assert_eq!(parse_worker_override(Some("2")), Some(2));
+        assert_eq!(parse_worker_override(Some("32")), Some(32));
+        // 0・上限超過・非数値・空・前後空白はすべて無視 (既定へ戻る)
+        assert_eq!(parse_worker_override(Some("0")), None);
+        assert_eq!(parse_worker_override(Some("33")), None);
+        assert_eq!(parse_worker_override(Some("-1")), None);
+        assert_eq!(parse_worker_override(Some("abc")), None);
+        assert_eq!(parse_worker_override(Some("")), None);
+        assert_eq!(parse_worker_override(Some(" 2")), None);
+        assert_eq!(parse_worker_override(None), None);
+    }
+
+    /// 既定経路: env未設定なら min(4, parallelism) のまま。
+    /// (worker_count_from_env 自体はenvを読むため、ここは引数で既定を検証)
+    #[test]
+    fn worker_count_default_is_min4_when_override_absent() {
+        // このテストはenv GENTO_THUMB_WORKERS を設定せずに実行される前提。
+        // 計測ドライバが当環境変数をexportしていない状態で実行すること。
+        let resolved = worker_count_from_env(20);
+        if std::env::var_os("GENTO_THUMB_WORKERS").is_some() {
+            return; // 外部からoverrideされた環境では検証しない
+        }
+        assert_eq!(resolved, 4);
+        assert_eq!(worker_count_from_env(2), 2);
+    }
 
     /// 即時に成功するジョブ。
     struct OkJob {

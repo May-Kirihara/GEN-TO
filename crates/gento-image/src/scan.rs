@@ -15,6 +15,26 @@ use walkdir::WalkDir;
 /// sinkへ渡すバッチの最大件数。
 pub const SCAN_BATCH_SIZE: usize = 64;
 
+/// 環境変数 `GENTO_SCAN_BATCH` によるバッチ件数の上書き (WP-16 低スペック
+/// 計測ノブ)。1..=4096の整数のみ受け付ける。未設定・範囲外・非数値は
+/// [`SCAN_BATCH_SIZE`] 既定のまま。走査開始ごとに一度だけ読む。
+fn effective_batch_size(env_value: Option<&str>) -> usize {
+    env_value
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| (1..=4096).contains(n))
+        .unwrap_or(SCAN_BATCH_SIZE)
+}
+
+/// 現在プロセスの実効バッチ件数 (走査1回の開始時に一度だけ評価する)。
+fn current_batch_size() -> usize {
+    let env = std::env::var_os("GENTO_SCAN_BATCH");
+    let size = effective_batch_size(env.as_deref().and_then(|v| v.to_str()));
+    if size != SCAN_BATCH_SIZE {
+        tracing::info!(batch_size = size, "GENTO_SCAN_BATCH override active");
+    }
+    size
+}
+
 /// 一時走査の深さ上限 (ルート相対。ルート直下のファイルが深さ1)。
 /// `/` 起点クリック等の際限ない再帰を防ぐ (QA-WP4 Major-1)。
 pub const SCAN_MAX_DEPTH: usize = 16;
@@ -114,7 +134,8 @@ fn scan_batched_with_limits(
     let mut truncated = false;
     let mut cancelled = false;
     let mut errors: Vec<ScanEntryError> = Vec::new();
-    let mut pending: Vec<ScannedFile> = Vec::with_capacity(SCAN_BATCH_SIZE);
+    let batch_size = current_batch_size();
+    let mut pending: Vec<ScannedFile> = Vec::with_capacity(batch_size);
 
     for entry in WalkDir::new(root).max_depth(limits.max_depth).into_iter() {
         let entry = match entry {
@@ -145,7 +166,7 @@ fn scan_batched_with_limits(
                 reason: err.to_string(),
             }),
         }
-        if pending.len() >= SCAN_BATCH_SIZE {
+        if pending.len() >= batch_size {
             found += pending.len() as u64;
             if !sink(ScanBatch {
                 entries_walked: entries,
@@ -753,6 +774,22 @@ mod tests {
         assert_eq!(result.png_count, 5);
         // 総件数が上限ちょうど → 打ち切り警告なし
         assert!(!result.truncated);
+    }
+
+    #[test]
+    fn scan_batch_override_parses_only_bounded_positive_ints() {
+        // WP-16: GENTO_SCAN_BATCH の解析 (純粋関数なのでenv競合なし)
+        assert_eq!(effective_batch_size(Some("1")), 1);
+        assert_eq!(effective_batch_size(Some("256")), 256);
+        assert_eq!(effective_batch_size(Some("4096")), 4096);
+        // 0・上限超過・非数値・空・前後空白はすべて既定64のまま
+        assert_eq!(effective_batch_size(Some("0")), SCAN_BATCH_SIZE);
+        assert_eq!(effective_batch_size(Some("4097")), SCAN_BATCH_SIZE);
+        assert_eq!(effective_batch_size(Some("-1")), SCAN_BATCH_SIZE);
+        assert_eq!(effective_batch_size(Some("abc")), SCAN_BATCH_SIZE);
+        assert_eq!(effective_batch_size(Some("")), SCAN_BATCH_SIZE);
+        assert_eq!(effective_batch_size(Some(" 8")), SCAN_BATCH_SIZE);
+        assert_eq!(effective_batch_size(None), SCAN_BATCH_SIZE);
     }
 
     #[test]
