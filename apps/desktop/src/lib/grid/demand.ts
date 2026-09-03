@@ -106,6 +106,8 @@ export class ReadyMap {
 /** サイズクラス別の失敗記録。 */
 export class FailureSet {
   private readonly sets = new Map<string, Set<string>>();
+  /** 失敗理由 (最新のみ保持。UIの失敗セル説明用 — WP-17 H-1)。 */
+  private readonly reasons = new Map<string, Map<string, string>>();
 
   add(sizeClass: string, ids: string[]): void {
     let set = this.sets.get(sizeClass);
@@ -116,6 +118,22 @@ export class FailureSet {
     for (const id of ids) {
       set.add(id);
     }
+  }
+
+  /** 失敗IDとその理由を記録する (add + 理由保持)。 */
+  record(sizeClass: string, id: string, reason: string): void {
+    this.add(sizeClass, [id]);
+    let reasons = this.reasons.get(sizeClass);
+    if (!reasons) {
+      reasons = new Map();
+      this.reasons.set(sizeClass, reasons);
+    }
+    reasons.set(id, reason);
+  }
+
+  /** このIDの最新の失敗理由 (未記録・他クラスはnull)。 */
+  reasonFor(sizeClass: string, id: string): string | null {
+    return this.reasons.get(sizeClass)?.get(id) ?? null;
   }
 
   has(sizeClass: string, id: string): boolean {
@@ -131,16 +149,19 @@ export class FailureSet {
   /** 指定IDの失敗記録を解除する (画面外へ出た→再登場時に再試行させる)。 */
   retract(sizeClass: string, ids: Iterable<string>): void {
     const set = this.sets.get(sizeClass);
+    const reasons = this.reasons.get(sizeClass);
     if (!set) {
       return;
     }
     for (const id of ids) {
       set.delete(id);
+      reasons?.delete(id);
     }
   }
 
   clear(): void {
     this.sets.clear();
+    this.reasons.clear();
   }
 }
 

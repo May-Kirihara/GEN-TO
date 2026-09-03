@@ -254,6 +254,14 @@ export class GridStore {
   }
 
   /**
+   * このセルの最新の失敗理由 (失敗セルの説明表示用。未失敗はnull)。
+   * Rust側の保護上限メッセージ (上限値と理由) を利用者へ届ける (WP-17 H-1)。
+   */
+  failureReasonFor(id: string): string | null {
+    return this.failures.reasonFor(this.sizeClassValue, id);
+  }
+
+  /**
    * ビューポート変化の通知。rangeは**行番号** (virtualizer準拠)。
    * ページ取得は即時、サムネイル要求はデバウンスする。
    * 方向はscrollTop差分から判定 (閾値未満は現行維持)。
@@ -483,7 +491,7 @@ export class GridStore {
 
   private applyFailed(items: ThumbFailedItem[]): void {
     for (const item of items) {
-      this.failures.add(item.size_class, [item.asset_id]);
+      this.failures.record(item.size_class, item.asset_id, item.reason);
       this.pending.delete(pendingKey(item.size_class, item.asset_id));
     }
     this.stats.failedReceived += items.length;

@@ -425,6 +425,13 @@
     return grid.isFailed(item.id);
   }
 
+  /** 失敗セルの説明 (理由付きtooltip。WP-17 H-1)。 */
+  function failReasonTitle(item: ImageListItem): string {
+    void gridTick;
+    const reason = grid.failureReasonFor(item.id);
+    return reason === null ? "サムネイル生成失敗" : `サムネイル生成失敗 — ${reason}`;
+  }
+
   /**
    * セルバッジ表示値 (WP-5)。pagerのin-placeパッチ (asset:updated) は項目
    * オブジェクトの同一性を保つため、gridTickを読むへルパ経由で評価する
@@ -553,7 +560,7 @@
                 {#if url !== null}
                   <img src={url} alt={item.displayName} loading="lazy" decoding="async" draggable="false" />
                 {:else if failed(item)}
-                  <span class="cell-fail-mark" role="img" aria-label="サムネイル生成失敗">✕</span>
+                  <span class="cell-fail-mark" role="img" aria-label="サムネイル生成失敗" title={failReasonTitle(item)}>✕</span>
                 {/if}
                 {#if badges !== null}
                   <span class="cell-badges" aria-hidden="true">

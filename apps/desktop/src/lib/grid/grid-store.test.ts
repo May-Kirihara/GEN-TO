@@ -576,6 +576,29 @@ describe("GridStore — 画面外キャンセルと失敗リトラクト (WP-7)"
     expect(last?.args?.ids).toContain("5");
   });
 
+  it("失敗理由をセル表示向けに取得できる (WP-17 H-1)", async () => {
+    const { ipc, listeners } = makeIpc();
+    const grid = new GridStore(ipc, { debounceMs: 150, prefetchRows: 0 });
+    await grid.init();
+    emit(listeners, "thumb:failed", {
+      items: [
+        {
+          asset_id: "5",
+          size_class: "s256",
+          reason: "decode failed: 画像が大きすぎるため上限で拒否しました (上限: 256MiB)",
+        },
+      ],
+    });
+    expect(grid.isFailed("5")).toBe(true);
+    expect(grid.failureReasonFor("5")).toContain("256MiB");
+
+    // 画面外リトラクトで失敗記録とともに理由も消える
+    grid.viewportChanged({ start: 20, end: 22 }, 0, 5000, 3);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(grid.isFailed("5")).toBe(false);
+    expect(grid.failureReasonFor("5")).toBe(null);
+  });
+
   it("キャンセル要求の結果は統計に計上される", async () => {
     const { ipc } = makeIpc();
     const grid = new GridStore(ipc, { debounceMs: 150, prefetchRows: 0 });

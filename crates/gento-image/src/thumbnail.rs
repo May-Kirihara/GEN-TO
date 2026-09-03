@@ -54,7 +54,19 @@ impl fmt::Display for ThumbnailError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ThumbnailError::Unreadable(reason) => write!(f, "unreadable: {reason}"),
-            ThumbnailError::Decode(err) => write!(f, "decode failed: {err}"),
+            ThumbnailError::Decode(err) => match err {
+                // 上限拒否は理由 (画像が大きすぎ) と上限値を利用者に伝える
+                // (WP-17 H-1)。bomb対策の政策値そのものが問い合わせ先のため
+                // 定数から埋め込む。その他のデコード失敗は素通し。
+                ImageError::Limits(limit) => write!(
+                    f,
+                    "decode failed: 画像が大きすぎるため上限で拒否しました \
+                     (上限: デコード割り当て{}MiB・1辺{}px): {limit}",
+                    MAX_DECODE_ALLOC_BYTES / 1024 / 1024,
+                    MAX_DECODE_DIMENSION,
+                ),
+                other => write!(f, "decode failed: {other}"),
+            },
             ThumbnailError::Encode(reason) => write!(f, "encode failed: {reason}"),
             ThumbnailError::Cancelled => write!(f, "cancelled"),
         }
@@ -757,6 +769,20 @@ mod tests {
             }
             other => panic!("expected limits error, got: {other}"),
         }
+    }
+
+    #[test]
+    fn limits_error_message_tells_the_user_the_reason_and_the_limits() {
+        // WP-17 H-1: 上限拒否のDisplayは「理由 (画像が大きすぎ) と上限値」を
+        // 利用者へ伝える (100MP級対策の政策値そのものが問い合わせ先)。
+        let dir = TestDir::new("bomb-msg");
+        let path = dir.path().join("bomb.png");
+        fs::write(&path, bomb_png_bytes()).unwrap();
+        let err = generate(&path, SizeClass::S256, &CancelToken::new()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("大きすぎ"), "{msg}");
+        assert!(msg.contains("256MiB"), "{msg}");
+        assert!(msg.contains("20000"), "{msg}");
     }
 
     #[test]

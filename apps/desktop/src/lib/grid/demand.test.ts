@@ -299,4 +299,20 @@ describe("FailureSet — 画面外リトラクト (WP-7)", () => {
     expect(failures.has("s256", "1")).toBe(true);
     expect(failures.has("s256", "3")).toBe(true);
   });
+
+  it("失敗理由を記録し、retract/clearで記録と一緒に消える (WP-17 H-1)", () => {
+    const failures = new FailureSet();
+    failures.record("s256", "1", "decode failed: 画像が大きすぎるため上限で拒否しました");
+    expect(failures.reasonFor("s256", "1")).toBe(
+      "decode failed: 画像が大きすぎるため上限で拒否しました",
+    );
+    // クラス違い・未記録はnull
+    expect(failures.reasonFor("s512", "1")).toBe(null);
+    expect(failures.reasonFor("s256", "2")).toBe(null);
+    failures.retract("s256", ["1"]);
+    expect(failures.reasonFor("s256", "1")).toBe(null);
+    failures.record("s256", "3", "a");
+    failures.clear();
+    expect(failures.reasonFor("s256", "3")).toBe(null);
+  });
 });
