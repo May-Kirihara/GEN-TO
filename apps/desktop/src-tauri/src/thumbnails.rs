@@ -137,6 +137,45 @@ struct BacklogState {
     deferred_total: u64,
     /// 現在の要求でbacklogから処理 (投入・統合・フィード時ヒット) した数。
     processed: u64,
+    /// feederがpop済み・まだプールへ投入していないitem (FG-WP16-4 R1)。
+    /// pop時 (backlogロック内) に登録され、投入判定 (同ロック内) で消費
+    /// される。この間にcancelが一致キーを破棄した場合はNoneへ差し替えられ、
+    /// feederは投入判定で当該itemを廃棄する — pop→submit窓にcancelの
+    /// 死角が構造的に存在しない。
+    inflight: Option<InflightItem>,
+    /// inflight識別子の供給 (単調増加。feederは単一スレッドのためABAなし)。
+    pop_seq: u64,
+}
+
+/// feeder処理中のbacklog itemの追跡 (cancel照合に使用。世代検査は
+/// feederが手持ちのitem自体の世代で行うためここには保持しない)。
+#[derive(Debug, Clone)]
+struct InflightItem {
+    pop_id: u64,
+    /// cancel照合用のキャッシュキー (pop時に算出)。
+    key: String,
+}
+
+impl BacklogState {
+    /// 先頭itemをfeeder処理中として取り出す (backlogロック内で呼ぶこと)。
+    /// popと同時にinflightへ登録するため、この直後から投入判定までの間も
+    /// cancelはこのitemを観測・破棄できる (FG-WP16-4 R1)。
+    fn pop_for_feeder(&mut self) -> Option<(u64, BacklogItem)> {
+        let item = self.items.pop_front()?;
+        self.pop_seq += 1;
+        let pop_id = self.pop_seq;
+        let key = cache_key(
+            &asset_fingerprint(
+                &item.asset.source_path,
+                item.asset.byte_size,
+                item.asset.mtime_ms,
+            ),
+            item.size_class,
+        )
+        .hex;
+        self.inflight = Some(InflightItem { pop_id, key });
+        Some((pop_id, item))
+    }
 }
 
 /// エミッタスレッドへのメッセージ。
@@ -173,6 +212,10 @@ struct ThumbnailCore {
     /// 開発用エラー注入 (WP-7)。全ジョブが共有する。devtoolsビルドのみ (WP-0)。
     #[cfg(any(debug_assertions, feature = "devtools"))]
     injection: Arc<FailureInjection>,
+    /// テスト用: feederのpop直後・投入直前で一時停止するゲート
+    /// (決定論的インターリーブ再現。FG-WP16-4)。
+    #[cfg(any(debug_assertions, feature = "devtools"))]
+    feeder_gate: Arc<FeederGate>,
     emitter_tx: Sender<EmitterMsg>,
 }
 
@@ -314,6 +357,8 @@ impl ThumbnailService {
             cache_generation: AtomicU64::new(1),
             #[cfg(any(debug_assertions, feature = "devtools"))]
             injection: Arc::new(FailureInjection::new()),
+            #[cfg(any(debug_assertions, feature = "devtools"))]
+            feeder_gate: Arc::new(FeederGate::default()),
             emitter_tx: emitter_tx.clone(),
         });
 
@@ -416,12 +461,15 @@ impl ThumbnailService {
     /// `deferred` が繰延件数。既存のbacklogは新しいスナップショットで
     /// 置換され、排液完了・置換・終了時の残数はログで報告される。
     ///
-    /// 世代安全性 (FG-WP16-3 B3): 各呼び出しは単調増加のgeneration tokenを
-    /// 取得し、開始時にbacklogを自世代で初期化した上で、繰延分を**単一
-    /// ロック+世代検査で一括install**する。install時点でより新しい
-    /// request_allが開始済みなら自世代の繰延分は破棄される (backlogは
-    /// 常に最新世代のみ)。プールへ**既に投入済み**の旧世代jobは冪等な
-    /// cache書き込みのため完了を許容する (仕様 — docs/dev/api-contract §8)。
+    /// 世代安全性 (FG-WP16-3 B3 / FG-WP16-4 R2): 各呼び出しは単調増加の
+    /// generation tokenを取得し、開始時にbacklogを自世代で初期化した上で、
+    /// 繰延分を**単一ロック+世代検査で一括install**する。install時点でより
+    /// 新しいrequest_allが開始済みなら自世代の繰延分は破棄される (backlogは
+    /// 常に最新世代のみ)。feeder (drain_backlog) もpop済みitemの世代を
+    /// プール投入**前**に同一ロック内で検査するため、新世代開始後に旧世代
+    /// itemがプールへ投入される経路は存在しない。プールへ**既に投入済み**
+    /// の旧世代jobは冪等なcache書き込みのため完了を許容する
+    /// (仕様 — docs/dev/api-contract §8)。
     pub fn request_all(&self, assets: &[AssetSnapshot], size_class: SizeClass) -> RequestAccepted {
         let generation = self.request_generation.fetch_add(1, Ordering::SeqCst) + 1;
         {
@@ -519,13 +567,14 @@ impl ThumbnailService {
     }
 
     /// 要求のキャンセル (未開始は即時、実行中は協調)。
-    /// プールに**未投入**のbacklog entries (generate-all繰延分) も同じ
-    /// キーで破棄する — 破棄分がfeederから二度と投入されない
-    /// (FG-WP16-3 B2)。
+    /// プールに**未投入**のbacklog分 (deque内の繰延entryとfeederがpop直後の
+    /// inflight itemの両方) も同じキーで破棄する — 破棄分がfeederから
+    /// 二度と投入されない (FG-WP16-3 B2 / FG-WP16-4 R1: pop→submit窓の
+    /// 死角を閉じた)。
     pub fn cancel(&self, assets: &[AssetSnapshot], size_class: SizeClass) -> CancelResult {
         let mut result = CancelResult::default();
-        // backlogから破棄したキー (プール未投入のためpool.cancel_jobは
-        // NotFoundになる — 二重計上しない)
+        // backlog (deque + inflight) から破棄したキー (プール未投入のため
+        // pool.cancel_jobはNotFoundになる — not_foundに二重計上しない)
         let mut dropped_keys: HashSet<String> = HashSet::new();
         {
             let keys: HashSet<String> = assets
@@ -541,7 +590,7 @@ impl ThumbnailService {
                 .collect();
             if !keys.is_empty() {
                 let mut backlog = lock_backlog(&self.backlog);
-                let before = backlog.items.len();
+                let mut dropped: u64 = 0;
                 backlog.items.retain(|item| {
                     let key = cache_key(
                         &asset_fingerprint(
@@ -551,13 +600,27 @@ impl ThumbnailService {
                         ),
                         item.size_class,
                     );
-                    !keys.contains(&key.hex)
+                    if keys.contains(&key.hex) {
+                        dropped += 1;
+                        dropped_keys.insert(key.hex);
+                        false
+                    } else {
+                        true
+                    }
                 });
-                let dropped = (before - backlog.items.len()) as u64;
+                // feederがpop直後・まだプールへ投入していないitemも破棄
+                // (inflightを差し替えるため、feederの投入判定はこのitemを
+                // 廃棄する — 「not_found返却後の事後投入」は構造的に起きない)
+                if let Some(inflight) = backlog.inflight.clone() {
+                    if keys.contains(&inflight.key) {
+                        backlog.inflight = None;
+                        dropped += 1;
+                        dropped_keys.insert(inflight.key);
+                    }
+                }
                 if dropped > 0 {
                     tracing::info!(dropped, "generate-all backlog entries dropped by cancel");
                     result.cancelled_backlog = dropped;
-                    dropped_keys = keys;
                 }
             }
         }
@@ -627,6 +690,28 @@ impl ThumbnailService {
     pub fn set_injection(&self, mode: InjectionMode, rate: f64) {
         self.core.injection.set(mode, rate);
         tracing::info!(mode = mode.as_str(), rate, "failure injection updated");
+    }
+
+    /// テスト用: backlog feederの次のpop直後・投入直前で一時停止させる
+    /// ゲートを装填する (一度だけ有効)。devtools/debug専用 (FG-WP16-4)。
+    /// IPC非公開 — 決定論的raceテスト (単体テスト) 専用の注入。
+    #[cfg(any(debug_assertions, feature = "devtools"))]
+    pub fn debug_arm_feeder_gate(&self) -> FeederGateHandle {
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel();
+        *self
+            .core
+            .feeder_gate
+            .wiring
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(FeederGateWiring {
+            reached: reached_tx,
+            go: go_rx,
+        });
+        FeederGateHandle {
+            reached: reached_rx,
+            go: go_tx,
+        }
     }
 
     pub fn set_paused(&self, paused: bool) {
@@ -703,6 +788,65 @@ fn lock_backlog(backlog: &Mutex<BacklogState>) -> std::sync::MutexGuard<'_, Back
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+// ===== テスト用feederゲート (devtools/debug専用 — FG-WP16-4) =====
+
+/// backlog feederのpop直後・投入直前に一時停止する注入フック
+/// (決定論的インターリーブテスト用。`set_failure_injection` と同じ
+/// コンパイルゲートで、prod releaseには存在しない)。backlogロックは
+/// 保持したまま待機しない — 停止中もcancel/request_allは進行でき、
+/// それらとfeeder投入の競合窓を決定論的に再現する。
+#[cfg(any(debug_assertions, feature = "devtools"))]
+#[derive(Debug, Default)]
+pub struct FeederGate {
+    /// 一度だけ有効な接続 (装填→feeder到達→解放の1往復)。
+    wiring: Mutex<Option<FeederGateWiring>>,
+}
+
+#[cfg(any(debug_assertions, feature = "devtools"))]
+#[derive(Debug)]
+struct FeederGateWiring {
+    reached: Sender<()>,
+    go: Receiver<()>,
+}
+
+#[cfg(any(debug_assertions, feature = "devtools"))]
+impl FeederGate {
+    /// feeder側から呼ぶ: 接続されていれば到達を通知して解放を待つ。
+    /// 接続がない (通常運用) 場合は即座に通過する。
+    fn wait_if_armed(&self) {
+        let wiring = self
+            .wiring
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(wiring) = wiring {
+            let _ = wiring.reached.send(());
+            // 解放を待つ。ハンドルdropも解放扱い (試験停滞防止)。
+            let _ = wiring.go.recv();
+        }
+    }
+}
+
+/// [`ThumbnailService::debug_arm_feeder_gate`] が返すテスト側ハンドル。
+#[cfg(any(debug_assertions, feature = "devtools"))]
+pub struct FeederGateHandle {
+    reached: Receiver<()>,
+    go: Sender<()>,
+}
+
+#[cfg(any(debug_assertions, feature = "devtools"))]
+impl FeederGateHandle {
+    /// feederがゲートへ到達した (backlog先頭をpopした) ことを待つ。
+    pub fn wait_reached(&self) -> bool {
+        self.reached.recv_timeout(Duration::from_secs(10)).is_ok()
+    }
+
+    /// ゲートを解放し、feederの投入判定を再開させる。
+    pub fn release(&self) {
+        let _ = self.go.send(());
+    }
+}
+
 /// 即時readyアイテムをエミッタへ送る (投入経路の共通末尾)。
 fn send_immediate(emitter_tx: &Sender<EmitterMsg>, items: Vec<ThumbReadyItem>) {
     if !items.is_empty() {
@@ -742,6 +886,18 @@ fn spawn_backlog_feeder(
 }
 
 /// backlogをキュー空きぶんだけ投入する (1起床で空きが尽きるまで繰り返す)。
+///
+/// FG-WP16-4 R1/R2: 各itemの投入はbacklogロックで守られた2区間で行う。
+/// ① pop区間: itemをdequeからinflightへ移す (この直後からcancelに可視)。
+/// ② 投入区間: cancelがinflightを破棄していないか (pop_id一致) と世代が
+/// 現行かを検査してから `enqueue_asset` によるプール投入 (満杯時の先頭戻し
+/// を含む) までを**同一ロック内で完結**させる。cancelも同じロック内で
+/// (a) deque内の一致key破棄 (b) inflightの一致key破棄を行うため、
+/// 「cancelがnot_foundで完了した後にそのキーがfeeder経由で投入される」
+/// 経路と「より新しいrequest_all開始後の旧世代item投入」は構造的に
+/// 存在しない。投入区間内の `enqueue_asset` はregistryロック・pool
+/// キューロック取得と非ブロッキングchannel送信のみで、backlogロック
+/// 保持中に呼んでも安全 (ロック順序は常に backlog → registry → pool)。
 fn drain_backlog(core: &ThumbnailCore, backlog: &Mutex<BacklogState>, stop: &AtomicBool) {
     let capacity = core.pool.queue_capacity();
     let margin = BACKLOG_SUBMIT_MARGIN.min(capacity / 4);
@@ -759,49 +915,67 @@ fn drain_backlog(core: &ThumbnailCore, backlog: &Mutex<BacklogState>, stop: &Ato
         let mut immediate = Vec::new();
         let mut hit_full = false;
         while taken < free.min(BACKLOG_SUBMIT_BATCH) {
-            let item = lock_backlog(backlog).items.pop_front();
-            let Some(item) = item else {
+            let Some((pop_id, item)) = lock_backlog(backlog).pop_for_feeder() else {
                 break;
             };
             taken += 1;
-            // popからsubmitの間に新しいrequest_allがbacklogを置換しても、
-            // このitemの再キューは世代検査で拒否される (旧世代は破棄)。
-            match core.enqueue_asset(&item.asset, item.size_class, item.priority) {
-                EnqueueOutcome::Queued | EnqueueOutcome::Merged => {
-                    let mut b = lock_backlog(backlog);
-                    if b.generation == item.generation {
-                        b.processed += 1;
-                    }
+            // テスト注入ゲート: pop後・投入判定前に一時停止 (ロック保持なし
+            // — 停止中のcancel/request_allの進行を妨げない)
+            #[cfg(any(debug_assertions, feature = "devtools"))]
+            core.feeder_gate.wait_if_armed();
+            // 投入区間: cancel消費・世代検査・プール投入を同一ロックで。
+            // 破棄判定に当たった場合はcontinueで次のitemへ (cancel側で
+            // 計上済みのためここでは何も報告しない)。
+            let step = {
+                let mut b = lock_backlog(backlog);
+                let still_current = matches!(&b.inflight, Some(inf) if inf.pop_id == pop_id);
+                if !still_current {
+                    // cancelがinflightを破棄済み、またはclear/置換で状態が
+                    // 初期化済み — このitemは投入しない。
+                    continue;
                 }
-                EnqueueOutcome::CacheHit(hit) => {
-                    let mut b = lock_backlog(backlog);
-                    if b.generation == item.generation {
-                        b.processed += 1;
-                    }
-                    immediate.push(hit);
+                if b.generation != item.generation {
+                    // より新しいrequest_all (またはclear) が開始済み —
+                    // 旧世代itemは投入しない (FG-WP16-4 R2)。
+                    b.inflight = None;
+                    tracing::debug!(
+                        generation = item.generation,
+                        superseded_by = b.generation,
+                        "popped backlog item discarded: superseded before enqueue"
+                    );
+                    continue;
                 }
-                EnqueueOutcome::Full => {
+                b.inflight = None;
+                match core.enqueue_asset(&item.asset, item.size_class, item.priority) {
+                    EnqueueOutcome::Queued | EnqueueOutcome::Merged => {
+                        b.processed += 1;
+                        FeedStep::Submitted
+                    }
+                    EnqueueOutcome::CacheHit(hit) => {
+                        b.processed += 1;
+                        FeedStep::Immediate(hit)
+                    }
                     // 他の投入と競合して満杯: 先頭へ戻して次の完了で再試行
-                    // (ただし自世代のみ — 置換済みなら破棄)
-                    let mut b = lock_backlog(backlog);
-                    if b.generation == item.generation {
+                    // (自世代のみ — 世代は上で検査済み)
+                    EnqueueOutcome::Full => {
                         b.items.push_front(item);
-                    } else {
-                        tracing::debug!(
-                            generation = item.generation,
-                            superseded_by = b.generation,
-                            "popped backlog item discarded: superseded while submitting"
-                        );
+                        FeedStep::RequeuedFull
                     }
+                    // プール停止: 以降の再投入は無意味 (残りは停止時報告)
+                    EnqueueOutcome::Shutdown => {
+                        b.items.push_front(item);
+                        FeedStep::RequeuedShutdown
+                    }
+                }
+            };
+            match step {
+                FeedStep::Submitted => {}
+                FeedStep::Immediate(hit) => immediate.push(hit),
+                FeedStep::RequeuedFull => {
                     hit_full = true;
                     break;
                 }
-                EnqueueOutcome::Shutdown => {
-                    // プール停止: 以降の再投入は無意味 (残りは停止時報告)
-                    let mut b = lock_backlog(backlog);
-                    if b.generation == item.generation {
-                        b.items.push_front(item);
-                    }
+                FeedStep::RequeuedShutdown => {
                     send_immediate(&core.emitter_tx, immediate);
                     return;
                 }
@@ -824,6 +998,18 @@ fn drain_backlog(core: &ThumbnailCore, backlog: &Mutex<BacklogState>, stop: &Ato
             return;
         }
     }
+}
+
+/// drain_backlogの1item分の投入区間の結果。
+enum FeedStep {
+    /// 投入または既存ジョブへ統合 (processed更新済み)。
+    Submitted,
+    /// キャッシュヒット (processed更新済み。呼び出し側で即時readyへ集約)。
+    Immediate(ThumbReadyItem),
+    /// キュー満杯で先頭へ戻した。
+    RequeuedFull,
+    /// プール停止で先頭へ戻した。
+    RequeuedShutdown,
 }
 
 /// fingerprintからURLバージョンを計算する (キャッシュキー計算と同一入力から
@@ -943,8 +1129,9 @@ pub struct ReprioritizeResult {
 pub struct CancelResult {
     pub cancelled_queued: u64,
     pub cancel_requested: u64,
-    /// backlog (プール未投入のgenerate-all繰延分) から破棄した件数
-    /// (FG-WP16-3 B2 — 差し替え投入されない)。
+    /// backlog (プール未投入のgenerate-all繰延分 — deque内のentryと
+    /// feederがpop直後のinflight itemの両方) から破棄した件数
+    /// (FG-WP16-3 B2 / FG-WP16-4 R1 — 破棄分は差し替え投入されない)。
     pub cancelled_backlog: u64,
     pub not_found: u64,
     pub skipped_unreadable: u64,
@@ -1652,6 +1839,133 @@ mod tests {
             all_a || all_b,
             "backlogは単一世代でなければならない (混在): {ids:?}"
         );
+        svc.shutdown();
+    }
+
+    // ===== FG-WP16-4 R1/R2: pop→submit窓の決定論的インターリーブ =====
+
+    /// FG-WP16-4 R1: cancelはfeederがpop直後・まだプールへ投入していない
+    /// item (inflight) も破棄する。ゲートでfeederをpop直後に停止し、
+    /// pop→submit窓でcancelが走っても「not_found報告 → 事後投入」が
+    /// 起きないことを決定論的に実証する。
+    #[cfg(any(debug_assertions, feature = "devtools"))]
+    #[test]
+    fn cancel_discards_feeder_inflight_item_in_pop_to_submit_window() {
+        let dir = TestDir::new("backlog-inflight-cancel");
+        let events = SharedEvents::default();
+        let svc = service_with_queue_capacity(&dir, events.clone(), 3);
+        svc.set_paused(true); // 決定的にキューを埋める
+        let assets: Vec<AssetSnapshot> = (0..4)
+            .map(|i| {
+                asset(
+                    u64::try_from(i).unwrap() + 1,
+                    &dir.write_png(&format!("w{i}.png"), 64, 64),
+                    true,
+                )
+            })
+            .collect();
+        let accepted = svc.request_all(&assets, SizeClass::S256);
+        assert_eq!(accepted.queued, 3);
+        assert_eq!(accepted.deferred, 1, "w3 (id=4) がbacklogへ");
+
+        // ゲートを先に装填してから投入済み1件をcancel → feederが起床し
+        // w3をpopした直後で確定的に停止する
+        let gate = svc.debug_arm_feeder_gate();
+        let cancel_first = svc.cancel(&assets[0..1], SizeClass::S256);
+        assert_eq!(cancel_first.cancelled_queued, 1);
+        assert!(gate.wait_reached(), "feederがbacklog先頭 (w3) をpopした");
+
+        // pop→submit窓でcancel(w3): w3はまだプールへ無い
+        let cancel_w3 = svc.cancel(&assets[3..4], SizeClass::S256);
+        assert_eq!(
+            cancel_w3.cancelled_backlog, 1,
+            "inflight分を破棄報告: {cancel_w3:?}"
+        );
+        assert_eq!(cancel_w3.not_found, 0, "{cancel_w3:?}");
+        assert_eq!(cancel_w3.cancelled_queued, 0, "{cancel_w3:?}");
+
+        gate.release();
+        // w3がプールへ投入されない (キューはw1,w2の2件のまま)
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            svc.stats_dto().queue_depth,
+            2,
+            "cancel済みw3は事後投入されない"
+        );
+        assert_eq!(svc.backlog_len(), 0);
+
+        svc.set_paused(false);
+        let ready = events.wait_ready_count(2);
+        let ready_ids: std::collections::HashSet<u64> =
+            ready.iter().map(|r| r.asset_id.value()).collect();
+        assert!(
+            ready_ids.contains(&2) && ready_ids.contains(&3),
+            "{ready_ids:?}"
+        );
+        assert!(
+            !ready_ids.contains(&4),
+            "cancel済みw3 (id=4) は生成されない: {ready_ids:?}"
+        );
+        assert_eq!(svc.stats_dto().generated, 2);
+        svc.shutdown();
+    }
+
+    /// FG-WP16-4 R2: feederがpopした旧世代itemは、より新しいrequest_allの
+    /// 開始後はプールへ投入されない (generation検査は投入**前**)。
+    /// ゲート停止中に新世代request_allを実行→解放、で決定論的に実証。
+    #[cfg(any(debug_assertions, feature = "devtools"))]
+    #[test]
+    fn feeder_never_submits_stale_generation_item_after_new_request_all() {
+        let dir = TestDir::new("backlog-stale-gen");
+        let events = SharedEvents::default();
+        let svc = service_with_queue_capacity(&dir, events.clone(), 3);
+        svc.set_paused(true);
+        let first: Vec<AssetSnapshot> = (0..4)
+            .map(|i| {
+                asset(
+                    u64::try_from(i).unwrap() + 1,
+                    &dir.write_png(&format!("g1-{i}.png"), 64, 64),
+                    true,
+                )
+            })
+            .collect();
+        let accepted = svc.request_all(&first, SizeClass::S256);
+        assert_eq!(accepted.queued, 3);
+        assert_eq!(accepted.deferred, 1, "旧世代item (g1-3, id=4) がbacklogへ");
+
+        // ゲート装填後に投入済み2件をcancel → feederが旧世代itemをpopした
+        // 直後に確定的に停止
+        let gate = svc.debug_arm_feeder_gate();
+        let cancel_two = svc.cancel(&first[0..2], SizeClass::S256);
+        assert_eq!(cancel_two.cancelled_queued, 2);
+        assert!(gate.wait_reached(), "feederが旧世代itemをpopした");
+
+        // 停止中に新世代request_all (g2-0): プールに空き1 → 直接投入
+        let second = vec![asset(100, &dir.write_png("g2-0.png", 64, 64), true)];
+        let accepted2 = svc.request_all(&second, SizeClass::S256);
+        assert_eq!(accepted2.queued, 1);
+        assert_eq!(accepted2.deferred, 0);
+
+        gate.release();
+        std::thread::sleep(Duration::from_millis(300));
+        // 旧世代itemは投入されない: キューは g1-2 + g2-0 の2件
+        assert_eq!(
+            svc.stats_dto().queue_depth,
+            2,
+            "旧世代itemは新世代開始後に投入されない"
+        );
+
+        svc.set_paused(false);
+        let ready = events.wait_ready_count(2);
+        let ready_ids: std::collections::HashSet<u64> =
+            ready.iter().map(|r| r.asset_id.value()).collect();
+        assert!(ready_ids.contains(&3), "g1-2 (id=3): {ready_ids:?}");
+        assert!(ready_ids.contains(&100), "g2-0 (id=100): {ready_ids:?}");
+        assert!(
+            !ready_ids.contains(&4),
+            "旧世代g1-3 (id=4) は生成されない: {ready_ids:?}"
+        );
+        assert_eq!(svc.stats_dto().generated, 2);
         svc.shutdown();
     }
 

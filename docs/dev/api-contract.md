@@ -301,10 +301,15 @@ invoke<{ cancelled_queued, cancel_requested, cancelled_backlog, not_found,
 
 - 未開始=即時除去 (イベントは出ない)。実行中=協調キャンセル要求
   (ジョブがデコード前/リサイズ前/エンコード前で検査)。
-- `cancelled_backlog` (FG-WP16-3 B2): プールに**未投入**のgenerate-all
-  繰延分 (backlog) から破棄した件数。同一キーのbacklog entryは同じ
-  cancelで破棄されるため、破棄分がfeederから後段投入されることはない
-  (backlog破棄済みキーは `not_found` に二重計上しない)。
+- `cancelled_backlog` (FG-WP16-3 B2 / FG-WP16-4 R1): プールに**未投入**の
+  generate-all繰延分 (backlog) から破棄した件数。対象はdeque内のentryと
+  **feederがpop直後・まだプールへ投入していないitem (inflight) の両方**。
+  feederのpop→投入はbacklogロックで守られた2区間 (pop時にinflight登録 →
+  cancel消費/世代検査/プール投入を同一ロック内で完結) で行われ、cancelも
+  同じロック内で (a) deque内の一致key破棄 (b) inflightの一致key破棄を
+  行うため、**cancelが`not_found`を報告したキーがその後feeder経由で
+  プールへ投入される経路は構造的に存在しない** (破棄済みキーは
+  `not_found` に二重計上しない)。
 
 ### `generate_all_thumbnails`
 
@@ -317,16 +322,18 @@ invoke<RequestAccepted>("generate_all_thumbnails", { sizeClass: SizeClassId })
   (`deferred` に件数)、プール完了駆動で空きができ次第投入される
   (WP-16 F1。ライブラリのハッシュ再提出と同一の需要駆動方式)。
   排液完了・再要求による置換・終了/キャッシュ全削除での残数はログで報告。
-- **置換の世代規約 (FG-WP16-3 B3)**: 各 `generate_all` 呼び出しは単調
+- **置換の世代規約 (FG-WP16-3 B3 / FG-WP16-4 R2)**: 各 `generate_all` 呼び出しは単調
   増加のgeneration tokenを取得する。呼び出し開始時にbacklogは即座に
   新世代へ置換され、繰延分は**単一ロック+世代検査で一括install**される
   (より新しい呼び出しが開始済みなら破棄)。このためbacklogは常に
   **最新の要求の資産のみ**を含む (並行押下・排液中の再押下で混入しない)。
-  ただし**プールへ既に投入済み**の旧世代jobは取り消されず、その完了は
-  **冪等なキャッシュ書き込みのため許容**する (内容はキーに対応する
-  正当なサムネイル。cancelで明示的に止めることは可能)。
-  drain中にpopされた旧世代itemが満杯でbacklogへ戻る場合も世代検査で
-  破棄される (再投入されない)。
+  feederもpop済みitemの世代をプール投入**前**にbacklogロック内で検査する
+  ため、**より新しい `generate_all` 開始後に旧世代itemがプールへ投入される
+  経路は存在しない**。ただし**プールへ既に投入済み**の旧世代jobは取り消され
+  ず、その完了は**冪等なキャッシュ書き込みのため許容**する (内容はキーに
+  対応する正当なサムネイル。cancelで明示的に止めることは可能)。
+  満杯でbacklogへ戻る場合も同一ロック内の世代検査で破棄される
+  (再投入されない)。
 
 ### `get_thumbnail_stats`
 
@@ -2456,6 +2463,11 @@ score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
   dry-runを1回取得しないと実行不可 (`canExecute`。構造変更でdry-runは
   無効化)。実行は計画を組み直してから項目単位で処理 (クライアント由来の
   planは信頼しない — fileops/WP-13と同一規約)。
+  **既知挙動 (previewの安全側不一致 — 修正しない)**: previewは読み取り
+  専用の `OutputDir` で分類するため、開けない/安全でないパス (symlink済み
+  subdir等) は「不在」として報告され (`toWrite` に加算)、実行側は同じ
+  パスを拒否してfailedにする。つまりpreviewの予測が実行結果と不一致に
+  なり得るが、これは読み取り専用性・安全性を優先した既知の安全側挙動。
 - **部分失敗・キャンセル**: 単一項目の失敗 (ソース不在・書込エラー) は
   続行し manifest に記録。キャンセル (`export_cancel` → AtomicBool) は
   per-item境界で確認し、中断時もそれまでの成果 + manifestは残す
@@ -2464,11 +2476,13 @@ score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
   場合は以後のエクスポートを拒否し続ける (安全側 — 再起動で回復)。
 - **manifest** (`export-manifest.json` を出力dirへ): tmp書き→sync→
   **`renameat2(RENAME_NOREPLACE)` で出版** (FG-WP16-3 N3)。
-  既存 `export-manifest.json` が**GEN-TO自身の旧manifest**
-  (format_versionが現行と一致するJSON) なら最新runの記録として同一名で
-  置換する。それ以外 (ユーザー所有のファイル・破損) は**上書きせず**
-  回避名 `export-manifest-{run uuid}.json` へ出版する (応答の
-  `manifestPath` が実際のパスを報告)。
+  **既存ファイルは所有者を問わず (GEN-TO自身の旧manifestも含め) 一切
+  削除・上書きしない** (FG-WP16-4 R3 — 「所有確認→unlink」間に他actorが
+  差し替えたユーザーファイルを消しうるTOCTOUを、unlink自体をなくす
+  方針で解消)。正規名 `export-manifest.json` が空きならそこへ出版し、
+  占有されていれば回避名 `export-manifest-{run uuid}.json` へNOREPLACE
+  出版する (既存は不接触。応答の `manifestPath` が実際のパスを報告 —
+  再実行のたびに回避名のmanifestが蓄積するのはこの方針の帰結)。
   snake_case (backup artifactと同一規約)。内容: format_version / created_at /
   cancelled / structure / dest_dir / **asset_count (処理済み + plan失敗 +
   キャンセル未処理 = 要求した一意asset数。DTOの `total` と同一定義 —
@@ -2554,6 +2568,11 @@ score(d) = w · 1/(k + rank_sem(d)) + (1-w) · 1/(k + rank_kw(d))
     対象**。**空白を挟んで後に区切り (`/` `\`) が続くトークンはパス候補
     として丸ごと** scrubする (`/home/u/My Photos/x.png` 等。誤爆<漏れの
     方針。URLは `:` が継続を打ち切るため保持 — FG-WP16-3 B4)。
+    **既知の限界 (WP-17申し送り — FG-WP16-4で文書化)**: ①パス構成文字の
+    判定がASCII範囲のみのため、部分scrub後の非ASCII成分
+    (例: `/home/利用者/file.png` の `利用者/…` 部分) は漏れ得る
+    ②空白継続heuristicは後に区切りが続く散文を過剰scrubし得る
+    (「漏れ<誤爆」方針の既知の代償)。
   - `MetadataColumns`/`AssetMetadataParsed` のDebugを手動実装 (GPS列は
     `<gps>`、rawスロットはバイト数要約に伏せる — `{:?}` 混入時の防護)。
   - AIジョブ失敗時のwarnログ (scrub通し)。panic payloadのscrub。

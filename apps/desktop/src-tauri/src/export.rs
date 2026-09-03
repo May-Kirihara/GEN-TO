@@ -28,10 +28,13 @@
 //!   同名衝突は asset uuid 辞書順で `{stem}-{n}.{ext}` suffixを振る
 //!   (再実行で同一結果)。
 //! - **manifest**: `export-manifest.json` を出力dirへ
-//!   tmp→sync→`renameat2 NOREPLACE` で出版。既存ファイルがGEN-TO自身の
-//!   旧manifest (format_version一致) なら置換、それ以外 (ユーザー所有) は
-//!   上書きせず回避名 `export-manifest-{run uuid}.json` へ出版する
-//!   (FG-WP16-3 N3)。キャンセル・部分失敗も含めた全エントリを記録する。
+//!   tmp→sync→`renameat2 NOREPLACE` で出版。**既存ファイルは所有者を
+//!   問わず (GEN-TO自身の旧manifestも含め) 一切削除・上書きしない**
+//!   (FG-WP16-4 R3: 所有確認→unlink間の差し替え競合でユーザーファイル
+//!   を消しうるTOCTOUを、unlink自体をなくす方針で解消)。正規名が占有
+//!   されていれば回避名 `export-manifest-{run uuid}.json` へ出版し、
+//!   結果DTOの `manifestPath` が実際のパスを報告する。
+//!   キャンセル・部分失敗も含めた全エントリを記録する。
 //! - キャンセルは協調 ([`ExportService::cancel`] → AtomicBool、per-item境界)。
 //!   キャンセル時もそれまでの成果 + manifestは残す。
 
@@ -801,8 +804,8 @@ struct ExportManifestError {
 }
 
 /// manifestを組み立てて出版し、パスを返す。出版の所有権規約は
-/// [`publish_manifest_file`] (FG-WP16-3 N3: 自身の旧manifestのみ置換、
-/// ユーザー所有ファイルは上書きしない)。
+/// [`publish_manifest_file`] (FG-WP16-4 R3: 既存ファイルは一切削除・
+/// 上書きしない — 占有時は回避名へ出版)。
 fn publish_manifest(run: &ExportRun, created_at: &str) -> Result<PathBuf, String> {
     let mut exported = 0u64;
     let mut identical = 0u64;
@@ -867,11 +870,13 @@ fn publish_manifest(run: &ExportRun, created_at: &str) -> Result<PathBuf, String
     publish_manifest_file(&run.dest_dir, json.as_bytes())
 }
 
-/// manifestファイルを出版する (tmp書き→sync→`renameat2 NOREPLACE`。
-/// FG-WP16-3 N3: 既存 `export-manifest.json` が**GEN-TO自身の成果物**
-/// (format_version一致で判定) なら最新runの記録として置換する。ユーザー
-/// 所有のファイル (判定不能・破損) は上書きせず、回避名
-/// `export-manifest-{run uuid}.json` へ出版する。
+/// manifestファイルを出版する (tmp書き→sync→`renameat2 NOREPLACE`)。
+/// FG-WP16-4 R3: **既存ファイルは所有者を問わず一切削除・上書きしない**
+/// (GEN-TO自身の旧manifestも含む — 「所有確認→unlink」間の差し替え競合で
+/// ユーザーファイルを消しうるTOCTOUを、unlink自体をなくす方針で解消)。
+/// 正規名 `export-manifest.json` が空きならそこへ出版。占有されていれば
+/// 回避名 `export-manifest-{run uuid}.json` へNOREPLACE出版し (既存は
+/// 不接触) 、実パスを呼び出し側へ返す (結果DTOの `manifestPath`)。
 fn publish_manifest_file(dest_dir: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
     let root = gento_core::OutputDir::open_root(dest_dir).map_err(|e| {
         format!(
@@ -904,21 +909,11 @@ fn publish_manifest_file(dest_dir: &Path, bytes: &[u8]) -> Result<PathBuf, Strin
             sync_dir_best_effort(dest_dir);
             Ok(dest_dir.join(EXPORT_MANIFEST_FILE))
         }
+        // 正規名占有 (ユーザーファイル・GEN-TO旧manifestを問わず) —
+        // unlinkせず回避名へ (既存は不接触)
         Err(gento_core::RenameAtNoReplaceError::DestinationExists) => {
-            if manifest_is_gento_owned(&root, &final_name) {
-                // 自身の旧manifest → 最新runの記録として置換 (remove→norename)
-                if root.remove_file_at(&final_name).is_ok() {
-                    if let Ok(()) = root.rename_noreplace_at(&tmp, &final_name) {
-                        sync_dir_best_effort(dest_dir);
-                        return Ok(dest_dir.join(EXPORT_MANIFEST_FILE));
-                    }
-                }
-                // 置換に失敗 (競合) → 回避名へ (下と同じ経路)
-            }
-            // ユーザー所有または置換失敗 → 回避名 (決して上書きしない)
             let alt = OsString::from(format!("export-manifest-{run_uuid}.json"));
-            let result = root.rename_noreplace_at(&tmp, &alt);
-            match result {
+            match root.rename_noreplace_at(&tmp, &alt) {
                 Ok(()) => {
                     sync_dir_best_effort(dest_dir);
                     Ok(dest_dir.join(alt.to_string_lossy().into_owned()))
@@ -948,25 +943,6 @@ fn publish_manifest_file(dest_dir: &Path, bytes: &[u8]) -> Result<PathBuf, Strin
 fn sync_dir_best_effort(dest_dir: &Path) {
     if let Ok(dir) = File::open(dest_dir) {
         let _ = dir.sync_all();
-    }
-}
-
-/// 既存の `export-manifest.json` がGEN-TO自身の成果物か (format_versionが
-/// 現行と一致するJSON)。破損・不一致・読取不能はユーザー所有扱い。
-fn manifest_is_gento_owned(root: &gento_core::OutputDir, name: &OsStr) -> bool {
-    let Ok((mut file, _md)) = root.open_regular_at(name) else {
-        return false;
-    };
-    let mut body = String::new();
-    if file.read_to_string(&mut body).is_err() {
-        return false;
-    }
-    match serde_json::from_str::<serde_json::Value>(&body) {
-        Ok(value) => {
-            value.get("format_version").and_then(|v| v.as_u64())
-                == Some(EXPORT_MANIFEST_VERSION as u64)
-        }
-        Err(_) => false,
     }
 }
 
@@ -2169,14 +2145,26 @@ mod tests {
         assert_eq!(entry["image"], "written");
         assert_eq!(entry["txt"], "written");
         assert_eq!(entry["caption_source"], "none");
-        // 再実行でmanifestは最新runへ置換される (identicalに更新)
-        service.execute(&[a], &dest, ExportStructure::Flat).unwrap();
-        let manifest2: serde_json::Value = serde_json::from_str(
+        // 再実行: 正規名は最初のrunのままで、新manifestは回避名へ
+        // (FG-WP16-4 R3 — 既存は一切削除・上書きしない)
+        let second = service.execute(&[a], &dest, ExportStructure::Flat).unwrap();
+        assert_ne!(
+            second.manifest_path,
+            dest.join(EXPORT_MANIFEST_FILE).display().to_string(),
+            "正規名占有時は回避名へ出版: {}",
+            second.manifest_path
+        );
+        assert!(second.manifest_path.contains("export-manifest-"));
+        let manifest2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&second.manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest2["summary"]["identical"], 1);
+        assert_eq!(manifest2["summary"]["exported"], 0);
+        // 正規名の旧manifestは無傷 (最初のrunの内容のまま)
+        let manifest1_again: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dest.join(EXPORT_MANIFEST_FILE)).unwrap(),
         )
         .unwrap();
-        assert_eq!(manifest2["summary"]["identical"], 1);
-        assert_eq!(manifest2["summary"]["exported"], 0);
+        assert_eq!(manifest1_again["summary"]["exported"], 1);
     }
 
     // ===== 代表file: 重複登録 =====
@@ -2442,22 +2430,32 @@ mod tests {
         assert_eq!(parsed["cancelled"], true);
     }
 
-    /// 既存の `export-manifest.json` がGEN-TO成果物 (format_version一致) なら
-    /// 最新runの記録として置換する (従来どおり同一パス)。
+    /// FG-WP16-4 R3: 正規名の占有者がGEN-TO自身の旧manifestでも置換
+    /// (unlink) しない — 回避名へ出版し、旧manifestは残置、戻り値が
+    /// 実際のパスを報告する (所有確認→unlink間の差し替えでユーザー
+    /// ファイルを消しうるTOCTOUの構造的解消)。
     #[test]
-    fn manifest_replaces_gento_owned_file_in_place() {
+    fn manifest_never_replaces_even_gento_owned_file() {
         let dir = TestDir::new("mown");
-        // 先行runのmanifest (format_version 1)
+        // 先行runのmanifest (正規名をGEN-TO自身が占有)
         let first = cancelled_run_base(dir.0.clone());
         publish_manifest(&first, "2026-09-03T00:00:00Z").unwrap();
         assert!(dir.0.join(EXPORT_MANIFEST_FILE).exists());
-        // 再実行 → 同一名へ置換
+        // 再実行 → 回避名へ (旧manifestは残置)
         let second = cancelled_run_base(dir.0.clone());
         let path = publish_manifest(&second, "2026-09-03T00:01:00Z").unwrap();
-        assert_eq!(path, dir.0.join(EXPORT_MANIFEST_FILE));
-        let parsed: serde_json::Value =
+        assert_ne!(path, dir.0.join(EXPORT_MANIFEST_FILE), "回避名へ出版される");
+        assert!(path.to_string_lossy().contains("export-manifest-"));
+        // 旧manifestは無傷 (最初のrunの内容のまま)
+        let old: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.0.join(EXPORT_MANIFEST_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(old["created_at"], "2026-09-03T00:00:00Z");
+        // 新manifestは回避名にあり、最新runの内容
+        let new: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(parsed["created_at"], "2026-09-03T00:01:00Z");
+        assert_eq!(new["created_at"], "2026-09-03T00:01:00Z");
     }
 
     fn cancelled_run_base(dest_dir: PathBuf) -> ExportRun {
