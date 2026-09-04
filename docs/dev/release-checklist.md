@@ -7,8 +7,8 @@
 
 - 現在の状態 (2026-09-04): Linux実機E2Eは全て実測済み。
   **Windows実機・Wayland実機の検証は利用者承認済みでRCゲートへ先送り**
-  (§4)。cargo基準 961 (b6e7858時点956 + WP-18-1の5) / vitest基準 529
-  (b6e7858時点・45ファイル)。
+  (§4)。cargo基準 965 (9cf9b49時点963 + FG-WP18-1の2) / vitest基準
+  549 (9cf9b49時点・49ファイル)。
 
 ## 1. MVPリリース阻止条件 — 証拠マトリクス
 
@@ -101,6 +101,10 @@ bash scripts/release-smoke.sh   # featureなしreleaseにdev系識別子不在+�
    (`scripts/gen-licenses.sh`) し、`licenses/MODEL-LICENSES.md` (埋め込み
    モデル) とともに成果物へ同梱されていることを確認 (tauri.conf.json
    resources)。
+   - 配布scope policy (FG-WP18-1): Rust側 = **Cargo.lockの全package**
+     (build-tool系optional依存を含む)。完全性は `licenses_notice` unit
+     test (gento-tauri) が `cargo test --workspace` で常時検証する。
+     依存変更後の再生成を怠るとこのテストが赤くなる。
 6. **バージョン情報**: `CHANGELOG.md`・about表示のバージョン/commitが
    正しいこと (WP-18後半の成果物)。
 

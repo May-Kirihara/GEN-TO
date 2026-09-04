@@ -29,6 +29,10 @@ pub mod settings;
 pub mod thumbnails;
 pub mod vectorindex;
 
+// 配布物license完全性の回帰検査 (FG-WP18-1)。本体コードは持たない。
+#[cfg(test)]
+mod licenses_notice;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 

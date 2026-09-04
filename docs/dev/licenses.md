@@ -1,14 +1,17 @@
 # 依存ライセンス一覧 (自動生成)
 
-- 生成日: 2026-09-02
+- 生成日: 2026-09-04
 - 生成コマンド: `scripts/gen-licenses.sh` (要 cargo / jq / pnpm)
-- 内容: Cargo.lock解決グラフの全Rustクレート + apps/desktopのnpm依存 (prod+dev)。
-  依存を追加・更新した際は再生成してコミットすること。
-- Rust側のworkspaceメンバー (gento-core/gento-image/gento-tauri) は本リポジトリ管理。
+- 内容: Rust = **Cargo.lockの全package** (workspaceメンバー + build-tool系
+  optional依存を含む。cargo metadata解決graph外の分も網羅 — FG-WP18-1)、
+  npm = apps/desktop依存 (prod+dev)。
+  依存を追加・更新した際は再生成してコミットすること (完全性は
+  gento-tauriの licenses_notice unit test が常時検証する)。
+- Rust側のworkspaceメンバー (gento-* の8 crate) は本リポジトリ管理。
   license欄が空のクレートはpackage.json/Cargo.tomlにlicense宣言がないもの
   (入手元のリポジトリで確認すること)。
 
-## Rust (workspace + Cargo.lock依存)
+## Rust (Cargo.lock全package)
 
 | クレート | バージョン | license | 入手元 |
 |---|---|---|---|
@@ -19,6 +22,7 @@
 | alloc-no-stdlib | 2.0.4 | BSD-3-Clause | https://github.com/dropbox/rust-alloc-no-stdlib |
 | alloc-stdlib | 0.2.4 | BSD-3-Clause | https://github.com/dropbox/rust-alloc-no-stdlib |
 | android_system_properties | 0.1.6 | MIT OR Apache-2.0 | https://github.com/nical/android_system_properties |
+| anstyle | 1.0.14 | MIT OR Apache-2.0 | https://github.com/rust-cli/anstyle |
 | anyhow | 1.0.104 | MIT OR Apache-2.0 | https://github.com/dtolnay/anyhow |
 | apple-native-keyring-store | 1.0.2 | MIT OR Apache-2.0 | https://github.com/open-source-cooperative/apple-native-keyring-store.git |
 | arrayvec | 0.7.8 | MIT OR Apache-2.0 | https://github.com/bluss/arrayvec |
@@ -81,6 +85,9 @@
 | chacha20 | 0.10.2 | MIT OR Apache-2.0 | https://github.com/RustCrypto/stream-ciphers |
 | chrono | 0.4.45 | MIT OR Apache-2.0 | https://github.com/chronotope/chrono |
 | cipher | 0.5.2 | MIT OR Apache-2.0 | https://github.com/RustCrypto/traits |
+| clap | 4.6.6 | MIT OR Apache-2.0 | https://github.com/clap-rs/clap |
+| clap_builder | 4.6.6 | MIT OR Apache-2.0 | https://github.com/clap-rs/clap |
+| clap_lex | 1.1.0 | MIT OR Apache-2.0 | https://github.com/clap-rs/clap |
 | cmake | 0.1.58 | MIT OR Apache-2.0 | https://github.com/rust-lang/cmake-rs |
 | cmov | 0.5.4 | Apache-2.0 OR MIT | https://github.com/RustCrypto/utils |
 | codespan-reporting | 0.13.1 | Apache-2.0 | https://github.com/brendanzab/codespan |
@@ -113,6 +120,7 @@
 | ctutils | 0.4.2 | Apache-2.0 OR MIT | https://github.com/RustCrypto/utils |
 | cxx | 1.0.199 | MIT OR Apache-2.0 | https://github.com/dtolnay/cxx |
 | cxx-build | 1.0.199 | MIT OR Apache-2.0 | https://github.com/dtolnay/cxx |
+| cxxbridge-cmd | 1.0.199 | MIT OR Apache-2.0 | https://github.com/dtolnay/cxx |
 | cxxbridge-flags | 1.0.199 | MIT OR Apache-2.0 | https://github.com/dtolnay/cxx |
 | cxxbridge-macro | 1.0.199 | MIT OR Apache-2.0 | https://github.com/dtolnay/cxx |
 | daachorse | 1.0.1 | MIT OR Apache-2.0 | https://github.com/daac-tools/daachorse |
@@ -410,11 +418,11 @@
 | quote | 1.0.47 | MIT OR Apache-2.0 | https://github.com/dtolnay/quote |
 | r-efi | 5.3.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later | https://github.com/r-efi/r-efi |
 | r-efi | 6.0.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later | https://github.com/r-efi/r-efi |
-| rand | 0.9.5 | MIT OR Apache-2.0 | https://github.com/rust-random/rand |
 | rand | 0.10.2 | MIT OR Apache-2.0 | https://github.com/rust-random/rand |
+| rand | 0.9.5 | MIT OR Apache-2.0 | https://github.com/rust-random/rand |
 | rand_chacha | 0.9.0 | MIT OR Apache-2.0 | https://github.com/rust-random/rand |
-| rand_core | 0.9.5 | MIT OR Apache-2.0 | https://github.com/rust-random/rand |
 | rand_core | 0.10.1 | MIT OR Apache-2.0 | https://github.com/rust-random/rand_core |
+| rand_core | 0.9.5 | MIT OR Apache-2.0 | https://github.com/rust-random/rand |
 | rand_pcg | 0.10.2 | MIT OR Apache-2.0 | https://github.com/rust-random/rngs |
 | raw-window-handle | 0.6.2 | MIT OR Apache-2.0 OR Zlib | https://github.com/rust-windowing/raw-window-handle |
 | rawpointer | 0.2.1 | MIT/Apache-2.0 | https://github.com/bluss/rawpointer/ |
@@ -738,7 +746,10 @@
 | @types/esrecurse | 4.3.1 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/esrecurse |
 | @types/estree | 1.0.9 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/estree |
 | @types/json-schema | 7.0.15 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/json-schema |
+| @types/node | 26.4.1 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/node |
 | @types/trusted-types | 2.0.7 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/trusted-types |
+| @types/whatwg-mimetype | 3.0.2 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/whatwg-mimetype |
+| @types/ws | 8.18.1 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/ws |
 | @typescript-eslint/eslint-plugin | 8.68.0 | MIT | https://typescript-eslint.io/packages/eslint-plugin |
 | @typescript-eslint/parser | 8.68.0 | MIT | https://typescript-eslint.io/packages/parser |
 | @typescript-eslint/project-service | 8.68.0 | MIT | https://typescript-eslint.io |
@@ -764,6 +775,7 @@
 | axobject-query | 4.1.0 | Apache-2.0 | https://github.com/A11yance/axobject-query#readme |
 | balanced-match | 4.0.4 | MIT | https://github.com/juliangruber/balanced-match#readme |
 | brace-expansion | 5.0.9 | MIT | https://github.com/juliangruber/brace-expansion#readme |
+| buffer-image-size | 0.6.4 | MIT | https://github.com/evidentpoint/buffer-image-size#readme |
 | chai | 6.2.2 | MIT | http://chaijs.com |
 | chokidar | 4.0.3 | MIT | https://github.com/paulmillr/chokidar |
 | clsx | 2.1.1 | MIT | https://github.com/lukeed/clsx#readme |
@@ -775,6 +787,7 @@
 | deepmerge | 4.3.1 | MIT | https://github.com/TehShrike/deepmerge |
 | detect-libc | 2.1.2 | Apache-2.0 | https://github.com/lovell/detect-libc#readme |
 | devalue | 5.9.2 | MIT | https://github.com/sveltejs/devalue#readme |
+| entities | 7.0.1 | BSD-2-Clause | https://github.com/fb55/entities#readme |
 | es-module-lexer | 2.3.2 | MIT | https://github.com/guybedford/es-module-lexer#readme |
 | escape-string-regexp | 4.0.0 | MIT | https://github.com/sindresorhus/escape-string-regexp#readme |
 | eslint | 10.9.1 | MIT | https://eslint.org |
@@ -800,6 +813,7 @@
 | flatted | 3.4.4 | ISC | https://github.com/WebReflection/flatted#readme |
 | glob-parent | 6.0.2 | ISC | https://github.com/gulpjs/glob-parent#readme |
 | globals | 16.5.0, 17.11.0 | MIT | https://github.com/sindresorhus/globals#readme |
+| happy-dom | 20.13.2 | MIT | https://github.com/capricorn86/happy-dom |
 | ignore | 5.3.2, 7.0.6 | MIT | https://github.com/kaelzhang/node-ignore#readme |
 | imurmurhash | 0.1.4 | MIT | https://github.com/jensyt/imurmurhash-js |
 | is-extglob | 2.1.1 | MIT | https://github.com/jonschlinkert/is-extglob |
@@ -860,14 +874,17 @@
 | type-check | 0.4.0 | MIT | https://github.com/gkz/type-check |
 | typescript | 6.0.3 | Apache-2.0 | https://www.typescriptlang.org/ |
 | typescript-eslint | 8.68.0 | MIT | https://typescript-eslint.io/packages/typescript-eslint |
+| undici-types | 8.3.0 | MIT | https://undici.nodejs.org |
 | uri-js | 4.4.1 | BSD-2-Clause | https://github.com/garycourt/uri-js |
 | util-deprecate | 1.0.2 | MIT | https://github.com/TooTallNate/util-deprecate |
 | vite | 8.2.2 | MIT | https://vite.dev |
 | vitefu | 1.1.3 | MIT | https://github.com/svitejs/vitefu#readme |
 | vitest | 4.1.11 | MIT | https://vitest.dev |
+| whatwg-mimetype | 3.0.0 | MIT | https://github.com/jsdom/whatwg-mimetype#readme |
 | which | 2.0.2 | ISC | https://github.com/isaacs/node-which#readme |
 | why-is-node-running | 2.3.0 | MIT | https://github.com/mafintosh/why-is-node-running |
 | word-wrap | 1.2.5 | MIT | https://github.com/jonschlinkert/word-wrap |
+| ws | 8.21.3 | MIT | https://github.com/websockets/ws |
 | yaml | 1.10.3 | ISC | https://eemeli.org/yaml/v1/ |
 | yocto-queue | 0.1.0 | MIT | https://github.com/sindresorhus/yocto-queue#readme |
 | zimmerframe | 1.1.4 | MIT | https://github.com/sveltejs/zimmerframe#readme |

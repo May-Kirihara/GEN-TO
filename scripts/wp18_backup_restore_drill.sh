@@ -8,8 +8,10 @@
 # 演習の流れ (計画書§26「バックアップからの復元演習」):
 #   P1) 登録 (実キー入力でルート追加) → ハッシュ → ★5評価 + タグ付与
 #   P2) ポータブルバックアップ作成 (dev bridge 6 = 生産command経由)
-#   P3) アンインストール相当: DB (+WAL/SHM) とサムネイルキャッシュを削除
-#       — .gentoバックアップと元画像は残す (OS慣行: データは残る設計)
+#   P3) アプリデータ喪失の再現: DB (+WAL/SHM) とサムネイルキャッシュを削除
+#       — .gentoバックアップと元画像は残す (パッケージ削除ではない。
+#       実際のuninstallではDB等は保持される — ここでは意図的に
+#       より厳しい喪失条件を再現している)
 #   P4) 再起動 (=新規DBをmigrationで作成) → 同ルート再登録 → 再ハッシュ
 #       — 評価/タグが失われた状態 (データ消失の実証) を確認
 #   P5) 復元 (dev bridge 7 = plan→確認トークン→execute. RestoreDialogと
@@ -18,8 +20,10 @@
 #
 # この演習で機械的にカバーできない部分 (debアンインストーラ実行・
 # デスクトップエントリ削除等) は docs/handoff/2026-09-04-mvp-wp18-1.md
-# の手順書を参照 (DB削除はアプリデータ消失の本体であり、ここで等価に
-# 再現している)。
+# の手順書を参照。P3のDB+キャッシュ削除はアンインストールの再現では
+# なく、アンインストール時には通常保持されるアプリデータを意図的に
+# 失わせる**より厳しい**喪失シナリオである (パッケージ削除後のデータ
+# 保持確認はrelease-checklist §3.4の手動ゲート)。
 #
 # 運用メモ: 専用Xディスプレイ (既定 :6 = Xephyr。無ければ起動)。
 # dev bridgeの機械可読行 (app.logの devtest: 行) で検証する。
@@ -181,7 +185,7 @@ else
 fi
 shot 02-backup-created
 
-# ========== P3) アンインストール相当: DB+キャッシュ削除 (.gentoは残す) ==========
+# ========== P3) アプリデータ喪失の再現: DB+キャッシュ削除 (.gentoは残す) ==========
 graceful_stop && pass "P3: SIGTERM graceful終了" || fail "P3: graceful終了せず"
 rm -f "$DB" "$DB-wal" "$DB-shm"
 rm -rf "$WORK/env/thumbs"; mkdir -p "$WORK/env/thumbs"
@@ -203,7 +207,7 @@ if wait_value tags 0 8 && [[ "$(devtest_value rat || echo -)" == "0" ]]; then
 else
   fail "P4: 復元前状態が期待と違う (rat=$(devtest_value rat || echo -) tags=$(devtest_value tags || echo -))"
 fi
-shot 03-fresh-db-after-uninstall-equivalent
+shot 03-fresh-db-after-data-loss
 
 xdotool key ctrl+shift+F12; sleep 0.4         # foCmdMode
 xdotool key 7; sleep 1.0                      # bkRestoreLatest
