@@ -10,9 +10,10 @@
     *   Ctrl修飾=コピー。ツリーノードへドロップ)
     */
   import { onDestroy } from "svelte";
-  import type { FolderTreeStore } from "../fsview";
-  import { registeredStateFor } from "../fsview";
+  import type { FolderTreeStore, TreeContextTarget } from "../fsview";
+  import { registeredStateFor, treeContextTargetFor } from "../fsview";
   import type { LibraryRoot } from "../library";
+  import ContextMenu, { type MenuAction } from "../ui/ContextMenu.svelte";
 
   let {
     tree,
@@ -21,10 +22,13 @@
     libraryMode,
     onSelect,
     onDrop,
+    onRegisterRoot,
+    onUnregisterRoot,
+    onBackupRoot,
+    onRescan,
   }: {
     tree: FolderTreeStore;
     roots: LibraryRoot[];
-    /** 現在閲覧中フォルダ (未登録表示時)。 */
     currentFolder: string | null;
     libraryMode: boolean;
     onSelect: (path: string) => void;
@@ -32,6 +36,14 @@
     onDrop:
       | ((destPath: string, paths: string[], copy: boolean) => void)
       | undefined;
+    /** UIUX-1: 未登録フォルダを登録ルートへ追加 (library.addRoot経路)。 */
+    onRegisterRoot: (path: string) => void;
+    /** UIUX-1: 登録ルートを解除。 */
+    onUnregisterRoot: (rootId: string) => void;
+    /** UIUX-1: ルート単位の.gentoバックアップダイアログ (WP-13)。 */
+    onBackupRoot: (root: LibraryRoot) => void;
+    /** UIUX-1: ライブラリ全体の再スキャン (per-root APIは無く全体スキャンで代用)。 */
+    onRescan: () => void;
   } = $props();
 
   let treeTick = $state(0);
@@ -128,6 +140,79 @@
     event.preventDefault();
     onDrop(path, paths, event.ctrlKey || event.metaKey);
   }
+
+  // ===== UIUX-1: 右クリックコンテキストメニュー (R-D 3状態) =====
+
+  /** 開いているメニューの不変スナップショット (クリック時点のpath/rootId)。 */
+  let treeMenu = $state<{ x: number; y: number; target: TreeContextTarget } | null>(null);
+
+  $effect(() => {
+    // roots更新でスナップショットがstale (状態kindが変化) したら閉じる。
+    // 無関係なroots変化 (他ルートの追加) では閉じない。
+    void roots;
+    const open = treeMenu;
+    if (open === null) {
+      return;
+    }
+    if (treeContextTargetFor(open.target.path, roots).kind !== open.target.kind) {
+      treeMenu = null;
+    }
+  });
+
+  function handleRowContextMenu(event: MouseEvent, path: string): void {
+    // WebView既定のコンテキストメニューを出さない。伝播も止めて
+    // 単一ノードのメニューだけを開く (行入れ子・パネル境界の二重発火防止)。
+    event.preventDefault();
+    event.stopPropagation();
+    const target = treeContextTargetFor(path, roots);
+    if (target.kind === "descendant") {
+      // 登録ルート配下: 追加・解除の対象外。ナビは通常クリック (既存) のみ
+      return;
+    }
+    treeMenu = { x: event.clientX, y: event.clientY, target };
+  }
+
+  function menuActionsOf(target: TreeContextTarget): MenuAction[] {
+    if (target.kind === "unrelated") {
+      return [
+        {
+          id: "register",
+          label: "このフォルダーを登録ルートに追加",
+          title: "ライブラリへ登録して走査・編集可能にします",
+          run: () => onRegisterRoot(target.path),
+        },
+      ];
+    }
+    if (target.kind === "root") {
+      const rootId = target.rootId;
+      return [
+        {
+          id: "unregister",
+          label: "登録を解除",
+          title: "このルートの登録をDBから解除します (ファイルは影響しません)",
+          run: () => onUnregisterRoot(rootId),
+        },
+        {
+          id: "backup",
+          label: "このルートをバックアップ",
+          title: "このルートのメタデータを.gentoバックアップへ書き出します",
+          run: () => {
+            const root = roots.find((entry) => entry.id === rootId);
+            if (root !== undefined) {
+              onBackupRoot(root);
+            }
+          },
+        },
+        {
+          id: "rescan",
+          label: "ライブラリを再スキャン",
+          title: "登録ルート全体の再スキャンを開始します (per-rootスキャンではなく全体)",
+          run: onRescan,
+        },
+      ];
+    }
+    return [];
+  }
 </script>
 
 <div class="tree-pane">
@@ -146,6 +231,7 @@
         ondragover={(event) => handleDragOver(event, row.path)}
         ondragleave={() => handleDragLeave(row.path)}
         ondrop={(event) => handleDrop(event, row.path)}
+        oncontextmenu={(event) => handleRowContextMenu(event, row.path)}
       >
         <button
           class="tree-expander"
@@ -195,12 +281,21 @@
   {/if}
 </div>
 
+{#if treeMenu !== null}
+  <ContextMenu
+    x={treeMenu.x}
+    y={treeMenu.y}
+    actions={menuActionsOf(treeMenu.target)}
+    onClose={() => (treeMenu = null)}
+  />
+{/if}
+
 <style>
   .tree-pane {
     display: flex;
     flex-direction: column;
-    /* 左ペインはFolderTree + CollectionsPane + LibraryPanelの3子なので
-     * height:100%でなくflex配分にする (WP-6)。 */
+    /* UIUX-1: 左ペインはタブ化され本コンポーネントはパネル単独の子。
+     * 内部スクロール (.tree-scroll) が高さを握る。 */
     flex: 1 1 auto;
     min-height: 6rem;
   }

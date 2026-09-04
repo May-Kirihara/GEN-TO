@@ -31,6 +31,7 @@
     emptySelection,
     type MoveAction,
   } from "./selection";
+  import { computeWheelScroll, conditionalWheel } from "./wheel-speed";
   import type { GridStore } from "./grid-store";
   import type { ScrollPositionStore } from "./scroll-position";
   import type { ImageListItem } from "../catalog-types";
@@ -41,6 +42,7 @@
     modeKey,
     cellClass,
     overscanRows,
+    scrollSpeed = 1,
     onOpen,
     onSelectionChange,
     onContextMenu,
@@ -58,6 +60,8 @@
     modeKey: string;
     cellClass: ThumbCellClass;
     overscanRows: number;
+    /** UIUX-1: ホイールスクロール速度係数 (既定1.0=ネイティブ。1.0ではリスナ未登録)。 */
+    scrollSpeed?: number;
     /** ダブルクリック/中央キー(Enter)でビューアを開く (WP-6)。indexを渡す。 */
     onOpen?: (index: number) => void;
     /** 選択変化の通知 (比較表示の充填ソース用、WP-6)。 */
@@ -345,6 +349,29 @@
     }
   }
 
+  // ===== UIUX-1: ホイールスクロール速度 (R-C) =====
+
+  /**
+   * 係数≠1.0のときだけ速度を適用するwheelハンドラ (action経由でpassive:false)。
+   * ctrlKey (ピンチズーム) は素通り。端ではscrollByが自然に停止する
+   * (チェイニング阻害なし)。
+   */
+  function handleWheel(event: WheelEvent): void {
+    const element = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
+    if (element === null) {
+      return;
+    }
+    const delta = computeWheelScroll(event.deltaY, event.deltaMode, scrollSpeed, {
+      lineHeight: extent,
+      pageHeight: element.clientHeight,
+    });
+    if (delta === null) {
+      return;
+    }
+    event.preventDefault();
+    element.scrollBy({ top: delta });
+  }
+
   // ===== WP-7: リネーム (F2インライン) =====
 
   let renameValue = $state("");
@@ -529,6 +556,7 @@
     onclick={handleClick}
     ondblclick={handleDblClick}
     oncontextmenu={handleContextMenu}
+    use:conditionalWheel={{ enabled: scrollSpeed !== 1, handler: handleWheel }}
   >
     <div class="grid-inner" style="height:{totalSize}px">
       {#each vitems as row (row.key)}

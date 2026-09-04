@@ -2,6 +2,7 @@
   import { onDestroy, onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
   import { normalizeHealth, type HealthInfo, type HealthUiState } from "./lib/health";
   import {
     CatalogStore,
@@ -29,9 +30,8 @@
   import { CompareStore, type CompareIpc } from "./lib/compare/compare-store";
   import CompareView from "./lib/compare/CompareView.svelte";
   import { perf } from "./lib/perf";
-  import { breadcrumbOf, deriveEmptyState } from "./lib/browse";
-  import { FolderTreeStore } from "./lib/fsview";
-  import { registeredStateFor } from "./lib/fsview";
+  import { breadcrumbOf, deriveEmptyState, normalizePastedPath } from "./lib/browse";
+  import { FolderTreeStore, registeredStateFor } from "./lib/fsview";
   import { QuickPreviewStore } from "./lib/preview/quick-preview";
   import QuickPreview from "./lib/preview/QuickPreview.svelte";
   import {
@@ -44,6 +44,7 @@
   import {
     LayoutPrefsStore,
     clampPaneWidth,
+    type LeftPaneTab,
   } from "./lib/ui/layout-prefs";
   import { FolderPrefsStore, LIBRARY_SORT_KEY } from "./lib/ui/folder-prefs";
   import { copyText } from "./lib/ui/clipboard";
@@ -114,6 +115,8 @@
   import { focusTrap } from "./lib/ui/focus-trap";
   type TriageKeyAction = import("./lib/triage-keys").TriageKeyAction;
   import ContextMenu, { type MenuAction } from "./lib/ui/ContextMenu.svelte";
+  import MenuBar, { type MenuDef } from "./lib/ui/MenuBar.svelte";
+  import LeftPaneTabs from "./lib/ui/LeftPaneTabs.svelte";
   import FolderTree from "./lib/shell/FolderTree.svelte";
   import CollectionsPane from "./lib/shell/CollectionsPane.svelte";
   import CollectionPicker from "./lib/ui/CollectionPicker.svelte";
@@ -146,7 +149,7 @@
   let libraryError = $state<string | null>(null);
   let libraryScanBusy = $state(false);
 
-  // ===== レイアウト (WP-4: 3ペイン) =====
+  // ===== レイアウト (WP-4: 3ペイン / UIUX-1: タブ・スクロール速度) =====
 
   const layoutStore = new LayoutPrefsStore(localStorage);
   const folderStore = new FolderPrefsStore(localStorage);
@@ -156,6 +159,10 @@
   let rightWidth = $state(280);
   let cellClass = $state<ThumbCellClass>("s256");
   let overscanChoice = $state(2);
+  /** 左ペインのアクティブタブ (全パネルはマウント維持・隠蔽切替)。 */
+  let leftTab = $state<LeftPaneTab>("folders");
+  /** ホイールスクロール速度係数 (1.0=ネイティブ=ハンドラ実質無効)。 */
+  let scrollSpeed = $state(1);
 
   // ===== 閲覧状態 =====
 
@@ -310,8 +317,9 @@
   let backupFor = $state<LibraryRoot | null>(null);
   /** 復元ダイアログ。 */
   let restoreOpen = $state(false);
-  // WP-15: 設定ダイアログ (ヘッダー歯車から)
+  // WP-15: 設定ダイアログ (メニューバー ツール>設定… から)
   let settingsOpen = $state(false);
+  let settingsInitialTab = $state<"general" | "about">("general");
   let settingsProfiles = $state<AiProfile[]>([]);
   const settingsDisplayInfo = $derived.by(() => {
     const prefs = folderStore.load();
@@ -322,10 +330,13 @@
       lastFolder: currentFolder,
       expandedCount: tree.expandedPaths().length,
       sortLabel,
+      scrollSpeed,
     };
   });
 
-  async function openSettings(): Promise<void> {
+  /** メニューの「設定…」/「このアプリについて」導線 (初期タブ指定)。 */
+  async function openSettings(initialTab: "general" | "about" = "general"): Promise<void> {
+    settingsInitialTab = initialTab;
     settingsOpen = true;
     // AI タブ表示用にプロファイルを一度だけ取得 (短命モーダル規約)
     try {
@@ -410,6 +421,130 @@
     } finally {
       fullDbBusy = false;
     }
+  }
+
+  // ===== UIUX-1: メニューバー・ツリー右クリック・パンくず入力 =====
+
+  /** アプリ終了 (Tauri window close経路。capabilitiesがcore:window:allow-closeを要求)。 */
+  async function quitApp(): Promise<void> {
+    try {
+      await getCurrentWindow().close();
+    } catch (error) {
+      folderNotice = `終了できませんでした: ${toErrorMessage(error)}`;
+    }
+  }
+
+  /** ツリー右クリック: 未登録フォルダを登録 (登録→見える導線はUXLIB-1規約)。 */
+  async function registerRootFromTree(path: string): Promise<void> {
+    const ok = await library.addRoot(path);
+    if (!ok) {
+      libraryError = library.lastError ?? "登録に失敗しました";
+      return;
+    }
+    await showLibrary();
+  }
+
+  /** ツリー右クリック: 登録解除 (状態が変わるだけ。表示はshowLibrary/ツリーで追従)。 */
+  async function unregisterRootFromTree(rootId: string): Promise<void> {
+    const ok = await library.removeRoot(rootId);
+    if (!ok) {
+      libraryError = library.lastError ?? "解除に失敗しました";
+    }
+  }
+
+  /** ツリー右クリック: ライブラリ全体の再スキャン (per-root APIは存在しない)。 */
+  async function rescanLibraryFromTree(): Promise<void> {
+    const ok = await library.startScan();
+    if (!ok) {
+      libraryError = library.lastError ?? "再スキャン開始に失敗しました";
+    }
+  }
+
+  /** ツール>「ルートのバックアップ…」: 1ルートなら直開、複数なら選択picker。 */
+  let backupPickOpen = $state(false);
+
+  function backupRootFromMenu(): void {
+    if (libraryRoots.length === 1) {
+      backupFor = libraryRoots[0]!;
+      return;
+    }
+    if (libraryRoots.length > 1) {
+      backupPickOpen = true;
+    }
+  }
+
+  /** メニューのエクスポート対象があるか (表示中コレクション優先・次に選択資産)。 */
+  function menuExportAvailable(): boolean {
+    if (activeCollection !== null) {
+      return true;
+    }
+    return stableSelectionIds().length > 0;
+  }
+
+  function exportFromMenu(): void {
+    const collection = activeCollection;
+    if (collection !== null) {
+      void startExportForCollection(collection);
+      return;
+    }
+    const items: ImageListItem[] = [];
+    const ids = new Set(gridSelection.ids);
+    for (const [, index] of grid.pager.findIndicesByIds(ids)) {
+      const item = grid.getItem(index);
+      if (item !== null) {
+        items.push(item);
+      }
+    }
+    startExportForSelection(items);
+  }
+
+  /** パンくずのパス入力モード (UIUX-1 / R-E)。 */
+  let pathInputOpen = $state(false);
+  let pathInputValue = $state("");
+
+  function openPathInput(): void {
+    pathInputValue = currentFolder ?? "/";
+    pathInputOpen = true;
+  }
+
+  function cancelPathInput(): void {
+    pathInputOpen = false;
+  }
+
+  function commitPathInput(): void {
+    const raw = pathInputValue;
+    pathInputOpen = false;
+    const result = normalizePastedPath(raw);
+    if (!result.ok) {
+      folderNotice = result.error;
+      return;
+    }
+    // 通常のツリー選択と同一遷移 (library/collection表示モードからの脱出を含む)
+    void selectFolder(result.path);
+  }
+
+  /** 左ペインタブ切替 (フォーカス移動・永続化)。 */
+  function setLeftTab(tab: LeftPaneTab): void {
+    leftTab = tab;
+    saveLayout();
+    requestAnimationFrame(() => {
+      document.getElementById(`left-panel-${tab}`)?.focus({ preventScroll: true });
+    });
+  }
+
+  /** パンくずのパス入力をDOM挿入時にフォーカス・全選択 (Svelte action)。 */
+  function autofocusSelect(node: HTMLInputElement): void {
+    node.focus();
+    node.select();
+  }
+
+  /** ツールバーの速度スライダー (入力時に即時反映・changeで永続化)。 */
+  function onScrollSpeedInput(value: number): void {
+    scrollSpeed = value;
+  }
+
+  function onScrollSpeedCommit(): void {
+    saveLayout();
   }
 
   /** 選択項目のパス列 (ライブラリ表示中のみ。ファイル操作の対象)。 */
@@ -2268,6 +2403,8 @@
       leftWidth,
       rightWidth,
       thumbSize: cellClass,
+      scrollSpeed,
+      leftTab,
     });
   }
 
@@ -2335,13 +2472,15 @@
     perf.startLongTaskObserver();
     perf.startFrameMonitor();
 
-    // レイアウト・閲覧状態の復元 (WP-4)
+    // レイアウト・閲覧状態の復元 (WP-4 / UIUX-1: タブ・速度)
     const layout = layoutStore.load();
     leftVisible = layout.leftVisible;
     rightVisible = layout.rightVisible;
     leftWidth = layout.leftWidth;
     rightWidth = layout.rightWidth;
     cellClass = layout.thumbSize;
+    leftTab = layout.leftTab;
+    scrollSpeed = layout.scrollSpeed;
     grid.setSizeClass(cellClass);
 
     registerKeys();
@@ -2601,6 +2740,138 @@
     catalogSource === "library" ? [] : breadcrumbOf(currentFolder ?? ""),
   );
 
+  /** UIUX-1 (R-A): メニューバー項目 (状態依存の有効無効はここで毎評価)。 */
+  const menus = $derived.by(() => {
+    const scanning = summaryNow()?.scanning ?? false;
+    const file: MenuDef = {
+      id: "file",
+      label: "ファイル",
+      items: [
+        scanning
+          ? {
+              id: "temp-scan-cancel",
+              label: "一時走査を中止",
+              title: "実行中の一時走査を中止します (確定済みの結果は残ります)",
+              run: () => void cancelScan(),
+            }
+          : {
+              id: "temp-scan",
+              label: "一時走査を実行",
+              title: "現在の一時走査対象を再走査します",
+              run: () => void startScan(),
+              disabled: scanBusy,
+            },
+        {
+          id: "export",
+          label: "SD学習用エクスポート…",
+          title: "表示中コレクション (優先) または選択中の確定済み画像をSD学習用データセットとして書き出します",
+          run: () => exportFromMenu(),
+          disabled: !menuExportAvailable(),
+        },
+        { id: "quit", label: "終了", run: () => void quitApp() },
+      ],
+    };
+    const view: MenuDef = {
+      id: "view",
+      label: "表示",
+      items: [
+        {
+          id: "toggle-left",
+          label: "左ペイン",
+          title: "フォルダツリー・コレクション・登録ルートの表示切替",
+          run: toggleLeft,
+          checked: leftVisible,
+        },
+        {
+          id: "toggle-right",
+          label: "右ペイン",
+          title: "情報パネルの表示切替",
+          run: toggleRight,
+          checked: rightVisible,
+        },
+        {
+          id: "size-256",
+          label: "サムネイルサイズ: 標準",
+          run: () => setCellClass("s256"),
+          checked: cellClass === "s256",
+        },
+        {
+          id: "size-512",
+          label: "サムネイルサイズ: 大",
+          run: () => setCellClass("s512"),
+          checked: cellClass === "s512",
+        },
+      ],
+    };
+    const tools: MenuDef = {
+      id: "tools",
+      label: "ツール",
+      items: [
+        {
+          id: "ai",
+          label: "AIパネル…",
+          title: "AIプロファイル・ジョブキュー・自動処理設定",
+          run: () => {
+            aiPanelOpen = true;
+          },
+        },
+        {
+          id: "settings",
+          label: "設定…",
+          title: "設定・診断",
+          run: () => void openSettings(),
+          testId: "settings-button",
+        },
+        {
+          id: "backup-root",
+          label: "ルートのバックアップ…",
+          title: "登録ルート単位の.gentoバックアップを作成します",
+          run: backupRootFromMenu,
+          disabled: libraryRoots.length === 0,
+        },
+        {
+          id: "backup-db",
+          label: "全データベースをバックアップ",
+          title: "DB全体を単一SQLiteファイルへバックアップ (世代保持)",
+          run: () => void runFullDbBackup(),
+          disabled: fullDbBusy,
+        },
+        {
+          id: "restore",
+          label: "バックアップから復元…",
+          title: ".gentoバックアップからメタデータを復元",
+          run: () => {
+            restoreOpen = true;
+          },
+        },
+        ...(devBridgeActive
+          ? [
+              {
+                id: "dev",
+                label: "開発パネル",
+                run: () => {
+                  devPanelOpen = !devPanelOpen;
+                },
+              } satisfies MenuAction,
+            ]
+          : []),
+      ],
+    };
+    const help: MenuDef = {
+      id: "help",
+      label: "ヘルプ",
+      items: [
+        {
+          id: "about",
+          label: "このアプリについて",
+          title: "設定ダイアログの「このアプリについて」を開きます",
+          run: () => void openSettings("about"),
+        },
+      ],
+    };
+    return [file, view, tools, help];
+  });
+
   const sortValue = $derived(summaryNow()?.sort ?? "name");
 
   const focusInfo = $derived(focusItem());
@@ -2682,74 +2953,71 @@
     {#if osNotice}
       <span class="header-notice">{osNotice}</span>
     {/if}
-    {#if summary?.scanning}
-      <button
-        onclick={() => void cancelScan()}
-        title="実行中の一時走査を中止します (確定済みの結果は残ります)"
-      >
-        走査をキャンセル
-      </button>
-    {:else}
-      <button onclick={() => void startScan()} disabled={scanBusy}>
-        スキャン開始
-      </button>
-    {/if}
-    <button class:active={leftVisible} onclick={toggleLeft} title="フォルダツリーの表示切替">
-      左ペイン
-    </button>
-    <button class:active={rightVisible} onclick={toggleRight} title="情報パネルの表示切替">
-      右ペイン
-    </button>
-    <button
-      class:active={aiPanelOpen}
-      onclick={() => (aiPanelOpen = !aiPanelOpen)}
-      title="AIプロファイル・ジョブキュー・自動処理設定 (WP-10)"
-    >
-      AI
-    </button>
-    <button
-      class:active={settingsOpen}
-      onclick={() => void openSettings()}
-      title="設定・診断 (WP-15)"
-      data-testid="settings-button"
-    >
-      ⚙ 設定
-    </button>
-    {#if devBridgeActive}
-      <button class:active={devPanelOpen} onclick={() => (devPanelOpen = !devPanelOpen)}>
-        開発パネル
-      </button>
-    {/if}
+    <!-- UIUX-1 (R-A): 操作ボタン類はメニューバーへ移動。headerは状態表示のみ。 -->
   </header>
+
+  <MenuBar {menus} />
 
   <div class="app-panes">
     {#if leftVisible}
       <aside class="side-pane left" style="width:{leftWidth}px">
-        <FolderTree
-          {tree}
-          roots={libraryRoots}
-          {currentFolder}
-          libraryMode={catalogSource === "library"}
-          onSelect={(path) => void selectFolder(path)}
-          onDrop={handleTreeDrop}
-        />
-        <CollectionsPane
-          store={collectionsStore}
-          activeCollectionId={activeCollection?.id ?? null}
-          onSelect={(collection) => void showCollection(collection)}
-        />
-        <LibraryPanel
-          {library}
-          roots={libraryRoots}
-          notice={libraryNotice}
-          error={libraryError}
-          scanBusy={libraryScanBusy}
-          onRefresh={() => void library.refreshRoots()}
-          onShowLibrary={() => showLibrary()}
-          onBackupRoot={(root) => (backupFor = root)}
-          onRestore={() => (restoreOpen = true)}
-          onFullDbBackup={() => void runFullDbBackup()}
-        />
+        <!-- UIUX-1 (R-B): 3パネルは全マウント維持。非アクティブはhidden属性で
+             アクセシブルに隠蔽 (ドラフト入力がタブ切替で失われない)。 -->
+        <LeftPaneTabs active={leftTab} onChange={setLeftTab} />
+        <div
+          class="left-tabpanel"
+          id="left-panel-folders"
+          role="tabpanel"
+          aria-labelledby="left-tab-folders"
+          tabindex="-1"
+          hidden={leftTab !== "folders"}
+        >
+          <FolderTree
+            {tree}
+            roots={libraryRoots}
+            {currentFolder}
+            libraryMode={catalogSource === "library"}
+            onSelect={(path) => void selectFolder(path)}
+            onDrop={handleTreeDrop}
+            onRegisterRoot={(path) => void registerRootFromTree(path)}
+            onUnregisterRoot={(rootId) => void unregisterRootFromTree(rootId)}
+            onBackupRoot={(root) => (backupFor = root)}
+            onRescan={() => void rescanLibraryFromTree()}
+          />
+        </div>
+        <div
+          class="left-tabpanel"
+          id="left-panel-collections"
+          role="tabpanel"
+          aria-labelledby="left-tab-collections"
+          tabindex="-1"
+          hidden={leftTab !== "collections"}
+        >
+          <CollectionsPane
+            store={collectionsStore}
+            activeCollectionId={activeCollection?.id ?? null}
+            onSelect={(collection) => void showCollection(collection)}
+          />
+        </div>
+        <div
+          class="left-tabpanel"
+          id="left-panel-library"
+          role="tabpanel"
+          aria-labelledby="left-tab-library"
+          tabindex="-1"
+          hidden={leftTab !== "library"}
+        >
+          <LibraryPanel
+            {library}
+            roots={libraryRoots}
+            notice={libraryNotice}
+            error={libraryError}
+            scanBusy={libraryScanBusy}
+            onRefresh={() => void library.refreshRoots()}
+            onShowLibrary={() => showLibrary()}
+            onBackupRoot={(root) => (backupFor = root)}
+          />
+        </div>
       </aside>
       <div
         class="pane-resizer"
@@ -2823,6 +3091,39 @@
                 {crumb.name}
               </button>
             {/each}
+            <!-- UIUX-1 (R-E): パス直接入力。Enterで移動・ESCで取消。 -->
+            {#if pathInputOpen}
+              <input
+                class="crumb-input"
+                data-testid="breadcrumb-path-input"
+                type="text"
+                aria-label="移動先フォルダーの絶対パス"
+                placeholder="/絶対パス (Enterで移動・Escで取消)"
+                value={pathInputValue}
+                oninput={(event) => (pathInputValue = event.currentTarget.value)}
+                onkeydown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    commitPathInput();
+                  } else if (event.key === "Escape") {
+                    event.preventDefault();
+                    cancelPathInput();
+                  }
+                }}
+                onblur={() => cancelPathInput()}
+                use:autofocusSelect
+              />
+            {:else}
+              <button
+                class="crumb crumb-path-button"
+                data-testid="breadcrumb-path-button"
+                aria-label="パスを入力して移動"
+                title="パスを入力して移動 (絶対パス)"
+                onclick={() => openPathInput()}
+              >
+                ✏
+              </button>
+            {/if}
           {/if}
         </nav>
         {#if activeCollection === null}
@@ -2928,6 +3229,21 @@
             oninput={(event) => onSizeSlider(Number(event.currentTarget.value))}
           />
         </label>
+        <!-- UIUX-1 (R-C): スクロール速度。1.0=ネイティブ (ハンドラ未登録)。 -->
+        <label class="size-label" title="ホイール1目盛りのスクロール量 (1.0=標準・デバイス毎に保存)">
+          速度
+          <input
+            type="range"
+            min="0.5"
+            max="5"
+            step="0.1"
+            value={scrollSpeed}
+            data-testid="scroll-speed-slider"
+            oninput={(event) => onScrollSpeedInput(Number(event.currentTarget.value))}
+            onchange={() => onScrollSpeedCommit()}
+          />
+        </label>
+        <span class="speed-value" data-testid="scroll-speed-value">{scrollSpeed.toFixed(1)}×</span>
         <span class="viewer-choice">
           <button class:active={viewerChoice === "single"} onclick={() => (viewerChoice = "single")}>
             単一
@@ -3173,6 +3489,7 @@
             modeKey={gridModeKey}
             {cellClass}
             overscanRows={overscanChoice}
+            scrollSpeed={scrollSpeed}
             showStats={devBridgeActive}
             onOpen={(index) => void openViewerForChoice(index)}
             onSelectionChange={onGridSelectionChange}
@@ -3388,8 +3705,52 @@
     roots={libraryRoots}
     profiles={settingsProfiles}
     displayInfo={settingsDisplayInfo}
+    initialTab={settingsInitialTab}
     onClose={() => (settingsOpen = false)}
   />
+{/if}
+
+{#if backupPickOpen}
+  <!-- UIUX-1: ツール>ルートのバックアップ…の複数ルート選択 (短命モーダル規約) -->
+  <div class="picker-backdrop" role="presentation">
+    <div
+      class="picker backup-root-picker"
+      role="dialog"
+      aria-modal="true"
+      aria-label="バックアップするルートの選択"
+      tabindex="-1"
+      use:focusTrap
+      onkeydown={(event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          backupPickOpen = false;
+        }
+      }}
+    >
+      <h2>バックアップするルートを選択</h2>
+      <ul class="backup-root-list">
+        {#each libraryRoots as root (root.id)}
+          <li>
+            <button
+              class:unavailable={!root.available}
+              onclick={() => {
+                backupPickOpen = false;
+                backupFor = root;
+              }}
+            >
+              <span class="backup-root-path">{root.path}</span>
+              <span class="backup-root-state">
+                {root.enabled ? (root.available ? "有効" : "不在") : "無効"}
+              </span>
+            </button>
+          </li>
+        {/each}
+      </ul>
+      <div class="picker-actions">
+        <button onclick={() => (backupPickOpen = false)}>キャンセル</button>
+      </div>
+    </div>
+  </div>
 {/if}
 
 {#if exportFor !== null}
@@ -3489,6 +3850,8 @@
     padding: 0.4rem 0.75rem;
     border-bottom: 1px solid light-dark(#d0d7de, #30363d);
     font-size: 0.85rem;
+    /* UIUX-1 (R-A): 状態表示のみになったheader。狭幅では折返し (省略なし) */
+    flex-wrap: wrap;
   }
 
   .app-title {
@@ -3638,6 +4001,27 @@
     font-size: 0.875rem;
   }
 
+  /* UIUX-1 (R-B): タブパネル。hidden属性でアクセシブルに隠蔽しつつ
+   * マウント維持 (ドラフト入力の生存)。パネル毎に独立スクロール。 */
+  .left-tabpanel {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    outline: none;
+  }
+
+  /* フォルダタブはツリー自身が内部スクロールを持つため
+   * 二重スクロールを避ける (collapsible treeの既存動作維持)。 */
+  #left-panel-folders {
+    overflow: hidden;
+  }
+
+  .left-tabpanel[hidden] {
+    display: none;
+  }
+
   .side-pane.right {
     border-left: 1px solid light-dark(#d0d7de, #30363d);
   }
@@ -3746,6 +4130,110 @@
 
   .crumb-sep {
     color: light-dark(#8b949e, #6e7681);
+  }
+
+  /* UIUX-1 (R-E): パンくずのパス直接入力 */
+  .crumb-input {
+    font: inherit;
+    font-size: 0.78rem;
+    font-family: monospace;
+    min-width: 14rem;
+    flex: 0 1 auto;
+    padding: 0.1rem 0.3rem;
+  }
+
+  .crumb-path-button {
+    font-size: 0.85rem;
+    padding: 0.1rem 0.35rem;
+  }
+
+  /* UIUX-1 (R-C): スクロール速度の現在値表示 */
+  .speed-value {
+    font-size: 0.72rem;
+    font-variant-numeric: tabular-nums;
+    color: light-dark(#57606a, #8b949e);
+    min-width: 2.2rem;
+  }
+
+  /* UIUX-1: ツール>ルートのバックアップ… の選択ダイアログ
+   * (他ダイアログと同じpicker様式 — SettingsDialog等と共通の見た目) */
+  .picker-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 60;
+  }
+
+  .backup-root-picker {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    width: min(40rem, 92vw);
+    max-height: 70vh;
+    overflow-y: auto;
+    background: light-dark(#ffffff, #1c2128);
+    border: 1px solid light-dark(#d0d7de, #444c56);
+    border-radius: 0.6rem;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+    padding: 0.9rem 1rem;
+    font-size: 0.85rem;
+  }
+
+  .backup-root-picker h2 {
+    font-size: 1rem;
+    margin: 0;
+  }
+
+  .backup-root-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  .backup-root-list button {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.15rem;
+    padding: 0.3rem 0.4rem;
+    border: 1px solid light-dark(#d0d7de, #444c56);
+    border-radius: 0.375rem;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .backup-root-list button:hover {
+    background: light-dark(#eaeef2, #21262d);
+  }
+
+  .backup-root-list button.unavailable {
+    border-color: light-dark(#bf8700, #d29922);
+  }
+
+  .backup-root-path {
+    font-family: monospace;
+    font-size: 0.75rem;
+    overflow-wrap: anywhere;
+  }
+
+  .backup-root-state {
+    font-size: 0.7rem;
+    color: light-dark(#57606a, #8b949e);
+  }
+
+  .backup-root-picker .picker-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.4rem;
   }
 
   .sort-label,

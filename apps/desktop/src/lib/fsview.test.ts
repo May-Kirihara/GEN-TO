@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import { FolderTreeStore, registeredStateFor, type FsDirList, type FsIpc } from "./fsview";
+import {
+  FolderTreeStore,
+  registeredStateFor,
+  treeContextTargetFor,
+  type FsDirList,
+  type FsIpc,
+} from "./fsview";
 
 type InvokeLog = Array<{ command: string; args?: Record<string, unknown> }>;
 type MockIpc = FsIpc & { invokes: InvokeLog };
@@ -65,6 +71,53 @@ describe("registeredStateFor", () => {
     expect(registeredStateFor("/data/library2", libOnly)).toBeNull();
     expect(registeredStateFor("/data/lib2", libOnly)).toBeNull();
     expect(registeredStateFor("/x", [])).toBeNull();
+  });
+});
+
+describe("treeContextTargetFor (UIUX-1: ツリー右クリック3状態)", () => {
+  const roots = [
+    { id: "7", path: "/data/lib" },
+    { id: "9", path: "/data/other" },
+  ];
+
+  it("完全一致は root + rootId のスナップショット", () => {
+    expect(treeContextTargetFor("/data/lib", roots)).toEqual({
+      kind: "root",
+      path: "/data/lib",
+      rootId: "7",
+    });
+  });
+
+  it("登録ルート配下は descendant (rootIdは持たない)", () => {
+    expect(treeContextTargetFor("/data/lib/2026/09", roots)).toEqual({
+      kind: "descendant",
+      path: "/data/lib/2026/09",
+    });
+  });
+
+  it("無関係 (祖先・兄弟・全く無関係) は unrelated", () => {
+    // 登録ルートの親 (=/data) も親子包含はbackendが拒否するため unrelated 扱い
+    expect(treeContextTargetFor("/data", roots)).toEqual({
+      kind: "unrelated",
+      path: "/data",
+    });
+    expect(treeContextTargetFor("/data/library2", roots)).toEqual({
+      kind: "unrelated",
+      path: "/data/library2",
+    });
+    expect(treeContextTargetFor("/mnt/pics", roots)).toEqual({
+      kind: "unrelated",
+      path: "/mnt/pics",
+    });
+    expect(treeContextTargetFor("/x", [])).toEqual({ kind: "unrelated", path: "/x" });
+  });
+
+  it("複数ルートで一致順序に依存せず正しいrootIdを返す", () => {
+    expect(treeContextTargetFor("/data/other", roots)).toEqual({
+      kind: "root",
+      path: "/data/other",
+      rootId: "9",
+    });
   });
 });
 

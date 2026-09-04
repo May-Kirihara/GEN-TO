@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { breadcrumbOf, deriveEmptyState, formatTimestamp } from "./browse";
+import {
+  breadcrumbOf,
+  deriveEmptyState,
+  formatTimestamp,
+  normalizePastedPath,
+} from "./browse";
 
 describe("breadcrumbOf", () => {
   it("絶対パスを / から順に分割する", () => {
@@ -57,5 +62,86 @@ describe("formatTimestamp", () => {
     expect(formatTimestamp(Number.NaN)).toBe("—");
     const text = formatTimestamp(Date.UTC(2026, 7, 30, 1, 2, 3));
     expect(text).toContain("2026");
+  });
+});
+
+describe("normalizePastedPath (UIUX-1: パンくずパス入力)", () => {
+  it("前後空白をtrimし絶対パスをそのまま通す", () => {
+    expect(normalizePastedPath("  /home/user/pictures ")).toEqual({
+      ok: true,
+      path: "/home/user/pictures",
+    });
+  });
+
+  it("末尾スラッシュを正規化 (/ 自体は保存)", () => {
+    expect(normalizePastedPath("/home/user/")).toEqual({ ok: true, path: "/home/user" });
+    expect(normalizePastedPath("/home/user//")).toEqual({ ok: true, path: "/home/user" });
+    expect(normalizePastedPath("/")).toEqual({ ok: true, path: "/" });
+  });
+
+  it("対になった引用符 (二重・単一) のみ除去する", () => {
+    expect(normalizePastedPath('"/home/user/pic"')).toEqual({
+      ok: true,
+      path: "/home/user/pic",
+    });
+    expect(normalizePastedPath("'/home/user/pic'")).toEqual({
+      ok: true,
+      path: "/home/user/pic",
+    });
+    // 片側だけ・対でない引用符はパスの一部として保持 (保守的)
+    expect(normalizePastedPath('/home/u"ser')).toEqual({ ok: true, path: '/home/u"ser' });
+    expect(normalizePastedPath('"home')).toEqual({ ok: false, error: expect.any(String) });
+  });
+
+  it("改行・NULを拒否する", () => {
+    expect(normalizePastedPath("/home/u\nser").ok).toBe(false);
+    expect(normalizePastedPath("/home/u\rser").ok).toBe(false);
+    expect(normalizePastedPath("/home/u\x00ser").ok).toBe(false);
+  });
+
+  it("file:// URIは非対応として通知 (percent-decodeしない)", () => {
+    const result = normalizePastedPath("file:///home/user/pic");
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toContain("file://");
+    }
+    // 通常パスの%はdecodeしない
+    expect(normalizePastedPath("/home/a%20b")).toEqual({ ok: true, path: "/home/a%20b" });
+  });
+
+  it("相対パス・空は拒否 (~展開もしない)", () => {
+    expect(normalizePastedPath("pictures").ok).toBe(false);
+    expect(normalizePastedPath("./pictures").ok).toBe(false);
+    expect(normalizePastedPath("").ok).toBe(false);
+    expect(normalizePastedPath("   ").ok).toBe(false);
+    expect(normalizePastedPath("~/pictures").ok).toBe(false);
+  });
+
+  it("Windowsドライブ・UNCパスを受け入れ、ドライブルートの末尾は保存する", () => {
+    expect(normalizePastedPath("C:\\Users\\me\\pic")).toEqual({
+      ok: true,
+      path: "C:\\Users\\me\\pic",
+    });
+    // ドライブルート (C:\) の末尾区切りは保存
+    expect(normalizePastedPath("C:\\")).toEqual({ ok: true, path: "C:\\" });
+    expect(normalizePastedPath("C:/Users/me/pic/")).toEqual({
+      ok: true,
+      path: "C:/Users/me/pic",
+    });
+    expect(normalizePastedPath("\\\\server\\share\\pic")).toEqual({
+      ok: true,
+      path: "\\\\server\\share\\pic",
+    });
+  });
+
+  it("..や.セグメントは字句判断せずbackendへ委譲する", () => {
+    expect(normalizePastedPath("/home/user/../other")).toEqual({
+      ok: true,
+      path: "/home/user/../other",
+    });
+  });
+
+  it("http等のURLスキームはfile://と同じ通知経路で拒否される", () => {
+    expect(normalizePastedPath("https://example.com/x").ok).toBe(false);
   });
 });

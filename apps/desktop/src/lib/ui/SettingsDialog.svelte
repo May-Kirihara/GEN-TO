@@ -41,16 +41,42 @@
     roots,
     profiles,
     displayInfo,
+    initialTab = "general",
     onClose,
   }: {
     roots: LibraryRoot[];
     profiles: AiProfile[];
-    displayInfo: { lastFolder: string | null; expandedCount: number; sortLabel: string | null };
+    displayInfo: {
+      lastFolder: string | null;
+      expandedCount: number;
+      sortLabel: string | null;
+      scrollSpeed: number;
+    };
+    /** UIUX-1: 初期タブ (ヘルプ>「このアプリについて」からのAbout直開等)。 */
+    initialTab?: Tab;
     onClose: () => void;
   } = $props();
 
   type Tab = "general" | "display" | "cache" | "ai" | "search" | "backup" | "diagnostics" | "about";
-  let tab = $state<Tab>("general");
+
+  /** 不正なタブidは無視して既定 (一般) へ。初期タブは開いた時点で固定。 */
+  function coerceInitialTab(value: string | undefined): Tab {
+    switch (value) {
+      case "display":
+      case "cache":
+      case "ai":
+      case "search":
+      case "backup":
+      case "diagnostics":
+      case "about":
+        return value;
+      default:
+        return "general";
+    }
+  }
+
+  // svelte-ignore state_referenced_locally
+  let tab = $state<Tab>(coerceInitialTab(initialTab));
   let settings = $state<SettingsDto>(normalizeSettings(null));
   let settingsError = $state<string | null>(null);
   let about = $state<AboutInfo | null>(null);
@@ -320,6 +346,8 @@
           <dd>{displayInfo.expandedCount.toLocaleString()}</dd>
           <dt>現在のソート</dt>
           <dd>{displayInfo.sortLabel ?? "(既定)"}</dd>
+          <dt>スクロール速度 (UIUX-1)</dt>
+          <dd>{displayInfo.scrollSpeed.toFixed(1)}倍 (ツールバー「速度」で変更)</dd>
         </dl>
       </section>
     {:else if tab === "cache"}

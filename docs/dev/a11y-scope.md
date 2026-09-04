@@ -23,11 +23,28 @@
    - 評価: 星記号 + 数値 (`★3`)、情報パネルの `role="radiogroup"` による
      テキスト選択肢も併存
    - トリアージ (採用/除外)・お気に入り: グリッドセルのバッジは形状 (✓/✗/♥) と
-     title (「採用」「除外」「お気に入り」「評価」) を併記。バッジ自体は装飾
+     title (「採用」「除外」「お気に入り」「評価」) 併記。バッジ自体は装飾
      (`aria-hidden`) とし、状態の正本は情報パネルのテキスト表示で保証
    - DB接続状態 (ヘッダーのドット): `role="status"` + `aria-label` + title
    - endpoint分類 (ローカル/プライベート/外部): 色バッジ + テキストラベル併記
    - 初回起動ガイドのステップ状態: テキスト (「未実施」「登録済み」「未配置」) 併記
+4. **メニューバーと左ペインタブのキーボード操作 (UIUX-1)**
+   - メニューバー (`src/lib/ui/MenuBar.svelte`): `role="menubar"` / `role="menu"` /
+     `aria-haspopup` / `aria-expanded`。トップレベルは矢印左右 (Home/End) で
+     移動、Enter/Space/ArrowDownで開く。メニュー内は矢印上下で項目移動
+     (無効項目はスキップ)、矢印左右で隣メニューへ切替、Escapeで閉じて
+     トリガボタンへフォーカス復帰、クリック外で閉じる。開いた直後に
+     最初の有効項目へフォーカスする。Alt系ニーモニックは非依存
+     (OSのアクセラレータと衝突しない)。チェック付き項目は
+     `role="menuitemcheckbox"` + `aria-checked` + ✓マーク
+   - 左ペインタブ (`src/lib/ui/LeftPaneTabs.svelte`): APG tabsパターン
+     (`role="tablist"` / `role="tab"` / `aria-selected` / `aria-controls`、
+     ロービングtabindex)。矢印左右・Home/Endでタブ移動 (自動活性化)。
+     非アクティブパネルは `hidden` 属性でアクセシビリティツリーから除外し
+     フォーカス不可。タブ切替でパネルへフォーカス移動
+   - パンくずのパス入力 (UIUX-1): ✏ボタンに `aria-label`、入力はEnterで
+     確定・Escapeで取消。ツリー右クリックメニューはContextMenu (ESC・
+     クリック外閉じ) を再利用
 
 ## スコープ外 (MVPでは実施しない)
 
@@ -41,6 +58,10 @@
 ## 検証方法
 
 - 自動: `src/lib/ui/focus-trap.test.ts` (Tab循環・初期フォーカス・解除)、
-  `SettingsDialog.test.ts` (初期フォーカス + ESC閉じ)
+  `SettingsDialog.test.ts` (初期フォーカス + ESC閉じ)、
+  `MenuBar.test.ts` (矢印移動・Escape復帰・項目focus初期化・無効項目)、
+  `LeftPaneTabs.test.ts` (タブ矢印移動・aria-selected)
 - 手動: Xephyr上でのキーボードのみ操作 (設定ダイアログのTab移動、各ダイアログの
-  ESC閉じ) — 実施記録は handoff `2026-09-04-mvp-wp18-2.md` 参照
+  ESC閉じ) — 実施記録は handoff `2026-09-04-mvp-wp18-2.md` 参照。
+  UIUX-1メニューバー・タブ・パンくず入力の実機検証は handoff
+  `2026-09-04-uiux-1.md` 参照

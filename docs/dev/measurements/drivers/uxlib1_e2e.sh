@@ -30,12 +30,14 @@ set -uo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 BIN=/mnt/holyland/Project/GEN-TO/target/release/gento-tauri
 WORK=/tmp/opencode/uxlib1/e2e
+# Xephyrのホスト表示は起動時のDISPLAY (上書き前に退避)
+HOST_DISPLAY="${DISPLAY:-:0}"
 DISPLAY="${GENTO_E2E_DISPLAY:-:5}"
 export NO_COLOR=1 GENTO_LOG=info GENTO_DEV_BRIDGE=1
 # グリッド領域ピクセル判定の閾値 (描画済み>=此値、プレースホルダー<<此値)
 PIXEL_MIN_COLORS=800
 if ! xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
-  setsid nohup Xephyr "$DISPLAY" -screen 1600x1000 >/tmp/opencode/uxlib1-xephyr.log 2>&1 </dev/null &
+  env DISPLAY="$HOST_DISPLAY" setsid nohup Xephyr "$DISPLAY" -screen 1600x1000 >/tmp/opencode/uxlib1-xephyr.log 2>&1 </dev/null &
   for _ in $(seq 1 50); do
     xdpyinfo -display "$DISPLAY" >/dev/null 2>&1 && break
     sleep 0.2

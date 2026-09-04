@@ -124,7 +124,10 @@ shot 01-initial
 echo "=== 2) ツリーのホームクリック → open_folder ==="
 geo
 found=0
-for cy in 34 40 28 46 22; do
+# UIUX-1: header下にメニューバー+左ペインタブストリップが追加された分
+# (約+58px) ツリー先頭行の座標を更新。クリック先はツリー行 (タブボタン
+# を押さないようY>=80に限定)。
+for cy in 92 100 86 104 82; do
   click_at "$(sx 60)" "$(sy $cy)"
   sleep 1.2
   if grep -aq "folder opened (adhoc scan started)" "$WORK/logs/app.log"; then found=1; break; fi

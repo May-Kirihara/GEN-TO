@@ -15,12 +15,21 @@ export const LAYOUT_STORAGE_KEY = "gento:layout:v1";
 export const PANE_MIN_WIDTH = 160;
 export const PANE_MAX_WIDTH = 520;
 
+/** UIUX-1: ホイールスクロール速度係数の範囲と刻み。既定1.0=ネイティブ。 */
+export const SCROLL_SPEED_MIN = 0.5;
+export const SCROLL_SPEED_MAX = 5;
+
+/** 左ペインのタブ (UIUX-1)。 */
+export type LeftPaneTab = "folders" | "collections" | "library";
+
 export type LayoutPrefs = {
   leftVisible: boolean;
   rightVisible: boolean;
   leftWidth: number;
   rightWidth: number;
   thumbSize: ThumbCellClass;
+  scrollSpeed: number;
+  leftTab: LeftPaneTab;
 };
 
 export const DEFAULT_LAYOUT_PREFS: LayoutPrefs = {
@@ -29,6 +38,8 @@ export const DEFAULT_LAYOUT_PREFS: LayoutPrefs = {
   leftWidth: 240,
   rightWidth: 280,
   thumbSize: "s256",
+  scrollSpeed: 1,
+  leftTab: "folders",
 };
 
 export type KeyValueStorage = {
@@ -58,6 +69,20 @@ function coerceWidth(value: unknown, fallback: number): number {
     : fallback;
 }
 
+/** 係数は0.5–5.0へクランプし0.1刻みへ丸める (スライダ入力の桁落ち吸収)。 */
+export function coerceScrollSpeed(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return DEFAULT_LAYOUT_PREFS.scrollSpeed;
+  }
+  const clamped = Math.min(SCROLL_SPEED_MAX, Math.max(SCROLL_SPEED_MIN, value));
+  return Math.round(clamped * 10) / 10;
+}
+
+/** 未知のタブidは既定へ (前方互換)。 */
+function coerceLeftTab(value: unknown): LeftPaneTab {
+  return value === "collections" || value === "library" ? value : "folders";
+}
+
 /** 保存値のパース。不正・破損時はnull (呼び出し側は既定値を使う)。 */
 export function parseLayoutPrefs(raw: string | null): LayoutPrefs | null {
   if (raw === null) {
@@ -74,6 +99,8 @@ export function parseLayoutPrefs(raw: string | null): LayoutPrefs | null {
       leftWidth: coerceWidth(value.leftWidth, DEFAULT_LAYOUT_PREFS.leftWidth),
       rightWidth: coerceWidth(value.rightWidth, DEFAULT_LAYOUT_PREFS.rightWidth),
       thumbSize: coerceThumbSize(value.thumbSize),
+      scrollSpeed: coerceScrollSpeed(value.scrollSpeed),
+      leftTab: coerceLeftTab(value.leftTab),
     };
   } catch {
     return null;
@@ -98,6 +125,8 @@ export class LayoutPrefsStore {
         leftWidth: clampPaneWidth(prefs.leftWidth),
         rightWidth: clampPaneWidth(prefs.rightWidth),
         thumbSize: prefs.thumbSize,
+        scrollSpeed: coerceScrollSpeed(prefs.scrollSpeed),
+        leftTab: coerceLeftTab(prefs.leftTab),
       }),
     );
   }

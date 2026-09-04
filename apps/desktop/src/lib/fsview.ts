@@ -65,6 +65,35 @@ export function registeredStateFor(
   return null;
 }
 
+// ===== UIUX-1: フォルダツリー右クリック (3状態) =====
+
+/**
+ * ツリー行の右クリックメニュー構築用の不変スナップショット (R-D)。
+ * クリック時点のpath/rootIDのみからなり、選択状態に依存しない。
+ * - unrelated: 未登録 (登録ルートの祖先も含む — 包含拒否はbackend通知に従う)
+ * - root: 登録ルートそのもの (rootId付き)
+ * - descendant: 登録ルート配下 (メニュー項目なし。ナビは通常クリック)
+ */
+export type TreeContextTarget =
+  | { kind: "unrelated"; path: string }
+  | { kind: "root"; path: string; rootId: string }
+  | { kind: "descendant"; path: string };
+
+export function treeContextTargetFor(
+  path: string,
+  roots: ReadonlyArray<{ id: string; path: string }>,
+): TreeContextTarget {
+  for (const root of roots) {
+    if (path === root.path) {
+      return { kind: "root", path, rootId: root.id };
+    }
+    if (root.path === "/" ? path.startsWith("/") : path.startsWith(root.path + "/")) {
+      return { kind: "descendant", path };
+    }
+  }
+  return { kind: "unrelated", path };
+}
+
 export class FolderTreeStore {
   /** 起点ノード (ホーム・/)。 */
   tops: string[] = [];

@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "main windowへの既定core権限",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "core:window:allow-close"]
 }

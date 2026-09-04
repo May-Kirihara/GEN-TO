@@ -7,6 +7,8 @@
     * - 不在ルート (アンマウント等) は「不在」表示 (WP-2仕様)
     * - UXLIB-1: 追加成功後のライブラリ表示への自動切替・ルート行クリック・
     *   「ライブラリを表示」ボタン (切替遷移はAppのshowLibraryが正本)
+    * - UIUX-1: 全体バックアップ/復元のentryはメニューバー (ツール) へ移動。
+    *   このパネルはルート一覧 + per-root操作 (バックアップ含む) に専念
     */
   import type { LibraryRoot, LibraryStore } from "../library";
 
@@ -19,8 +21,6 @@
     onRefresh,
     onShowLibrary,
     onBackupRoot,
-    onRestore,
-    onFullDbBackup,
   }: {
     library: LibraryStore;
     roots: LibraryRoot[];
@@ -32,10 +32,6 @@
     onShowLibrary: () => Promise<boolean>;
     /** ルート単位の.gentoバックアップ作成ダイアログを開く (WP-13)。 */
     onBackupRoot: (root: LibraryRoot) => void;
-    /** 復元ダイアログを開く (WP-13)。 */
-    onRestore: () => void;
-    /** フルDBバックアップを作成 (WP-13)。 */
-    onFullDbBackup: () => void;
   } = $props();
 
   let newRootPath = $state("");
@@ -123,13 +119,6 @@
     </button>
     <button onclick={() => void library.stopScan()} disabled={!scanBusy}>停止</button>
     <button onclick={onRefresh}>再取得</button>
-    <button onclick={onRestore} title=".gentoバックアップからメタデータを復元">復元</button>
-    <button
-      onclick={onFullDbBackup}
-      title="DB全体を単一SQLiteファイルへバックアップ (世代保持)"
-    >
-      DBバックアップ
-    </button>
   </div>
   <p class="roots-status">
     {library.status.phase ?? "待機"} /

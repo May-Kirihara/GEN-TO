@@ -15,6 +15,10 @@
     disabled?: boolean;
     /** ホバー時に出す補足 (無効理由等)。 */
     title?: string;
+    /** E2E/devtest用の安定selector (header撤去に伴うtestid維持等)。 */
+    testId?: string;
+    /** 選択状態の表示 (メニューバーのチェック付き項目)。 */
+    checked?: boolean;
   };
 
   let {
@@ -96,10 +100,9 @@
       role="menuitem"
       disabled={action.disabled}
       title={action.title ?? ""}
+      data-testid={action.testId}
       onclick={() => void runAction(action)}
-    >
-      {action.label}
-    </button>
+    >{#if action.checked === true}<span class="menu-check" aria-hidden="true">✓</span>{/if}{action.label}</button>
   {/each}
 </div>
 
@@ -136,5 +139,12 @@
   .context-menu button:disabled {
     opacity: 0.45;
     cursor: default;
+  }
+
+  .menu-check {
+    display: inline-block;
+    width: 1em;
+    margin-left: -0.4em;
+    padding-right: 0.1em;
   }
 </style>

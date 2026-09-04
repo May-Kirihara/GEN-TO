@@ -285,6 +285,74 @@ function clickButton(prefix: string): void {
   findButton(prefix)?.click();
 }
 
+// ===== UIUX-1 E2E: メニューバー・左ペインタブ駆動 =====
+
+/** 左ペインのタブを切替 (全パネル常駐のためhidden要素もclickで駆動可能)。 */
+function clickLeftTab(id: "folders" | "collections" | "library"): void {
+  document.querySelector<HTMLButtonElement>(`#left-tab-${id}`)?.click();
+}
+
+/** メニューバーの topLabel を開き itemPrefix で始まる項目をクリック (生産経路)。 */
+function runMenuItem(topLabel: string, itemPrefix: string): void {
+  const top = Array.from(
+    document.querySelectorAll<HTMLButtonElement>(".menubar-button"),
+  ).find((b) => (b.textContent ?? "").trim() === topLabel);
+  if (top === undefined) {
+    return;
+  }
+  top.click();
+  setTimeout(() => {
+    const item = Array.from(
+      document.querySelectorAll<HTMLButtonElement>(".menu-popover button"),
+    ).find((b) => (b.textContent ?? "").trim().startsWith(itemPrefix));
+    item?.click();
+  }, 150);
+}
+
+/** 開いているメニューバーのメニューを閉じる (トリガ再クリック=トグル)。 */
+function closeMenuBar(): void {
+  document
+    .querySelectorAll<HTMLButtonElement>(".menubar-button[aria-expanded='true']")
+    .forEach((button) => button.click());
+}
+
+/** メニューバーの topLabel を開く (項目クリックはしない)。 */
+function runMenuOpen(topLabel: string): void {
+  const top = Array.from(
+    document.querySelectorAll<HTMLButtonElement>(".menubar-button"),
+  ).find((b) => (b.textContent ?? "").trim() === topLabel);
+  top?.click();
+}
+
+/** openFirstHomeChild本体 (UIUX-1: フォルダタブ切替後に呼ばれる)。 */
+function openFirstHomeChildNow(): void {
+  const labels = Array.from(document.querySelectorAll<HTMLElement>(".tree-label"));
+  const home = labels[0]?.title;
+  if (home === undefined) {
+    return;
+  }
+  const childPrefix = `${home}/`;
+  const clickChild = (): void => {
+    const rows = Array.from(document.querySelectorAll<HTMLElement>(".tree-label"));
+    rows
+      .slice(1)
+      .find((label) => label.title.startsWith(childPrefix))
+      ?.click();
+  };
+  const already = labels.slice(1).some((label) => label.title.startsWith(childPrefix));
+  if (already) {
+    clickChild();
+    return;
+  }
+  // 折りたたみ中: 展開して子の遅延ロード後にクリック (冪等: 再実行は
+  // already経路を通る)
+  labels[0]
+    .closest(".tree-row")
+    ?.querySelector<HTMLButtonElement>(".tree-expander")
+    ?.click();
+  setTimeout(clickChild, 700);
+}
+
 /** 高速選別キー相当のkeydownをwindowへ合成 (ビューアのsvelte:windowリスナ経由)。 */
 function pressTriageKey(key: string): void {
   window.dispatchEvent(
@@ -454,6 +522,8 @@ export function installDevBridge(stores: DevBridgeStores): void {
   // WP-6 E2E: コレクションコマンドモード (ctrl+shift+F1でトグル)
   let collCmdMode = false;
   let foCmdMode = false;
+  // UIUX-1 E2E: メニュー/タブ/右クリック/パンくずコマンドモード (shift+F1で入る)
+  let uxCmdMode = false;
 
   // WP-18-1 D3 E2E: バックアップ/復元の状態行 (foCmdModeの 6/7 で駆動)。
   // 本物のTauri command (BackupDialog/RestoreDialogと同一のinvoke) を
@@ -528,7 +598,7 @@ export function installDevBridge(stores: DevBridgeStores): void {
       const active = order.findIndex((label) => findButton(label)?.classList.contains("active"));
       clickButton(order[(active + 1) % order.length]);
     },
-    scan: () => clickButton("スキャン開始"),
+    scan: () => runMenuItem("ファイル", "一時走査を実行"),
     virtualMode: () => clickButton("仮想カタログ"),
     realMode: () => clickButton("実カタログ"),
     generateAll: () => clickButton("全件生成"),
@@ -567,8 +637,8 @@ export function installDevBridge(stores: DevBridgeStores): void {
       select.value = next;
       select.dispatchEvent(new Event("change", { bubbles: true }));
     },
-    // QA-WP4: 走査キャンセルボタン (走査中のみ出現)
-    cancelScan: () => clickButton("走査をキャンセル"),
+    // QA-WP4: 走査キャンセル (メニューバー ファイル>一時走査を中止)
+    cancelScan: () => runMenuItem("ファイル", "一時走査を中止"),
     // WP-8 E2E: 検索バーの駆動 (foCmdModeのh/j)
     srFocusInput: () => {
       const input = document.querySelector<HTMLInputElement>(
@@ -639,8 +709,12 @@ export function installDevBridge(stores: DevBridgeStores): void {
     pressKeyX: () => pressTriageKey("x"),
     pressKeyP: () => pressTriageKey("p"),
     // WP-5 E2E: 実キー入力 (xdotool type) の着地ポイントへフォーカス
+    // UIUX-1: LibraryPanelはライブラリタブ内 (タブを切替えてから着地)
     focusLibraryPathInput: () => {
-      document.querySelector<HTMLInputElement>(".roots-add input")?.focus();
+      clickLeftTab("library");
+      setTimeout(() => {
+        document.querySelector<HTMLInputElement>(".roots-add input")?.focus();
+      }, 200);
     },
     focusTagInput: () => {
       document.querySelector<HTMLInputElement>('[data-meta="tags"] input')?.focus();
@@ -659,19 +733,26 @@ export function installDevBridge(stores: DevBridgeStores): void {
     focusCell2: () => clickCell(2),
     focusCell3: () => clickCell(3),
     // WP-6 E2E: コレクション (本物のDOM要素 → 生産経路で駆動)
+    // UIUX-1: CollectionsPaneはコレクションタブ内 (タブ切替後にフォーム操作)
     /** 「+ 手動」フォームを開き名前入力へフォーカス (xdotool typeの着地)。 */
     collCreateManualForm: () => {
-      clickButton("+ 手動");
+      clickLeftTab("collections");
       setTimeout(() => {
-        document.querySelector<HTMLInputElement>(".coll-create .coll-name-input")?.focus();
-      }, 100);
+        clickButton("+ 手動");
+        setTimeout(() => {
+          document.querySelector<HTMLInputElement>(".coll-create .coll-name-input")?.focus();
+        }, 100);
+      }, 150);
     },
     /** 「+ スマート」フォームを開き名前入力へフォーカス (既定条件=評価≥4)。 */
     collCreateSmartForm: () => {
-      clickButton("+ スマート");
+      clickLeftTab("collections");
       setTimeout(() => {
-        document.querySelector<HTMLInputElement>(".coll-create .coll-name-input")?.focus();
-      }, 100);
+        clickButton("+ スマート");
+        setTimeout(() => {
+          document.querySelector<HTMLInputElement>(".coll-create .coll-name-input")?.focus();
+        }, 100);
+      }, 150);
     },
     /** 次のコレクションを表示 (活性の次。非表示時は最初。一覧末尾で先頭へ戻る)。 */
     collShowNext: () => {
@@ -738,9 +819,12 @@ export function installDevBridge(stores: DevBridgeStores): void {
     },
     // QA-WP4: ツリー行クリック (xdotoolポインタが環境により不安定なため
     // 本物のtree-labelボタンをDOM clickで駆動。selectFolder→open_folder
-    // の生産経路を通る)
+    // の生産経路を通る)。UIUX-1: フォルダタブへ切替えてから操作。
     openTreeFsRoot: () => {
-      document.querySelector<HTMLButtonElement>('.tree-label[title="/"]')?.click();
+      clickLeftTab("folders");
+      setTimeout(() => {
+        document.querySelector<HTMLButtonElement>('.tree-label[title="/"]')?.click();
+      }, 150);
     },
     // WP-7 E2E: ファイル操作 (本物のDOM要素 → 生産経路で駆動)
     /** 宛先ダイアログ: 最初のノード (登録ルート) を選択して確定。 */
@@ -828,43 +912,53 @@ export function installDevBridge(stores: DevBridgeStores): void {
      * WP-7 E2E (共有デスクトップでxdotool typeが不安定な環境向け):
      * 登録ルート追加フォームに --dataset のパスを設定して追加
      * (input値設定+inputイベント+追加ボタンclick = 生産経路)。
+     * UIUX-1: フォームはライブラリタブ内。
      */
     foAddRootDataset: () => {
-      void (async () => {
-        const health = await stores
-          .invoke<{ dataset_path: string | null }>("health")
-          .catch(() => null);
-        const path = health?.dataset_path ?? null;
-        const input = document.querySelector<HTMLInputElement>(".roots-add input");
-        if (path === null || path === "" || input === null) {
-          return;
-        }
-        input.value = path;
-        input.dispatchEvent(new Event("input", { bubbles: true }));
-        setTimeout(() => {
-          document
-            .querySelectorAll<HTMLButtonElement>(".roots-add button")
-            .forEach((b) => {
-              if ((b.textContent ?? "").includes("追加")) {
-                b.click();
-              }
-            });
-        }, 100);
-      })();
+      clickLeftTab("library");
+      setTimeout(() => {
+        void (async () => {
+          const health = await stores
+            .invoke<{ dataset_path: string | null }>("health")
+            .catch(() => null);
+          const path = health?.dataset_path ?? null;
+          const input = document.querySelector<HTMLInputElement>(".roots-add input");
+          if (path === null || path === "" || input === null) {
+            return;
+          }
+          input.value = path;
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+          setTimeout(() => {
+            document
+              .querySelectorAll<HTMLButtonElement>(".roots-add button")
+              .forEach((b) => {
+                if ((b.textContent ?? "").includes("追加")) {
+                  b.click();
+                }
+              });
+          }, 100);
+        })();
+      }, 150);
     },
     /** UXLIB-1 E2E: 登録ルート行の切替ボタンclick (ライブラリ表示 = 生産経路)。 */
     foShowLibraryRow: () => {
-      document.querySelector<HTMLButtonElement>(".roots-list li .roots-open")?.click();
+      clickLeftTab("library");
+      setTimeout(() => {
+        document.querySelector<HTMLButtonElement>(".roots-list li .roots-open")?.click();
+      }, 150);
     },
     /** UXLIB-1 E2E: 「ライブラリを表示」ボタンclick (生産経路)。 */
     foShowLibraryBtn: () => {
-      document
-        .querySelectorAll<HTMLButtonElement>(".roots-controls button")
-        .forEach((b) => {
-          if ((b.textContent ?? "").includes("ライブラリを表示")) {
-            b.click();
-          }
-        });
+      clickLeftTab("library");
+      setTimeout(() => {
+        document
+          .querySelectorAll<HTMLButtonElement>(".roots-controls button")
+          .forEach((b) => {
+            if ((b.textContent ?? "").includes("ライブラリを表示")) {
+              b.click();
+            }
+          });
+      }, 150);
     },
     /**
      * リネーム入力へ "will-revert.png" を設定して確定 (E2E固定値。
@@ -935,31 +1029,46 @@ export function installDevBridge(stores: DevBridgeStores): void {
       );
     },
     openFirstHomeChild: () => {
-      const labels = Array.from(document.querySelectorAll<HTMLElement>(".tree-label"));
-      const home = labels[0]?.title;
-      if (home === undefined) {
-        return;
-      }
-      const childPrefix = `${home}/`;
-      const clickChild = (): void => {
-        const rows = Array.from(document.querySelectorAll<HTMLElement>(".tree-label"));
-        rows
-          .slice(1)
-          .find((label) => label.title.startsWith(childPrefix))
-          ?.click();
-      };
-      const already = labels.slice(1).some((label) => label.title.startsWith(childPrefix));
-      if (already) {
-        clickChild();
-        return;
-      }
-      // 折りたたみ中: 展開して子の遅延ロード後にクリック (冪等: 再実行は
-      // already経路を通る)
-      labels[0]
-        .closest(".tree-row")
-        ?.querySelector<HTMLButtonElement>(".tree-expander")
-        ?.click();
-      setTimeout(clickChild, 700);
+      clickLeftTab("folders");
+      setTimeout(() => {
+        openFirstHomeChildNow();
+      }, 150);
+    },
+    /** UIUX-1 E2E: フォルダツリーの最初の (可視) 行で右クリックメニューを開く。 */
+    treeContextFirst: () => {
+      clickLeftTab("folders");
+      setTimeout(() => {
+        document
+          .querySelector<HTMLElement>(".tree-label")
+          ?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+      }, 150);
+    },
+    /** UIUX-1 E2E: 選択中 (row-selected) のツリー行で右クリックメニューを開く。
+     *  未選択時は最初の行へfallback (登録外フォルダ選択後の登録導線検証用)。 */
+    treeContextCurrent: () => {
+      clickLeftTab("folders");
+      setTimeout(() => {
+        const label =
+          document.querySelector<HTMLElement>(".tree-row.row-selected .tree-label") ??
+          document.querySelector<HTMLElement>(".tree-label");
+        label?.dispatchEvent(
+          new MouseEvent("contextmenu", { bubbles: true, cancelable: true }),
+        );
+      }, 150);
+    },
+    /** UIUX-1 E2E: 開いているツリー右クリックメニューの「このフォルダーを登録ルートに追加」。 */
+    treeMenuRegister: () => {
+      const item = Array.from(
+        document.querySelectorAll<HTMLButtonElement>(".context-menu button"),
+      ).find((b) => (b.textContent ?? "").trim().startsWith("このフォルダーを登録ルートに追加"));
+      item?.click();
+    },
+    /** UIUX-1 E2E: 開いているツリー右クリックメニューの「登録を解除」。 */
+    treeMenuUnregister: () => {
+      const item = Array.from(
+        document.querySelectorAll<HTMLButtonElement>(".context-menu button"),
+      ).find((b) => (b.textContent ?? "").trim().startsWith("登録を解除"));
+      item?.click();
     },
     // WP-18-1 D3 E2E: 最初の登録ルートのポータブルバックアップを作成
     // (destDir=null = 既定dir。BackupDialogと同一のcommandと引数)。
@@ -1028,6 +1137,89 @@ export function installDevBridge(stores: DevBridgeStores): void {
           bkState.err = toBridgeMessage(err);
         }
       })();
+    },
+    // ===== UIUX-1 E2E: メニューバー実操作・タブ・パンくず入力 =====
+    /** メニューバー「ファイル」を開く (開いたまま — 項目数はUX行で観測)。 */
+    uxMenuFile: () => {
+      closeMenuBar();
+      runMenuOpen("ファイル");
+    },
+    /** メニューバー「表示」を開く。 */
+    uxMenuView: () => {
+      closeMenuBar();
+      runMenuOpen("表示");
+    },
+    /** メニューバー「ツール」を開く。 */
+    uxMenuTools: () => {
+      closeMenuBar();
+      runMenuOpen("ツール");
+    },
+    /** メニューバー「ヘルプ」を開く。 */
+    uxMenuHelp: () => {
+      closeMenuBar();
+      runMenuOpen("ヘルプ");
+    },
+    /** 開いているメニューを閉じる。 */
+    uxMenuClose: () => closeMenuBar(),
+    /** ツール>「設定…」を開く (data-testid=settings-buttonと同一項目)。 */
+    uxMenuSettings: () => runMenuItem("ツール", "設定…"),
+    /** ヘルプ>「このアプリについて」(設定dialogのAboutタブ直開)。 */
+    uxMenuAbout: () => runMenuItem("ヘルプ", "このアプリについて"),
+    /** ツール>「ルートのバックアップ…」(1ルートならBackupDialog直開)。 */
+    uxMenuBackupRoot: () => runMenuItem("ツール", "ルートのバックアップ…"),
+    /** ファイル>「SD学習用エクスポート…」(無効条件の検証用 — 無効なら不発火)。 */
+    uxMenuExport: () => runMenuItem("ファイル", "SD学習用エクスポート…"),
+    /** ファイル>「一時走査を実行」。 */
+    uxMenuScan: () => runMenuItem("ファイル", "一時走査を実行"),
+    /** 左ペインタブ切替 (ドラフト生存検証: 切替えても入力値が残る)。 */
+    uxTabFolders: () => clickLeftTab("folders"),
+    uxTabCollections: () => clickLeftTab("collections"),
+    uxTabLibrary: () => clickLeftTab("library"),
+    /** コレクション作成フォームを開き名前入力へフォーカス (xdotool typeの着地)。 */
+    uxCollCreateForm: () => {
+      clickLeftTab("collections");
+      setTimeout(() => {
+        clickButton("+ 手動");
+        setTimeout(() => {
+          document.querySelector<HTMLInputElement>(".coll-create .coll-name-input")?.focus();
+        }, 120);
+      }, 150);
+    },
+    /** パンくずの「パスを入力」ボタンを開きinputへフォーカス (xdotool typeの着地)。 */
+    uxFocusBreadcrumb: () => {
+      document
+        .querySelector<HTMLButtonElement>('[data-testid="breadcrumb-path-button"]')
+        ?.click();
+      setTimeout(() => {
+        document
+          .querySelector<HTMLInputElement>('[data-testid="breadcrumb-path-input"]')
+          ?.focus();
+      }, 150);
+    },
+    /** ツールバーのスクロール速度スライダーへフォーカス (矢印キー=本物の操作)。 */
+    uxFocusSpeedSlider: () => {
+      document
+        .querySelector<HTMLInputElement>('[data-testid="scroll-speed-slider"]')
+        ?.focus();
+    },
+    /** グリッドのスクロール要素へ合成wheelを3ノッチ dispatch (速度係数の実測用。
+     * 実環境のX button4/5がWebKitGTKでホイール処理されないため、ビューアの
+     * wheelAtと同じ方針 — 本物のconditionalWheelリスナを通る)。 */
+    uxWheelGrid: () => {
+      const el = document.querySelector<HTMLElement>(".grid-scroll");
+      if (el === null) {
+        return;
+      }
+      for (let i = 0; i < 3; i++) {
+        el.dispatchEvent(
+          new WheelEvent("wheel", {
+            bubbles: true,
+            cancelable: true,
+            deltaMode: 0,
+            deltaY: 200,
+          }),
+        );
+      }
     },
   };
 
@@ -1188,6 +1380,53 @@ export function installDevBridge(stores: DevBridgeStores): void {
     ];
   }
 
+  /** UIUX-1: メニューバー・左ペインタブ・パンくず入力の状態行 (UX接頭辞)。
+   * フィールドはx接頭辞で既存行の先頭一致を奪わない (命名規約はbkLines参照)。
+   * xtab=アクティブタブ(f/c/l) / xmen=開中メニュー(f/v/t/h/-) / xmi=項目数
+   * / xdlg=picker系dialog数 / xab=設定About表示 / xcr=コレクション作成
+   * 入力文字数 / xcm=作成モード(n/m/s) / xbi=パンくず入力中 / xbc=crumb数
+   * / xed=エクスポート項目の無効(1/0/-1=メニュー閉) / xerr=toolbarエラー通知
+   * / xsp=スクロール速度係数 (スライダーvalue) */
+  function uiuxLines(): string[] {
+    const tabBtn = document.querySelector<HTMLButtonElement>(
+      ".left-tabs [role='tab'][aria-selected='true']",
+    );
+    const xtab = tabBtn === null ? "-" : tabBtn.id.replace("left-tab-", "").slice(0, 1);
+    const openTop = Array.from(
+      document.querySelectorAll<HTMLButtonElement>(".menubar-button"),
+    ).findIndex((b) => b.getAttribute("aria-expanded") === "true");
+    const xmen = openTop === -1 ? "-" : ["f", "v", "t", "h"][openTop] ?? "-";
+    const popover = document.querySelector(".menu-popover");
+    const xmi = popover === null ? 0 : popover.querySelectorAll("button").length;
+    const xdlg = document.querySelectorAll(".picker-backdrop").length;
+    const xab = document.querySelector("[data-testid='settings-about']") !== null ? 1 : 0;
+    const collName = document.querySelector<HTMLInputElement>(".coll-create .coll-name-input");
+    const createForm = document.querySelector(".coll-create");
+    const xcm = createForm === null ? "n" : collName === null ? "n" : "m";
+    const xcr = collName === null ? -1 : collName.value.length;
+    const xbi =
+      document.querySelector('[data-testid="breadcrumb-path-input"]') !== null ? 1 : 0;
+    const xbc = document.querySelectorAll(".breadcrumb .crumb").length;
+    const xerr = document.querySelector(".toolbar-notice.error") !== null ? 1 : 0;
+    const speedSlider = document.querySelector<HTMLInputElement>(
+      '[data-testid="scroll-speed-slider"]',
+    );
+    const xsp = speedSlider === null ? "-1" : speedSlider.value;
+    let xed = -1;
+    if (popover !== null) {
+      const exportItem = Array.from(
+        popover.querySelectorAll<HTMLButtonElement>("button"),
+      ).find((b) => (b.textContent ?? "").trim().startsWith("SD学習用エクスポート"));
+      if (exportItem !== undefined) {
+        xed = exportItem.disabled ? 1 : 0;
+      }
+    }
+    return [
+      `UX xtab=${xtab} xmen=${xmen} xmi=${xmi} xdlg=${xdlg} xab=${xab}` +
+        ` xcr=${xcr} xcm=${xcm} xbi=${xbi} xbc=${xbc} xed=${xed} xerr=${xerr} xsp=${xsp}`,
+    ];
+  }
+
   /** WP-5: メタデータ編集状態行 (E2Eの機械検証用)。 */
   function metaLines(): string[] {
     const meta = stores.getMeta();
@@ -1321,6 +1560,7 @@ export function installDevBridge(stores: DevBridgeStores): void {
       ...collectionLines(),
       ...fileOpsLines(),
       ...bkLines(),
+      ...uiuxLines(),
     );
     if (!lines.some((line) => line.startsWith("V ") || line.startsWith("C "))) {
       lines.push("idle (viewer closed)");
@@ -1447,6 +1687,38 @@ export function installDevBridge(stores: DevBridgeStores): void {
         setTimeout(dump, 600);
         return;
       }
+      if (uxCmdMode) {
+        const uxKeys: Record<string, string> = {
+          "1": "uxMenuFile",
+          "2": "uxMenuTools",
+          "3": "uxMenuHelp",
+          "4": "uxMenuClose",
+          "5": "uxTabFolders",
+          "6": "uxTabCollections",
+          "7": "uxTabLibrary",
+          "8": "uxCollCreateForm",
+          "9": "uxFocusBreadcrumb",
+          "0": "treeContextCurrent",
+          a: "treeMenuRegister",
+          u: "treeMenuUnregister",
+          s: "uxMenuSettings",
+          b: "uxMenuAbout",
+          e: "uxMenuExport",
+          k: "uxMenuBackupRoot",
+          c: "uxMenuScan",
+          v: "uxFocusSpeedSlider",
+          w: "uxWheelGrid",
+        };
+        const action = uxKeys[event.key];
+        if (action !== undefined) {
+          actions[action]?.();
+        }
+        uxCmdMode = false;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        setTimeout(dump, 600);
+        return;
+      }
       if (collCmdMode) {
         const collKeys: Record<string, string> = {
           "1": "collCreateManualForm",
@@ -1488,6 +1760,15 @@ export function installDevBridge(stores: DevBridgeStores): void {
       // F2はリネーム本体に取られているため)。
       if (event.ctrlKey && event.shiftKey && !event.altKey && key === "F12") {
         foCmdMode = true;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        setTimeout(dump, 300);
+        return;
+      }
+      // UIUX-1 E2E: メニュー/タブ/右クリック/パンくずコマンドモード
+      // (shift+F1で入る。ctrl+shift+F1はcollCmdModeが使用済みのため)。
+      if (event.shiftKey && !event.ctrlKey && !event.altKey && key === "F1") {
+        uxCmdMode = true;
         event.preventDefault();
         event.stopImmediatePropagation();
         setTimeout(dump, 300);

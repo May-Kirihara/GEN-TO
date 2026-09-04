@@ -134,6 +134,7 @@ async function mountDialog(
     profiles?: AiProfile[];
     about?: unknown;
     onClose?: () => void;
+    initialTab?: string;
   } = {},
 ): Promise<void> {
   const {
@@ -142,6 +143,7 @@ async function mountDialog(
     profiles = [],
     about = ABOUT_INFO,
     onClose = () => {},
+    initialTab,
   } = options;
   target = document.createElement("div");
   document.body.appendChild(target);
@@ -180,8 +182,15 @@ async function mountDialog(
     props: {
       roots,
       profiles,
-      displayInfo: { lastFolder: "/photos/2026", expandedCount: 7, sortLabel: "名前順" },
+      displayInfo: {
+        lastFolder: "/photos/2026",
+        expandedCount: 7,
+        sortLabel: "名前順",
+        scrollSpeed: 1,
+      },
       onClose,
+      // 不正なタブidも意図的に渡すため、コンポーネント側のTab unionへは表明付きで渡す
+      initialTab: initialTab as "general",
     },
   });
   flushSync();
@@ -362,6 +371,8 @@ describe("SettingsDialog", () => {
     expect(text).toContain("/photos/2026");
     expect(text).toContain("7");
     expect(text).toContain("名前順");
+    // UIUX-1: スクロール速度の現在値も読み取り専用で表示
+    expect(text).toContain("1.0倍");
   });
 
   it("このアプリについてタブ: バージョン・ビルド情報・更新履歴・ライセンス情報を表示する", async () => {
@@ -399,5 +410,15 @@ describe("SettingsDialog", () => {
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
     flushSync();
     expect(closed).toBe(1);
+  });
+
+  it("UIUX-1: initialTab指定で指定タブを直開する (ヘルプ>このアプリについて導線)", async () => {
+    await mountDialog({ initialTab: "about" });
+    // Aboutタブが初期表示 (タブクリックなし)
+    expect(target!.querySelector("[data-testid='settings-about']")).not.toBeNull();
+    expect(target!.querySelector("[data-testid='settings-general']")).toBeNull();
+    // 不正なタブidは無視して既定 (一般) へ
+    await mountDialog({ initialTab: "no-such-tab" });
+    expect(target!.querySelector("[data-testid='settings-general']")).not.toBeNull();
   });
 });
