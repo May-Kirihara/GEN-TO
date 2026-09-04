@@ -17,6 +17,7 @@
   } from "./lib/thumbnails";
   import {
     LibraryStore,
+    needsRegistrationConfirm,
     startupCatalogView,
     type LibraryIpc,
     type LibraryRoot,
@@ -103,6 +104,8 @@
   import DestPicker from "./lib/ui/DestPicker.svelte";
   import ConflictDialog from "./lib/ui/ConflictDialog.svelte";
   import DeleteForeverDialog from "./lib/ui/DeleteForeverDialog.svelte";
+  // UIUX-2: 危険パス (`/` 等) 登録の確認ダイアログ
+  import ConfirmRegistrationDialog from "./lib/ui/ConfirmRegistrationDialog.svelte";
   // WP-13: バックアップと復元
   import BackupDialog from "./lib/ui/BackupDialog.svelte";
   import ExportDialog from "./lib/ui/ExportDialog.svelte";
@@ -434,14 +437,30 @@
     }
   }
 
-  /** ツリー右クリック: 未登録フォルダを登録 (登録→見える導線はUXLIB-1規約)。 */
-  async function registerRootFromTree(path: string): Promise<void> {
+  /** ツリー右クリック: 未登録フォルダを登録 (登録→見える導線はUXLIB-1規約)。
+   * UIUX-2: 危険パス (`/` 等の広域ルート) は確認ダイアログを挟む。 */
+  let registerConfirmPath = $state<string | null>(null);
+
+  function requestAddRoot(path: string): Promise<boolean> {
+    if (needsRegistrationConfirm(path)) {
+      registerConfirmPath = path;
+      return Promise.resolve(false);
+    }
+    return addRootConfirmed(path);
+  }
+
+  async function addRootConfirmed(path: string): Promise<boolean> {
     const ok = await library.addRoot(path);
     if (!ok) {
       libraryError = library.lastError ?? "登録に失敗しました";
-      return;
+      return false;
     }
     await showLibrary();
+    return true;
+  }
+
+  function registerRootFromTree(path: string): void {
+    void requestAddRoot(path);
   }
 
   /** ツリー右クリック: 登録解除 (状態が変わるだけ。表示はshowLibrary/ツリーで追従)。 */
@@ -3015,6 +3034,7 @@
             onRefresh={() => void library.refreshRoots()}
             onShowLibrary={() => showLibrary()}
             onBackupRoot={(root) => (backupFor = root)}
+            onAddRoot={requestAddRoot}
           />
         </div>
       </aside>
@@ -3692,6 +3712,20 @@
     root={backupFor}
     roots={libraryRoots}
     onClose={() => (backupFor = null)}
+  />
+{/if}
+
+{#if registerConfirmPath !== null}
+  <ConfirmRegistrationDialog
+    path={registerConfirmPath}
+    onConfirm={() => {
+      const path = registerConfirmPath;
+      registerConfirmPath = null;
+      if (path !== null) {
+        void addRootConfirmed(path);
+      }
+    }}
+    onCancel={() => (registerConfirmPath = null)}
   />
 {/if}
 

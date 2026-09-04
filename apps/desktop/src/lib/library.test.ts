@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   EMPTY_SCAN_STATUS,
   LibraryStore,
+  needsRegistrationConfirm,
   startupCatalogView,
   type LibraryIpc,
   type LibraryRoot,
@@ -315,5 +316,43 @@ describe("startupCatalogView (UXLIB-1 起動既定表示)", () => {
     expect(startupCatalogView("/data/other/sub", true, ["/data/photos", "/data/other"])).toEqual({
       kind: "library",
     });
+  });
+});
+
+describe("needsRegistrationConfirm (UIUX-2 危険パス登録の確認要求)", () => {
+  it("depth≤1のPOSIX絶対パスは確認対象 (ファイルシステム全体・直下1段)", () => {
+    expect(needsRegistrationConfirm("/")).toBe(true);
+    expect(needsRegistrationConfirm("/home")).toBe(true);
+    expect(needsRegistrationConfirm("/usr")).toBe(true);
+    expect(needsRegistrationConfirm("/home/")).toBe(true);
+    expect(needsRegistrationConfirm("/mnt//")).toBe(true);
+  });
+
+  it("depth≥2のPOSIX絶対パスは確認不要 (通常の登録単位)", () => {
+    expect(needsRegistrationConfirm("/home/u")).toBe(false);
+    expect(needsRegistrationConfirm("/data/photos")).toBe(false);
+    expect(needsRegistrationConfirm("/a/b/c")).toBe(false);
+  });
+
+  it("Windowsドライブルートは確認対象 (区切り・大小文字・bareを含む)", () => {
+    expect(needsRegistrationConfirm("C:\\")).toBe(true);
+    expect(needsRegistrationConfirm("C:")).toBe(true);
+    expect(needsRegistrationConfirm("c:/")).toBe(true);
+    expect(needsRegistrationConfirm("D:\\")).toBe(true);
+    expect(needsRegistrationConfirm("C:\\Users")).toBe(false);
+    expect(needsRegistrationConfirm("C:\\Users\\me\\Pictures")).toBe(false);
+  });
+
+  it("UNC共有ルートは確認対象 (server/shareまで。より深い部分は対象外)", () => {
+    expect(needsRegistrationConfirm("\\\\server\\share\\")).toBe(true);
+    expect(needsRegistrationConfirm("\\\\server\\share")).toBe(true);
+    expect(needsRegistrationConfirm("//server/share/")).toBe(true);
+    expect(needsRegistrationConfirm("\\\\server\\share\\photos")).toBe(false);
+  });
+
+  it("相対パス・空は確認不要 (backendの拒否に委譲)", () => {
+    expect(needsRegistrationConfirm("foo/bar")).toBe(false);
+    expect(needsRegistrationConfirm("")).toBe(false);
+    expect(needsRegistrationConfirm(".")).toBe(false);
   });
 });

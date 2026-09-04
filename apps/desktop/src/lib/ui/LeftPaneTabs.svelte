@@ -84,7 +84,11 @@
   }
 
   .left-tabs button {
-    flex: 1;
+    /* UIUX-2 (C2): コンテンツ幅を基準に伸縮する — 既定240pxの左ペインで
+     * 「コレクション」が省略されない (均等flexだと最長ラベルが切れる。
+     * 余白は均等配分、狭い幅では長い方から順に縮む)。 */
+    flex: 1 1 auto;
+    min-width: 0;
     border: 1px solid transparent;
     border-bottom: none;
     background: transparent;

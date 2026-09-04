@@ -21,6 +21,7 @@
     onRefresh,
     onShowLibrary,
     onBackupRoot,
+    onAddRoot,
   }: {
     library: LibraryStore;
     roots: LibraryRoot[];
@@ -32,6 +33,9 @@
     onShowLibrary: () => Promise<boolean>;
     /** ルート単位の.gentoバックアップ作成ダイアログを開く (WP-13)。 */
     onBackupRoot: (root: LibraryRoot) => void;
+    /** ルートを追加 (UIUX-2: Appが危険パスの確認ダイアログを挟む。
+     * 成功時はApp側でlibrary表示へ切替えるため、ここでは入力クリアのみ)。 */
+    onAddRoot: (path: string) => Promise<boolean>;
   } = $props();
 
   let newRootPath = $state("");
@@ -40,14 +44,11 @@
     if (newRootPath.trim() === "") {
       return;
     }
-    const ok = await library.addRoot(newRootPath.trim());
+    const ok = await onAddRoot(newRootPath.trim());
     if (!ok) {
       return;
     }
     newRootPath = "";
-    // 登録したら自分のライブラリが見える導線 (UXLIB-1)。切替失敗は
-    // showLibraryがlibraryErrorへ出すため、ここでは表示を維持して継続。
-    await onShowLibrary();
   }
 </script>
 
@@ -73,7 +74,9 @@
     <p class="roots-error">{error}</p>
   {/if}
   {#if roots.length === 0}
-    <p class="roots-notice">登録されたルートはありません</p>
+    <p class="roots-notice">
+      登録されたルートはありません。上の入力欄またはフォルダーの右クリックでも登録できます。
+    </p>
   {:else}
     <ul class="roots-list">
       {#each roots as root (root.id)}

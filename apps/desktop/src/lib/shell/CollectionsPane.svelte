@@ -131,10 +131,13 @@
   let renaming = $state<{ id: string; name: string } | null>(null);
   let renameInput: HTMLInputElement | null = $state(null);
 
-  // 改名入力へフォーカス (autofocusはa11y警告のため$effectで)
+  // 改名入力へフォーカス (autofocusはa11y警告のため$effectで)。
+  // 既存テキストは選択済みにする (ThumbnailGridのリネームと同一挙動 —
+  // 修正入力より全置換が多い操作のため)。
   $effect(() => {
     if (renaming !== null) {
       renameInput?.focus();
+      renameInput?.select();
     }
   });
 

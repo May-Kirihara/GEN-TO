@@ -19,6 +19,8 @@
 #      + 一時走査を中止 (scn=1を観測してからメニューから中止 — r1)
 #   6) FolderTree右クリック3状態: unrelated (登録導線) / root (3項目) /
 #      descendant (メニュー無し) — r1
+#   6c) / (ファイルシステム) 行登録の確認dialog: 表示 + Escape取消で
+#      roots不変 (UIUX-2 — 実登録はしない) / 6d) タブラベル省略なし (C2)
 #   7) メニューkeyboard操作: 矢印で開く・項目focus・ESCでトリガ復帰・
 #      トップレベル矢印切替 (r1 — 実キー)
 #   8) タブfocusモデル: 非アクティブパネルはhidden + focus不可 (xhf=0)
@@ -418,6 +420,42 @@ else
 fi
 shot 09-tree-descendant
 
+# ========== 6c) 「ファイルシステム (/)」登録の確認dialog — UIUX-2 ==========
+# 危険パス (depth≤1) の登録は確認dialogを挟む。Cancel = 登録されない
+# (roots不変・表示遷移なし)。実際の登録は行わない (走査コスト・危険)。
+roots_before=$(devtest_value xrt || echo -)
+mode_before=$(devtest_value mode || echo -)
+ux l 1.0    # treeContextFsRoot — / 行で右クリック (unrelated)
+if wait_value menu 1 10; then
+  pass "6) / 行右クリックでcontext menu (U menu=1)"
+else
+  fail "6) / 行のcontext menuが開かない (menu=$(devtest_value menu || echo -))"
+fi
+shot 14-fsroot-context-menu
+ux a 1.0    # treeMenuRegister → 確認dialog
+if wait_value xrc 1 10; then
+  pass "6) / 登録で確認dialog表示 (xrc=1 — 無確認登録の解消)"
+else
+  fail "6) / 登録の確認dialogが出ない (xrc=$(devtest_value xrc || echo -))"
+fi
+shot 15-register-confirm
+xdotool key Escape; sleep 1.0   # dialogをEscapeで取消
+if wait_value xrc 0 10 \
+  && [[ "$(devtest_value xrt || true)" == "$roots_before" ]] \
+  && [[ "$(devtest_value mode || true)" == "$mode_before" ]]; then
+  pass "6) 確認dialog取消で登録されない (xrc=0 roots/mode不変)"
+else
+  fail "6) 取消後の状態が不正 (xrc=$(devtest_value xrc || echo -) xrt=$(devtest_value xrt || echo -) 期待=$roots_before)"
+fi
+
+# ========== 6d) 左ペインタブのラベル省略なし (UIUX-2 C2) ==========
+if [[ "$(devtest_value xtt || true)" == "0" ]]; then
+  pass "6) 既定240pxでタブラベル省略なし (xtt=0)"
+else
+  fail "6) タブラベルが省略されている (xtt=$(devtest_value xtt || echo -))"
+fi
+shot 16-left-tabs
+
 # ========== 2c) ツール>ルートのバックアップ… (登録済み → BackupDialog直開) ==========
 ux k 1.5    # uxMenuBackupRoot
 if wait_value xdlg 1 10; then
@@ -596,7 +634,7 @@ else
 fi
 
 echo | tee -a "$NOTE"
-echo "UIUX1 E2E RESULT: $((46 - FAILURES))/46 conditions passed, FAILURES=$FAILURES" | tee -a "$NOTE"
+echo "UIUX1 E2E RESULT: $((52 - FAILURES))/52 conditions passed, FAILURES=$FAILURES" | tee -a "$NOTE"
 if (( FAILURES > 0 )); then
   echo "FAILING LINES:" | tee -a "$NOTE"
   grep -a "devtest:" "$WORK/logs/app.log" | tail -5 | tee -a "$NOTE"

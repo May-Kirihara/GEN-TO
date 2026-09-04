@@ -189,7 +189,9 @@ struct Shared {
     db: Arc<gento_db::Db>,
     fs: Arc<dyn ScanFs>,
     host: Arc<dyn LibraryHost>,
-    cancel: AtomicBool,
+    /// Arcなのは走査wedge検証のテストdoubleが同じフラグを観測するため
+    /// (本番コードはMutex-freeの単一フラグとして使う・挙動は従来と同一)。
+    cancel: Arc<AtomicBool>,
     /// スキャン位相・進捗 (status commandとイベント送出の正本)。
     progress: Mutex<LibraryProgress>,
     /// ハッシュ待ち残数 (おおよ其の値: キュー投入と完了の差)。
@@ -271,7 +273,7 @@ impl LibraryController {
             db,
             fs,
             host,
-            cancel: AtomicBool::new(false),
+            cancel: Arc::new(AtomicBool::new(false)),
             progress: Mutex::new(LibraryProgress::default()),
             hash_pending: AtomicU64::new(0),
             last_hash_emit: Mutex::new(None),
@@ -383,7 +385,17 @@ impl LibraryController {
     }
 
     /// ルートを解除 (配下FileはCASCADE削除。Assetは残る)。
+    ///
+    /// 走査中の解除はin-flightのwalkの処理を即座に止める (cancel発火)。
+    /// cancelは次の `run_scan_root` 開始時点で解除されるため、多ルート
+    /// 走査の後続ルートには影響しない (解除されたルート自身はDB行が
+    /// 消えるため再照会でskipされる)。単発の巨大ルート (`/` 等) の
+    /// walk列挙そのものは trait に中断経路が無いため残余だけ走るが、
+    /// 処理 (DB書き込み・ハッシュ) は直ちに停止する。
     pub fn remove_root(&self, root_id: i64) -> Result<(), String> {
+        if self.is_scanning() {
+            self.cancel_scan();
+        }
         self.stop_watcher(root_id);
         self.shared
             .db
@@ -912,6 +924,59 @@ fn run_scan_all(shared: &Arc<Shared>, hash_pool: &Arc<WorkerPool>, only_root: Op
     shared.scanning.store(false, Ordering::SeqCst);
 }
 
+/// ルート生存監視の照会周期。走査中のみ稼働するスレッド1本あたりの
+/// 負荷はこの1クエリ (roots表は小さい)。
+const ROOT_LIVENESS_POLL: Duration = Duration::from_millis(250);
+
+/// walk中のルート消失監視 (UIUX-2 二重防御)。
+///
+/// DBからルート行が消えたら `cancel` を立てる。`scan_root` のsinkは
+/// cancelをエントリごとに確認するため、反映は「処理の停止」として
+/// 即座に効く (列挙自体はfs実装に委ねる)。誤キャンセルを避けるため
+/// 照会失敗 (DB一時エラー) は生存扱いする。
+struct RootLivenessWatchdog {
+    stop: Sender<()>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+fn spawn_root_liveness_watchdog(shared: &Arc<Shared>, root_id: i64) -> RootLivenessWatchdog {
+    let watcher_shared = Arc::clone(shared);
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let handle = std::thread::Builder::new()
+        .name("root-liveness".into())
+        .spawn(move || {
+            // recv_timeoutをスリップ代わりに使う: stop送信で即時起床する
+            // ため、走査ごとのjoin待ちがポーリング周期ぶん遅れない。
+            while stop_rx.recv_timeout(ROOT_LIVENESS_POLL).is_err() {
+                let alive = watcher_shared
+                    .db
+                    .with_reader(|repos| repos.list_roots())
+                    .map(|roots| roots.iter().any(|root| root.id == root_id))
+                    .unwrap_or(true);
+                if !alive {
+                    tracing::info!(root_id, "root row vanished during walk; cancelling scan");
+                    watcher_shared.cancel.store(true, Ordering::SeqCst);
+                    return;
+                }
+            }
+        })
+        .expect("spawn root liveness watchdog");
+    RootLivenessWatchdog {
+        stop: stop_tx,
+        handle: Some(handle),
+    }
+}
+
+impl RootLivenessWatchdog {
+    /// 監視を終了してスレッドを回収する (stop送信で即時退出する)。
+    fn stop(mut self) {
+        let _ = self.stop.send(());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 fn run_scan_all_inner(shared: &Arc<Shared>, hash_pool: &Arc<WorkerPool>, only_root: Option<i64>) {
     let roots = match shared.db.with_reader(|repos| repos.list_roots()) {
         Ok(roots) => roots
@@ -952,6 +1017,11 @@ fn run_scan_root(
     }
 
     shared.cancel.store(false, Ordering::SeqCst);
+    // 二重防御: walk中にDBからルート行が消えたらcancelへ反映する。
+    // controller.remove_root自身もcancelを発火するが、行削除は他経路
+    // (直接DB操作・将来のbatch解除) でも起き得るため、walkの生存期間中は
+    // この監視が兜底する。
+    let watchdog = spawn_root_liveness_watchdog(shared, root_id);
     let host = Arc::clone(&shared.host);
     let started = Instant::now();
     let mut error_samples: Vec<String> = Vec::new();
@@ -976,6 +1046,7 @@ fn run_scan_root(
             host.scan_progress(progress_payload(shared, started, false, &[]));
         },
     );
+    watchdog.stop();
     match summary {
         Ok(summary) => {
             error_samples = summary.error_samples.clone();
@@ -2125,7 +2196,7 @@ mod tests {
             db,
             fs: Arc::new(PlatformFs),
             host: TestHost::new(),
-            cancel: AtomicBool::new(false),
+            cancel: Arc::new(AtomicBool::new(false)),
             progress: Mutex::new(LibraryProgress::default()),
             hash_pending: AtomicU64::new(0),
             last_hash_emit: Mutex::new(None),
@@ -2496,6 +2567,179 @@ mod tests {
             0,
             "終了时会計0"
         );
+    }
+
+    // ===== UIUX-2 (A): 走査中ルート解除のwedge (QA Major) =====
+
+    /// walkのエントリ供給をテストが制御するfs (wedgeの決定論再現)。
+    ///
+    /// 本物PlatformFsの列挙に挟み、「テストの解放または `cancel` 観測まで
+    /// 各エントリをsinkへ手放さない」ゲートを入れる。cancel観測後は残り
+    /// のエントリを即座に素通りさせる — これは `scan_root` のsinkが
+    /// cancelで処理をskipする本番の意味論を遅延付きで模擬したもの
+    /// (列挙自体は小規模dirなので即終了する)。
+    struct GatedScanFs {
+        cancel: StdMutex<Option<Arc<AtomicBool>>>,
+        gate_rx: StdMutex<mpsc::Receiver<()>>,
+        entries_arrived: AtomicU64,
+    }
+
+    impl GatedScanFs {
+        fn new(gate_rx: mpsc::Receiver<()>) -> Arc<Self> {
+            Arc::new(Self {
+                cancel: StdMutex::new(None),
+                gate_rx: StdMutex::new(gate_rx),
+                entries_arrived: AtomicU64::new(0),
+            })
+        }
+
+        /// controller構築後に共有cancelフラグへ接続する
+        /// (fsはSharedより先に作る必要があるため)。
+        fn attach(&self, cancel: Arc<AtomicBool>) {
+            *self.cancel.lock().unwrap() = Some(cancel);
+        }
+
+        fn entries_arrived(&self) -> u64 {
+            self.entries_arrived.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ScanFs for GatedScanFs {
+        fn walk(
+            &self,
+            root: &Path,
+            scope: Option<&Path>,
+            sink: &mut dyn FnMut(ScanEntry),
+        ) -> WalkOutcome {
+            let mut cancelled = false;
+            let outcome = PlatformFs.walk(root, scope, &mut |entry| {
+                if cancelled {
+                    return;
+                }
+                self.entries_arrived.fetch_add(1, Ordering::SeqCst);
+                loop {
+                    if let Some(flag) = self.cancel.lock().unwrap().as_ref() {
+                        if flag.load(Ordering::SeqCst) {
+                            cancelled = true;
+                            return;
+                        }
+                    }
+                    match self
+                        .gate_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_millis(15))
+                    {
+                        Ok(()) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        // 送信側drop (= ゲート解放扱い): ブロックしない
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                sink(entry);
+            });
+            outcome
+        }
+
+        fn hash_and_probe(
+            &self,
+            path: &Path,
+            expect: &GenerationToken,
+            cancel: &AtomicBool,
+        ) -> Result<HashedFile, HashFileError> {
+            PlatformFs.hash_and_probe(path, expect, cancel)
+        }
+    }
+
+    /// GatedScanFsで「ルート登録済み・walkが最初のエントリでブロック中」
+    /// の状態まで進めたcontroller一式を作る。戻り値のTestDirはテストが
+    /// 保持する (Dropでdirが消えるとwalkが空で即完結してしまう)。
+    fn gated_controller(
+        name: &str,
+    ) -> (
+        Arc<LibraryController>,
+        Arc<TestHost>,
+        Arc<GatedScanFs>,
+        mpsc::Sender<()>,
+        i64,
+        TestDir,
+    ) {
+        let (db_path, _dir) = temp_db(name);
+        let data = TestDir::new(&format!("{name}-data"));
+        data.write("a.png", PNG_A);
+        data.write("b.png", PNG_B);
+        let db = Arc::new(gento_db::Db::open(&db_path).unwrap());
+        let host = TestHost::new();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let gated = GatedScanFs::new(gate_rx);
+        // メンテナンス経路を排して走査1回だけを観測する
+        let controller = LibraryController::with_fs_maintenance(
+            db,
+            host.clone(),
+            gated.clone(),
+            Duration::from_secs(3600),
+            8_192,
+        )
+        .unwrap();
+        gated.attach(Arc::clone(&controller.shared.cancel));
+        let (root, _) = controller.add_root(data.path()).unwrap();
+        (controller, host, gated, gate_tx, root.id, data)
+    }
+
+    /// 走査中 (walkがエントリをブロック中) になったことを待つ。
+    fn wait_walk_blocked(controller: &LibraryController, gated: &GatedScanFs) -> bool {
+        wait_until(10, || {
+            controller.is_scanning() && gated.entries_arrived() >= 1
+        })
+    }
+
+    #[test]
+    fn remove_root_during_walk_stops_scan_promptly() {
+        // QA Major: 走査中のルート解除でscannerがwedgeする (再起動で回復)。
+        // テストはゲートを一切開けない — remove_rootだけで走査が完結
+        // (is_scanning=false) しなければならない。現在はcancelが発火
+        // しないためwalkがブロックしたまま = wedgeを再現する。
+        let (controller, _host, gated, _gate_tx, root_id, _data) =
+            gated_controller("remove-walk-cancel");
+        assert!(wait_walk_blocked(&controller, &gated), "walkが開始しない");
+
+        controller.remove_root(root_id).unwrap();
+
+        let stopped = wait_until(10, || !controller.is_scanning());
+        assert!(
+            stopped,
+            "走査中解除でscanが完了しない (wedge): entries={}",
+            gated.entries_arrived()
+        );
+        let roots = controller
+            .db()
+            .with_reader(|repos| repos.list_roots())
+            .unwrap()
+            .len();
+        assert_eq!(roots, 0, "ルートは削除済み");
+        controller.shutdown();
+    }
+
+    #[test]
+    fn root_row_removal_during_scan_triggers_liveness_watchdog() {
+        // 二重防御: controller.remove_rootを経由しないルート行削除でも、
+        // walk中にDBからルートが消えたらcancelが反映されて走査が完結する。
+        let (controller, _host, gated, _gate_tx, root_id, _data) = gated_controller("watchdog");
+        assert!(wait_walk_blocked(&controller, &gated), "walkが開始しない");
+
+        // cancel発火なしの経路: 直接DB行を削除する
+        controller
+            .db()
+            .with_writer(|repos| repos.remove_root(root_id))
+            .unwrap();
+
+        let stopped = wait_until(10, || !controller.is_scanning());
+        assert!(
+            stopped,
+            "ルート行消失がwatchdogでcancelされない (wedge): entries={}",
+            gated.entries_arrived()
+        );
+        controller.shutdown();
     }
 
     // ===== FG-WP2-2: 破棄/拒否ジョブの決定論リトライ =====

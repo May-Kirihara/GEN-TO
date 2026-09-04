@@ -120,6 +120,37 @@ function toMessage(value: unknown): string {
   return value instanceof Error ? value.message : String(value);
 }
 
+/**
+ * 登録前に確認ダイアログを出すべき「危険な」パスか (UIUX-2)。
+ *
+ * 構造規則で判定する (ブロックリスト不要):
+ * - POSIX絶対パスはdepth≤1 (`/` 自体・`/home` 等、直下1段まで)。
+ *   depth≥2 (`/home/user`) は通常の登録単位。
+ * - Windowsドライブルート (`C:\`・`C:`。区切り/大小文字は不問)。
+ * - UNC共有ルート (`\\server\share`。共有より深い部分は対象外)。
+ * 相対パス・空は確認不要 (backendの存在確認が拒否する)。
+ */
+export function needsRegistrationConfirm(path: string): boolean {
+  const segments = (value: string): number =>
+    value.split(/[\\/]+/).filter((part) => part !== "").length;
+  if (path === "") {
+    return false;
+  }
+  // Windowsドライブルート: ドライブ文字1字 + コロン (+区切り)
+  if (/^[a-zA-Z]:[\\/]*$/.test(path)) {
+    return true;
+  }
+  // UNC: 先頭2区切りで始まり server\share (2セグメント) まで
+  if (/^[\\/]{2}/.test(path)) {
+    return segments(path) <= 2;
+  }
+  // POSIX絶対パス: depth ≤ 1
+  if (path.startsWith("/")) {
+    return segments(path) <= 1;
+  }
+  return false;
+}
+
 /** 登録ルートUI状態ストア。 */
 export class LibraryStore {
   roots: LibraryRoot[] = [];

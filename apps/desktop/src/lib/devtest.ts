@@ -1256,6 +1256,18 @@ export function installDevBridge(stores: DevBridgeStores): void {
           );
       }, 150);
     },
+    /** UIUX-2 E2E: ファイルシステム (/) 行で右クリック (危険パス登録の
+     *  確認ダイアログ検証用 — 登録導線のunrelated状態)。 */
+    treeContextFsRoot: () => {
+      clickLeftTab("folders");
+      setTimeout(() => {
+        document
+          .querySelector<HTMLElement>('.tree-label[title="/"]')
+          ?.dispatchEvent(
+            new MouseEvent("contextmenu", { bubbles: true, cancelable: true }),
+          );
+      }, 150);
+    },
     /** 登録ルート行の展開矢印をクリック (配下行の出現)。 */
     treeExpandRoot: () => {
       clickLeftTab("folders");
@@ -1502,7 +1514,9 @@ export function installDevBridge(stores: DevBridgeStores): void {
    * / xhf=hidden内focus試行 (0=拒否が正常) / xrn=リネーム入力文字数
    * / xra=ルート追加path入力文字数 / xes=エクスポートdialog入力元(c/s/-)
    * / xsc=ファイルメニュー走査項目(r=実行/c=中止/-) / xti=登録内バッジ数
-   * / xdd=開発パネル / xai=AIパネル / xln=DBバックアップ完了通知 */
+   * / xdd=開発パネル / xai=AIパネル / xln=DBバックアップ完了通知
+   * / xrc=危険パス登録確認dialog / xrt=登録ルート行数 / xtt=省略タブ数
+   * (UIUX-2) */
   function uiuxLines(): string[] {
     const tabBtn = document.querySelector<HTMLButtonElement>(
       ".left-tabs [role='tab'][aria-selected='true']",
@@ -1573,6 +1587,12 @@ export function installDevBridge(stores: DevBridgeStores): void {
       (document.querySelector(".roots-notice")?.textContent ?? "").includes("DBバックアップを作成しました")
         ? 1
         : 0;
+    // UIUX-2: 危険パス登録確認dialog・登録ルート行数・タブラベル省略
+    const xrc = document.querySelector('[data-testid="register-confirm"]') !== null ? 1 : 0;
+    const xrt = document.querySelectorAll(".roots-list li").length;
+    const xtt = Array.from(
+      document.querySelectorAll<HTMLButtonElement>(".left-tabs button"),
+    ).filter((tab) => tab.scrollWidth > tab.clientWidth).length;
     let xed = -1;
     if (popover !== null) {
       const exportItem = Array.from(
@@ -1586,7 +1606,8 @@ export function installDevBridge(stores: DevBridgeStores): void {
       `UX xtab=${xtab} xmen=${xmen} xmi=${xmi} xdlg=${xdlg} xab=${xab}` +
         ` xcr=${xcr} xcm=${xcm} xbi=${xbi} xbc=${xbc} xed=${xed} xerr=${xerr} xsp=${xsp}` +
         ` xrole=${xrole} xlp=${xlp} xrp=${xrp} xhid=${xhid} xhf=${uxHiddenFocusResult}` +
-        ` xrn=${xrn} xra=${xra} xes=${xes} xsc=${xsc} xti=${xti} xdd=${xdd} xai=${xai} xln=${xln}`,
+        ` xrn=${xrn} xra=${xra} xes=${xes} xsc=${xsc} xti=${xti} xdd=${xdd} xai=${xai} xln=${xln}` +
+        ` xrc=${xrc} xrt=${xrt} xtt=${xtt}`,
     ];
   }
 
@@ -1867,6 +1888,7 @@ export function installDevBridge(stores: DevBridgeStores): void {
           d: "treeContextInside",
           t: "treeExpandRoot",
           h: "treeContextRoot",
+          l: "treeContextFsRoot",
           s: "uxMenuSettings",
           b: "uxMenuAbout",
           e: "uxMenuExport",
