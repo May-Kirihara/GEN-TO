@@ -189,9 +189,9 @@ struct Shared {
     db: Arc<gento_db::Db>,
     fs: Arc<dyn ScanFs>,
     host: Arc<dyn LibraryHost>,
-    /// Arcなのは走査wedge検証のテストdoubleが同じフラグを観測するため
-    /// (本番コードはMutex-freeの単一フラグとして使う・挙動は従来と同一)。
-    cancel: Arc<AtomicBool>,
+    /// 走査・ハッシュの協調キャンセルフラグ (walk列挙境界・sink処理・
+    /// ハッシュ計算で観察される)。
+    cancel: AtomicBool,
     /// スキャン位相・進捗 (status commandとイベント送出の正本)。
     progress: Mutex<LibraryProgress>,
     /// ハッシュ待ち残数 (おおよ其の値: キュー投入と完了の差)。
@@ -273,7 +273,7 @@ impl LibraryController {
             db,
             fs,
             host,
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: AtomicBool::new(false),
             progress: Mutex::new(LibraryProgress::default()),
             hash_pending: AtomicU64::new(0),
             last_hash_emit: Mutex::new(None),
@@ -386,12 +386,17 @@ impl LibraryController {
 
     /// ルートを解除 (配下FileはCASCADE削除。Assetは残る)。
     ///
-    /// 走査中の解除はin-flightのwalkの処理を即座に止める (cancel発火)。
+    /// 走査中の解除はin-flightのwalkを即座に止める (cancel発火)。cancelは
+    /// [`ScanFs::walk`] の列挙境界でも観察されるため、列挙 (readdir) ごと
+    /// 停止する (UIUX-3。`/` 規模でも列挙tailを残さない)。
     /// cancelは次の `run_scan_root` 開始時点で解除されるため、多ルート
     /// 走査の後続ルートには影響しない (解除されたルート自身はDB行が
-    /// 消えるため再照会でskipされる)。単発の巨大ルート (`/` 等) の
-    /// walk列挙そのものは trait に中断経路が無いため残余だけ走るが、
-    /// 処理 (DB書き込み・ハッシュ) は直ちに停止する。
+    /// 消えるため再照会でskipされる)。
+    ///
+    /// 既知の設計上の取引 (N4): cancelフラグはglobalのため、多ルート走査中に
+    /// 「別のルート」を解除すると、その時点で走査中だったルートも巻き込んで
+    /// 打ち切られる場合がある。失われた分は次のスキャン・メンテナンス周期の
+    /// 再走査で冪等に拾い直される (収束動作)。
     pub fn remove_root(&self, root_id: i64) -> Result<(), String> {
         if self.is_scanning() {
             self.cancel_scan();
@@ -920,8 +925,19 @@ fn worker_loop(
 
 fn run_scan_all(shared: &Arc<Shared>, hash_pool: &Arc<WorkerPool>, only_root: Option<i64>) {
     shared.scanning.store(true, Ordering::SeqCst);
+    // panic (walk内のunwind等) でもscanning=falseを復元する: 復元されないと
+    // scan_startが「進行中」拒否のまま恒久化する (UIUX-3)。
+    let _scanning_guard = ScanningGuard(&shared.scanning);
     run_scan_all_inner(shared, hash_pool, only_root);
-    shared.scanning.store(false, Ordering::SeqCst);
+}
+
+/// `scanning=true` の間のRAII復元guard (Dropでfalseへ戻す)。
+struct ScanningGuard<'a>(&'a AtomicBool);
+
+impl Drop for ScanningGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 /// ルート生存監視の照会周期。走査中のみ稼働するスレッド1本あたりの
@@ -930,12 +946,18 @@ const ROOT_LIVENESS_POLL: Duration = Duration::from_millis(250);
 
 /// walk中のルート消失監視 (UIUX-2 二重防御)。
 ///
-/// DBからルート行が消えたら `cancel` を立てる。`scan_root` のsinkは
-/// cancelをエントリごとに確認するため、反映は「処理の停止」として
-/// 即座に効く (列挙自体はfs実装に委ねる)。誤キャンセルを避けるため
+/// DBからルート行が消えたら `cancel` を立てる。cancelは [`ScanFs::walk`]
+/// の列挙境界と `scan_root` のsink処理の両方で観察されるため、反映は
+/// 「列挙・処理の停止」として即座に効く (UIUX-3)。誤キャンセルを避けるため
 /// 照会失敗 (DB一時エラー) は生存扱いする。
+///
+/// 停止はRAII: 明示的な停止を呼ばなくてもDropがstop送信+joinを行う
+/// (`run_scan_root` が早期unwindしてもスレッドが残留しない)。
+/// joinは監視スレッドがDB照会実行中ならSQLiteのbusy_timeout
+/// (最大5秒) ぶん遅れ得る — 外部書き込みロック・checkpoint競合時のみ
+/// で通常は即時 (既知の許容遅延)。
 struct RootLivenessWatchdog {
-    stop: Sender<()>,
+    stop: Option<Sender<()>>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -947,7 +969,14 @@ fn spawn_root_liveness_watchdog(shared: &Arc<Shared>, root_id: i64) -> RootLiven
         .spawn(move || {
             // recv_timeoutをスリップ代わりに使う: stop送信で即時起床する
             // ため、走査ごとのjoin待ちがポーリング周期ぶん遅れない。
-            while stop_rx.recv_timeout(ROOT_LIVENESS_POLL).is_err() {
+            // Disconnected (送信側drop = 呼び出し側のunwind等) は即脱出する
+            // — Timeoutと同一視するとDB照会のbusyループに落ちる (UIUX-3)。
+            loop {
+                match stop_rx.recv_timeout(ROOT_LIVENESS_POLL) {
+                    Ok(()) => return,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
                 let alive = watcher_shared
                     .db
                     .with_reader(|repos| repos.list_roots())
@@ -962,15 +991,17 @@ fn spawn_root_liveness_watchdog(shared: &Arc<Shared>, root_id: i64) -> RootLiven
         })
         .expect("spawn root liveness watchdog");
     RootLivenessWatchdog {
-        stop: stop_tx,
+        stop: Some(stop_tx),
         handle: Some(handle),
     }
 }
 
-impl RootLivenessWatchdog {
+impl Drop for RootLivenessWatchdog {
     /// 監視を終了してスレッドを回収する (stop送信で即時退出する)。
-    fn stop(mut self) {
-        let _ = self.stop.send(());
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -1020,7 +1051,7 @@ fn run_scan_root(
     // 二重防御: walk中にDBからルート行が消えたらcancelへ反映する。
     // controller.remove_root自身もcancelを発火するが、行削除は他経路
     // (直接DB操作・将来のbatch解除) でも起き得るため、walkの生存期間中は
-    // この監視が兜底する。
+    // この監視が兜底する。停止はDrop (RAII) が担う。
     let watchdog = spawn_root_liveness_watchdog(shared, root_id);
     let host = Arc::clone(&shared.host);
     let started = Instant::now();
@@ -1046,7 +1077,8 @@ fn run_scan_root(
             host.scan_progress(progress_payload(shared, started, false, &[]));
         },
     );
-    watchdog.stop();
+    // watchdogはここ以降使わない — 即座にRAII停止 (stop送信+join) する。
+    drop(watchdog);
     match summary {
         Ok(summary) => {
             error_samples = summary.error_samples.clone();
@@ -2196,7 +2228,7 @@ mod tests {
             db,
             fs: Arc::new(PlatformFs),
             host: TestHost::new(),
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: AtomicBool::new(false),
             progress: Mutex::new(LibraryProgress::default()),
             hash_pending: AtomicU64::new(0),
             last_hash_emit: Mutex::new(None),
@@ -2573,13 +2605,13 @@ mod tests {
 
     /// walkのエントリ供給をテストが制御するfs (wedgeの決定論再現)。
     ///
-    /// 本物PlatformFsの列挙に挟み、「テストの解放または `cancel` 観測まで
-    /// 各エントリをsinkへ手放さない」ゲートを入れる。cancel観測後は残り
-    /// のエントリを即座に素通りさせる — これは `scan_root` のsinkが
-    /// cancelで処理をskipする本番の意味論を遅延付きで模擬したもの
-    /// (列挙自体は小規模dirなので即終了する)。
+    /// 列挙・cancel観測は本番そのもの (UIUX-3でwalkがcancelを列挙境界で
+    /// 観察する)。このテストdoubleが注入するのは「各エントリをsinkへ
+    /// 手放す前にテストの解放を待つ」遅延のみ — cancel観測後は当該
+    /// エントリを破棄し、残りは本番walk側の境界チェックが打ち切る。
+    /// (「本番と同一の観測点」を検証する形 — ゲートモデルが本番能力を
+    /// 仮定しない。実fsでの中断はgento-image側のlarge-tree試験が担保)
     struct GatedScanFs {
-        cancel: StdMutex<Option<Arc<AtomicBool>>>,
         gate_rx: StdMutex<mpsc::Receiver<()>>,
         entries_arrived: AtomicU64,
     }
@@ -2587,16 +2619,9 @@ mod tests {
     impl GatedScanFs {
         fn new(gate_rx: mpsc::Receiver<()>) -> Arc<Self> {
             Arc::new(Self {
-                cancel: StdMutex::new(None),
                 gate_rx: StdMutex::new(gate_rx),
                 entries_arrived: AtomicU64::new(0),
             })
-        }
-
-        /// controller構築後に共有cancelフラグへ接続する
-        /// (fsはSharedより先に作る必要があるため)。
-        fn attach(&self, cancel: Arc<AtomicBool>) {
-            *self.cancel.lock().unwrap() = Some(cancel);
         }
 
         fn entries_arrived(&self) -> u64 {
@@ -2609,20 +2634,16 @@ mod tests {
             &self,
             root: &Path,
             scope: Option<&Path>,
+            cancel: &AtomicBool,
             sink: &mut dyn FnMut(ScanEntry),
         ) -> WalkOutcome {
-            let mut cancelled = false;
-            let outcome = PlatformFs.walk(root, scope, &mut |entry| {
-                if cancelled {
-                    return;
-                }
+            PlatformFs.walk(root, scope, cancel, &mut |entry| {
                 self.entries_arrived.fetch_add(1, Ordering::SeqCst);
                 loop {
-                    if let Some(flag) = self.cancel.lock().unwrap().as_ref() {
-                        if flag.load(Ordering::SeqCst) {
-                            cancelled = true;
-                            return;
-                        }
+                    if cancel.load(Ordering::SeqCst) {
+                        // 本番scan_rootのsinkと同様、処理を停止
+                        // (列挙の打ち切りは外側のwalkが行う)
+                        return;
                     }
                     match self
                         .gate_rx
@@ -2637,8 +2658,7 @@ mod tests {
                     }
                 }
                 sink(entry);
-            });
-            outcome
+            })
         }
 
         fn hash_and_probe(
@@ -2681,7 +2701,6 @@ mod tests {
             8_192,
         )
         .unwrap();
-        gated.attach(Arc::clone(&controller.shared.cancel));
         let (root, _) = controller.add_root(data.path()).unwrap();
         (controller, host, gated, gate_tx, root.id, data)
     }
@@ -2742,6 +2761,126 @@ mod tests {
         controller.shutdown();
     }
 
+    // ===== UIUX-3 (B3): watchdogのRAII化とspin防止 =====
+
+    /// watchdogテストの土台: ルート行が存在するShared (監視対象を生存させ、
+    /// 停止経路そのものを分離して観察する)。
+    fn watchdog_shared_with_root(name: &str) -> (Arc<Shared>, i64) {
+        let (db_path, _dir) = temp_db(name);
+        let shared = make_shared(&db_path);
+        let data = TestDir::new(&format!("{name}-data"));
+        data.write("a.png", PNG_A);
+        let root = shared
+            .db
+            .with_writer(|repos| repos.add_root(data.path()))
+            .unwrap();
+        (shared, root.id)
+    }
+
+    /// handleのjoinを打ち切り付きで待つ (spin/漏洩でテスト全体が固まらない)。
+    fn join_with_timeout(handle: std::thread::JoinHandle<()>, secs: u64) -> bool {
+        let (tx, rx) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _ = handle.join();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(secs)).is_ok()
+    }
+
+    #[test]
+    fn watchdog_exits_promptly_when_stop_sender_drops() {
+        // run_scan_rootがwatchdog.stop()を呼ばずにunwindした状況の再現:
+        // sender dropでrecv_timeoutはDisconnectedを返し続ける。
+        // DisconnectedをTimeoutと区別しない旧実装は生存ルートに対して
+        // DB照会のbusyループに落ち、スレッドが終了しない。
+        let (shared, root_id) = watchdog_shared_with_root("watchdog-disc");
+        let mut watchdog = spawn_root_liveness_watchdog(&shared, root_id);
+        // stop送信なしにsenderのみdrop (RAII停止が走らない経路)
+        watchdog.stop = None;
+        let handle = watchdog.handle.take().unwrap();
+        assert!(
+            join_with_timeout(handle, 2),
+            "sender drop (Disconnected) でwatchdogがspinせず即脱出しなければならない"
+        );
+    }
+
+    #[test]
+    fn watchdog_drop_stops_and_joins_thread() {
+        // RAII停止: 明示的なstop()を呼ばなくてもDropで停止送信+joinが完結する
+        // (run_scan_rootが早期unwindしてもwatchdogスレッドが残留しない)。
+        let (shared, root_id) = watchdog_shared_with_root("watchdog-drop");
+        let watchdog = spawn_root_liveness_watchdog(&shared, root_id);
+        let started = Instant::now();
+        drop(watchdog);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "Dropで即時に停止+joinされなければならない: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// walkが必ずpanicするfs (panic guard試験用)。
+    struct PanicWalkFs;
+
+    impl ScanFs for PanicWalkFs {
+        fn walk(
+            &self,
+            _root: &Path,
+            _scope: Option<&Path>,
+            _cancel: &AtomicBool,
+            _sink: &mut dyn FnMut(ScanEntry),
+        ) -> WalkOutcome {
+            panic!("injected walk failure (run_scan_all panic guard test)");
+        }
+        fn hash_and_probe(
+            &self,
+            _path: &Path,
+            _expect: &GenerationToken,
+            _cancel: &AtomicBool,
+        ) -> Result<HashedFile, HashFileError> {
+            Err(HashFileError::Io("not reached".to_string()))
+        }
+    }
+
+    #[test]
+    fn run_scan_all_restores_scanning_flag_when_walk_panics() {
+        // workerスレッド内でwalkがunwindしてもscanning=falseが復元されること
+        // (guardのDrop)。復元されないとscan_startが恒久拒否される。
+        let (db_path, _dir) = temp_db("panic-guard");
+        let data = TestDir::new("panic-guard-data");
+        data.write("a.png", PNG_A);
+        let db = Arc::new(gento_db::Db::open(&db_path).unwrap());
+        db.with_writer(|repos| repos.add_root(data.path())).unwrap();
+        let shared = Arc::new(Shared {
+            db,
+            fs: Arc::new(PanicWalkFs),
+            host: TestHost::new(),
+            cancel: AtomicBool::new(false),
+            progress: Mutex::new(LibraryProgress::default()),
+            hash_pending: AtomicU64::new(0),
+            last_hash_emit: Mutex::new(None),
+            scanning: AtomicBool::new(false),
+            hash_retry: Mutex::new(HashRetry::default()),
+            hash_queue_capacity: 8,
+        });
+        let (pool, _pool_rx) = WorkerPool::new(PoolConfig {
+            worker_count: 1,
+            queue_capacity: 8,
+        });
+        let original_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_scan_all(&shared, &pool, None);
+        }));
+        std::panic::set_hook(original_hook);
+        assert!(result.is_err(), "walkパニックはここまで伝播する");
+        assert!(
+            !shared.scanning.load(Ordering::SeqCst),
+            "panic後もscanning=falseが復元されていなければならない"
+        );
+        pool.shutdown();
+    }
+
     // ===== FG-WP2-2: 破棄/拒否ジョブの決定論リトライ =====
 
     /// hash_and_probe差し替えフック: (path, 呼び出し回数) → 差し替え結果。
@@ -2783,10 +2922,11 @@ mod tests {
             &self,
             root: &Path,
             scope: Option<&Path>,
+            cancel: &AtomicBool,
             sink: &mut dyn FnMut(ScanEntry),
         ) -> WalkOutcome {
             self.walk_calls.fetch_add(1, Ordering::SeqCst);
-            PlatformFs.walk(root, scope, sink)
+            PlatformFs.walk(root, scope, cancel, sink)
         }
         fn hash_and_probe(
             &self,

@@ -17,11 +17,11 @@
   } from "./lib/thumbnails";
   import {
     LibraryStore,
-    needsRegistrationConfirm,
     startupCatalogView,
     type LibraryIpc,
     type LibraryRoot,
   } from "./lib/library";
+  import { RegistrationConfirmGate } from "./lib/ui/registration-confirm";
   import { GridStore, type GridIpc } from "./lib/grid/grid-store";
   import { ScrollPositionStore } from "./lib/grid/scroll-position";
   import type { ThumbCellClass } from "./lib/grid/layout";
@@ -438,15 +438,16 @@
   }
 
   /** ツリー右クリック: 未登録フォルダを登録 (登録→見える導線はUXLIB-1規約)。
-   * UIUX-2: 危険パス (`/` 等の広域ルート) は確認ダイアログを挟む。 */
+   * UIUX-2: 危険パス (`/` 等の広域ルート) は確認ダイアログを挟む。
+   * UIUX-3 N2: dialog確定まで requestAddRoot のPromiseを保留し、
+   * 確認経由の登録でも呼び出し側 (LibraryPanel) の入力クリアが効く。 */
   let registerConfirmPath = $state<string | null>(null);
+  const registrationGate = new RegistrationConfirmGate(
+    () => (registerConfirmPath = registrationGate.pendingPath),
+  );
 
   function requestAddRoot(path: string): Promise<boolean> {
-    if (needsRegistrationConfirm(path)) {
-      registerConfirmPath = path;
-      return Promise.resolve(false);
-    }
-    return addRootConfirmed(path);
+    return registrationGate.request(path, addRootConfirmed);
   }
 
   async function addRootConfirmed(path: string): Promise<boolean> {
@@ -3718,14 +3719,8 @@
 {#if registerConfirmPath !== null}
   <ConfirmRegistrationDialog
     path={registerConfirmPath}
-    onConfirm={() => {
-      const path = registerConfirmPath;
-      registerConfirmPath = null;
-      if (path !== null) {
-        void addRootConfirmed(path);
-      }
-    }}
-    onCancel={() => (registerConfirmPath = null)}
+    onConfirm={() => registrationGate.dialogConfirmed(addRootConfirmed)}
+    onCancel={() => registrationGate.dialogCancelled()}
   />
 {/if}
 

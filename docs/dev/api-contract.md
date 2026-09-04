@@ -809,8 +809,10 @@ type LibraryScanStatus = {
 
 - `scan_start` はワーカー処理中 (`scanning: true`) の呼び出しを
   「スキャンが既に進行中です」で拒否。既定ではUIから非同期で完了する。
-- `scan_stop` は協調キャンセル (walk中止・不在化確定前の打ち切り・ハッシュ
-  中止)。**再開 = `scan_start` 再呼び出し** (進行状況はDBが正本のため、
+- `scan_stop` は協調キャンセル。walkの列挙 (readdir) 自体もエントリ境界で
+  即座に打ち切る (UIUX-3 — 巨大ルートでも列挙tailを残さない) ほか、
+  不在化確定前の打ち切り・ハッシュ中止を行う。
+  **再開 = `scan_start` 再呼び出し** (進行状況はDBが正本のため、
   差分スキャンが続きを冪等に拾う。ハッシュ待ちも `asset_id IS NULL` から
   再構成される)。
 - `scan_status` は常に成功 (DB未開は初期値0のDTO)。

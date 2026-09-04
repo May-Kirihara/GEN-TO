@@ -8,6 +8,7 @@
 
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use walkdir::WalkDir;
@@ -281,13 +282,24 @@ pub struct ScannedImage {
 /// MVP対象7形式を再帰列挙し、1ファイルごとに `sink` へ渡す (WP-2登録ルート用)。
 /// rel_path解決は呼び出し側 (gento-coreのScanFs実装) で行う。
 /// DB書き込みのバッチ化も呼び出し側の責務 (ここは純粋な列挙)。
-pub fn scan_images(root: &Path, sink: &mut dyn FnMut(ScannedImage)) -> ScanResult {
+///
+/// `cancel` は列挙 (readdir) のエントリ境界で検査する (UIUX-3): trueなら
+/// 処理中のsink呼び出しの後に次エントリへ進まず即座に返る。`entries` は
+/// 走査済み分の部分カウントになる。
+pub fn scan_images(
+    root: &Path,
+    cancel: &AtomicBool,
+    sink: &mut dyn FnMut(ScannedImage),
+) -> ScanResult {
     let started = Instant::now();
     let mut entries: u64 = 0;
     let mut image_count: u64 = 0;
     let mut errors: Vec<ScanEntryError> = Vec::new();
 
     for entry in WalkDir::new(root).into_iter() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         let entry = match entry {
             Ok(e) => e,
             Err(err) => {
@@ -561,7 +573,9 @@ mod tests {
         fs::write(sub.join("nested.png"), PNG_BYTES).unwrap();
 
         let mut files = Vec::new();
-        let result = scan_images(dir.path(), &mut |img| files.push(img));
+        let result = scan_images(dir.path(), &AtomicBool::new(false), &mut |img| {
+            files.push(img)
+        });
         let mut names: Vec<String> = files
             .iter()
             .map(|f| f.path.file_name().unwrap().to_string_lossy().into_owned())
@@ -596,9 +610,49 @@ mod tests {
         let dir = TestDir::new("imgos");
         dir.write("a.png", PNG_BYTES);
         let mut ids = Vec::new();
-        scan_images(dir.path(), &mut |img| ids.push(img.os_file_id));
+        scan_images(dir.path(), &AtomicBool::new(false), &mut |img| {
+            ids.push(img.os_file_id)
+        });
         assert_eq!(ids.len(), 1);
         assert!(ids[0].is_some());
+    }
+
+    #[test]
+    fn scan_images_stops_enumeration_on_cancel() {
+        // UIUX-3 B1: cancelは列挙 (readdir) のエントリ境界で観察される。
+        // sinkが最初のエントリでcancelを立てたら、残りの列挙は行われない
+        // (処理停止だけでなく列挙tailも残さない)。
+        let dir = TestDir::new("imgcancel");
+        for i in 0..10 {
+            dir.write(&format!("f{i:02}.png"), PNG_BYTES);
+        }
+        let cancel = AtomicBool::new(false);
+        let mut seen = 0u64;
+        let result = scan_images(dir.path(), &cancel, &mut |_img| {
+            seen += 1;
+            if seen == 1 {
+                cancel.store(true, Ordering::SeqCst);
+            }
+        });
+        assert_eq!(seen, 1, "最初のエントリだけで列挙が止まる");
+        assert_eq!(result.entries, 1);
+        assert_eq!(result.png_count, 1);
+    }
+
+    #[test]
+    fn scan_images_pre_cancelled_yields_nothing() {
+        // 最初からcancel=trueならルートのreaddir結果を1件も処理しない
+        // (エントリ0・エラー0で即時リターン)。
+        let dir = TestDir::new("imgcancel0");
+        dir.write("a.png", PNG_BYTES);
+        dir.write("b.png", PNG_BYTES);
+        let mut seen = 0u64;
+        let result = scan_images(dir.path(), &AtomicBool::new(true), &mut |_| {
+            seen += 1;
+        });
+        assert_eq!(seen, 0);
+        assert_eq!(result.entries, 0);
+        assert!(result.errors.is_empty());
     }
 
     #[test]

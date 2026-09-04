@@ -38,6 +38,7 @@ impl ScanFs for PlatformFs {
         &self,
         root: &Path,
         scope: Option<&Path>,
+        cancel: &AtomicBool,
         sink: &mut dyn FnMut(ScanEntry),
     ) -> WalkOutcome {
         let walk_root = match scope {
@@ -45,7 +46,7 @@ impl ScanFs for PlatformFs {
             None => root.to_path_buf(),
         };
         let mut outcome = WalkOutcome::default();
-        let result = scan_images(&walk_root, &mut |image| {
+        let result = scan_images(&walk_root, cancel, &mut |image| {
             // rel_path は常にルート基準で解決する (scope基準ではない)。
             let rel_path = image
                 .path
@@ -168,9 +169,12 @@ mod tests {
 
         let fs = PlatformFs;
         let mut found = Vec::new();
-        let outcome = fs.walk(&dir.0, Some(Path::new("sub")), &mut |e| {
-            found.push(e.rel_path)
-        });
+        let outcome = fs.walk(
+            &dir.0,
+            Some(Path::new("sub")),
+            &AtomicBool::new(false),
+            &mut |e| found.push(e.rel_path),
+        );
         assert_eq!(outcome.entries_walked, 2);
         assert_eq!(found.len(), 2);
         assert!(found.contains(&PathBuf::from("sub/a.png")), "{found:?}");
@@ -188,7 +192,9 @@ mod tests {
         dir.write("a.png", BYTES);
         let fs = PlatformFs;
         let mut ids = Vec::new();
-        fs.walk(&dir.0, None, &mut |e| ids.push(e.os_file_id));
+        fs.walk(&dir.0, None, &AtomicBool::new(false), &mut |e| {
+            ids.push(e.os_file_id)
+        });
         assert_eq!(ids.len(), 1);
         assert!(ids[0].is_some(), "Linuxでは dev+inode を取得");
     }
@@ -200,15 +206,70 @@ mod tests {
         let file = dir.write("a.png", BYTES);
         let fs = PlatformFs;
         let mut ns_values = Vec::new();
-        fs.walk(&dir.0, None, &mut |e| ns_values.push(e.mtime_ns));
+        fs.walk(&dir.0, None, &AtomicBool::new(false), &mut |e| {
+            ns_values.push(e.mtime_ns)
+        });
         assert_eq!(ns_values.len(), 1);
         assert_eq!(ns_values[0], stat_token(&file).unwrap().mtime_ns);
     }
 
     #[test]
+    fn walk_stops_enumeration_promptly_on_cancel() {
+        // UIUX-3 B1: PlatformFs実体での中断検証。大きな実ファイルツリー
+        // (200ディレクトリ x 50ファイル) を生成し、sinkが最初のエントリで
+        // cancelを立てたときに列挙が即座に打ち切られることを
+        // 「全走査とのentries差分」と所要時間で表明する (列挙tail残存なし)。
+        let dir = TestDir::new("cancel-large");
+        const DIRS: u32 = 200;
+        const FILES: u32 = 50;
+        for d in 0..DIRS {
+            for f in 0..FILES {
+                dir.write(&format!("d{d:03}/f{f:03}.png"), BYTES);
+            }
+        }
+        let fs = PlatformFs;
+
+        // 基準: キャンセルなしの全列挙エントリ数
+        let full = fs.walk(&dir.0, None, &AtomicBool::new(false), &mut |_| {});
+        assert_eq!(
+            full.entries_walked,
+            (DIRS * FILES) as u64,
+            "全列挙は全ファイルを数える"
+        );
+
+        // 中断: 最初のsink呼び出しでcancel → 列挙は残りを読まない
+        let cancel = AtomicBool::new(false);
+        let mut seen = 0u64;
+        let started = std::time::Instant::now();
+        let stopped = fs.walk(&dir.0, None, &cancel, &mut |_entry| {
+            seen += 1;
+            if seen == 1 {
+                cancel.store(true, Ordering::SeqCst);
+            }
+        });
+        let elapsed = started.elapsed();
+        assert_eq!(seen, 1, "最初のエントリだけで停止する");
+        assert!(
+            stopped.entries_walked < full.entries_walked / 10,
+            "列挙は打ち切られている: {} / {}",
+            stopped.entries_walked,
+            full.entries_walked
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "打ち切りは即時であるべき: {elapsed:?}"
+        );
+    }
+
+    #[test]
     fn walk_reports_missing_root_as_error() {
         let fs = PlatformFs;
-        let outcome = fs.walk(Path::new("/nonexistent-gento-root"), None, &mut |_| {});
+        let outcome = fs.walk(
+            Path::new("/nonexistent-gento-root"),
+            None,
+            &AtomicBool::new(false),
+            &mut |_| {},
+        );
         assert_eq!(outcome.entries_walked, 0);
         assert_eq!(outcome.errors.len(), 1);
         // ルート自体が不在 = 実際の不在のためmissing化はブロックしない
@@ -238,7 +299,9 @@ mod tests {
         let mut found = Vec::new();
         std::fs::set_permissions(dir.0.join("locked"), std::fs::Permissions::from_mode(0o000))
             .unwrap();
-        let outcome = fs.walk(&dir.0, None, &mut |e| found.push(e.rel_path.clone()));
+        let outcome = fs.walk(&dir.0, None, &AtomicBool::new(false), &mut |e| {
+            found.push(e.rel_path.clone())
+        });
         std::fs::set_permissions(dir.0.join("locked"), std::fs::Permissions::from_mode(0o755))
             .unwrap();
 

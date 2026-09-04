@@ -35,7 +35,8 @@
 //!
 //! # キャンセルと再開
 //!
-//! キャンセルは [`AtomicBool`] をバッチ境界で検査する協調キャンセル。
+//! キャンセルは [`AtomicBool`] をバッチ境界とwalk列挙のエントリ境界で
+//! 検査する協調キャンセル (UIUX-3でwalk自体もcancelを観察する)。
 //! 進行状況はDB (files/assets) が正本のため、再開 = 再スキャンで冪等に
 //! 続きから拾う (ハッシュ待ちも `asset_id IS NULL` から再構成される)。
 //!
@@ -271,10 +272,15 @@ pub trait ScanFs: Send + Sync {
     /// `root` (またはその配下 `scope`) を再帰走査し、画像拡張子のファイルを
     /// `sink` へ渡す。`rel_path` は常に `root` 基準。シンボリックリンクは
     /// 辿らない。個別エラーで走査を停止しない。
+    ///
+    /// `cancel` がtrueのとき列挙 (readdir) のエントリ境界で即座に打ち切る
+    /// (UIUX-3。処理中のsink呼び出しの完了を待ってから次エントリ前に
+    /// 返る。`entries_walked` は走査済み分の部分カウントになる)。
     fn walk(
         &self,
         root: &Path,
         scope: Option<&Path>,
+        cancel: &AtomicBool,
         sink: &mut dyn FnMut(ScanEntry),
     ) -> WalkOutcome;
 
@@ -486,7 +492,7 @@ pub fn scan_root(
     let mut ctx = ScanCtx::new(root, scope, options);
     ctx.load_existing(store)?;
 
-    let outcome = fs.walk(&root.path, scope, &mut |entry| {
+    let outcome = fs.walk(&root.path, scope, cancel, &mut |entry| {
         if cancel.load(Ordering::Relaxed) || ctx.write_error.is_some() {
             return;
         }
@@ -1731,16 +1737,23 @@ mod tests {
             &self,
             _root: &Path,
             scope: Option<&Path>,
+            cancel: &AtomicBool,
             sink: &mut dyn FnMut(ScanEntry),
         ) -> WalkOutcome {
+            let mut walked = 0u64;
             for entry in self.entries.lock().unwrap().iter() {
+                // 本番 (PlatformFs) と同一の観測点: 列挙境界でcancelを検査
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
                 if scope.is_some_and(|s| !entry.rel_path.starts_with(s)) {
                     continue;
                 }
+                walked += 1;
                 sink(entry.clone());
             }
             WalkOutcome {
-                entries_walked: self.entries.lock().unwrap().len() as u64,
+                entries_walked: walked,
                 errors: self.walk_errors.lock().unwrap().clone(),
             }
         }
@@ -2386,10 +2399,14 @@ mod tests {
             &self,
             _root: &Path,
             _scope: Option<&Path>,
+            cancel: &AtomicBool,
             sink: &mut dyn FnMut(ScanEntry),
         ) -> WalkOutcome {
             (self.before_walk)();
             for e in &self.entries {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
                 sink(e.clone());
             }
             WalkOutcome {

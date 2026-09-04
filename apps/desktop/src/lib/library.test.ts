@@ -355,4 +355,21 @@ describe("needsRegistrationConfirm (UIUX-2 危険パス登録の確認要求)", 
     expect(needsRegistrationConfirm("")).toBe(false);
     expect(needsRegistrationConfirm(".")).toBe(false);
   });
+
+  it("字句的な `.`/`..` を先に解決してからdepth判定する (UIUX-3 B2)", () => {
+    // `.`/`..` で広域ルートへ解けるパスは確認対象 (r1 blocker:
+    // 正規化前のdepthでは `/home/..` が素通りしていた)
+    expect(needsRegistrationConfirm("/home/..")).toBe(true); // → /
+    expect(needsRegistrationConfirm("/home/user/../..")).toBe(true); // → /
+    expect(needsRegistrationConfirm("/home/user/..")).toBe(true); // → /home
+    expect(needsRegistrationConfirm("/./home")).toBe(true); // → /home
+    expect(needsRegistrationConfirm("/a/../b")).toBe(true); // → /b
+    expect(needsRegistrationConfirm("/../..")).toBe(true); // → /
+    expect(needsRegistrationConfirm("C:\\Users\\..")).toBe(true); // → C:\
+    expect(needsRegistrationConfirm("C:\\Users\\me\\..\\..")).toBe(true); // → C:\
+    expect(needsRegistrationConfirm("\\\\server\\share\\..")).toBe(true); // → \\\\server
+    // `..` を解いても深いパスは確認不要のまま
+    expect(needsRegistrationConfirm("/home/user/../sub")).toBe(false); // → /home/sub
+    expect(needsRegistrationConfirm("C:\\Users\\me\\..\\Pictures")).toBe(false); // → C:\Users\Pictures
+  });
 });

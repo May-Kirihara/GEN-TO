@@ -121,32 +121,61 @@ function toMessage(value: unknown): string {
 }
 
 /**
- * 登録前に確認ダイアログを出すべき「危険な」パスか (UIUX-2)。
+ * 字句正規化: 区切りで分割し `.` を落とし、`..` は直前セグメントを消費する
+ * (先行が無ければ根へ潰れる — `/home/..` → `/`)。Windowsドライブ文字
+ * (`C:`) は `..` で消さない (`C:\Users\..` → `C:\` のため)。
+ */
+function resolveLexicalSegments(path: string): string[] {
+  const segments: string[] = [];
+  for (const part of path.split(/[\\/]+/)) {
+    if (part === "" || part === ".") {
+      continue;
+    }
+    if (part === "..") {
+      const parent = segments[segments.length - 1];
+      if (parent !== undefined && !/^[a-zA-Z]:$/.test(parent)) {
+        segments.pop();
+      }
+      continue;
+    }
+    segments.push(part);
+  }
+  return segments;
+}
+
+/**
+ * 登録前に確認ダイアログを出すべき「危険な」パスか (UIUX-2 / UIUX-3 B2)。
  *
- * 構造規則で判定する (ブロックリスト不要):
+ * 構造規則で判定する (ブロックリスト不要)。`.`/`..` 成分は字句解決を
+ * **先に**行ってからdepth判定する (`/home/..` → `/` → 対象)。
  * - POSIX絶対パスはdepth≤1 (`/` 自体・`/home` 等、直下1段まで)。
  *   depth≥2 (`/home/user`) は通常の登録単位。
  * - Windowsドライブルート (`C:\`・`C:`。区切り/大小文字は不問)。
  * - UNC共有ルート (`\\server\share`。共有より深い部分は対象外)。
  * 相対パス・空は確認不要 (backendの存在確認が拒否する)。
+ *
+ * 既知の限界: シンボリックリンク・マウントポイントは字句解析で捕まえられ
+ * ない (例: `/mnt/disk` がdepth≥2でも実体はファイルシステム全体)。
+ * この確認dialogはUX保護でbackendの不変条件ではない — direct IPC
+ * (`library_roots_add` 直接呼び出し) は確認なしで通る。
  */
 export function needsRegistrationConfirm(path: string): boolean {
-  const segments = (value: string): number =>
-    value.split(/[\\/]+/).filter((part) => part !== "").length;
   if (path === "") {
     return false;
   }
-  // Windowsドライブルート: ドライブ文字1字 + コロン (+区切り)
-  if (/^[a-zA-Z]:[\\/]*$/.test(path)) {
-    return true;
+  const segments = resolveLexicalSegments(path);
+  // Windowsドライブパス (ドライブ文字+区切り、またはbareドライブ)
+  if (/^[a-zA-Z]:(?:[\\/]|$)/.test(path)) {
+    // 正規化後にドライブルートのみ残れば確認対象 (`C:\Users\..` → `C:`)
+    return segments.length <= 1;
   }
   // UNC: 先頭2区切りで始まり server\share (2セグメント) まで
   if (/^[\\/]{2}/.test(path)) {
-    return segments(path) <= 2;
+    return segments.length <= 2;
   }
-  // POSIX絶対パス: depth ≤ 1
+  // POSIX絶対パス: depth ≤ 1 (0 = `/` 自体への解消を含む)
   if (path.startsWith("/")) {
-    return segments(path) <= 1;
+    return segments.length <= 1;
   }
   return false;
 }

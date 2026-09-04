@@ -59,8 +59,9 @@ rm -rf "$WORK"; mkdir -p "$WORK/home" "$WORK/env/thumbs" "$WORK/env/db" "$WORK/d
 SHOT="$WORK/shots"
 NOTE="$WORK/e2e-notes.txt"; : > "$NOTE"
 shot() { import -window root "$SHOT/$1.png" 2>/dev/null || true; }
-pass() { echo "PASS: $*" | tee -a "$NOTE"; }
+pass() { echo "PASS: $*" | tee -a "$NOTE"; PASSES=$((PASSES + 1)); }
 fail() { echo "FAIL: $*" | tee -a "$NOTE"; FAILURES=$((FAILURES + 1)); }
+PASSES=0
 FAILURES=0
 
 devtest_value() {
@@ -633,8 +634,12 @@ else
   fail "12) ファイル>終了でプロセスが終了しない"
 fi
 
+# 条件数はpass/failの実呼び出しから動的に集計する (UIUX-3 N1:
+# 手書き総数は実体とずれる — 46→52修正時に実際のpass呼び出しは50で
+# 「50/52」と表示されていた。passのみ報告する条件 (|| fail のみの暗黙検査)
+# は失敗時にのみ分母へ現れる点に注意)。
 echo | tee -a "$NOTE"
-echo "UIUX1 E2E RESULT: $((52 - FAILURES))/52 conditions passed, FAILURES=$FAILURES" | tee -a "$NOTE"
+echo "UIUX1 E2E RESULT: $PASSES/$((PASSES + FAILURES)) conditions passed, FAILURES=$FAILURES" | tee -a "$NOTE"
 if (( FAILURES > 0 )); then
   echo "FAILING LINES:" | tee -a "$NOTE"
   grep -a "devtest:" "$WORK/logs/app.log" | tail -5 | tee -a "$NOTE"
