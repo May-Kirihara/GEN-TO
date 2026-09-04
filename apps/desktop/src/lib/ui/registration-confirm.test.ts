@@ -129,4 +129,30 @@ describe("RegistrationConfirmGate (UIUX-3 N2)", () => {
     gate.dialogConfirmed(register);
     await expect(third).resolves.toBe(true);
   });
+
+  // r3: busy検査はneedsRegistrationConfirm分類より先行しなければならない —
+  // 危険path dialog保留中に来た確認不要path要求が分類を通過してregisterへ
+  // 直达すると、表示中dialogの背後で並行登録が走り直列化契約をbypassする。
+  it("二重送信: 危険path保留中の確認不要path要求も即falseで拒否される", async () => {
+    const gate = new RegistrationConfirmGate();
+    const register = vi.fn().mockResolvedValue(true);
+    const first = gate.request("/", register);
+    let firstSettled = false;
+    void first.then(() => {
+      firstSettled = true;
+    });
+
+    // 2回目は確認不要path: busy検査が分類に先行するためregisterへは流れない
+    await expect(gate.request("/tmp/a/b/c", register)).resolves.toBe(false);
+    expect(register).not.toHaveBeenCalled();
+    expect(gate.pendingPath).toBe("/");
+    await tick();
+    expect(firstSettled).toBe(false);
+
+    // 1回目の危険path要求は通常どおりdialog確定の成否で解決する
+    gate.dialogConfirmed(register);
+    await expect(first).resolves.toBe(true);
+    expect(register).toHaveBeenCalledTimes(1);
+    expect(register).toHaveBeenCalledWith("/");
+  });
 });
