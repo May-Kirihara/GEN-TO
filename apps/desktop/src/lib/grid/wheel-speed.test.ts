@@ -1,7 +1,9 @@
-import { describe, expect, it } from "vitest";
+// @vitest-environment happy-dom
+import { describe, expect, it, vi } from "vitest";
 import {
   SCROLL_SPEED_MAX,
   SCROLL_SPEED_MIN,
+  applyWheelScroll,
   canScrollWithin,
   coerceScrollSpeed,
   computeWheelScroll,
@@ -110,5 +112,59 @@ describe("canScrollWithin (境界チェイニング判定 — r1 B1)", () => {
   it("delta=0・非有限値は不可", () => {
     expect(canScrollWithin(0, bounds)).toBe(false);
     expect(canScrollWithin(Number.NaN, bounds)).toBe(false);
+  });
+});
+
+describe("applyWheelScroll (ハンドラ適用 — r2: ctrlKey素通りの実保証)", () => {
+  /** 係数2でapplyWheelScrollを結線した要素。happy-domはレイアウトしない
+   *  ため境界は仕様値で与える (clientHeight=400・scrollHeight=1000 →
+   *  範囲 [0,600]。中間位置300)。 */
+  function makeScrollEl(): HTMLElement {
+    const el = document.createElement("div");
+    Object.defineProperty(el, "clientHeight", { value: 400 });
+    Object.defineProperty(el, "scrollHeight", { value: 1000 });
+    Object.defineProperty(el, "scrollTop", { value: 300, writable: true });
+    const scrollBy = vi.fn();
+    el.scrollBy = scrollBy;
+    el.addEventListener("wheel", (event) => applyWheelScroll(event, 2), { passive: false });
+    return el;
+  }
+
+  /**
+   * happy-domのWheelEventはUIEvent直継承でctrlKey等の修飾initを落とす
+   * (実ブラウザはMouseEvent継承でinitが渡る) ため、インスタンスへ
+   * 明示的に補完してから返す。
+   */
+  function wheelEvent(init: { deltaY: number; ctrlKey?: boolean }): WheelEvent {
+    const event = new WheelEvent("wheel", { cancelable: true, deltaY: init.deltaY });
+    if (init.ctrlKey === true) {
+      Object.defineProperty(event, "ctrlKey", { value: true });
+    }
+    return event;
+  }
+
+  it("ctrlKey (ピンチズーム) はpreventDefaultもscrollByもしない", () => {
+    const el = makeScrollEl();
+    const event = wheelEvent({ deltaY: -100, ctrlKey: true });
+    el.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(false);
+    expect(el.scrollBy).not.toHaveBeenCalled();
+  });
+
+  it("通常wheelはpreventDefaultして係数倍をscrollByする (対照)", () => {
+    const el = makeScrollEl();
+    const event = wheelEvent({ deltaY: -100 });
+    el.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
+    expect(el.scrollBy).toHaveBeenCalledWith({ top: -200 });
+  });
+
+  it("端の外向きwheelはpreventDefaultしない (親へのチェイニング)", () => {
+    const el = makeScrollEl();
+    Object.defineProperty(el, "scrollTop", { value: 0, writable: true });
+    const event = wheelEvent({ deltaY: -100 });
+    el.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(false);
+    expect(el.scrollBy).not.toHaveBeenCalled();
   });
 });

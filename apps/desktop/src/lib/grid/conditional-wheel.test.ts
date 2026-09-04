@@ -5,7 +5,7 @@
  * - 係数1.0 (enabled=false) ではリスナを登録しない
  * - 有効時は {passive:false} で登録する
  * - updateは同一listener identityで除去→再登録 (二重登録なし)
- * - 無効化updateで除去。destroyで除去
+ * - 無効化updateで除去。destroyは除去のみ (再登録しない・r2)
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { conditionalWheel } from "./wheel-speed";
@@ -74,10 +74,21 @@ describe("conditionalWheel", () => {
     expect(addSpy).toHaveBeenCalledTimes(1);
   });
 
-  it("destroyでリスナを除去する", () => {
-    const action = conditionalWheel(node, { enabled: true, handler });
+  it("destroyは除去のみ — enabled=trueでも再登録せず破棄後のイベントは不達 (r2)", () => {
+    const received: WheelEvent[] = [];
+    const action = conditionalWheel(node, {
+      enabled: true,
+      handler: (event) => received.push(event),
+    });
     const registered = addSpy.mock.calls[0]![1];
+    // 破棄前は配送される (破棄後の不達表明が空的でない保証)
+    node.dispatchEvent(new WheelEvent("wheel", { cancelable: true }));
+    expect(received).toHaveLength(1);
     action.destroy();
     expect(removeSpy).toHaveBeenCalledWith("wheel", registered);
+    // sync()経由の実装だとenabled=trueのまま除去→即再登録する (リーク)
+    expect(addSpy).toHaveBeenCalledTimes(1);
+    node.dispatchEvent(new WheelEvent("wheel", { cancelable: true }));
+    expect(received).toHaveLength(1);
   });
 });

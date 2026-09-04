@@ -86,6 +86,40 @@ export function resolveLineHeight(computed: string | null | undefined): number {
 }
 
 /**
+ * 係数≠1.0のとき速度を適用するwheelハンドラの本体
+ * (ThumbnailGrid.handleWheelから委譲。イベント経由のctrlKey受け渡しまで
+ * 含めてテスト可能にするため分離 — r2)。
+ */
+export function applyWheelScroll(event: WheelEvent, factor: number): void {
+  const element = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
+  if (element === null) {
+    return;
+  }
+  // line高はCSS慣行値 (computed line-height、非pxなら16px/行)。
+  // サムネ行extent (~200px) には依存させない (r1 B2)。pixel/pageでは未使用。
+  const lineHeight =
+    event.deltaMode === 1 ? resolveLineHeight(getComputedStyle(element).lineHeight) : 1;
+  const delta = computeWheelScroll(
+    event.deltaY,
+    event.deltaMode,
+    factor,
+    {
+      lineHeight,
+      pageHeight: element.clientHeight,
+    },
+    { ctrlKey: event.ctrlKey },
+  );
+  if (delta === null) {
+    return;
+  }
+  if (!canScrollWithin(delta, element)) {
+    return;
+  }
+  event.preventDefault();
+  element.scrollBy({ top: delta });
+}
+
+/**
  * 係数≠1.0のときだけ `{passive:false}` でwheelリスナを登録するSvelte action。
  *
  * - 同一listener identityで除去・再登録するため、update時の二重登録は起きない
@@ -126,7 +160,11 @@ export function conditionalWheel(
       sync();
     },
     destroy(): void {
-      sync();
+      // 除去のみ。sync()だとenabled=trueのまま除去→即再登録する (r2)。
+      if (attached) {
+        node.removeEventListener("wheel", listener);
+        attached = false;
+      }
     },
   };
 }

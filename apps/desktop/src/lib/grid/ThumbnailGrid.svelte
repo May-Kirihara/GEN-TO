@@ -31,7 +31,7 @@
     emptySelection,
     type MoveAction,
   } from "./selection";
-  import { computeWheelScroll, conditionalWheel, canScrollWithin, resolveLineHeight } from "./wheel-speed";
+  import { applyWheelScroll, conditionalWheel } from "./wheel-speed";
   import type { GridStore } from "./grid-store";
   import type { ScrollPositionStore } from "./scroll-position";
   import type { ImageListItem } from "../catalog-types";
@@ -353,32 +353,13 @@
 
   /**
     * 係数≠1.0のときだけ速度を適用するwheelハンドラ (action経由でpassive:false)。
-    * ctrlKey (ピンチズーム) は素通り。端の外向きdeltaではpreventDefaultしない
-    * = 親スクロールへのチェイニングを阻害しない (r1 B1)。
+    * 適用パイプライン (正規化→ctrlKey素通り→境界判定→scrollBy) は
+    * wheel-speed.applyWheelScroll — ctrlKey受け渡しまで単体テストで保証
+    * するため分離 (r2)。端の外向きdeltaではpreventDefaultしない = 親
+    * スクロールへのチェイニングを阻害しない (r1 B1)。
     */
   function handleWheel(event: WheelEvent): void {
-    const element = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
-    if (element === null) {
-      return;
-    }
-    // line高はCSS慣行値 (computed line-height、非pxなら16px/行)。
-    // サムネ行extent (~200px) には依存させない (r1 B2)。
-    const lineHeight =
-      event.deltaMode === 1
-        ? resolveLineHeight(getComputedStyle(element).lineHeight)
-        : 1; // pixel/pageモードでは未使用
-    const delta = computeWheelScroll(event.deltaY, event.deltaMode, scrollSpeed, {
-      lineHeight,
-      pageHeight: element.clientHeight,
-    });
-    if (delta === null) {
-      return;
-    }
-    if (!canScrollWithin(delta, element)) {
-      return;
-    }
-    event.preventDefault();
-    element.scrollBy({ top: delta });
+    applyWheelScroll(event, scrollSpeed);
   }
 
   // ===== WP-7: リネーム (F2インライン) =====
