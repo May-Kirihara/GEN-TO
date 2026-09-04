@@ -4,12 +4,18 @@
  * - 係数は layout-prefs (localStorage) に保存。既定1.0 = ネイティブ挙動で
  *   **リスナ自体を登録しない** (係数≠1.0時のみactionが登録する)
  * - deltaMode別の正規化: pixel=そのまま / line=行高さ換算 / page=viewport高さ換算
+ *   (line高はCSS慣行値 — computed line-height。サムネ行extent非依存)
  * - ctrlKey (ピンチズーム) は素通り。deltaXは無視 (縦スクロールコンテナ)
- * - `..`等の解決は無関係。端でのチェイニング阻害はしない (scrollByが自然に停止)
-*/
+ * - `..`等の解決は無関係。端の外向きdeltaではpreventDefaultしない
+ *   (canScrollWithin判定 → 親スクロールへのチェイニングを阻害しない)
+ */
 import { coerceScrollSpeed, SCROLL_SPEED_MAX, SCROLL_SPEED_MIN } from "../ui/layout-prefs";
 
 export { coerceScrollSpeed, SCROLL_SPEED_MIN, SCROLL_SPEED_MAX };
+
+/** lineモード換算の行高フォールバック (px)。DOM慣行値 (normalize-wheel等と
+ * 同一 — computed line-heightが使えない環境での1行相当)。 */
+export const FALLBACK_LINE_HEIGHT = 16;
 
 export type WheelMetrics = {
   /** 1行の高さ (px)。lineモード換算に使う。 */
@@ -45,6 +51,41 @@ export function computeWheelScroll(
 }
 
 /**
+ * 現在位置からdelta方向へさらにスクロール可能か。
+ * false (= 端の外向き、またはスクロール不能コンテナ) では
+ * preventDefaultしないこと — 親スクロールへチェイニングさせる。
+ */
+export function canScrollWithin(
+  delta: number,
+  bounds: { scrollTop: number; clientHeight: number; scrollHeight: number },
+): boolean {
+  const max = bounds.scrollHeight - bounds.clientHeight;
+  if (max <= 0 || !Number.isFinite(delta) || delta === 0) {
+    return false;
+  }
+  return delta < 0 ? bounds.scrollTop > 0 : bounds.scrollTop < max;
+}
+
+/**
+ * lineモード (DOM_DELTA_LINE) 換算の行高 (px) を解決する。
+ * CSS慣行: `getComputedStyle(el).lineHeight` のpx値。非px ("normal"等)・
+ * 不正値・取得不能ならFALLBACK_LINE_HEIGHT (16px/行)。
+ * サムネイル行の実寸 (extent) には依存しない — デバイス・イベントモード
+ * 非依存の正規化 (UIUX-1 r1 B2)。
+ */
+export function resolveLineHeight(computed: string | null | undefined): number {
+  if (typeof computed !== "string") {
+    return FALLBACK_LINE_HEIGHT;
+  }
+  const match = /^(-?[0-9]+(?:\.[0-9]+)?)px$/.exec(computed.trim());
+  if (match === null) {
+    return FALLBACK_LINE_HEIGHT;
+  }
+  const value = Number(match[1]);
+  return Number.isFinite(value) && value > 0 ? value : FALLBACK_LINE_HEIGHT;
+}
+
+/**
  * 係数≠1.0のときだけ `{passive:false}` でwheelリスナを登録するSvelte action。
  *
  * - 同一listener identityで除去・再登録するため、update時の二重登録は起きない
@@ -64,13 +105,18 @@ export function conditionalWheel(
   destroy(): void;
 } {
   let current = params;
+  let attached = false;
   const listener = (event: WheelEvent): void => {
     current.handler(event);
   };
   function sync(): void {
-    node.removeEventListener("wheel", listener);
+    if (attached) {
+      node.removeEventListener("wheel", listener);
+      attached = false;
+    }
     if (current.enabled) {
       node.addEventListener("wheel", listener, { passive: false });
+      attached = true;
     }
   }
   sync();
@@ -80,7 +126,7 @@ export function conditionalWheel(
       sync();
     },
     destroy(): void {
-      node.removeEventListener("wheel", listener);
+      sync();
     },
   };
 }

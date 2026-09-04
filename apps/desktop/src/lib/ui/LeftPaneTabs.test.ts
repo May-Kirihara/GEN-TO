@@ -15,6 +15,10 @@ let component: Record<string, unknown> | null = null;
 let selected: string[] = [];
 
 function mountTabs(active: "folders" | "collections" | "library" = "folders"): void {
+  // 同一ファイル内で複数回mountするため、旧targetを先に除去する
+  // (left-tab-* のid重複が残るとgetElementById系の實focus先が古い
+  // インスタンスへずれる)
+  target?.remove();
   target = document.createElement("div");
   document.body.appendChild(target);
   component = mount(LeftPaneTabs, {
@@ -39,13 +43,16 @@ beforeEach(() => {
   selected = [];
 });
 
-afterEach(() => {
+afterEach(async () => {
   if (component) {
     unmount(component);
     component = null;
   }
   target?.remove();
   target = null;
+  // 直前テストのキーボード切替が予約したrAFフォーカスを排出させる
+  // (取り外し済みDOMへ向かうためno-opになり、次テストへ汚染しない)
+  await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
 });
 
 describe("LeftPaneTabs", () => {
@@ -92,5 +99,18 @@ describe("LeftPaneTabs", () => {
     mountTabs("library");
     key(target!.querySelector("[role='tablist']") as HTMLElement, "Home");
     expect(selected.at(-1)).toBe("folders");
+  });
+
+  it("キーボード切替ではフォーカスがタブ側へ追従する (APG: タブに留まる・r1 N2)", async () => {
+    mountTabs("folders");
+    const first = tabs()[0]!;
+    first.focus();
+    expect(document.activeElement).toBe(first);
+    key(target!.querySelector("[role='tablist']") as HTMLElement, "ArrowRight");
+    expect(selected).toEqual(["collections"]);
+    // 自動活性化に伴いフォーカスも新しいタブへ (パネルへは移さない)
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    expect(document.activeElement).toBe(tabs()[1]);
   });
 });

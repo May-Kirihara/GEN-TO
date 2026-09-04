@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   FolderTreeStore,
+  isStaleTreeMenuTarget,
   registeredStateFor,
   treeContextTargetFor,
   type FsDirList,
@@ -118,6 +119,56 @@ describe("treeContextTargetFor (UIUX-1: ツリー右クリック3状態)", () =>
       path: "/data/other",
       rootId: "9",
     });
+  });
+});
+
+describe("isStaleTreeMenuTarget (UIUX-1 r1 B4: rootId込み完全比較)", () => {
+  const roots = [
+    { id: "7", path: "/data/lib" },
+    { id: "9", path: "/data/other" },
+  ];
+
+  it("同path・同rootIdのrootスナップショットはstaleでない", () => {
+    expect(
+      isStaleTreeMenuTarget({ kind: "root", path: "/data/lib", rootId: "7" }, roots),
+    ).toBe(false);
+  });
+
+  it("同pathでもrootIdが差し替わっていればstale (メニューを閉じる)", () => {
+    expect(
+      isStaleTreeMenuTarget({ kind: "root", path: "/data/lib", rootId: "old" }, roots),
+    ).toBe(true);
+  });
+
+  it("登録解除 (kind変化 root→unrelated) はstale", () => {
+    expect(
+      isStaleTreeMenuTarget({ kind: "root", path: "/data/lib", rootId: "7" }, []),
+    ).toBe(true);
+  });
+
+  it("unrelated/descendantスナップショットは状態が同一ならstaleでない", () => {
+    expect(
+      isStaleTreeMenuTarget({ kind: "unrelated", path: "/mnt/pics" }, roots),
+    ).toBe(false);
+    expect(
+      isStaleTreeMenuTarget({ kind: "descendant", path: "/data/lib/2026" }, roots),
+    ).toBe(false);
+  });
+
+  it("無関係なroots変化 (他ルートの追加・削除) ではstaleにしない", () => {
+    const snapshot = { kind: "root" as const, path: "/data/lib", rootId: "7" };
+    expect(isStaleTreeMenuTarget(snapshot, [...roots, { id: "11", path: "/mnt" }])).toBe(
+      false,
+    );
+    expect(isStaleTreeMenuTarget(snapshot, [{ id: "7", path: "/data/lib" }])).toBe(false);
+  });
+
+  it("descendantが親ルート登録でkind変化すればstale", () => {
+    expect(
+      isStaleTreeMenuTarget({ kind: "descendant", path: "/data/lib/2026" }, [
+        { id: "7", path: "/data/lib/2026" },
+      ]),
+    ).toBe(true);
   });
 });
 

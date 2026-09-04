@@ -140,7 +140,7 @@ export type MetaLike = {
 };
 
 type GridLike = {
-  summary: { total: number; mode: string; sort?: string } | null;
+  summary: { total: number; mode: string; sort?: string; scanning?: boolean } | null;
   stats: {
     requested: number;
     batches: number;
@@ -292,7 +292,10 @@ function clickLeftTab(id: "folders" | "collections" | "library"): void {
   document.querySelector<HTMLButtonElement>(`#left-tab-${id}`)?.click();
 }
 
-/** メニューバーの topLabel を開き itemPrefix で始まる項目をクリック (生産経路)。 */
+/** メニューバーの topLabel を開き itemPrefix で始まる項目をクリック (生産経路)。
+ * (チェック付き項目はテキスト先頭に✓が付くため除去してから照合。
+ *  既に開いているメニューをclickするとトグルで閉じるため、開いていない
+ *  ときだけトップボタンをクリックする) */
 function runMenuItem(topLabel: string, itemPrefix: string): void {
   const top = Array.from(
     document.querySelectorAll<HTMLButtonElement>(".menubar-button"),
@@ -300,11 +303,13 @@ function runMenuItem(topLabel: string, itemPrefix: string): void {
   if (top === undefined) {
     return;
   }
-  top.click();
+  if (top.getAttribute("aria-expanded") !== "true") {
+    top.click();
+  }
   setTimeout(() => {
     const item = Array.from(
       document.querySelectorAll<HTMLButtonElement>(".menu-popover button"),
-    ).find((b) => (b.textContent ?? "").trim().startsWith(itemPrefix));
+    ).find((b) => (b.textContent ?? "").replace("✓", "").trim().startsWith(itemPrefix));
     item?.click();
   }, 150);
 }
@@ -524,6 +529,10 @@ export function installDevBridge(stores: DevBridgeStores): void {
   let foCmdMode = false;
   // UIUX-1 E2E: メニュー/タブ/右クリック/パンくずコマンドモード (shift+F1で入る)
   let uxCmdMode = false;
+
+  // UIUX-1 r1 E2E: 非アクティブタブパネル (hidden) 内のfocus試行結果。
+  // 0=focus拒否 (hidden実効・正常) / 1=着地 (不良) / -1=未実施 or 対象なし。
+  let uxHiddenFocusResult = -1;
 
   // WP-18-1 D3 E2E: バックアップ/復元の状態行 (foCmdModeの 6/7 で駆動)。
   // 本物のTauri command (BackupDialog/RestoreDialogと同一のinvoke) を
@@ -1171,6 +1180,106 @@ export function installDevBridge(stores: DevBridgeStores): void {
     uxMenuExport: () => runMenuItem("ファイル", "SD学習用エクスポート…"),
     /** ファイル>「一時走査を実行」。 */
     uxMenuScan: () => runMenuItem("ファイル", "一時走査を実行"),
+    /** ファイル>「一時走査を中止」(scanning中のみ項目が存在)。 */
+    uxMenuCancelScan: () => runMenuItem("ファイル", "一時走査を中止"),
+    /** ファイル>「終了」— 実window close経路 (プロセス終了のE2E用)。 */
+    uxMenuQuit: () => runMenuItem("ファイル", "終了"),
+    /** 表示>「左ペイン」(表示切替)。 */
+    uxMenuToggleLeft: () => runMenuItem("表示", "左ペイン"),
+    /** 表示>「右ペイン」(表示切替)。 */
+    uxMenuToggleRight: () => runMenuItem("表示", "右ペイン"),
+    /** ツール>「AIパネル…」。 */
+    uxMenuAiPanel: () => runMenuItem("ツール", "AIパネル…"),
+    /** ツール>「開発パネル」(devBridgeActive時のみ項目が存在)。 */
+    uxMenuDevPanel: () => runMenuItem("ツール", "開発パネル"),
+    /** ツール>「全データベースをバックアップ」(即時実行・完了は通知)。 */
+    uxMenuBackupDb: () => runMenuItem("ツール", "全データベースをバックアップ"),
+    /** ツール>「バックアップから復元…」(RestoreDialogを開く)。 */
+    uxMenuRestore: () => runMenuItem("ツール", "バックアップから復元…"),
+    /** メニューバー先頭 (ファイル) ボタンへフォーカス (実キー操作の着地)。 */
+    uxFocusMenubar: () => {
+      document.querySelector<HTMLButtonElement>(".menubar-button")?.focus();
+    },
+    /**
+     * 非アクティブタブパネル内の最初の操作要素へfocusを試みて結果を記録
+     * (hidden属性の実効性 — 本物のWebKitでは拒否=0が正常)。
+     */
+    uxTryFocusHiddenPane: () => {
+      const activeTab = document.querySelector(
+        ".left-tabs [role='tab'][aria-selected='true']",
+      );
+      const activePanelId =
+        activeTab instanceof HTMLElement ? `left-panel-${activeTab.id.replace("left-tab-", "")}` : "";
+      const hidden = Array.from(
+        document.querySelectorAll<HTMLElement>(".left-tabpanel"),
+      ).find((panel) => panel.id !== activePanelId && panel.hidden);
+      const control =
+        hidden?.querySelector<HTMLElement>("button, input, textarea, select, [tabindex]") ??
+        null;
+      if (control === null) {
+        uxHiddenFocusResult = -1;
+        return;
+      }
+      const before = document.activeElement;
+      control.focus();
+      uxHiddenFocusResult = document.activeElement === control && before !== control ? 1 : 0;
+    },
+    /** 「+ スマート」フォームを開き名前入力へフォーカス (ドラフト生存検証)。 */
+    uxCollSmartForm: () => {
+      clickLeftTab("collections");
+      setTimeout(() => {
+        clickButton("+ スマート");
+        setTimeout(() => {
+          document.querySelector<HTMLInputElement>(".coll-create .coll-name-input")?.focus();
+        }, 120);
+      }, 150);
+    },
+    /** ライブラリタブのルート追加path入力へフォーカス (ドラフト生存検証)。 */
+    uxFocusRootPathInput: () => {
+      clickLeftTab("library");
+      setTimeout(() => {
+        document.querySelector<HTMLInputElement>(".roots-add input")?.focus();
+      }, 200);
+    },
+    /** 登録ルート行 (「登録ルート」バッジ持ち行) で右クリックメニューを開く
+     * (登録済みパスはクリック表示がlibrary固定のため選択状態に依存しない)。 */
+    treeContextRoot: () => {
+      clickLeftTab("folders");
+      setTimeout(() => {
+        const row = Array.from(document.querySelectorAll<HTMLElement>(".tree-row")).find(
+          (r) => r.querySelector(".tree-badge")?.textContent === "登録ルート",
+        );
+        row
+          ?.querySelector<HTMLElement>(".tree-label")
+          ?.dispatchEvent(
+            new MouseEvent("contextmenu", { bubbles: true, cancelable: true }),
+          );
+      }, 150);
+    },
+    /** 登録ルート行の展開矢印をクリック (配下行の出現)。 */
+    treeExpandRoot: () => {
+      clickLeftTab("folders");
+      setTimeout(() => {
+        const row = Array.from(document.querySelectorAll<HTMLElement>(".tree-row")).find(
+          (r) => r.querySelector(".tree-badge")?.textContent === "登録ルート",
+        );
+        row?.querySelector<HTMLElement>(".tree-expander")?.click();
+      }, 150);
+    },
+    /** 登録内バッジ (登録ルート配下) の行で右クリック (メニュー不出現の検証)。 */
+    treeContextInside: () => {
+      clickLeftTab("folders");
+      setTimeout(() => {
+        const row = Array.from(document.querySelectorAll<HTMLElement>(".tree-row")).find(
+          (r) => r.querySelector(".tree-badge")?.textContent === "登録内",
+        );
+        row
+          ?.querySelector<HTMLElement>(".tree-label")
+          ?.dispatchEvent(
+            new MouseEvent("contextmenu", { bubbles: true, cancelable: true }),
+          );
+      }, 150);
+    },
     /** 左ペインタブ切替 (ドラフト生存検証: 切替えても入力値が残る)。 */
     uxTabFolders: () => clickLeftTab("folders"),
     uxTabCollections: () => clickLeftTab("collections"),
@@ -1276,6 +1385,7 @@ export function installDevBridge(stores: DevBridgeStores): void {
     const s = grid.stats;
     const gridLinesOut = [
       `G tot=${grid.summary?.total ?? 0} mode=${grid.summary?.mode ?? "-"}` +
+        ` scn=${grid.summary?.scanning ? 1 : 0}` +
         ` srt=${grid.summary?.sort ?? "-"}` +
         ` req=${s.requested} bat=${s.batches} rej=${s.rejectedFull}` +
         ` rdy=${s.readyReceived} fail=${s.failedReceived} can=${s.cancelled} canB=${s.cancelBatches}`,
@@ -1382,11 +1492,17 @@ export function installDevBridge(stores: DevBridgeStores): void {
 
   /** UIUX-1: メニューバー・左ペインタブ・パンくず入力の状態行 (UX接頭辞)。
    * フィールドはx接頭辞で既存行の先頭一致を奪わない (命名規約はbkLines参照)。
-   * xtab=アクティブタブ(f/c/l) / xmen=開中メニュー(f/v/t/h/-) / xmi=項目数
+   * xtab=アクティブタブ(f/c/l/-) / xmen=開中メニュー(f/v/t/h/-) / xmi=項目数
    * / xdlg=picker系dialog数 / xab=設定About表示 / xcr=コレクション作成
-   * 入力文字数 / xcm=作成モード(n/m/s) / xbi=パンくず入力中 / xbc=crumb数
-   * / xed=エクスポート項目の無効(1/0/-1=メニュー閉) / xerr=toolbarエラー通知
-   * / xsp=スクロール速度係数 (スライダーvalue) */
+   * 入力文字数 / xcm=作成モード(n/なし m=手動 s=スマート) / xbi=パンくず入力中
+   * / xbc=crumb数 / xed=エクスポート項目の無効(1/0/-1=メニュー閉)
+   * / xerr=toolbarエラー通知 / xsp=スクロール速度係数 (スライダーvalue)
+   * / xrole=activeElementのrole (実キー操作のfocus検証)
+   * / xlp=左ペイン可視 / xrp=右ペイン可視 / xhid=非アクティブパネルhidden
+   * / xhf=hidden内focus試行 (0=拒否が正常) / xrn=リネーム入力文字数
+   * / xra=ルート追加path入力文字数 / xes=エクスポートdialog入力元(c/s/-)
+   * / xsc=ファイルメニュー走査項目(r=実行/c=中止/-) / xti=登録内バッジ数
+   * / xdd=開発パネル / xai=AIパネル / xln=DBバックアップ完了通知 */
   function uiuxLines(): string[] {
     const tabBtn = document.querySelector<HTMLButtonElement>(
       ".left-tabs [role='tab'][aria-selected='true']",
@@ -1400,9 +1516,9 @@ export function installDevBridge(stores: DevBridgeStores): void {
     const xmi = popover === null ? 0 : popover.querySelectorAll("button").length;
     const xdlg = document.querySelectorAll(".picker-backdrop").length;
     const xab = document.querySelector("[data-testid='settings-about']") !== null ? 1 : 0;
-    const collName = document.querySelector<HTMLInputElement>(".coll-create .coll-name-input");
     const createForm = document.querySelector(".coll-create");
-    const xcm = createForm === null ? "n" : collName === null ? "n" : "m";
+    const collName = document.querySelector<HTMLInputElement>(".coll-create .coll-name-input");
+    const xcm = createForm === null ? "n" : createForm.querySelector(".coll-builder") === null ? "m" : "s";
     const xcr = collName === null ? -1 : collName.value.length;
     const xbi =
       document.querySelector('[data-testid="breadcrumb-path-input"]') !== null ? 1 : 0;
@@ -1412,6 +1528,51 @@ export function installDevBridge(stores: DevBridgeStores): void {
       '[data-testid="scroll-speed-slider"]',
     );
     const xsp = speedSlider === null ? "-1" : speedSlider.value;
+    const active = document.activeElement;
+    const xrole =
+      active === null || active === document.body
+        ? "-"
+        : active.getAttribute("role") ?? active.tagName.toLowerCase();
+    const xlp = document.querySelector(".left-tabs") !== null ? 1 : 0;
+    const xrp = document.querySelector(".side-pane.right") !== null ? 1 : 0;
+    const anyHidden = Array.from(document.querySelectorAll<HTMLElement>(".left-tabpanel")).find(
+      (panel) => panel.hidden,
+    );
+    const xhid = tabBtn === null ? -1 : anyHidden === undefined ? 0 : 1;
+    const xrn =
+      document.querySelector<HTMLInputElement>('[data-testid="rename-input"]')?.value.length ??
+      -1;
+    const xra = document.querySelector<HTMLInputElement>(".roots-add input")?.value.length ?? -1;
+    const exportSource = document.querySelector("[data-testid='export-source']");
+    const xes =
+      exportSource === null
+        ? "-"
+        : (exportSource.textContent ?? "").includes("コレクション")
+          ? "c"
+          : (exportSource.textContent ?? "").includes("選択")
+            ? "s"
+            : "-";
+    let xsc = "-";
+    if (popover !== null) {
+      const first = popover.querySelectorAll<HTMLButtonElement>("button")[0];
+      if (first !== undefined) {
+        const label = (first.textContent ?? "").trim();
+        if (label.startsWith("一時走査を実行")) {
+          xsc = "r";
+        } else if (label.startsWith("一時走査を中止")) {
+          xsc = "c";
+        }
+      }
+    }
+    const xti = Array.from(document.querySelectorAll(".tree-badge")).filter(
+      (badge) => badge.textContent === "登録内",
+    ).length;
+    const xdd = document.querySelector(".dev-drawer") !== null ? 1 : 0;
+    const xai = document.querySelector('[role="dialog"][aria-label="AI設定"]') !== null ? 1 : 0;
+    const xln =
+      (document.querySelector(".roots-notice")?.textContent ?? "").includes("DBバックアップを作成しました")
+        ? 1
+        : 0;
     let xed = -1;
     if (popover !== null) {
       const exportItem = Array.from(
@@ -1423,7 +1584,9 @@ export function installDevBridge(stores: DevBridgeStores): void {
     }
     return [
       `UX xtab=${xtab} xmen=${xmen} xmi=${xmi} xdlg=${xdlg} xab=${xab}` +
-        ` xcr=${xcr} xcm=${xcm} xbi=${xbi} xbc=${xbc} xed=${xed} xerr=${xerr} xsp=${xsp}`,
+        ` xcr=${xcr} xcm=${xcm} xbi=${xbi} xbc=${xbc} xed=${xed} xerr=${xerr} xsp=${xsp}` +
+        ` xrole=${xrole} xlp=${xlp} xrp=${xrp} xhid=${xhid} xhf=${uxHiddenFocusResult}` +
+        ` xrn=${xrn} xra=${xra} xes=${xes} xsc=${xsc} xti=${xti} xdd=${xdd} xai=${xai} xln=${xln}`,
     ];
   }
 
@@ -1701,11 +1864,27 @@ export function installDevBridge(stores: DevBridgeStores): void {
           "0": "treeContextCurrent",
           a: "treeMenuRegister",
           u: "treeMenuUnregister",
+          d: "treeContextInside",
+          t: "treeExpandRoot",
+          h: "treeContextRoot",
           s: "uxMenuSettings",
           b: "uxMenuAbout",
           e: "uxMenuExport",
           k: "uxMenuBackupRoot",
           c: "uxMenuScan",
+          n: "uxMenuCancelScan",
+          q: "uxMenuQuit",
+          m: "uxMenuView",
+          p: "uxMenuToggleLeft",
+          j: "uxMenuToggleRight",
+          i: "uxMenuAiPanel",
+          g: "uxMenuDevPanel",
+          f: "uxMenuBackupDb",
+          r: "uxMenuRestore",
+          z: "uxFocusMenubar",
+          x: "uxTryFocusHiddenPane",
+          y: "uxCollSmartForm",
+          o: "uxFocusRootPathInput",
           v: "uxFocusSpeedSlider",
           w: "uxWheelGrid",
         };

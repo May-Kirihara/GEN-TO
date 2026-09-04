@@ -220,7 +220,7 @@
           {#each menu.items as item (item.id)}
             <button
               type="button"
-              role="menuitemcheckbox"
+              role={item.checked === undefined ? "menuitem" : "menuitemcheckbox"}
               aria-checked={item.checked === undefined ? undefined : item.checked}
               disabled={item.disabled}
               title={item.title ?? ""}

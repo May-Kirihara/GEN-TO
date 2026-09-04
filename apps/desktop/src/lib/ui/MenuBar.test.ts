@@ -159,6 +159,24 @@ describe("MenuBar", () => {
     expect(items[1]!.textContent).not.toContain("✓");
   });
 
+  it("通常コマンドはrole=menuitem・チェック項目のみmenuitemcheckbox (r1 N1)", () => {
+    mountBar(menusOf());
+    topButtons()[0]!.click(); // ファイル: 走査/エクスポート/終了 = すべて通常コマンド
+    flushSync();
+    for (const item of popoverItems()) {
+      expect(item.getAttribute("role")).toBe("menuitem");
+      expect(item.hasAttribute("aria-checked")).toBe(false);
+    }
+    topButtons()[0]!.click();
+    flushSync();
+    topButtons()[1]!.click(); // 表示: 左ペイン/右ペイン = チェック付き
+    flushSync();
+    for (const item of popoverItems()) {
+      expect(item.getAttribute("role")).toBe("menuitemcheckbox");
+      expect(item.hasAttribute("aria-checked")).toBe(true);
+    }
+  });
+
   it("キーボード: トップレベルの矢印左右で移動し、Enterで開いて項目へフォーカス", () => {
     mountBar(menusOf());
     const [file, view] = topButtons();

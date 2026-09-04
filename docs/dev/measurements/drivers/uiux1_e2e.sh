@@ -4,21 +4,31 @@
 #  (事前に pnpm build (apps/desktop) および
 #   cargo build --release -p gento-tauri --features custom-protocol,devtools)
 #
-# 検証項目 (UIUX-1 / R-F②。dev bridgeのuxCmdMode = shift+F1で駆動):
+# 検証項目 (UIUX-1 / R-F② + r1レビューの追加テスト。uxCmdMode = shift+F1):
 #   1) メニューバー: ファイル/表示/ツール/ヘルプの開閉 (UX xmen/xmi)・
 #      クリック外閉じ
 #   2) メニュー実操作: ツール>設定… (dialog) / ヘルプ>About直開 (xab) /
 #      ツール>ルートのバックアップ… (登録後 BackupDialog) /
 #      ファイル>SD学習用エクスポート…の無効条件 (xed=1・不発火)
-#   3) タブドラフト生存: コレクション作成フォーム入力 → タブ切替 → 復帰
-#      で入力値が残る (全マウント維持)
+#   3) タブドラフト生存: 手動コレクション作成フォーム (xcr) /
+#      スマート条件フォーム (xcm=s) / ルート追加path入力 (xra) /
+#      グリッドのリネーム入力 (xrn) — タブ切替を跨いで保存
 #   4) パンくずパス入力: 絶対パス移動 (mode=real)・存在しないパスは
 #      エラー通知 (xerr=1) でクラッシュしない
 #   5) ファイル>一時走査を実行 (scan metricsログで実行証明)
-#   6) FolderTree右クリック: 未登録フォルダ →「このフォルダーを登録ルートに
-#      追加」→ library表示へ自動切替 (UXLIB-1導線)
+#      + 一時走査を中止 (scn=1を観測してからメニューから中止 — r1)
+#   6) FolderTree右クリック3状態: unrelated (登録導線) / root (3項目) /
+#      descendant (メニュー無し) — r1
+#   7) メニューkeyboard操作: 矢印で開く・項目focus・ESCでトリガ復帰・
+#      トップレベル矢印切替 (r1 — 実キー)
+#   8) タブfocusモデル: 非アクティブパネルはhidden + focus不可 (xhf=0)
+#   9) 表示メニュー: 左ペイン・右ペインの切替 (xlp/xrp)
+#  10) エクスポート正ケース: コレクション優先 (xes=c) ・選択資産 (xes=s)
+#  11) ツール実操作: AIパネル (xai) / 開発パネル (xdd) /
+#      全DBバックアップ (xln=1) / 復元dialog (xdlg)
+#  12) 実Quit: ファイル>終了 → window closeでプロセス終了 (SIGTERMと区別)
 #
-# 運用メモ: uxlib1と同じ方針 (専用Xディスプレイ :6 = Xephyr。無ければ起動)。
+# 運用ノート: uxlib1と同じ方針 (専用Xディスプレイ :6 = Xephyr。無ければ起動)。
 set -uo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -28,6 +38,10 @@ WORK=/tmp/opencode/uiux1/e2e
 HOST_DISPLAY="${DISPLAY:-:0}"
 DISPLAY="${GENTO_E2E_DISPLAY:-:6}"
 export NO_COLOR=1 GENTO_LOG=info GENTO_DEV_BRIDGE=1
+
+# キャンセルテスト用: 登録ルート配下に作るサブフォルダのファイル数
+# (走査が十分長く続くよう多めに。scn観測は1秒粒度のreportCompact経由)
+BIG=600
 
 if ! xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
   env DISPLAY="$HOST_DISPLAY" setsid nohup Xephyr "$DISPLAY" -screen 1600x1000 >/tmp/opencode/uiux1-xephyr.log 2>&1 </dev/null &
@@ -39,7 +53,7 @@ fi
 xdpyinfo -display "$DISPLAY" >/dev/null 2>&1 || { echo "no X display on $DISPLAY" >&2; exit 1; }
 
 rm -rf "$WORK"; mkdir -p "$WORK/home" "$WORK/env/thumbs" "$WORK/env/db" "$WORK/dataset" \
-  "$WORK/home/AAA-unreg" "$WORK/appcwd" "$WORK/shots" "$WORK/logs"
+  "$WORK/home/AAA-unreg/sub" "$WORK/appcwd" "$WORK/shots" "$WORK/logs"
 SHOT="$WORK/shots"
 NOTE="$WORK/e2e-notes.txt"; : > "$NOTE"
 shot() { import -window root "$SHOT/$1.png" 2>/dev/null || true; }
@@ -69,8 +83,9 @@ wait_log() { # <pattern> <timeout_s>
   return 1
 }
 
-# fixture: dataset 4枚 + 登録外フォルダ 1枚 (実PNG。uxlib1と同一生成方式)
-python3 - "$WORK/dataset" "$WORK/home/AAA-unreg" <<'PYEOF'
+# fixture: dataset 4枚 + 登録外フォルダ 1枚 + サブ BIG枚 (実PNG。
+# seedは重複しない範囲を使い、BLAKE3重複による資産統合を避ける)
+python3 - "$WORK/dataset" "$WORK/home/AAA-unreg" "$WORK/home/AAA-unreg/sub" "$BIG" <<'PYEOF'
 import struct, sys, zlib
 from pathlib import Path
 def chunk(kind: bytes, data: bytes) -> bytes:
@@ -85,11 +100,14 @@ def png(path: Path, seed: int) -> None:
     path.write_bytes(b"\x89PNG\r\n\x1a\n"
                      + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
                      + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
-dataset, unreg = (Path(a) for a in sys.argv[1:3])
+dataset, unreg, sub = (Path(a) for a in sys.argv[1:4])
+big = int(sys.argv[4])
 for i in range(4):
     png(dataset / f"ux-{i:02}.png", i)
 png(unreg / "unreg.png", 9)
-print("fixture: dataset 4 pngs + AAA-unreg 1 png")
+for i in range(big):
+    png(sub / f"sub-{i:04}.png", 100 + i)
+print(f"fixture: dataset 4 + AAA-unreg 1 + sub {big} pngs")
 PYEOF
 
 APP_PID=""
@@ -125,15 +143,20 @@ graceful_stop() {
 }
 trap '[[ -n "$APP_PID" ]] && kill -9 "$APP_PID" 2>/dev/null; true' EXIT
 
-# uxCmdModeアクション: shift+F1 → <key> (1回のアクション実行で自動退出)
+# コマンドモードhelpers: ux=shift+F1 (UIUX-1) / coll=ctrl+shift+F1 (WP-6) /
+# fo=ctrl+shift+F12 (WP-7)。いずれもモーメンタリ (1回のアクションで自動退出)
 ux() { xdotool key shift+F1; sleep 0.4; xdotool key "$1"; sleep "${2:-1.2}"; }
+coll() { xdotool key ctrl+shift+F1; sleep 0.4; xdotool key "$1"; sleep "${2:-1.2}"; }
+fo() { xdotool key ctrl+shift+F12; sleep 0.4; xdotool key "$1"; sleep "${2:-1.2}"; }
 
 # ========== 起動 (未登録 dataset = adhoc) ==========
 launch
-wait_log "devtest:" 30 || fail "dev bridge not flowing"
-wait_value mode real 20 || fail "起動がadhocでない (mode=$(devtest_value mode || echo none))"
-wait_value tot 4 20 || fail "adhocカタログ4件 (tot=$(devtest_value tot || echo none))"
-pass "0) 起動: adhoc表示・4件 (メニューバー+タブ付きレイアウトで描画)"
+wait_log "devtest:" 30 || { fail "0) dev bridge not flowing"; }
+if wait_value mode real 20 && wait_value tot 4 20; then
+  pass "0) 起動: adhoc表示・4件 (メニューバー+タブ付きレイアウトで描画)"
+else
+  fail "0) 起動不全 (mode=$(devtest_value mode || echo none) tot=$(devtest_value tot || echo none))"
+fi
 shot 00-initial
 
 # ========== 1) メニューバー開閉 ==========
@@ -189,7 +212,66 @@ shot 02-settings-about
 xdotool key Escape; sleep 0.8
 wait_value xdlg 0 10 || fail "2) About dialogがEscapeで閉じない"
 
-# ========== 3) タブドラフト生存 ==========
+# ========== 7) メニューkeyboard操作 (実キー — r1) ==========
+ux z 0.6    # uxFocusMenubar (ファイルボタンへfocus)
+xdotool key Down; sleep 1.0   # トップレベルArrowDown = 開く+最初の有効項目へfocus
+if [[ "$(devtest_value xmen || true)" == "f" && "$(devtest_value xmi || true)" == "3" \
+  && "$(devtest_value xrole || true)" == "menuitem" ]]; then
+  pass "7) 実キーArrowDownでメニュー開+項目focus (xmen=f xrole=menuitem)"
+else
+  fail "7) keyboard open不正 (xmen=$(devtest_value xmen || echo -) xrole=$(devtest_value xrole || echo -))"
+fi
+xdotool key Down; sleep 0.5; xdotool key Down; sleep 0.8  # 項目移動 (循環)
+xdotool key Escape; sleep 1.0
+if wait_value xmen - 10 && [[ "$(devtest_value xrole || true)" == "menuitem" ]] \
+  && [[ "$(devtest_value ae || true)" == "BUTTON.menubar-button" ]]; then
+  pass "7) 実キーEscapeで閉じてトリガへfocus復帰 (ae=BUTTON.menubar-button)"
+else
+  fail "7) keyboard close/復帰不正 (xmen=$(devtest_value xmen || echo -) ae=$(devtest_value ae || echo -))"
+fi
+xdotool key Right; sleep 0.8   # トップレベルArrowRight = focus移動 (メニューは開かない)
+xdotool key Down; sleep 1.0    # 移動先 (表示) をArrowDownで開く
+if [[ "$(devtest_value xmen || true)" == "v" ]]; then
+  pass "7) トップレベルArrowRight→Downで表示メニューへ (xmen=v)"
+else
+  fail "7) ArrowRight切替不正 (xmen=$(devtest_value xmen || echo -))"
+fi
+ux 4 0.6
+
+# ========== 8) 非アクティブペイン: hidden + focus不可 (r1) ==========
+ux x 1.0    # uxTryFocusHiddenPane
+if [[ "$(devtest_value xhf || true)" == "0" && "$(devtest_value xhid || true)" == "1" ]]; then
+  pass "8) 非アクティブパネルはhidden (xhid=1) かつfocus不可 (xhf=0 — 実WebKit)"
+else
+  fail "8) hidden実効性不正 (xhid=$(devtest_value xhid || echo -) xhf=$(devtest_value xhf || echo -))"
+fi
+
+# ========== 9) 表示メニュー: ペイン切替 (r1) ==========
+ux p 1.0    # 表示>左ペイン → off
+if wait_value xlp 0 10 && [[ "$(devtest_value xtab || true)" == "-" ]]; then
+  pass "9) 表示>左ペインで左ペイン非表示 (xlp=0 xtab=-)"
+else
+  fail "9) 左ペインoff不正 (xlp=$(devtest_value xlp || echo -) xtab=$(devtest_value xtab || echo -))"
+fi
+ux p 1.0    # 再度 → on
+if wait_value xlp 1 10 && wait_value xtab f 10; then
+  pass "9) 左ペイン復帰 (xlp=1 xtab=f — leftTab永続化)"
+else
+  fail "9) 左ペインon不正 (xlp=$(devtest_value xlp || echo -) xtab=$(devtest_value xtab || echo -))"
+fi
+ux j 1.0    # 表示>右ペイン → off
+if ! wait_value xrp 0 10; then
+  fail "9) 右ペインoff不正 (xrp=$(devtest_value xrp || echo -))"
+else
+  ux j 1.0  # → on
+  if wait_value xrp 1 10; then
+    pass "9) 表示>右ペインのoff/on (xrp 0→1)"
+  else
+    fail "9) 右ペインon復帰不正 (xrp=$(devtest_value xrp || echo -))"
+  fi
+fi
+
+# ========== 3) タブドラフト生存: 手動コレクション ==========
 ux 8 1.0    # uxCollCreateForm (コレクションタブ+作成フォーム+名前input focus)
 xdotool type --delay 25 "draft-keep"; sleep 0.5
 if wait_value xcr 10 10 && [[ "$(devtest_value xcm || true)" == "m" ]]; then
@@ -211,13 +293,48 @@ fi
 shot 05-tab-draft-after
 # 作成フォームは開いたまま (以降のフェーズへ副作用なし・ドラフト生存状態を維持)
 
+# ========== 3b) タブドラフト生存: スマート条件フォーム (r1) ==========
+ux y 1.0    # uxCollSmartForm (+ スマート → 名前input focus)
+xdotool type --delay 20 "smart-draft"; sleep 0.5
+if wait_value xcr 11 10; then
+  pass "3) スマート条件フォームへ入力 (xcr=11)"
+else
+  fail "3) スマートフォーム入力不全 (xcr=$(devtest_value xcr || echo -))"
+fi
+ux 5 1.0; ux 6 1.0   # タブ往復
+if [[ "$(devtest_value xcm || true)" == "s" && "$(devtest_value xcr || true)" == "11" ]]; then
+  pass "3) スマート条件ドラフト生存 (xcm=s xcr=11)"
+else
+  fail "3) スマートドラフト不全 (xcm=$(devtest_value xcm || echo -) xcr=$(devtest_value xcr || echo -))"
+fi
+# フォームは残ってもstartCreateが名前を初期化するため以降へ影響しない
+
+# ========== 3c) タブドラフト生存: ルート追加path入力 (r1) ==========
+ux o 1.0    # uxFocusRootPathInput (ライブラリタブ + roots-add input)
+rootpath="$WORK/home/AAA-unreg"
+xdotool type --delay 20 "$rootpath"; sleep 0.5
+rootlen=${#rootpath}
+if wait_value xra "$rootlen" 10; then
+  pass "3) ルート追加pathへ入力 (xra=$rootlen)"
+else
+  fail "3) ルートpath入力不全 (xra=$(devtest_value xra || echo -) 期待=$rootlen)"
+fi
+ux 5 1.0; ux 7 1.0   # タブ往復 (folders → library)
+if [[ "$(devtest_value xra || true)" == "$rootlen" ]]; then
+  pass "3) ルートpathドラフト生存 (xra=$rootlen)"
+else
+  fail "3) ルートpathドラフト不全 (xra=$(devtest_value xra || echo -) 期待=$rootlen)"
+fi
+# フォーカスを外す (入力は残す — 追加ボタンは押さない)
+
 # ========== 4) パンくずパス入力: 移動成功 / エラー通知 ==========
 ux 9 1.0    # uxFocusBreadcrumb
 xdotool type --delay 25 "$WORK/home/AAA-unreg"; sleep 0.3
 shot 06-breadcrumb-input
 xdotool key Return; sleep 2.0
-if wait_value mode real 15 && wait_value tot 1 15; then
-  pass "4) パンくず入力で絶対パス移動 (mode=real tot=1: AAA-unreg)"
+# 一時走査カタログは再帰的: AAA-unreg直下1 + sub $BIG
+if wait_value mode real 15 && wait_value tot $((BIG + 1)) 15; then
+  pass "4) パンくず入力で絶対パス移動 (mode=real tot=$((BIG + 1)): AAA-unreg再帰)"
 else
   fail "4) パス移動不全 (mode=$(devtest_value mode || echo none) tot=$(devtest_value tot || echo -))"
 fi
@@ -254,25 +371,52 @@ else
   fail "5) メニューからの走査が実行されない"
 fi
 
-# ========== 6) FolderTree右クリック → 登録 ==========
+# ========== 6) FolderTree右クリック → 登録 (unrelated状態) ==========
 # ツリーのhomeを展開してAAA-unreg行を選択 (row-selectedをDOMへ出す)
 xdotool key shift+F7; sleep 2.5
 # 現在 adhoc で AAA-unreg 表示中 = ツリーの当該行が row-selected
 ux 0 1.0    # treeContextCurrent (選択中行でcontext menu)
 if wait_value menu 1 10; then
-  pass "6) ツリー右クリックでcontext menu (U menu=1)"
+  pass "6) ツリー右クリックでcontext menu — unrelated (U menu=1)"
 else
   fail "6) context menuが開かない (menu=$(devtest_value menu || echo -))"
 fi
 shot 07-tree-context-menu
 ux a 2.0    # treeMenuRegister
-if wait_value mode library 20; then
+if wait_value mode library 30; then
   pass "6) 「このフォルダーを登録ルートに追加」→ library表示へ自動切替 (mode=library)"
 else
   fail "6) 登録導線不全 (mode=$(devtest_value mode || echo none))"
 fi
-wait_value tot 1 20 || fail "6) 登録ルート表示1件 (tot=$(devtest_value tot || echo -))"
+if wait_value tot $((BIG + 1)) 40; then
+  pass "6) 登録ルート表示 $((BIG + 1))件 (直下1+sub $BIG — 再帰登録)"
+else
+  fail "6) 登録ルート表示不全 (tot=$(devtest_value tot || echo -) 期待=$((BIG + 1)))"
+fi
 shot 08-registered-library
+
+# ========== 6b) FolderTree右クリック: root状態 (3項目) と descendant (メニュー無し) — r1 ==========
+# 登録済みパスはクリック表示がlibrary固定のため、バッジで行を特定して右クリック
+ux h 1.0    # treeContextRoot → 登録ルート行でcontext menu
+if wait_value menu 1 10 && wait_value mbtn 3 10; then
+  pass "6) root右クリックは3項目 (解除/バックアップ/再スキャン — U mbtn=3)"
+else
+  fail "6) rootメニュー不正 (menu=$(devtest_value menu || echo -) mbtn=$(devtest_value mbtn || echo -))"
+fi
+xdotool key Escape; sleep 0.8    # メニューを閉じる
+ux t 2.0    # treeExpandRoot (登録ルート行を展開)
+if wait_value xti 1 15; then
+  pass "6) 登録ルート配下のサブフォルダが「登録内」バッジで出現 (xti=1)"
+else
+  fail "6) 登録内バッジ不出現 (xti=$(devtest_value xti || echo -))"
+fi
+ux d 1.0    # treeContextInside (登録内行で右クリック)
+if wait_value menu 0 10; then
+  pass "6) descendant右クリックはメニュー無し (U menu=0)"
+else
+  fail "6) descendantでメニューが出た (menu=$(devtest_value menu || echo -))"
+fi
+shot 09-tree-descendant
 
 # ========== 2c) ツール>ルートのバックアップ… (登録済み → BackupDialog直開) ==========
 ux k 1.5    # uxMenuBackupRoot
@@ -281,15 +425,178 @@ if wait_value xdlg 1 10; then
 else
   fail "2) BackupDialogが開かない (xdlg=$(devtest_value xdlg || echo -))"
 fi
-shot 09-backup-dialog
+shot 10-backup-dialog
 xdotool key Escape; sleep 0.8
 wait_value xdlg 0 10 || fail "2) BackupDialogがEscapeで閉じない"
 
-# ========== 終了 (graceful) ==========
-if graceful_stop; then pass "7) SIGTERM graceful終了"; else fail "7) SIGTERMで終了しない"; fi
+# ========== 10) エクスポート正ケース (コレクション優先) — r1 ==========
+fo 1 1.5    # foShowLibraryRow → library表示
+wait_value mode library 15 || fail "10) library表示へ戻れない (mode=$(devtest_value mode || echo -))"
+coll 1 1.0   # collCreateManualForm
+xdotool type --delay 25 "E2E Export"; sleep 0.3
+xdotool key Return; sleep 1.5
+if wait_value n 1 15; then
+  pass "10) 手動コレクション「E2E Export」作成 (CL n=1)"
+else
+  fail "10) コレクション作成不全 (n=$(devtest_value n || echo -))"
+fi
+coll 4 0.8   # contextMenuCell0
+coll 5 1.0   # 「コレクションへ追加…」→ ピッカー
+coll 6 1.4   # 既存「E2E Export」へ追加
+xdotool key Escape; sleep 0.6   # ピッカーを閉じる (残るとdialog数が増える)
+wait_value xdlg 0 10 || true
+coll 3 1.5   # collShowNext → E2E Exportを表示
+if [[ "$(devtest_value kind || true)" == "m" ]] && wait_value cnt 1 15; then
+  pass "10) コレクション表示 (CL kind=m cnt=1)"
+else
+  fail "10) コレクション表示不全 (kind=$(devtest_value kind || echo -) cnt=$(devtest_value cnt || echo -))"
+fi
+ux e 1.5    # uxMenuExport → コレクション優先
+if wait_value xdlg 1 10 && wait_value xes c 10; then
+  pass "10) エクスポート正: コレクション優先 (xdlg=1 xes=c)"
+else
+  fail "10) コレクション優先エクスポート不全 (xdlg=$(devtest_value xdlg || echo -) xes=$(devtest_value xes || echo -))"
+fi
+shot 11-export-collection
+xdotool key Escape; sleep 0.8
+wait_value xdlg 0 10 || fail "10) ExportDialogがEscapeで閉じない"
+
+# ========== 10b) エクスポート正ケース (選択資産) — r1 ==========
+fo 1 1.5    # library表示へ戻る
+wait_value mode library 15 || fail "10) library表示へ戻れない (mode=$(devtest_value mode || echo -))"
+xdotool key ctrl+shift+F4; sleep 1.0   # focusCell0 → 単一選択
+if wait_value selN 1 10; then
+  pass "10) 資産を単一選択 (G selN=1)"
+else
+  fail "10) 選択不全 (selN=$(devtest_value selN || echo -))"
+fi
+ux e 1.5    # uxMenuExport → 選択資産
+if wait_value xdlg 1 10 && wait_value xes s 10; then
+  pass "10) エクスポート正: 選択資産 (xdlg=1 xes=s)"
+else
+  fail "10) 選択資産エクスポート不全 (xdlg=$(devtest_value xdlg || echo -) xes=$(devtest_value xes || echo -))"
+fi
+shot 12-export-selection
+xdotool key Escape; sleep 0.8
+wait_value xdlg 0 10 || fail "10) ExportDialog (選択) がEscapeで閉じない"
+
+# ========== 5b) 一時走査を中止 (scn観測→メニュー中止 — r1) ==========
+# ローカルfolderの一時走査は一瞬で終わるため、長く続く対象として / を
+# ツリーから開く (qa_wp4_e2e.shのcancel検証と同一方針 = ctrl+F7)。
+# 中止はメニュー項目「一時走査を中止」(scanning中のみ存在 —
+# runMenuItemは項目が無ければclickしない=安全)。
+cancel_ok=0
+xsc_seen="-"
+xdotool key ctrl+F7; sleep 0.5   # openTreeFsRoot — / のadhoc走査が開始
+for _attempt in 1 2 3; do
+  scn_seen=0
+  deadline=$((SECONDS + 10))
+  while (( SECONDS < deadline )); do
+    [[ "$(devtest_value scn || true)" == "1" ]] && { scn_seen=1; break; }
+    sleep 0.2
+  done
+  (( scn_seen )) || { ux c 0.3; continue; }   # 走査再開を試す
+  ux 1 0.8   # scanning中にファイルメニューを開き項目ラベルを観測
+  xsc_seen=$(devtest_value xsc || true)
+  ux n 1.5   # ファイル>一時走査を中止
+  if wait_log "adhoc scan cancelled" 10; then cancel_ok=1; break; fi
+  ux 4 0.4   # メニュー閉じ (走査終了待ちで再試行)
+  sleep 1.0
+done
+if (( cancel_ok )) && ! grep -aq "scan metrics root=/ " "$WORK/logs/app.log"; then
+  pass "5) ファイル>一時走査を中止 (scn観測→メニュー中止→backend到達・完了扱いなし xsc=$xsc_seen)"
+else
+  fail "5) 走査中止が検証できず (scn=$(devtest_value scn || echo -) xsc=$xsc_seen)"
+fi
+
+# ========== 3d) タブドラフト生存: リネーム入力 (r1) ==========
+fo 1 1.5    # library表示 (リネームはasset対象のみ)
+wait_value mode library 15 || fail "3) library表示へ戻れない (mode=$(devtest_value mode || echo -))"
+xdotool key ctrl+shift+F4; sleep 0.8   # cell0単一選択
+fo 5 0.8    # contextMenuFocused (選択セルのコンテキストメニュー)
+fo e 1.2    # 「リネーム (F2)」→ インライン入力
+xdotool key ctrl+a; sleep 0.3    # 既存値を選択 (置換で入力)
+xdotool type --delay 25 "rename-draft"; sleep 0.5
+if wait_value xrn 12 10; then
+  pass "3) リネーム入力へドラフト (xrn=12)"
+else
+  fail "3) リネーム入力不全 (xrn=$(devtest_value xrn || echo -))"
+fi
+ux 5 1.0; ux 7 1.0   # 左タブ往復 (グリッドは中央ペイン — 編集が残るべき)
+if [[ "$(devtest_value xrn || true)" == "12" ]]; then
+  pass "3) リネームドラフト生存 (xrn=12 — タブ切替を跨いで維持)"
+else
+  fail "3) リネームドラフト不全 (xrn=$(devtest_value xrn || echo -))"
+fi
+xdotool key Escape; sleep 0.8   # リネーム取消 (xrn=-1へ)
+wait_value xrn -1 10 || fail "3) リネームEscapeで取消れない (xrn=$(devtest_value xrn || echo -))"
+
+# ========== 11) ツール実操作: AI / 開発 / 全DB / 復元 (r1) ==========
+ux i 1.5    # ツール>AIパネル…
+if wait_value xai 1 10; then
+  xdotool key Escape; sleep 0.8
+  if wait_value xai 0 10; then
+    pass "11) ツール>AIパネル… 開閉 (xai 1→0)"
+  else
+    fail "11) AIパネルがEscapeで閉じない (xai=$(devtest_value xai || echo -))"
+  fi
+else
+  fail "11) AIパネルが開かない (xai=$(devtest_value xai || echo -))"
+fi
+# dev bridge有効時は起動直後から開発パネルが開いている (App: devPanelOpen=enabled)。
+# トグルの実効を両方向で確認: 1回目で閉じ (xdd 1→0)・2回目で再び開く (0→1)
+ux g 1.2    # ツール>開発パネル (トグル)
+if wait_value xdd 0 10; then
+  ux g 1.2
+  if wait_value xdd 1 10; then
+    pass "11) ツール>開発パネル トグル (xdd 1→0→1)"
+  else
+    fail "11) 開発パネルが再び開かない (xdd=$(devtest_value xdd || echo -))"
+  fi
+else
+  fail "11) 開発パネルが閉じない (xdd=$(devtest_value xdd || echo -))"
+fi
+ux f 1.5    # ツール>全データベースをバックアップ (即時実行)
+if wait_value xln 1 20; then
+  pass "11) ツール>全データベースをバックアップ (xln=1 — 完了通知)"
+else
+  fail "11) 全DBバックアップ完了通知なし (xln=$(devtest_value xln || echo -))"
+fi
+ux r 1.5    # ツール>バックアップから復元… (RestoreDialog)
+if wait_value xdlg 1 10; then
+  xdotool key Escape; sleep 0.8
+  if wait_value xdlg 0 10; then
+    pass "11) ツール>バックアップから復元… 開閉 (RestoreDialog xdlg 1→0)"
+  else
+    fail "11) RestoreDialogがEscapeで閉じない (xdlg=$(devtest_value xdlg || echo -))"
+  fi
+else
+  fail "11) RestoreDialogが開かない (xdlg=$(devtest_value xdlg || echo -))"
+fi
+shot 13-tools-misc
+
+# ========== 12) 実Quit: ファイル>終了 → プロセス終了 (r1 — SIGTERMと区別) ==========
+ux q 2.0    # uxMenuQuit → getCurrentWindow().close()
+quit_ok=0
+deadline=$((SECONDS + 20))
+while (( SECONDS < deadline )); do
+  if ! kill -0 "$APP_PID" 2>/dev/null; then quit_ok=1; break; fi
+  sleep 0.3
+done
+if (( quit_ok )); then
+  if grep -aq "panicked\|Panic" "$WORK/logs/app.log"; then
+    fail "12) Quitでプロセス終了したがpanicが記録されている"
+  else
+    wait "$APP_PID" 2>/dev/null || true
+    APP_PID=""
+    pass "12) ファイル>終了でプロセス終了 (実window close — panic無し・SIGTERM不使用)"
+  fi
+else
+  fail "12) ファイル>終了でプロセスが終了しない"
+fi
 
 echo | tee -a "$NOTE"
-echo "UIUX1 E2E RESULT: $((23 - FAILURES))/23 conditions passed, FAILURES=$FAILURES" | tee -a "$NOTE"
+echo "UIUX1 E2E RESULT: $((46 - FAILURES))/46 conditions passed, FAILURES=$FAILURES" | tee -a "$NOTE"
 if (( FAILURES > 0 )); then
   echo "FAILING LINES:" | tee -a "$NOTE"
   grep -a "devtest:" "$WORK/logs/app.log" | tail -5 | tee -a "$NOTE"

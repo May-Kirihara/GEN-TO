@@ -123,10 +123,14 @@ export function normalizePastedPath(raw: string): PastedPathResult {
   if (!isAbsolutePathLike(value)) {
     return { ok: false, error: "絶対パス (/ から始まるパス) を入力してください" };
   }
-  // 末尾区切り正規化: ルート自体 (/・C:\) は保存、それ以外は削除
+  // 末尾区切り正規化: ルート自体 (/・C:\・UNC root \\server\share\) は保存、
+  // それ以外は削除
   const isPosixRoot = value === "/";
   const isWindowsDriveRoot = /^[A-Za-z]:[\\/]?$/.test(value);
-  if (!isPosixRoot && !isWindowsDriveRoot) {
+  // UNC root: \\server\share + 末尾区切り (\と/の混在も許容)。
+  // shareより深いセグメントは通常パスとして刈り取る。
+  const isUncRoot = /^[\\/]{2}[^\\/]+[\\/][^\\/]+[\\/]$/.test(value);
+  if (!isPosixRoot && !isWindowsDriveRoot && !isUncRoot) {
     value = value.replace(/[\\/]+$/, "");
   }
   return { ok: true, path: value };

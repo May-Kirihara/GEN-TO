@@ -48,6 +48,12 @@ coll_key() { # <digit|letter> [wait_s]
   xdotool key ctrl+shift+F1; sleep 0.6
   xdotool key "$1"; sleep "${2:-1.0}"
 }
+# UIUX-1 uxCmdMode (shift+F1): メニューバー駆動 (エクスポート入口は
+# コレクションパネルからメニューバーへ移動したため)
+ux_key() { # <key> [wait_s]
+  xdotool key shift+F1; sleep 0.4
+  xdotool key "$1"; sleep "${2:-1.0}"
+}
 wait_log() { # <pattern> <timeout_s>
   local deadline=$((SECONDS + ${2:-30}))
   while (( SECONDS < deadline )); do
@@ -192,8 +198,12 @@ echo "=== 2) manual表示 → 並び順変更 → メモ ==="
 coll_key 3 1.5                                # 次のコレクション = E2E Manualを表示
 [[ "$(devtest_value kind)" == "m" ]] || fail "expected manual display (kind=$(devtest_value kind || echo none))"
 [[ "$(devtest_value tot)" == "2" ]] || fail "manual view should show 2 (tot=$(devtest_value tot || echo none))"
-[[ "$(devtest_value exp)" == "1" ]] || fail "export entry (disabled) not shown"
-pass "manualコレクション表示 (position順。tot=2) + エクスポート入口表示"
+# UIUX-1: エクスポート入口はメニューバーへ移動。表示中コレクションが
+# ある間はメニュー項目が有効 (UX xed=0) であることで検証する
+ux_key 1 0.8                                  # ファイルメニューを開く
+wait_value xed 0 10 || fail "export menu item not enabled (xed=$(devtest_value xed || echo -))"
+ux_key 4 0.5                                  # メニューを閉じる
+pass "manualコレクション表示 (position順。tot=2) + エクスポート入口有効 (メニュー)"
 shot 01-manual-view
 # 並び順: セル1 (2番目) を先頭へ
 positions_before=$(db_query "SELECT asset_id, position FROM collection_items WHERE collection_id=(SELECT id FROM collections WHERE name='E2E Manual') ORDER BY position, asset_id")

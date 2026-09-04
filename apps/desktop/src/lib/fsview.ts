@@ -94,6 +94,25 @@ export function treeContextTargetFor(
   return { kind: "unrelated", path };
 }
 
+/**
+ * 開いているツリーメニューのスナップショットが現在のrootsと不一致 (stale) か。
+ * (path, kind, rootId) の完全一致比較 — 同path別IDでの再登録差し替えも
+ * 検出する (UIUX-1 r1 B4)。無関係なroots変化 (他ルートの追加) はstaleにしない。
+ */
+export function isStaleTreeMenuTarget(
+  snapshot: TreeContextTarget,
+  roots: ReadonlyArray<{ id: string; path: string }>,
+): boolean {
+  const fresh = treeContextTargetFor(snapshot.path, roots);
+  if (fresh.kind !== snapshot.kind) {
+    return true;
+  }
+  if (fresh.kind === "root" && snapshot.kind === "root") {
+    return fresh.rootId !== snapshot.rootId;
+  }
+  return false;
+}
+
 export class FolderTreeStore {
   /** 起点ノード (ホーム・/)。 */
   tops: string[] = [];

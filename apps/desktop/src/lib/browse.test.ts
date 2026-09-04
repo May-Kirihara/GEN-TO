@@ -134,6 +134,32 @@ describe("normalizePastedPath (UIUX-1: パンくずパス入力)", () => {
     });
   });
 
+  it("UNC root (\\\\server\\share\\) の末尾区切りは保存する (r1 B3)", () => {
+    expect(normalizePastedPath("\\\\server\\share\\")).toEqual({
+      ok: true,
+      path: "\\\\server\\share\\",
+    });
+    expect(normalizePastedPath("//server/share/")).toEqual({
+      ok: true,
+      path: "//server/share/",
+    });
+    // 区切り混在もroot扱いで保存
+    expect(normalizePastedPath("\\\\server/share/")).toEqual({
+      ok: true,
+      path: "\\\\server/share/",
+    });
+    // UNC配下の通常パスは従来どおり末尾を正規化
+    expect(normalizePastedPath("\\\\server\\share\\pic\\")).toEqual({
+      ok: true,
+      path: "\\\\server\\share\\pic",
+    });
+    // shareより浅い (serverのみ) はrootではなく通常の刈り取り
+    expect(normalizePastedPath("\\\\server\\")).toEqual({
+      ok: true,
+      path: "\\\\server",
+    });
+  });
+
   it("..や.セグメントは字句判断せずbackendへ委譲する", () => {
     expect(normalizePastedPath("/home/user/../other")).toEqual({
       ok: true,

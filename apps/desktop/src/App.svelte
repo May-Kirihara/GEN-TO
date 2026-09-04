@@ -523,13 +523,12 @@
     void selectFolder(result.path);
   }
 
-  /** 左ペインタブ切替 (フォーカス移動・永続化)。 */
+  /** 左ペインタブ切替 (永続化のみ)。フォーカスモデルはAPG標準に統一:
+   * クリック・キーボード (自動活性化+rAFフォーカス追従) ともタブに留まり、
+   * パネルへは移さない (r1 N2 — タブ自体が操作面のまま操作性が一貫)。 */
   function setLeftTab(tab: LeftPaneTab): void {
     leftTab = tab;
     saveLayout();
-    requestAnimationFrame(() => {
-      document.getElementById(`left-panel-${tab}`)?.focus({ preventScroll: true });
-    });
   }
 
   /** パンくずのパス入力をDOM挿入時にフォーカス・全選択 (Svelte action)。 */

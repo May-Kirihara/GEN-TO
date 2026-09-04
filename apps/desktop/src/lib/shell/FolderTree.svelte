@@ -11,7 +11,7 @@
     */
   import { onDestroy } from "svelte";
   import type { FolderTreeStore, TreeContextTarget } from "../fsview";
-  import { registeredStateFor, treeContextTargetFor } from "../fsview";
+  import { isStaleTreeMenuTarget, registeredStateFor, treeContextTargetFor } from "../fsview";
   import type { LibraryRoot } from "../library";
   import ContextMenu, { type MenuAction } from "../ui/ContextMenu.svelte";
 
@@ -147,14 +147,13 @@
   let treeMenu = $state<{ x: number; y: number; target: TreeContextTarget } | null>(null);
 
   $effect(() => {
-    // roots更新でスナップショットがstale (状態kindが変化) したら閉じる。
-    // 無関係なroots変化 (他ルートの追加) では閉じない。
+    // roots更新でスナップショットがstaleになったら閉じる。比較は
+    // (path, kind, rootId) の完全一致 — 同path別ID再登録でも古いrootIdを
+    // 保持したまま操作できないようにする (r1 B4)。無関係なroots変化
+    // (他ルートの追加) では閉じない。
     void roots;
     const open = treeMenu;
-    if (open === null) {
-      return;
-    }
-    if (treeContextTargetFor(open.target.path, roots).kind !== open.target.kind) {
+    if (open !== null && isStaleTreeMenuTarget(open.target, roots)) {
       treeMenu = null;
     }
   });
