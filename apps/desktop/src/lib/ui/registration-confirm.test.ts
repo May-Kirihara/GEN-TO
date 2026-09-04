@@ -87,4 +87,46 @@ describe("RegistrationConfirmGate (UIUX-3 N2)", () => {
     gate.dialogConfirmed(register);
     await expect(second).resolves.toBe(true);
   });
+
+  // r2: 二重送信回帰 — 旧実装は2回目が #pending を無条件上書きし、
+  // 1回目のPromiseを未解決のまま孤児化させていた (dialog確定でも解決不能)。
+  it("二重送信: dialog未解決の2回目要求は即falseに解決し、1回目はdialog確定で解決する", async () => {
+    const gate = new RegistrationConfirmGate();
+    const register = vi.fn().mockResolvedValue(true);
+    const first = gate.request("/", register);
+    let firstSettled = false;
+    void first.then(() => {
+      firstSettled = true;
+    });
+
+    // 2回目 (1回目のdialogが未解決の間): 即false解決・dialogは置換しない
+    await expect(gate.request("/home", register)).resolves.toBe(false);
+    expect(gate.pendingPath).toBe("/");
+    await tick();
+    expect(firstSettled).toBe(false);
+    expect(register).not.toHaveBeenCalled();
+
+    // 1回目は通常どおりdialog確定の成否で解決する
+    gate.dialogConfirmed(register);
+    await expect(first).resolves.toBe(true);
+    expect(register).toHaveBeenCalledTimes(1);
+    expect(register).toHaveBeenCalledWith("/");
+  });
+
+  it("二重送信: 拒否された2回目の後も取消意味論は1回目に適用される", async () => {
+    const gate = new RegistrationConfirmGate();
+    const register = vi.fn().mockResolvedValue(true);
+    const first = gate.request("/", register);
+    await expect(gate.request("/home", register)).resolves.toBe(false);
+
+    gate.dialogCancelled();
+    await expect(first).resolves.toBe(false);
+    expect(register).not.toHaveBeenCalled();
+    expect(gate.pendingPath).toBeNull();
+
+    // busy解除後の新規要求は正常に機能する
+    const third = gate.request("/", register);
+    gate.dialogConfirmed(register);
+    await expect(third).resolves.toBe(true);
+  });
 });

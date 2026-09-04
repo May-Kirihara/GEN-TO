@@ -18,6 +18,7 @@
     notice,
     error,
     scanBusy,
+    confirmBusy,
     onRefresh,
     onShowLibrary,
     onBackupRoot,
@@ -28,6 +29,9 @@
     notice: string;
     error: string | null;
     scanBusy: boolean;
+    /** 確認dialog保留中 (UIUX-2 r2): 追加フォームを無効化して二重送信を
+     * UI側でも防ぐ (ゲートは保留中の重複要求をfalseで拒否)。 */
+    confirmBusy: boolean;
     onRefresh: () => void;
     /** ライブラリ表示 (登録ルート全体) へ切替える (AppのshowLibrary)。 */
     onShowLibrary: () => Promise<boolean>;
@@ -59,13 +63,14 @@
       type="text"
       placeholder="/path/to/images"
       bind:value={newRootPath}
+      disabled={confirmBusy}
       onkeydown={(event) => {
         if (event.key === "Enter") {
           void addRoot();
         }
       }}
     />
-    <button onclick={() => void addRoot()}>追加</button>
+    <button onclick={() => void addRoot()} disabled={confirmBusy}>追加</button>
   </div>
   {#if notice}
     <p class="roots-notice">{notice}</p>

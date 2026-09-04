@@ -23,7 +23,10 @@ function makeLibrary(): LibraryStore {
   } as unknown as LibraryStore;
 }
 
-function mountPanel(onAddRoot: (path: string) => Promise<boolean>): void {
+function mountPanel(
+  onAddRoot: (path: string) => Promise<boolean>,
+  confirmBusy = false,
+): void {
   target = document.createElement("div");
   document.body.appendChild(target);
   components.push(
@@ -35,6 +38,7 @@ function mountPanel(onAddRoot: (path: string) => Promise<boolean>): void {
         notice: "",
         error: null,
         scanBusy: false,
+        confirmBusy,
         onRefresh: () => {},
         onShowLibrary: async () => true,
         onBackupRoot: () => {},
@@ -109,5 +113,23 @@ describe("LibraryPanel 登録入力のクリア契約 (UIUX-3 N2)", () => {
     await Promise.resolve();
     flushSync();
     expect(input!.value).toBe("/home");
+  });
+
+  it("確認dialog保留中 (confirmBusy) は追加フォームが無効化される (UIUX-2 r2)", async () => {
+    mountPanel(vi.fn(async () => true), true);
+    const input = document.querySelector<HTMLInputElement>(".roots-add input");
+    const button = document.querySelector<HTMLButtonElement>(".roots-add button");
+    expect(input?.disabled).toBe(true);
+    expect(button?.disabled).toBe(true);
+
+    // busy解除後は再有効化される
+    unmount(components.pop()!);
+    target?.remove();
+    target = null;
+    mountPanel(vi.fn(async () => true), false);
+    const input2 = document.querySelector<HTMLInputElement>(".roots-add input");
+    const button2 = document.querySelector<HTMLButtonElement>(".roots-add button");
+    expect(input2?.disabled).toBe(false);
+    expect(button2?.disabled).toBe(false);
   });
 });

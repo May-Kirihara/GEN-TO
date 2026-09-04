@@ -7,6 +7,7 @@
  * クリアしてよい — dialog経由の登録でもクリアが効くことが保証される
  * (r1: 確認dialog経由では requestAddRoot が即falseを返し、入力が
  * 残るままになっていた)。
+ * r2: 保留中の重複要求は即falseで拒否 (既存要求・dialogは維持)。
  */
 import { needsRegistrationConfirm } from "../library";
 
@@ -27,10 +28,19 @@ export class RegistrationConfirmGate {
    * 登録を要求する。確認が必要なパスは保留状態に入り (onChangedが
    * 発火し `pendingPath` が立つ)、`dialogConfirmed`/`dialogCancelled`
    * まで解決されないPromiseを返す。
+   *
+   * r2: 保留中に別の危険パス要求が来た場合、新要求は即falseで拒否され
+   * 既存の保留 (と表示中のdialog) はそのまま維持される。2回目の要求で
+   * 1回目のPromiseを破棄・孤児化させないための直列化契約。
+   * 呼び出し側は `pendingPath !== null` の間フォームを無効化して
+   * 二重送信をUI側でも防ぐ (App/LibraryPanel)。
    */
   request(path: string, register: RegisterRoot): Promise<boolean> {
     if (!needsRegistrationConfirm(path)) {
       return register(path);
+    }
+    if (this.#pending !== null) {
+      return Promise.resolve(false);
     }
     return new Promise<boolean>((settle) => {
       this.#pending = { path, settle };

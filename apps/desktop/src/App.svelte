@@ -3032,6 +3032,7 @@
             notice={libraryNotice}
             error={libraryError}
             scanBusy={libraryScanBusy}
+            confirmBusy={registerConfirmPath !== null}
             onRefresh={() => void library.refreshRoots()}
             onShowLibrary={() => showLibrary()}
             onBackupRoot={(root) => (backupFor = root)}
