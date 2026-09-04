@@ -267,6 +267,7 @@ fn restore_err(e: RestoreError) -> String {
 // ===== DTO (camelCase — api-contract §47) =====
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PortableCreatedDto {
     pub path: String,
     pub asset_count: u64,
@@ -275,6 +276,7 @@ pub struct PortableCreatedDto {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FullDbBackupDto {
     pub path: String,
     pub kept_generations: u32,
@@ -598,6 +600,33 @@ mod tests {
 
     fn hash_of(bytes: &[u8]) -> String {
         format!("blake3:{}", blake3::hash(bytes).to_hex())
+    }
+
+    #[test]
+    fn created_and_full_backup_dtos_serialize_camel_case() {
+        // WP-18-1 D3: BackupDialog/backup.tsはassetCount等のcamelCaseを
+        // 読む (api-contract §47)。PortableCreatedDto/FullDbBackupDtoへ
+        // rename_allが漏れていた際はundefinedになる (FIX-AI-DTO系の
+        // 逃し — 復元演習E2Eが発見)。
+        let created = serde_json::to_value(PortableCreatedDto {
+            path: "/tmp/x.gento".to_string(),
+            asset_count: 4,
+            file_count: 4,
+            collection_count: 0,
+        })
+        .unwrap();
+        assert_eq!(created["assetCount"], 4, "{created}");
+        assert_eq!(created["fileCount"], 4, "{created}");
+        assert_eq!(created["collectionCount"], 0, "{created}");
+        assert!(created.get("asset_count").is_none(), "{created}");
+
+        let full = serde_json::to_value(FullDbBackupDto {
+            path: "/tmp/x.sqlite3".to_string(),
+            kept_generations: 3,
+        })
+        .unwrap();
+        assert_eq!(full["keptGenerations"], 3, "{full}");
+        assert!(full.get("kept_generations").is_none(), "{full}");
     }
 
     fn seed(db: &gento_db::Db, root_dir: &Path, rel: &str, seed: u8) -> i64 {

@@ -455,6 +455,30 @@ export function installDevBridge(stores: DevBridgeStores): void {
   let collCmdMode = false;
   let foCmdMode = false;
 
+  // WP-18-1 D3 E2E: バックアップ/復元の状態行 (foCmdModeの 6/7 で駆動)。
+  // 本物のTauri command (BackupDialog/RestoreDialogと同一のinvoke) を
+  // 経由するため、作成・復元とも生産経路で実行される。
+  const bkState = {
+    op: "idle",
+    ok: -1,
+    assets: -1,
+    files: -1,
+    colls: -1,
+    applied: -1,
+    skipped: -1,
+    err: "",
+  };
+  const resetBk = (op: string): void => {
+    bkState.op = op;
+    bkState.ok = 0;
+    bkState.assets = -1;
+    bkState.files = -1;
+    bkState.colls = -1;
+    bkState.applied = -1;
+    bkState.skipped = -1;
+    bkState.err = "";
+  };
+
   const actions: Record<string, () => void> = {
     // WP-4計測: WebViewのlocalStorage (レイアウト・フォルダ・セッション状態) を
     // 消してリロードする (計測ドライバの初期状態を決定論化)
@@ -937,6 +961,74 @@ export function installDevBridge(stores: DevBridgeStores): void {
         ?.click();
       setTimeout(clickChild, 700);
     },
+    // WP-18-1 D3 E2E: 最初の登録ルートのポータブルバックアップを作成
+    // (destDir=null = 既定dir。BackupDialogと同一のcommandと引数)。
+    bkPortableCreateFirstRoot: () => {
+      resetBk("create");
+      void (async () => {
+        try {
+          const roots = await stores.invoke<Array<{ id: string; available: boolean }>>(
+            "library_roots_list",
+          );
+          const root = roots.find((r) => r.available) ?? roots[0];
+          if (root === undefined) {
+            throw new Error("登録ルートが無い");
+          }
+          const created = await stores.invoke<{
+            path: string;
+            assetCount: number;
+            fileCount: number;
+            collectionCount: number;
+          }>("backup_portable_create", { rootId: root.id, destDir: null });
+          bkState.ok = 1;
+          bkState.assets = created.assetCount;
+          bkState.files = created.fileCount;
+          bkState.colls = created.collectionCount;
+        } catch (err) {
+          bkState.ok = 0;
+          bkState.err = toBridgeMessage(err);
+        }
+      })();
+    },
+    // WP-18-1 D3 E2E: 既定dir内の最新 `.gento` を復元 (plan→token→execute。
+    // RestoreDialogと同一のcommand列。targetRootId=null = 経路自動照合)。
+    bkRestoreLatest: () => {
+      resetBk("restore");
+      void (async () => {
+        try {
+          const base = await stores.invoke<string>("backup_default_dir");
+          const list = await stores.invoke<{ entries: Array<{ name: string; path: string }> }>(
+            "fs_list_dirs",
+            { path: base },
+          );
+          const gento = list.entries
+            .filter((e) => e.name.endsWith(".gento"))
+            .sort((a, b) => a.name.localeCompare(b.name));
+          const latest = gento[gento.length - 1];
+          if (latest === undefined) {
+            throw new Error(".gentoバックアップが見つからない");
+          }
+          const plan = await stores.invoke<{ confirmToken: string }>(
+            "backup_restore_plan",
+            { backupDir: latest.path, targetRootId: null },
+          );
+          const result = await stores.invoke<{
+            applied: unknown[];
+            skipped: unknown[];
+          }>("backup_restore_execute", {
+            backupDir: latest.path,
+            targetRootId: null,
+            confirmToken: plan.confirmToken,
+          });
+          bkState.ok = 1;
+          bkState.applied = result.applied.length;
+          bkState.skipped = result.skipped.length;
+        } catch (err) {
+          bkState.ok = 0;
+          bkState.err = toBridgeMessage(err);
+        }
+      })();
+    },
   };
 
   function gridLines(): string[] {
@@ -1085,6 +1177,17 @@ export function installDevBridge(stores: DevBridgeStores): void {
     ];
   }
 
+  /** WP-18-1: バックアップ/復元の状態行 (BK接頭辞)。bok=-1は未実行。
+   * フィールドはb接頭辞 — 既存行の IM ok= / V ap= / FO err= との
+   * devtest_value先頭一致の奪い合いを避ける (命名規約はgridLines参照)。 */
+  function bkLines(): string[] {
+    return [
+      `BK bop=${bkState.op} bok=${bkState.ok} ba=${bkState.assets} bf=${bkState.files}` +
+        ` bc=${bkState.colls} bap=${bkState.applied} bsk=${bkState.skipped}` +
+        ` berr=${bkState.err === "" ? "-" : bkState.err.slice(0, 60)}`,
+    ];
+  }
+
   /** WP-5: メタデータ編集状態行 (E2Eの機械検証用)。 */
   function metaLines(): string[] {
     const meta = stores.getMeta();
@@ -1217,6 +1320,7 @@ export function installDevBridge(stores: DevBridgeStores): void {
       ...assetMetaLines(),
       ...collectionLines(),
       ...fileOpsLines(),
+      ...bkLines(),
     );
     if (!lines.some((line) => line.startsWith("V ") || line.startsWith("C "))) {
       lines.push("idle (viewer closed)");
@@ -1329,6 +1433,9 @@ export function installDevBridge(stores: DevBridgeStores): void {
           // WP-9 E2E: 埋め込みメタデータ (折りたたみ全展開・workflowコピー)
           p: "metaExpandAll",
           i: "metaCopyWorkflow",
+          // WP-18-1 D3 E2E: バックアップ作成 (6) と最新.gento復元 (7)
+          "6": "bkPortableCreateFirstRoot",
+          "7": "bkRestoreLatest",
         };
         const action = foKeys[event.key];
         if (action !== undefined) {

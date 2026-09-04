@@ -1046,4 +1046,408 @@ mod tests {
             })
             .collect()
     }
+
+    // ===== WP-18-1 D1: 全中間段階fixtureの最新版へのUpgrade実証 =====
+
+    /// 段階 `stage` のschemaで成立する代表データを投入する。
+    /// CHECK制約は段階ごとに異なるため、投入値は段階-aware:
+    /// - `files.mtime_ns` は#4以降のみ存在
+    /// - `file_operations.status` のCHECKは#5/#6で再構築される
+    ///   (投入値は当該段階のCHECKに適合するものだけ)
+    /// - `ai_profiles`/`ai_runs` は#8以降のみ存在
+    /// - `jobs` は#8のフィルタ (未対応job_type・pending重複の破棄) で
+    ///   意図的に除去されない行 (succeededかつ現行job_type) のみ投入。
+    ///   破棄側の意味は `v7_populated_jobs_migrate_to_v8_with_legacy_and_duplicate_rows`
+    ///   が正本。
+    fn insert_stage_fixture(conn: &Connection, stage: i32) {
+        conn.execute(
+            "INSERT INTO library_roots (uuid, path, path_encoding, display_path, \
+                 watch_enabled, ai_enabled, created_at, updated_at)
+             VALUES ('00000000-0000-7000-8000-000000000180', x'2f77313831', 'utf8', \
+                     '/w18-root', 1, 0, '2026-09-04T00:00:00.000Z', \
+                     '2026-09-04T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        // assets ×2: 評価情報の代表として片方にrating=5・favorite=1を設定
+        conn.execute(
+            "INSERT INTO assets (uuid, content_hash, hash_algorithm, byte_size, width, height, \
+                                    rating, triage, favorite, created_at, updated_at)
+             VALUES ('00000000-0000-7000-8000-000000000101', 'blake3:w18a', 'blake3', 100, 32, \
+                     32, 5, 'picked', 1, '2026-09-04T00:00:00.000Z', '2026-09-04T00:00:00.000Z'),
+                    ('00000000-0000-7000-8000-000000000102', 'blake3:w18b', 'blake3', 200, 64, \
+                     64, 0, 'unselected', 0, '2026-09-04T00:00:00.000Z', '2026-09-04T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        // files ×2 (mtime_nsは段階>=4のみ。それ以前は列自体が無い)
+        let mtime_ns_col = if stage >= 4 { ", mtime_ns" } else { "" };
+        let mtime_ns_val = if stage >= 4 { ", 1000000001" } else { "" };
+        conn.execute(
+            &format!(
+                "INSERT INTO files (uuid, root_id, asset_id, rel_path, path_encoding, \
+                                      display_name, extension, byte_size, mtime_ms, \
+                                      scan_state, last_seen_at, created_at, updated_at \
+                                      {mtime_ns_col})
+                 VALUES ('00000000-0000-7000-8000-000000000111', 1, 1, x'612e706e67', 'utf8', \
+                         'a.png', 'png', 100, 5000, 'present', '2026-09-04T00:00:00.000Z', \
+                         '2026-09-04T00:00:00.000Z', '2026-09-04T00:00:00.000Z' {mtime_ns_val}),
+                        ('00000000-0000-7000-8000-000000000112', 1, 2, x'622e706e67', 'utf8', \
+                         'b.png', 'png', 200, 6000, 'present', '2026-09-04T00:00:00.000Z', \
+                         '2026-09-04T00:00:00.000Z', '2026-09-04T00:00:00.000Z' {mtime_ns_val})"
+            ),
+            [],
+        )
+        .unwrap();
+        // tags ×2 + asset_tags ×1 + captions ×1 (現行)
+        conn.execute(
+            "INSERT INTO tags (uuid, display_name, normalized_name, category, created_at, updated_at)
+             VALUES ('00000000-0000-7000-8000-000000000121', '風景', '風景', NULL, \
+                     '2026-09-04T00:00:00.000Z', '2026-09-04T00:00:00.000Z'),
+                    ('00000000-0000-7000-8000-000000000122', 'ポートレート', 'ポートレート', \
+                     NULL, '2026-09-04T00:00:00.000Z', '2026-09-04T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO asset_tags (asset_id, tag_id, source, manually_edited, created_at)
+             VALUES (1, 1, 'manual', 1, '2026-09-04T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO captions (uuid, asset_id, kind, body, source, current, created_at, updated_at)
+             VALUES ('00000000-0000-7000-8000-000000000131', 1, 'description', \
+                     'wp18 fixture caption', 'manual', 1, '2026-09-04T00:00:00.000Z', \
+                     '2026-09-04T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        // collections (manual) + items + asset_metadata + embeddings
+        conn.execute(
+            "INSERT INTO collections (uuid, name, kind, created_at, updated_at)
+             VALUES ('00000000-0000-7000-8000-000000000141', 'wp18選', 'manual', \
+                     '2026-09-04T00:00:00.000Z', '2026-09-04T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO collection_items (collection_id, asset_id, position, note, created_at)
+             VALUES (1, 1, 7, 'wp18 note', '2026-09-04T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO asset_metadata (uuid, asset_id, camera_make, camera_model, \
+                                            parser_name, parser_version, created_at, updated_at)
+             VALUES ('00000000-0000-7000-8000-000000000151', 1, 'wp18-camera', 'wp18-model', \
+                     'exif', '1', '2026-09-04T00:00:00.000Z', '2026-09-04T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO embeddings (uuid, asset_id, purpose, model_name, model_revision, \
+                                        dimensions, dtype, source_hash, vector, created_at)
+             VALUES ('00000000-0000-7000-8000-000000000161', 1, 'caption', 'ruri-v3-70m', '1', \
+                     2, 'f32', 'w18h', x'0100000002000000', '2026-09-04T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        // jobs: 全段階のCHECKを満たしv8/v9フィルタで存続する行
+        conn.execute(
+            "INSERT INTO jobs (uuid, job_type, target_type, target_id, status, priority, \
+                                  payload, created_at, updated_at)
+             VALUES ('00000000-0000-7000-8000-000000000181', 'ai_caption_tags', 'asset', 1, \
+                     'succeeded', 5, '{}', '2026-09-04T00:00:00.000Z', \
+                     '2026-09-04T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        // file_operations: 段階のCHECKに適合するstatus値 (検証側で意味的等価を判定)
+        let (op_a, op_b) = if stage <= 4 {
+            ("'pending'", "'succeeded'") // #5のCHECK前の旧値
+        } else if stage == 5 {
+            ("'planned'", "'done'")
+        } else {
+            ("'planned'", "'partial_undone'")
+        };
+        conn.execute(
+            &format!(
+                "INSERT INTO file_operations (uuid, operation_type, status, undoable, \
+                                                  request_json, created_at)
+                 VALUES ('00000000-0000-7000-8000-000000000182', 'copy', {op_a}, 1, '{{}}', \
+                         '2026-09-04T00:00:00.000Z'),
+                        ('00000000-0000-7000-8000-000000000183', 'move', {op_b}, 1, '{{}}', \
+                         '2026-09-04T00:00:00.000Z')"
+            ),
+            [],
+        )
+        .unwrap();
+        // ai_profiles / ai_runs: #8以降のみ
+        if stage >= 8 {
+            conn.execute(
+                "INSERT INTO ai_profiles (uuid, display_name, base_url, model, vision_capable, \
+                                              created_at, updated_at)
+                 VALUES ('00000000-0000-7000-8000-000000000191', 'wp18-profile', \
+                         'http://127.0.0.1:8787/v1', 'wp18-model', 1, \
+                         '2026-09-04T00:00:00.000Z', '2026-09-04T00:00:00.000Z')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO ai_runs (uuid, asset_id, profile_id, operation, status, \
+                                         prompt_version, started_at, created_at)
+                 VALUES ('00000000-0000-7000-8000-000000000192', 1, 1, 'caption_and_tags', \
+                         'succeeded', 1, '2026-09-04T00:00:00.000Z', '2026-09-04T00:00:00.000Z')",
+                [],
+            )
+            .unwrap();
+        }
+    }
+
+    /// 全段階fixture検証の本体 (下のテストから呼ばれる)。
+    fn run_stage_fixture_case(stage: i32) {
+        let tmp = TempDir::new(&format!("wp18s{stage}"));
+        let backup_dir = tmp.path().join("db-backups");
+        let db_path = tmp.path().join("db.sqlite3");
+
+        // (1) 段階DB構築 + 代表データ投入 (FKを厳密に検証するためON)
+        let mut conn = Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run_migrations(
+            &mut conn,
+            &MIGRATIONS[..stage as usize],
+            &MigrationOpts::default(),
+        )
+        .unwrap();
+        assert_eq!(read_user_version(&conn).unwrap(), stage);
+        insert_stage_fixture(&conn, stage);
+
+        // (2) 最新まで適用 (backup付き — データ保有DBのため必須)
+        let opts = MigrationOpts {
+            backup_dir: Some(backup_dir.clone()),
+            keep_generations: 3,
+        };
+        let outcome = run_migrations(&mut conn, MIGRATIONS, &opts).unwrap();
+        let expected: Vec<i32> = ((stage + 1)..=LATEST_VERSION).collect();
+        assert_eq!(outcome.applied, expected, "段階{stage}からの適用列");
+        assert_eq!(read_user_version(&conn).unwrap(), LATEST_VERSION);
+        let backup = outcome.backup.expect("データ保有DBはbackup作成");
+        assert!(backup.starts_with(&backup_dir));
+
+        // (3) backupは段階{stage}のスナップショットとして単独で開ける
+        let bk = Connection::open(&backup).unwrap();
+        assert_eq!(
+            bk.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            stage as i64
+        );
+        drop(bk);
+
+        // (4) データ保持の検証は段階ごとの意味変換を踏まえて行う
+        verify_stage_fixture_after_upgrade(&conn, stage);
+
+        // (5) 整合性: FK違反なし・integrity ok
+        let fk_violations: i64 = conn
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(fk_violations, 0, "段階{stage}: FK違反");
+        let ic: String = conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ic, "ok", "段階{stage}: integrity");
+    }
+
+    /// 最新版適用後の代表データ検証 (段階awareな意味的等価)。
+    fn verify_stage_fixture_after_upgrade(conn: &Connection, stage: i32) {
+        // library_roots: 恒等
+        let (root_count, display): (i64, String) = conn
+            .query_row(
+                "SELECT count(*), max(display_path) FROM library_roots",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (root_count, display.as_str()),
+            (1, "/w18-root"),
+            "段階{stage}"
+        );
+
+        // assets: 恒等 (評価・選別・お気に入りは評価情報の代表)
+        let (assets, rating, triage, favorite): (i64, i64, String, i64) = conn
+            .query_row(
+                "SELECT count(*), max(rating), max(triage), max(favorite) FROM assets",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!((assets, rating, favorite), (2, 5, 1), "段階{stage}");
+        assert_eq!(triage, "unselected", "段階{stage}: max()は辞書順");
+
+        // files: mtime_nsは段階4以降の投入値を保持。それ以前はNULL
+        // (次の走査で充填 — 既存v3to4テストと同じ後方互換)。
+        let (files, ns): (i64, Option<i64>) = conn
+            .query_row("SELECT count(*), max(mtime_ns) FROM files", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(files, 2, "段階{stage}");
+        assert_eq!(
+            ns,
+            if stage >= 4 {
+                Some(1_000_000_001)
+            } else {
+                None
+            },
+            "段階{stage}: mtime_ns"
+        );
+
+        // tags / asset_tags / captions: 恒等
+        let tags: i64 = conn
+            .query_row("SELECT count(*) FROM tags", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tags, 2, "段階{stage}");
+        let (at, at_source): (i64, String) = conn
+            .query_row("SELECT count(*), max(source) FROM asset_tags", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((at, at_source.as_str()), (1, "manual"), "段階{stage}");
+        let (caps, body): (i64, String) = conn
+            .query_row(
+                "SELECT count(*), max(body) FROM captions WHERE current = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (caps, body.as_str()),
+            (1, "wp18 fixture caption"),
+            "段階{stage}"
+        );
+
+        // collections / collection_items / asset_metadata / embeddings: 恒等
+        let colls: i64 = conn
+            .query_row("SELECT count(*) FROM collections", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(colls, 1, "段階{stage}");
+        let (items, pos): (i64, i64) = conn
+            .query_row(
+                "SELECT count(*), max(position) FROM collection_items",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((items, pos), (1, 7), "段階{stage}");
+        let make: Option<String> = conn
+            .query_row("SELECT camera_make FROM asset_metadata", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(make.as_deref(), Some("wp18-camera"), "段階{stage}");
+        let vector: Vec<u8> = conn
+            .query_row("SELECT vector FROM embeddings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vector, vec![1u8, 0, 0, 0, 2, 0, 0, 0], "段階{stage}");
+
+        // jobs: 存続対象の行がuuidごと保持される
+        let jobs: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM jobs WHERE uuid = '00000000-0000-7000-8000-000000000181'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(jobs, 1, "段階{stage}: 存続jobの保持");
+
+        // file_operations: 段階<=4の旧statusは#5の文書化マッピング
+        // (pending→executing, succeeded→done) が「論理等価」の定義。
+        // 段階5は#5のCHECK値・段階>=6は#6のCHECK値 = 恒等コピー。
+        let statuses: Vec<(String, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT uuid, status FROM file_operations ORDER BY uuid")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let expected_ops: Vec<(&str, &str)> = if stage <= 4 {
+            vec![
+                ("00000000-0000-7000-8000-000000000182", "executing"),
+                ("00000000-0000-7000-8000-000000000183", "done"),
+            ]
+        } else if stage == 5 {
+            vec![
+                ("00000000-0000-7000-8000-000000000182", "planned"),
+                ("00000000-0000-7000-8000-000000000183", "done"),
+            ]
+        } else {
+            vec![
+                ("00000000-0000-7000-8000-000000000182", "planned"),
+                ("00000000-0000-7000-8000-000000000183", "partial_undone"),
+            ]
+        };
+        let got: Vec<(String, String)> = expected_ops
+            .iter()
+            .map(|(uuid, _)| {
+                statuses
+                    .iter()
+                    .find(|(u, _)| u == uuid)
+                    .unwrap_or_else(|| panic!("段階{stage}: file_operation {uuid} が消失"))
+                    .clone()
+            })
+            .collect();
+        for ((_, want), (_, got_status)) in expected_ops.iter().zip(got.iter()) {
+            assert_eq!(got_status, want, "段階{stage}: status mapping");
+        }
+        assert_eq!(statuses.len(), 2, "段階{stage}: file_operations行数");
+
+        // ai_profiles / ai_runs (#8以降の投入分): v9は影響しないため恒等
+        if stage >= 8 {
+            let (profiles, runs, profile_name): (i64, i64, String) = conn
+                .query_row(
+                    "SELECT (SELECT count(*) FROM ai_profiles), \
+                            (SELECT count(*) FROM ai_runs), \
+                            (SELECT max(display_name) FROM ai_profiles)",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (profiles, runs, profile_name.as_str()),
+                (1, 1, "wp18-profile"),
+                "段階{stage}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_stage_fixture_upgrades_to_latest_with_data_retention() {
+        // 初期→v1→...→v8の各段階で代表データを投入したDBが、最新 (v9) へ
+        // (a) 適用成功 (b) データ保持 (段階固有の文書化変換を含む論理等価)
+        // で移行できること的全数実証 (§26「全migrationを新規DBと旧fixtureで
+        // 検証する」の旧fixture側。新規DB側はfresh_db系テストが既に網羅)。
+        // v9は最新そのため段階ループに含めない (冪等は
+        // already_migrated_db_is_noopが検証済み)。
+        for stage in 1..LATEST_VERSION {
+            run_stage_fixture_case(stage);
+        }
+    }
+
+    #[test]
+    fn stage8_fixture_is_noop_at_latest_and_retains_data() {
+        // 最新段階 (=適用済み) のデータ保有DBは再実行で何も起きない
+        // (アップグレード経路の終端: 適用列空・backup無し・データ不変)。
+        let tmp = TempDir::new("wp18s9");
+        let mut conn = Connection::open(tmp.path().join("db.sqlite3")).unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run_migrations(&mut conn, MIGRATIONS, &MigrationOpts::default()).unwrap();
+        insert_stage_fixture(&conn, LATEST_VERSION);
+        let outcome = run_migrations(&mut conn, MIGRATIONS, &MigrationOpts::default()).unwrap();
+        assert!(outcome.applied.is_empty());
+        assert_eq!(outcome.backup, None);
+        verify_stage_fixture_after_upgrade(&conn, LATEST_VERSION);
+    }
 }

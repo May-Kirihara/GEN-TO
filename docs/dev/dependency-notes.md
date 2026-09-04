@@ -154,7 +154,9 @@
 ## WP-1で追加した依存 (2026-08-30。SQLite基盤)
 
 - **`rusqlite` =0.31.0 (features: `bundled`, `backup`)** (gento-db, 通常依存)
-  - 用途: SQLiteアクセス (WAL・foreign_keys・busy_timeout・migration)。
+  - WP-18-1 (2026-09-04): **gento-tauriのdev-dependencyとして同一pinを追加**
+    (`db.rs`結合テストが未来schema DBを直接構築するため。テスト専用で
+    release成果物には入らない。workspace `=0.31.0` pinを共有)。  - 用途: SQLiteアクセス (WAL・foreign_keys・busy_timeout・migration)。
     `backup` featureはSQLite Backup API用に有効化 (migration前backupの実装選択肢。
     実際のbackupは `VACUUM INTO` を使用しているが、接続間copyの正規手段として feature確保)。
   - 入手元: crates.io (`rusqlite`。wrappers/rusqliteリポジトリの派生版)。

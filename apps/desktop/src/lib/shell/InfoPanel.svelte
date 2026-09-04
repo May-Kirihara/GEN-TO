@@ -616,9 +616,9 @@
   {/if}
 
   {#if item !== null && hasRawSection(assetMetadata)}
-    <!-- WP-9: Raw metadata (未知形式も破棄せず表示・コピー) -->
+    <!-- WP-9: Rawメタデータ (未知形式も破棄せず表示・コピー) -->
     <section class="info-section" data-meta-section="raw">
-      <h3>Raw metadata</h3>
+      <h3>Rawメタデータ</h3>
       {#each assetMetadata?.parsers ?? [] as parser (parser.parserName)}
         {@const slots = rawSlots(parser)}
         {#if slots.length > 0}

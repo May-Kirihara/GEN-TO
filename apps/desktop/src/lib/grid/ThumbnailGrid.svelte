@@ -564,8 +564,8 @@
                 {/if}
                 {#if badges !== null}
                   <span class="cell-badges" aria-hidden="true">
-                    {#if badges.favorite}<span class="badge badge-fav">♥</span>{/if}
-                    {#if badges.rating > 0}<span class="badge badge-rating">★{badges.rating}</span>{/if}
+                    {#if badges.favorite}<span class="badge badge-fav" title="お気に入り">♥</span>{/if}
+                    {#if badges.rating > 0}<span class="badge badge-rating" title="評価">★{badges.rating}</span>{/if}
                     {#if badges.triage === "keep"}<span class="badge badge-keep" title="採用">✓</span>{/if}
                     {#if badges.triage === "reject"}<span class="badge badge-reject" title="除外">✗</span>{/if}
                   </span>

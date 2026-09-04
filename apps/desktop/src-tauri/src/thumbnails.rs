@@ -2299,6 +2299,55 @@ mod tests {
     }
 
     #[test]
+    fn deleted_cache_root_is_recreated_and_regenerates() {
+        // WP-18-1 D2: キャッシュdir全体を外部から削除しても起動不能に
+        // ならず、次回起動で再生成される (キャッシュ=再生成可能データの
+        // 実証。元画像・DBは対象外)。
+        let dir = TestDir::new("wp18cachedel");
+        let cache_root = dir.path().join("cache");
+        let events = SharedEvents::default();
+        let svc = service(&dir, events.clone());
+        let a = asset(1, &dir.write_png("a.png", 600, 400), true);
+        let first = svc.request(
+            std::slice::from_ref(&a),
+            SizeClass::S256,
+            Priority::Background,
+        );
+        assert_eq!(first.queued, 1);
+        events.wait_ready_count(1);
+        let second = svc.request(
+            std::slice::from_ref(&a),
+            SizeClass::S256,
+            Priority::Background,
+        );
+        assert_eq!(second.cache_hits, 1, "前提: キャッシュが効いている");
+        svc.shutdown();
+
+        // アンインストール掃除・利用者による削除相当: キャッシュdir全体を消す
+        std::fs::remove_dir_all(&cache_root).expect("cache dir exists");
+        assert!(!cache_root.exists());
+
+        // 再起動: 同一cache rootでサービスが開け、miss→再生成→hitする
+        let events2 = SharedEvents::default();
+        let svc2 = ThumbnailService::new(cache_root.clone(), Box::new(events2.clone())).unwrap();
+        let third = svc2.request(
+            std::slice::from_ref(&a),
+            SizeClass::S256,
+            Priority::Background,
+        );
+        assert_eq!(third.queued, 1, "キャッシュ消去後はmiss");
+        assert_eq!(third.cache_hits, 0);
+        events2.wait_ready_count(1);
+        let fourth = svc2.request(
+            std::slice::from_ref(&a),
+            SizeClass::S256,
+            Priority::Background,
+        );
+        assert_eq!(fourth.cache_hits, 1, "再生成後に再びキャッシュ");
+        svc2.shutdown();
+    }
+
+    #[test]
     fn failure_emits_failed_event() {
         let dir = TestDir::new("fail");
         let events = SharedEvents::default();

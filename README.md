@@ -83,6 +83,23 @@ BLAKE3による同一内容Asset統合 → フォルダ監視 (inotify) によ�
 有効になる。登録ルートとファイル一覧はSQLite (`~/.local/share/gento-spike/library.sqlite3`)
 へ永続化され、再起動後に復元される。詳細な契約は [docs/dev/api-contract.md](docs/dev/api-contract.md) §17〜21。
 
+## 初回起動ガイド (WP-18)
+
+登録ルートが0件の状態で起動すると、グリッド領域に3ステップの導線パネルを表示する
+(ウィザードではなく空状態の充実。登録ルートを追加すると自動的に消える)。
+
+1. **登録ルートを追加する** — 左ペイン下部の「登録ルート」に画像フォルダのパスを
+   入力して追加。以降はライブラリ表示 (永続管理・監視) になる
+2. **AI設定 (任意)** — ヘッダー「AI」からOpenAI互換endpointのプロファイルを登録。
+   AIなしでもファイラー機能 (閲覧・選別・タグ・検索・コレクション・ファイル操作) は
+   すべて使用できる
+3. **意味検索モデルの配置 (任意)** — 自然言語検索にはローカル埋め込みモデル
+   (ruri-v3) のパッケージが必要。配置先は `--models-dir <PATH>` /
+   環境変数 `GENTO_MODELS_DIR` / 既定のデータディレクトリ内 `models/`
+   (AIパネルの「モデルの保存先」に表示)。パッケージの入手・変換手順は
+   [docs/embedding-runtime.md](docs/embedding-runtime.md) §3〜4、変換の検証記録は
+   [docs/dev/ruri3-onnx-verification.md](docs/dev/ruri3-onnx-verification.md) を参照
+
 ## 必要システムパッケージ (Ubuntu 24.04)
 
 ```bash
@@ -172,15 +189,28 @@ panic時はpanic情報 + バージョン + OS + APIバージョンを
 GENTO_LOG=debug pnpm tauri dev -- -- -- --dataset ../../../sample/dataset
 ```
 
-## アプリケーションディレクトリ (WP-0)
+## アプリケーションディレクトリ (WP-0 / WP-18-1)
 
-| 用途 | 既定位置 |
-|---|---|
-| データ (MVP-WP-1のSQLite DB予定) | `dirs::data_dir()/gento-spike` (Linux: `~/.local/share/gento-spike`) |
-| キャッシュ | `dirs::cache_dir()/gento-spike` (Linux: `~/.cache/gento-spike`) |
-| ログ・panic記録 | `dirs::cache_dir()/gento-spike/log` |
+| 用途 | 既定位置 (Linux) | 寿命・バックアップ |
+|---|---|---|
+| ライブラリDB (正本) | `~/.local/share/gento-spike/library.sqlite3` | migration前に `db-backups/` へ自動backup (3世代) |
+| アプリ設定 (`app_settings`) | DB内 (`library.sqlite3`) | DBと運命を共にする (上のbackupに含まれる) |
+| migration・フルDB backup | `~/.local/share/gento-spike/db-backups/` | `library-pre-*` (migration用) と `library-full-*` (手動/自動) |
+| ポータブルバックアップ (`.gento`) | 作成時に指定したdir (既定は `db-backups/`) | 評価・タグ・キャプション・コレクション+ファイル照合情報 |
+| サムネイルキャッシュ | `~/.cache/gento-spike/thumbnails` | **削除しても再生成可能** (元画像・DBから自動復元) |
+| ベクトルindex (意味検索) | `~/.local/share/gento-spike/indexes/` | **削除・破損してもDBから自動再構築** |
+| 埋め込みモデル | `--models-dir <PATH>` / `GENTO_MODELS_DIR` / `~/.local/share/gento-spike/models/` | 再ダウンロード可能 (AIパネルの「モデルの保存先」に表示) |
+| ログ・panic記録 | `~/.cache/gento-spike/log` | 診断用 (削除可) |
 
-`--cache-dir <PATH>` はサムネイルキャッシュルートのみを上書きする (計測ドライバ互換)。
+- DBパスは `--db <PATH>` / 環境変数 `GENTO_DB` で上書き可能 (テスト・計測用)。
+  `--cache-dir <PATH>` はサムネイルキャッシュルートのみを上書きする (計測ドライバ互換)。
+- **アンインストール時のデータ保持**: アプリ (deb/rpm/AppImage) を削除しても
+  `~/.local/share/gento-spike/` (DB・設定・登録ルート情報・バックアップ) は
+  **削除されない** (OSのパッケージ削除はユーザーデータを触らない慣行どおり。
+  アンインストール前に `.gento` ポータブルバックアップを作成しておくと
+  別環境への引継ぎも可能 — 復元演習は `scripts/wp18_backup_restore_drill.sh`)。
+- リリース前の検証手順 (データ保持・復元を含む全ゲート) は
+  [docs/dev/release-checklist.md](docs/dev/release-checklist.md)。
 
 ## 依存ライセンス一覧
 

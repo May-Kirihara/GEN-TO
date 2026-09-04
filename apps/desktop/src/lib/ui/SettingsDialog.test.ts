@@ -115,13 +115,34 @@ const DIAGNOSTICS: DiagnosticsDto = {
   },
 };
 
+const ABOUT_INFO = {
+  version: "0.1.0",
+  apiVersion: "3",
+  commit: "b6e7858abcdef0123456789abcdef0123456789",
+  commitShort: "b6e7858",
+  profile: "release",
+  devtoolsBuild: false,
+};
+
 let target: HTMLElement | null = null;
 let component: Record<string, unknown> | null = null;
 
 async function mountDialog(
-  options: { settings?: unknown; roots?: LibraryRoot[]; profiles?: AiProfile[] } = {},
+  options: {
+    settings?: unknown;
+    roots?: LibraryRoot[];
+    profiles?: AiProfile[];
+    about?: unknown;
+    onClose?: () => void;
+  } = {},
 ): Promise<void> {
-  const { settings = HEALTHY_SETTINGS, roots = [], profiles = [] } = options;
+  const {
+    settings = HEALTHY_SETTINGS,
+    roots = [],
+    profiles = [],
+    about = ABOUT_INFO,
+    onClose = () => {},
+  } = options;
   target = document.createElement("div");
   document.body.appendChild(target);
   invokeMock.mockImplementation(async (command: string) => {
@@ -130,6 +151,12 @@ async function mountDialog(
         throw settings;
       }
       return settings;
+    }
+    if (command === "about_info") {
+      if (about instanceof Error) {
+        throw about;
+      }
+      return about;
     }
     if (command === "backup_settings_get") {
       return { autoFullDb: "off", retentionGenerations: 3 };
@@ -154,7 +181,7 @@ async function mountDialog(
       roots,
       profiles,
       displayInfo: { lastFolder: "/photos/2026", expandedCount: 7, sortLabel: "名前順" },
-      onClose: () => {},
+      onClose,
     },
   });
   flushSync();
@@ -335,5 +362,42 @@ describe("SettingsDialog", () => {
     expect(text).toContain("/photos/2026");
     expect(text).toContain("7");
     expect(text).toContain("名前順");
+  });
+
+  it("このアプリについてタブ: バージョン・ビルド情報・更新履歴・ライセンス情報を表示する", async () => {
+    await mountDialog();
+    const tabs = Array.from(target!.querySelectorAll<HTMLElement>(".tabs button"));
+    tabs.find((b) => b.textContent === "このアプリについて")!.click();
+    flushSync();
+    const text = textOf("[data-testid='settings-about']");
+    // バージョン・ビルド情報 (about_info)
+    expect(text).toContain("0.1.0");
+    expect(text).toContain("b6e7858");
+    expect(text).toContain("release");
+    // 更新履歴 (bundle resourcesのCHANGELOG.md本文)
+    expect(text).toContain("0.1.0");
+    // ライセンス: モデル (Apache-2.0) とアプリ本体 (未設定である旨)
+    expect(text).toContain("Apache-2.0");
+    expect(text).toContain("未設定");
+  });
+
+  it("このアプリについてタブ: about_info失敗時も失敗表示で描画を続ける", async () => {
+    await mountDialog({ about: new Error("about unavailable") });
+    const tabs = Array.from(target!.querySelectorAll<HTMLElement>(".tabs button"));
+    tabs.find((b) => b.textContent === "このアプリについて")!.click();
+    flushSync();
+    expect(textOf("[data-testid='settings-about']")).toContain("about unavailable");
+  });
+
+  it("キーボード: ダイアログ開いた直後のフォーカスがダイアログ内に移り、Escapeで閉じる", async () => {
+    let closed = 0;
+    await mountDialog({ onClose: () => (closed += 1) });
+    const dialog = target!.querySelector<HTMLElement>(".settings-picker")!;
+    // 初期フォーカス: focus trapがダイアログ内の最初のフォーカス可能要素へ移す
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    // Escapeで閉じる
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    flushSync();
+    expect(closed).toBe(1);
   });
 });

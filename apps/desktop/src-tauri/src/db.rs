@@ -268,6 +268,46 @@ mod tests {
     }
 
     #[test]
+    fn db_state_future_schema_db_keeps_app_alive_with_recovery_guidance() {
+        // WP-18-1 D2: 旧バイナリで新schemaのDB (ダウングレード相当) を開いて
+        // もpanicせずアプリは継続し、エラーが「新しいGEN-TOバイナリが必要」
+        // という明確な復旧案内を含むこと (キャッシュ/index/DB障害時に
+        // 「起動してファイラーが動く/明確な復旧案内」のDB側実証)。
+        let dir = std::env::temp_dir().join(format!(
+            "gento-dbstate-future-{}-{}",
+            std::process::id(),
+            gento_db::LATEST_VERSION
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("library.sqlite3");
+        {
+            let state = DbState::open(path.clone());
+            assert!(state.db.is_some(), "前提: 一度は最新schemaで開く");
+        }
+        // user_versionを未来へ進める (= 新バイナリで作られたDBを旧バイナリで開く)
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", gento_db::LATEST_VERSION + 1)
+                .unwrap();
+        }
+        let state = DbState::open(path.clone());
+        assert!(state.db.is_none(), "未来schemaは開けない");
+        let err = state.open_error.expect("エラー詳細を保持");
+        assert!(
+            err.contains("newer GEN-TO binary is required"),
+            "復旧案内がある: {err}"
+        );
+        assert!(err.contains("database migration failed"), "種別: {err}");
+        // DB本体は変更されない (user_versionは未来のまま)
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v as i32, gento_db::LATEST_VERSION + 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn sanitize_error_message_replaces_paths_but_keeps_kind() {
         // DBパス本体
         let msg = sanitize_error_message(

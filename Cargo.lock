@@ -1946,6 +1946,7 @@ dependencies = [
  "image",
  "libc",
  "notify",
+ "rusqlite",
  "serde",
  "serde_json",
  "tauri",

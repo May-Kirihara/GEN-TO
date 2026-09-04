@@ -22,6 +22,7 @@
     type RestorePlanDto,
     type RestoreResultDto,
   } from "../backup";
+  import { focusTrap } from "./focus-trap";
 
   let {
     roots,
@@ -160,7 +161,7 @@
 <svelte:window onkeydown={handleKeydown} />
 
 <div class="picker-backdrop" onpointerdown={handleBackdropPointerDown} role="presentation">
-  <div class="picker wide" role="dialog" aria-modal="true" aria-label="バックアップ復元">
+  <div class="picker wide" role="dialog" aria-modal="true" aria-label="バックアップ復元" use:focusTrap>
     <h2>バックアップ復元</h2>
     {#if error}
       <p class="picker-error" role="alert" data-testid="restore-error">{error}</p>

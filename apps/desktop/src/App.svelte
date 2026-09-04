@@ -107,6 +107,11 @@
   import ExportDialog from "./lib/ui/ExportDialog.svelte";
   import RestoreDialog from "./lib/ui/RestoreDialog.svelte";
   import SettingsDialog from "./lib/ui/SettingsDialog.svelte";
+  // WP-18 E3: 初回起動ガイド (登録ルート0件・空状態の充実)
+  import FirstRunGuide from "./lib/ui/FirstRunGuide.svelte";
+  import { deriveFirstRunGuide } from "./lib/ui/first-run";
+  // WP-18 E5: インライン確認ダイアログのフォーカストラップ
+  import { focusTrap } from "./lib/ui/focus-trap";
   type TriageKeyAction = import("./lib/triage-keys").TriageKeyAction;
   import ContextMenu, { type MenuAction } from "./lib/ui/ContextMenu.svelte";
   import FolderTree from "./lib/shell/FolderTree.svelte";
@@ -956,6 +961,10 @@
       ]);
       vectorIndexStatus = status;
       embeddingEnabled = embedding.enabled;
+      guideModel = {
+        modelsDir: embedding.modelsDir,
+        verifiedCount: embedding.packages.filter((pkg) => pkg.state === "verified").length,
+      };
     } catch {
       // 状態取得失敗はスライダーdisabled側へ吸収される
     }
@@ -2351,6 +2360,16 @@
     });
 
     void refreshHealth();
+    // WP-18 E3: 初回起動ガイド用にAIプロファイル数を一度だけ取得
+    // (登録ルート0件の導線表示にのみ使う。失敗時は「状態不明」表示)。
+    void aiStore
+      .listProfiles()
+      .then((profiles) => {
+        guideAiProfiles = profiles.length;
+      })
+      .catch(() => {
+        guideAiProfiles = null;
+      });
     // WP-12: 意味検索の状態 (埋め込み有効化・索引構築) 追跡
     void refreshSemanticState().then(async () => {
       disposeVectorIndexReady = await vectorIndex.subscribeReady(() => {
@@ -2554,6 +2573,30 @@
     }),
   );
 
+  // ===== 初回起動ガイド (WP-18 E3) =====
+  // 登録ルート0件かつグリッド空のとき、空状態に代えて3ステップ導線を表示。
+  // AI・モデルの状態は表示用に保持する (導線の「現在の状態」行)。
+  let guideAiProfiles = $state<number | null>(null);
+  let guideModel = $state<{ modelsDir: string | null; verifiedCount: number | null }>({
+    modelsDir: null,
+    verifiedCount: null,
+  });
+
+  const firstRunSteps = $derived(
+    deriveFirstRunGuide({
+      rootsCount: libraryRoots.length,
+      aiProfilesCount: guideAiProfiles,
+      model: guideModel,
+    }),
+  );
+
+  const firstRunVisible = $derived(
+    firstRunSteps !== null &&
+      emptyState?.kind === "empty" &&
+      !searchActive &&
+      activeCollection === null,
+  );
+
   const crumbs = $derived(
     catalogSource === "library" ? [] : breadcrumbOf(currentFolder ?? ""),
   );
@@ -2588,6 +2631,12 @@
       class="health-dot"
       class:ok={healthStatus?.kind === "ok"}
       class:ng={healthStatus?.kind === "error"}
+      role="status"
+      aria-label={healthStatus?.kind === "ok"
+        ? `DB: ${healthStatus.dbOpen ? "接続" : "未接続"}`
+        : healthStatus?.kind === "error"
+          ? `エラー: ${healthStatus.message}`
+          : "接続確認中"}
       title={healthStatus?.kind === "ok"
         ? `DB: ${healthStatus.dbOpen ? "接続" : "未接続"} / ${rawHealth?.dataset_path ?? ""}`
         : healthStatus?.kind === "error"
@@ -3146,7 +3195,9 @@
             }}
           />
         {/key}
-        {#if emptyState !== null}
+        {#if firstRunVisible}
+          <FirstRunGuide steps={firstRunSteps!} />
+        {:else if emptyState !== null}
           <div class="empty-state" role="status">
             <p class="empty-message">{emptyState.message}</p>
             {#if emptyState.detail !== null}
@@ -3352,7 +3403,20 @@
 
 {#if retryReport !== null}
   <div class="retry-backdrop" role="presentation">
-    <div class="retry" role="dialog" aria-modal="true" aria-label="一部のファイルで失敗">
+    <div
+      class="retry"
+      role="dialog"
+      aria-modal="true"
+      aria-label="一部のファイルで失敗"
+      tabindex="-1"
+      use:focusTrap
+      onkeydown={(event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          retryReport = null;
+        }
+      }}
+    >
       <h2>一部のファイルを処理できませんでした</h2>
       <ul class="retry-list" data-testid="retry-list">
         {#each retryReport.outcome.steps.filter((step) => step.status === "failed") as step (step.file_id)}

@@ -26,6 +26,7 @@
     type ExportStructure,
   } from "../export";
   import type { LibraryRoot } from "../library";
+  import { focusTrap } from "./focus-trap";
 
   let {
     assetIds,
@@ -198,7 +199,7 @@
 <svelte:window onkeydown={handleKeydown} />
 
 <div class="picker-backdrop" onpointerdown={handleBackdropPointerDown} role="presentation">
-  <div class="picker" role="dialog" aria-modal="true" aria-label="SD学習用エクスポート">
+  <div class="picker" role="dialog" aria-modal="true" aria-label="SD学習用エクスポート" use:focusTrap>
     <h2>SD学習用エクスポート</h2>
     {#if result}
       <p class="picker-sub" data-testid="export-done">
@@ -302,7 +303,7 @@
                 <th>画像</th>
                 <th>.txt</th>
                 <th>既存</th>
-                <th>caption</th>
+                <th>キャプション</th>
               </tr>
             </thead>
             <tbody>

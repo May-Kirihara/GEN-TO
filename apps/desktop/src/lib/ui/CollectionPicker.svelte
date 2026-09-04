@@ -9,6 +9,7 @@
     */
   import { onDestroy } from "svelte";
   import type { CollectionDto, CollectionsStore } from "../collections";
+  import { focusTrap } from "./focus-trap";
 
   let {
     store,
@@ -96,7 +97,7 @@
   onpointerdown={handleBackdropPointerDown}
   role="presentation"
 >
-  <div class="picker" role="dialog" aria-modal="true" aria-label="コレクションへ追加">
+  <div class="picker" role="dialog" aria-modal="true" aria-label="コレクションへ追加" use:focusTrap>
     <h2>コレクションへ追加</h2>
     <p class="picker-sub">
       選択 {assetIds.length.toLocaleString()}件を追加します

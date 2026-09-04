@@ -325,7 +325,7 @@
   <div class="compare-toolbar">
     <button class:active={countNow() === 2} onclick={() => void store.setCount(2)}>2枚</button>
     <button class:active={countNow() === 4} onclick={() => void store.setCount(4)}>4枚</button>
-    <button onclick={() => store.setView("fit")}>fit (f)</button>
+    <button onclick={() => store.setView("fit")}>全体表示 (f)</button>
     <button onclick={() => store.setView("actual")}>原寸</button>
     <button onclick={() => store.toggleSync()}>同期: {syncOn() ? "ON" : "OFF"}</button>
     <button class:active={baseNow() !== null} onclick={() => store.toggleBase()}>

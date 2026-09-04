@@ -45,6 +45,10 @@ tauri-plugin-opener = "=2.5.4"
 [dev-dependencies]
 
 image = { workspace = true }
+# WP-18-1 D2: db.rs結合テストが未来schema DBを直接作るため (テスト専用。
+# workspace既存pin =0.31.0と同一物。新規外部依存ではない —
+# docs/dev/dependency-notes.md 該当エントリ参照)。
+rusqlite = { workspace = true }
 
 [features]
 # Tauri CLIがrelease build時に有効化する。絶対に削除しないこと。

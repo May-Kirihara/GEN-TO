@@ -7,6 +7,7 @@
 //! `devtools` module配下で `debug_assertions` または `--features devtools`
 //! のときのみコンパイルされる。通常releaseビルドからは完全に除去される。
 
+pub mod about;
 pub mod ai;
 pub mod backup;
 pub mod catalog;
@@ -157,6 +158,7 @@ pub fn run() {
         db::db_status,
         devtools::dev_bridge_enabled,
         devtools::devtest_report,
+        about::about_info,
         catalog::get_catalog_summary,
         catalog::get_catalog_page,
         catalog::start_scan,
@@ -269,6 +271,7 @@ pub fn run() {
     let builder = builder.invoke_handler(tauri::generate_handler![
         health,
         db::db_status,
+        about::about_info,
         catalog::get_catalog_summary,
         catalog::get_catalog_page,
         catalog::start_scan,

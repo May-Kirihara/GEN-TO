@@ -8,6 +8,7 @@
     * 場合はサムネイル、無い場合はメタ情報のみ)。
     */
   import type { ConflictSession, ConflictResolution } from "../fileops";
+  import { focusTrap } from "./focus-trap";
 
   let {
     session,
@@ -66,7 +67,7 @@
 
 {#if conflict !== null && step !== null}
   <div class="backdrop" role="presentation">
-    <div class="dialog" role="dialog" aria-modal="true" aria-label="同名ファイルの衝突">
+    <div class="dialog" role="dialog" aria-modal="true" aria-label="同名ファイルの衝突" use:focusTrap>
       <h2>同名のファイルがあります</h2>
       <p class="sub">
         {step.display_name}

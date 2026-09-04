@@ -9,6 +9,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import type { LibraryRoot } from "../library";
   import type { PortableCreatedDto } from "../backup";
+  import { focusTrap } from "./focus-trap";
 
   let {
     root,
@@ -131,7 +132,7 @@
 <svelte:window onkeydown={handleKeydown} />
 
 <div class="picker-backdrop" onpointerdown={handleBackdropPointerDown} role="presentation">
-  <div class="picker" role="dialog" aria-modal="true" aria-label="バックアップ作成">
+  <div class="picker" role="dialog" aria-modal="true" aria-label="バックアップ作成" use:focusTrap>
     <h2>バックアップ作成</h2>
     {#if created}
       <p class="picker-sub" data-testid="backup-created">

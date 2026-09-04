@@ -1,8 +1,9 @@
 <script lang="ts">
   /**
-    * 設定ダイアログ (MVP WP-15)。
+    * 設定ダイアログ (MVP WP-15 / WP-18拡張)。
     *
-    * タブ: 一般 / 表示 / キャッシュ / AI / 検索 / バックアップ / 診断。
+    * タブ: 一般 / 表示 / キャッシュ / AI / 検索 / バックアップ / 診断 /
+    * このアプリについて。
     * - 設定の正本は backend `app_settings`。破損値は既定値へフォールバック
     *   された形で表示され、corruptKeysがあれば注意を示す。
     * - キャッシュ: 使用量と上限の表示・上限変更 (即時LRU prune)・
@@ -12,6 +13,8 @@
     * - 診断: 5領域スナップショット (更新ボタン) と診断bundle生成
     *   (秘密・実パス除外はbackendが担保)。
     * - 表示タブは既存の表示系pref (folder-prefs) の現状値の表示のみ。
+    * - このアプリについて (WP-18 E2): バージョン・ビルド情報 (about_info)、
+    *   ライセンス情報、更新履歴 (bundle resourcesのCHANGELOG.md)。
     */
   import { invoke } from "@tauri-apps/api/core";
   import type { LibraryRoot } from "../library";
@@ -26,6 +29,13 @@
     type DiagnosticsDto,
     type SettingsDto,
   } from "../settings";
+  import {
+    CHANGELOG_TEXT,
+    buildProfileLabel,
+    normalizeAboutInfo,
+    type AboutInfo,
+  } from "../about";
+  import { focusTrap } from "./focus-trap";
 
   let {
     roots,
@@ -39,10 +49,12 @@
     onClose: () => void;
   } = $props();
 
-  type Tab = "general" | "display" | "cache" | "ai" | "search" | "backup" | "diagnostics";
+  type Tab = "general" | "display" | "cache" | "ai" | "search" | "backup" | "diagnostics" | "about";
   let tab = $state<Tab>("general");
   let settings = $state<SettingsDto>(normalizeSettings(null));
   let settingsError = $state<string | null>(null);
+  let about = $state<AboutInfo | null>(null);
+  let aboutError = $state<string | null>(null);
   let logLevelInput = $state("info");
   let cacheBusy = $state(false);
   let cacheNotice = $state<string | null>(null);
@@ -90,6 +102,13 @@
         bundleDest = await invoke<string>("backup_default_dir");
       } catch {
         bundleDest = "";
+      }
+      try {
+        about = normalizeAboutInfo(await invoke("about_info"));
+        aboutError = about === null ? "about_infoの応答形状が不正です" : null;
+      } catch (err) {
+        about = null;
+        aboutError = err instanceof Error ? err.message : String(err);
       }
     })();
   });
@@ -234,10 +253,10 @@
 <svelte:window onkeydown={handleKeydown} />
 
 <div class="picker-backdrop" onpointerdown={handleBackdropPointerDown} role="presentation">
-  <div class="picker settings-picker" role="dialog" aria-modal="true" aria-label="設定">
+  <div class="picker settings-picker" role="dialog" aria-modal="true" aria-label="設定" use:focusTrap>
     <h2>設定</h2>
     <div class="tabs" role="tablist">
-      {#each [["general", "一般"], ["display", "表示"], ["cache", "キャッシュ"], ["ai", "AI"], ["search", "検索"], ["backup", "バックアップ"], ["diagnostics", "診断"]] as [id, label] (id)}
+      {#each [["general", "一般"], ["display", "表示"], ["cache", "キャッシュ"], ["ai", "AI"], ["search", "検索"], ["backup", "バックアップ"], ["diagnostics", "診断"], ["about", "このアプリについて"]] as [id, label] (id)}
         <button
           class:active={tab === id}
           onclick={() => switchTab(id as Tab)}
@@ -481,7 +500,7 @@
             <dd>{diagnostics.db.dbOpen ? "接続済" : "未接続"}</dd>
             <dt>整合性検査 (quick_check)</dt>
             <dd>{diagnostics.db.integrityCheck}</dd>
-            <dt>schema version</dt>
+            <dt>schemaバージョン</dt>
             <dd>{diagnostics.db.schemaVersion}</dd>
             <dt>サイズ</dt>
             <dd>DB {formatBytes(diagnostics.db.dbBytes)} / WAL {formatBytes(diagnostics.db.walBytes)}</dd>
@@ -572,6 +591,42 @@
             生成しました: <span class="mono">{bundleResult}</span>
           </p>
         {/if}
+      </section>
+    {:else if tab === "about"}
+      <section data-testid="settings-about">
+        <h3>バージョン・ビルド情報</h3>
+        {#if about !== null}
+          <dl class="kv" data-testid="about-info">
+            <dt>アプリバージョン</dt>
+            <dd>{about.version}</dd>
+            <dt>APIバージョン</dt>
+            <dd>{about.apiVersion}</dd>
+            <dt>ビルド</dt>
+            <dd>{buildProfileLabel(about.profile, about.devtoolsBuild)}</dd>
+            <dt>commit</dt>
+            <dd class="mono">{about.commitShort} <span class="mono-full">({about.commit})</span></dd>
+          </dl>
+        {:else}
+          <p class="picker-error" role="alert" data-testid="about-error">
+            バージョン情報を取得できませんでした: {aboutError ?? "不明なエラー"}
+          </p>
+        {/if}
+        <hr />
+        <h3>ライセンス</h3>
+        <dl class="kv">
+          <dt>アプリ本体</dt>
+          <dd>未設定 (MVP時点でプロジェクトライセンスは未選択)</dd>
+          <dt>意味検索モデル (ruri-v3)</dt>
+          <dd>Apache-2.0 (配布元: cl-nagoya/ruri-v3。ONNX変換版の表明は licenses/MODEL-LICENSES.md)</dd>
+          <dt>サードパーティライセンス</dt>
+          <dd>
+            同梱の licenses/THIRD-PARTY-NOTICES.md、licenses/MODEL-LICENSES.md
+            (インストール先のリソースディレクトリ) を参照
+          </dd>
+        </dl>
+        <hr />
+        <h3>更新履歴</h3>
+        <pre class="changelog">{CHANGELOG_TEXT}</pre>
       </section>
     {/if}
 
@@ -816,5 +871,26 @@
     border: none;
     border-top: 1px solid light-dark(#eaeef2, #30363d);
     margin: 0.5rem 0;
+  }
+
+  .mono-full {
+    font-size: 0.66rem;
+    color: light-dark(#57606a, #8b949e);
+    overflow-wrap: anywhere;
+  }
+
+  .changelog {
+    margin: 0;
+    padding: 0.5rem 0.6rem;
+    border: 1px solid light-dark(#eaeef2, #30363d);
+    border-radius: 0.4rem;
+    background: light-dark(#f6f8fa, #21262d);
+    font-family: monospace;
+    font-size: 0.68rem;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    max-height: 14rem;
+    overflow-y: auto;
   }
 </style>

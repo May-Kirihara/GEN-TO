@@ -8,6 +8,11 @@ export default defineConfig({
   server: {
     port: 5173,
     strictPort: true,
+    // WP-18: リポジトリ直下のCHANGELOG.mdを ?raw で読むため
+    // fsアクセス許可をリポジトリルートまで広げる。
+    fs: {
+      allow: ["../.."],
+    },
     watch: {
       // Rust側のビルドでフロントエンドを再読み込みさせない。
       ignored: ["**/src-tauri/**"],

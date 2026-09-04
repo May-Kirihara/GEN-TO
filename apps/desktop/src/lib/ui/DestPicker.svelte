@@ -7,6 +7,7 @@
     */
   import { invoke } from "@tauri-apps/api/core";
   import type { LibraryRoot } from "../library";
+  import { focusTrap } from "./focus-trap";
 
   let {
     roots,
@@ -145,7 +146,7 @@
 <svelte:window onkeydown={handleKeydown} />
 
 <div class="picker-backdrop" onpointerdown={handleBackdropPointerDown} role="presentation">
-  <div class="picker" role="dialog" aria-modal="true" aria-label={title}>
+  <div class="picker" role="dialog" aria-modal="true" aria-label={title} use:focusTrap>
     <h2>{title}</h2>
     <p class="picker-sub">宛先フォルダを選択してください (登録ルート内のフォルダツリー)</p>
     {#if notice}

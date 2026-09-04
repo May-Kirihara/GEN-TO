@@ -33,6 +33,11 @@
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.ico"
-    ]
+    ],
+    "resources": {
+      "../../../CHANGELOG.md": "CHANGELOG.md",
+      "../../../docs/dev/licenses.md": "licenses/THIRD-PARTY-NOTICES.md",
+      "licenses/MODEL-LICENSES.md": "licenses/MODEL-LICENSES.md"
+    }
   }
 }

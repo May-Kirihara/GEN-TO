@@ -6,6 +6,8 @@
     * チェックボックスの2段階の明示を持つ (ダイアログ+入力確認は過剰と
     * いうPM判断)。実行ボタンはチェックが付くまで無効。
     */
+  import { focusTrap } from "./focus-trap";
+
   let {
     count,
     onConfirm,
@@ -29,7 +31,7 @@
 <svelte:window onkeydown={handleKeydown} />
 
 <div class="backdrop" role="presentation">
-  <div class="dialog" role="dialog" aria-modal="true" aria-label="完全削除の確認">
+  <div class="dialog" role="dialog" aria-modal="true" aria-label="完全削除の確認" use:focusTrap>
     <h2>完全に削除しますか?</h2>
     <p class="sub">
       選択した {count.toLocaleString()}件を<strong>ゴミ箱を経由せず</strong>削除します。
