@@ -41,7 +41,13 @@
 | grid-statsのE2E DOM依存は少ない | devtestはbridge経由 | driver棚卸しで発覚 | driver更新（小） |
 | wheel送りは誤操作リスク低 | ビューアは画像単位文脈 | ユーザー違和感 | 設定化（次イテレーション） |
 
-## 改訂（Codex plan反映 — /tmp/codex-uiux3-plan.md・委任契約に優先）
+## 結果（2026-09-05完了）
+- 実装 `b9aff9f` → Codex差分 **approve-with-notes**（blockerなし。notes=scope-kind hookが確定値でない/lastSearchMeta未消費フィールド/ThumbnailGridの旧既定1/generate wheel-navのdeltaMode未正規化→いずれも次イテレーション候補として記録）→ QA **pass-with-notes・出荷可（条件なし）**（要求4件すべて実機検証・vitest 673/cargo 973/uiux1 72/72独立一致・比較ビュー/triage/矢印不変確認）
+- 付帯修正: devtest F4ハンドラの二重潜在bug（ctrl+F4がmetaRate5へ先行routing+wheelAtがctrlKey未伝播——wp16_s4_viewer.pyの主張が到達不能だった）を解消し橋アクション分離（素F1/F12モード）
+- QA申し送り（次イテレーション候補）: wheel連続送りの体感（latch+250ms静穏で連続回転=1枚止まり。ボタンrepeat/静穏の速度連動）・triage中wheel誤送りガード・明背景での‹›視認性・README括弧typo・scope badge f/cのE2E追加・DevDrawer poll単体試験
+- 環境注記: 本WP実装時にGaOTTTが実装者側から利用不可だった（PM側は正常——保存はPMが実施）
+
+## 改訂（Codex plan反映 — /tmp/codex-uiux3-plan.md・実装契約）
 1. **V-4 wheel**: ズーム=`Alt||ctrl||meta`+wheel（**pinch=ctrl+wheelをズームとして保存**）・平常wheel=送り（**accumulator+閾値+gesture cooldown/latch——trackpadの多発eventで複数枚飛びしない。意図的な1ノッチ/ジェスチャ=1送り**）・ビューアがジェスチャを握る間は常にpreventDefault
 2. **V-2**: コールバックでAppの$stateへlift**しない**（毎フレーム再描画の嵐）。`getStatsSnapshot()`をexportし**DevDrawerが開いている間だけ250-500msでpoll**。`data-grid-cell`/`.grid-scroll`のDOMフックはE2E（G行）が使うため温存
 3. **V-3**: 折りたたみ要約は**確定済み検索状態**（lastQuery/last-kind）から（`searchInput`でない）・類似画像は「類似画像」表示・**検索実行中はclear/exit操作を折りたたみでも見せる**・scope表示は実態名（「登録ルート: ‹名前›」「コレクション: ‹名前›」「ライブラリ全体」——「現在のフォルダ」は実装と不一致のため使わない）・フィルタ/意味重み有効表示・展開→focusはtick()後。`searchExpanded`（既定=展開）でlayout-prefsへ
