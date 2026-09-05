@@ -4,6 +4,9 @@
 - 基盤: commit `61fae22` + 本WP変更 (vitest 673 → **676** / cargo 973 変更なし)
 - 変更範囲: `ImageViewer.svelte` / `ImageViewer.test.ts` / `devtest.ts` /
   `uiux1_e2e.sh` / 本ドキュメント
+- **追記 (同日)**: r1レビューのblocking指摘によりFIX-VIEWERNAV-2を実施 —
+  本文中の「CompareView slot内にインタラクティブ要素が無い」という記載は
+  事実誤認として訂正済み (教訓セクション・末尾追記セクション参照)
 
 ## 結論サマリ
 
@@ -84,9 +87,12 @@ down/up両対象の**最近共通祖先**で dispatch。素朴な `.click()` は
 - 実配列を合成する際はブラウザの規定動作 (capture時のupリターゲット・
   clickはdown/up対象の最近共通祖先) をヘルパ側に再現する必要がある
 - 同一パターン (`setPointerCapture` を子ボタン持ち面で無条件呼出) は
-  `CompareView.svelte` のslotにも存在するが、slot内にボタンが無く顕在化
-  していないため本WPでは不改修 (要観測。slot内へインタラクティブ要素を
-  追加する際は同一の除外ガードが必要)
+  `CompareView.svelte` のslotにも存在した。**訂正 (FIX-VIEWERNAV-2)**:
+  初出時は「slot内にボタンが無く顕在化していないため不改修」と記載したが
+  これは事実誤認 — slotは各スロット右下に採用/除外ボタン (`.slot-cull`、
+  `onCullSlot` prop経由でAppから供給・通常使用で常在) を持ち、**同bugが
+  現存していた** (r1レビューが指摘)。FIX-VIEWERNAV-2で同一の除外ガードを
+  追加し修正済み (詳細は末尾の追記セクション)
 
 ## 検証
 
@@ -102,7 +108,64 @@ down/up両対象の**最近共通祖先**で dispatch。素朴な `.click()` は
 
 ## 残課題 / next steps
 
-- (任意) CompareView slotへインタラクティブ要素を追加する際の同ガード
-  (現状は顕在化なし)
+- ~~(任意) CompareView slotへインタラクティブ要素を追加する際の同ガード
+  (現状は顕在化なし)~~ → **訂正 (FIX-VIEWERNAV-2)**: 事実誤認 (上記教訓参照)。
+  採用/除外ボタンが既に存在し同bugが現存していたため、同WPでガード追加を済み
 - (任意) devtestの他ボタンアクションのrealClick全面置換 — 本WPは
-  navのみ (委任仕様どおり)
+  navのみ (委任仕様どおり)。FIX-VIEWERNAV-2で比較cullボタン
+  (`compareCullPick`/`compareCullReject`) を追加
+
+---
+
+## 追記: FIX-VIEWERNAV-2 — CompareView cullボタンの同一bug修正 (2026-09-05)
+
+- WP: FIX-VIEWERNAV-2 (上記r1レビューのblocking指摘への対応。基盤 `f41ead2`)
+- 変更範囲: `CompareView.svelte` / `CompareView.test.ts` (新規) /
+  `devtest.ts` (橋アクション追加) / `uiux1_e2e.sh` (15bセクション追加) /
+  本ドキュメント (事実誤認の訂正)
+
+### 事実
+
+`CompareView` の各slotは採用/除外ボタン (`.slot-cull`配下の
+`.cull-pick`/`.cull-reject`、`onCullSlot` propがAppから供給される通常使用で
+常在) を持つ。slotの `onPointerDown` が button=0 で無条件
+`setPointerCapture` するため、**cullボタン上の実クリックがFIX-VIEWERNAV-1
+と同じ機構で不発火** (pointerup/mouseupがslotへリターゲット → clickは
+最近共通祖先のslotで発火 → ボタンのonclick不達)。本体修正はImageViewerと
+同一の早期returnガード (`closest("button, a, input, select, textarea")`) を
+`store.setActive` の前に追加 — ボタン押下はスロットの選択・パン操作に
+完全に非参加。move/upの `drag === null` ガードは既存のためskip後も安全。
+
+### 検証 (red→green)
+
+`CompareView.test.ts` (新規3件、FIX-VIEWERNAV-1のrealClickヘルパと同一
+実装を再利用):
+
+| テスト | 旧実装 (red) | 新実装 (green) |
+|---|---|---|
+| cullボタン実クリック配列でcaptureせずonCullSlot発火 (slot0除外+slot1採用) | **FAILED** (`captured=true`) | ok |
+| cullボタン経由pointerdownはドラッグを開始しない | **FAILED** (centerX 0.5→0.375 = パン発生) | ok |
+| スロット面pointerdownは従来どおりcapture開始+パン+up終了 | ok (回帰防止) | ok |
+
+- red: `2 failed / 1 passed` — 上記2件がbug機構どおりに失敗
+- green: vitest **679** (676+3、62 files 全緑) / svelte-check 0 error
+  (12 warnings — 基盤と同数) / eslint 0 problem
+
+### E2E (uiux1 15bセクション)
+
+- 橋: `compareCullPick` (slot1採用) / `compareCullReject` (slot0除外) を
+  realClickで駆動。vwモード (素F12) の空きキー `k`/`x` へ割当 (他driver
+  未使用。wp5の比較cull検証はXキー=キーボード経路のため本bugを検出不可)
+- uiux1 15b: 比較表示 (F7→F3) → `vw x`でslot0除外 → DB `triage='rejected'`
+  1件・`vw k`でslot1採用 → DB `triage='picked'` 1件を実測 (wp5と同じ
+  python3 sqlite3 WAL並行読み取り規約)
+- E2E red実証: `CompareView.svelte`のみ一時revertビルドでuiux1実行 →
+  15bの2条件がFAIL (DB反映なし) — 本bugクラスをE2Eが検出できることを確認
+
+### 残された既知の非対象
+
+- toolbar (`.compare-toolbar`) のボタンはslot配下ではなくcapture対象外
+  (最初から無影響)。`.slot-label`/`.note`/`.pending`はpointer-events無し
+- cullボタン押下でスロットのactiveが切り替わらなくなった (旧実装の
+  pointerdown経由setActiveがskip) — ボタンは自身のslot indexへ直接作用
+  するため影響なし (テストで表明)

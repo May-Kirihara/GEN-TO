@@ -119,6 +119,12 @@
     if (event.button !== 0) {
       return;
     }
+    // slot内のインタラクティブ要素 (採用/除外ボタン) はパン対象外。captureすると
+    // pointerup/clickがslotへリターゲットされ、ボタン自身のclickが発火
+    // しなくなる (FIX-VIEWERNAV-1と同一原因 — FIX-VIEWERNAV-2)
+    if ((event.target as Element).closest("button, a, input, select, textarea") !== null) {
+      return;
+    }
     store.setActive(slot);
     drag = { slot, pointerId: event.pointerId, lastX: event.clientX, lastY: event.clientY };
     (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);

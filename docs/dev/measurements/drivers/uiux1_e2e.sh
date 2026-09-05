@@ -38,6 +38,9 @@
 #      (FIX-VIEWERNAV-1: vw f/bのnavボタンはpointerdown→pointerup→clickの
 #       実配列シミュレートで駆動 — stageのpointer captureがclickを壊す
 #       回帰をE2Eでも検出する)
+#  15b) 比較ビューcullボタン (採用/除外): FIX-VIEWERNAV-2 — vw k/xを
+#       実配列シミュレートで駆動しDB (triage) で実測 (wp5のXキー検証は
+#       キーボード経路のため本bugを検出できなかった)
 #  16) UIUX-3 V-2: 開発パネルのグリッド統計セクション (開中のみpoll)・
 #      主UIオーバーレイ (.grid-stats) 撤去
 #
@@ -95,6 +98,28 @@ wait_log() { # <pattern> <timeout_s>
   while (( SECONDS < deadline )); do
     grep -aqE -- "$1" "$WORK/logs/app.log" && return 0
     sleep 0.2
+  done
+  return 1
+}
+
+# DB検証はpython3 sqlite3 (WAL並行読み取り) で行う (wp5_e2e.shと同じ規約)。
+db_query() { # <sql>
+  python3 - "$WORK/env/db/library.sqlite3" "$1" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=5)
+try:
+    for row in conn.execute(sys.argv[2]):
+        print(row[0])
+finally:
+    conn.close()
+PY
+}
+wait_db() { # <sql> <expected-rows> <timeout_s>
+  local deadline=$((SECONDS + ${3:-30})) n=-1
+  while (( SECONDS < deadline )); do
+    n=$(db_query "$1" | wc -l)
+    [[ "$n" == "$2" ]] && return 0
+    sleep 0.4
   done
   return 1
 }
@@ -772,6 +797,29 @@ fi
 xdotool key Escape; sleep 1.0
 wait_value xvn -1 10 && pass "15) ビューア閉で送りボタン消滅 (xvn=-1)" \
   || fail "15) ビューア閉後もボタン残存 (xvn=$(devtest_value xvn || echo -))"
+
+# ========== 15b) 比較ビュー: cullボタン (採用/除外) の実クリック配列 (FIX-VIEWERNAV-2) ==========
+# 比較slotのonPointerDownが無条件setPointerCaptureするとcullボタンのclickが
+# 壊れる (FIX-VIEWERNAV-1と同一bug) — vw k/xのcullボタンはpointerdown→
+# pointerup→clickの実配列シミュレートで駆動し、適用結果はDB (triage) で実測。
+xdotool key ctrl+shift+F4; sleep 0.8   # focusCell0 → 単一選択 (比較スロット充填元)
+xdotool key F7; sleep 0.5              # cycleChoice: 単一 → 2枚比較
+xdotool key F3; sleep 1.8              # 比較表示で開く (スロットは選択+連続補充)
+wait_log "C n=2" 10 || fail "15b) 比較表示が開かない"
+vw x 1.5    # slot0の除外ボタン (実クリック配列)
+if wait_db "SELECT id FROM assets WHERE triage = 'rejected'" 1 15; then
+  pass "15b) 比較slot0の除外ボタンが実クリックで発火 (DB rejected=1)"
+else
+  fail "15b) 比較除外ボタン不全 (rejected=$(db_query "SELECT id FROM assets WHERE triage = 'rejected'" | wc -l))"
+fi
+vw k 1.5    # slot1の採用ボタン (実クリック配列)
+if wait_db "SELECT id FROM assets WHERE triage = 'picked'" 1 15; then
+  pass "15b) 比較slot1の採用ボタンが実クリックで発火 (DB picked=1)"
+else
+  fail "15b) 比較採用ボタン不全 (picked=$(db_query "SELECT id FROM assets WHERE triage = 'picked'" | wc -l))"
+fi
+shot 22-compare-cull-buttons
+xdotool key Escape; sleep 0.8          # 比較を閉じる
 
 # ========== 16) 開発パネル: グリッド統計セクション (UIUX-3 V-2) ==========
 # 開発パネルはセクション11で開状態 (xdd=1)。統計はパネル開中のみpoll表示。

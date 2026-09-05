@@ -1487,6 +1487,26 @@ export function installDevBridge(stores: DevBridgeStores): void {
         wheelAt(el, 0.25, 0.35, 3, -100);
       }
     },
+    /** 比較ビューのcullボタン (WP-5 採用/除外)。実クリック配列
+     *  (pointerdown→pointerup→click) で駆動 — FIX-VIEWERNAV-2: slotの
+     *  pointer captureがcullボタンのclickを壊す回帰をE2Eでも検出できる
+     *  ようにする。pickはslot1・rejectはslot0 (スロット毎の配線も検証)。 */
+    compareCullPick: () => {
+      const btn = document.querySelector<HTMLButtonElement>(
+        ".compare-overlay .slot[data-slot='1'] .slot-cull .cull-pick",
+      );
+      if (btn !== null) {
+        realClick(btn);
+      }
+    },
+    compareCullReject: () => {
+      const btn = document.querySelector<HTMLButtonElement>(
+        ".compare-overlay .slot[data-slot='0'] .slot-cull .cull-reject",
+      );
+      if (btn !== null) {
+        realClick(btn);
+      }
+    },
     /** ビューア左右端の送りボタン (V-4)。実クリック配列 (pointerdown→
      *  pointerup→click) で駆動 — FIX-VIEWERNAV-1: stageのpointer captureが
      *  ボタンのclickを壊す回帰をE2Eでも検出できるようにする。 */
@@ -2132,6 +2152,8 @@ export function installDevBridge(stores: DevBridgeStores): void {
           b: "viewerNavPrevBtn",
           f: "viewerNavNextBtn",
           m: "compareWheelZoom",
+          k: "compareCullPick",
+          x: "compareCullReject",
         };
         const action = vwKeys[event.key];
         if (action !== undefined) {
