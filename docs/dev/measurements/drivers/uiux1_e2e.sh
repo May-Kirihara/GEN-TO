@@ -35,6 +35,9 @@
 #      実行中表示中の✕クリア)・展開focus・再起動後も状態永続化
 #  15) UIUX-3 V-4: ビューア送りボタン (端disabled)・平常wheel=送り
 #      (accumulator: 3ノッチ=1送り)・Alt+wheelズーム・pinch (ctrl)ズーム
+#      (FIX-VIEWERNAV-1: vw f/bのnavボタンはpointerdown→pointerup→clickの
+#       実配列シミュレートで駆動 — stageのpointer captureがclickを壊す
+#       回帰をE2Eでも検出する)
 #  16) UIUX-3 V-2: 開発パネルのグリッド統計セクション (開中のみpoll)・
 #      主UIオーバーレイ (.grid-stats) 撤去
 #
@@ -727,13 +730,13 @@ else
   fail "15) 送りボタン初期状態不正 (xvn=$(devtest_value xvn || echo -) xvd=$(devtest_value xvd || echo -))"
 fi
 shot 20-viewer-nav
-vw f 1.2    # 次ボタン
+vw f 1.2    # 次ボタン (実クリック配列: pointerdown→up→click)
 if wait_value idx 1 10 && wait_value xvd 0 10; then
   pass "15) 次ボタンでidx 0→1 (中間は両方有効)"
 else
   fail "15) 次ボタン不全 (idx=$(devtest_value idx || echo -) xvd=$(devtest_value xvd || echo -))"
 fi
-vw b 1.2    # 前ボタン
+vw b 1.2    # 前ボタン (実クリック配列)
 if wait_value idx 0 10 && wait_value xvd 1 10; then
   pass "15) 前ボタンでidx 1→0 (先頭で前=disabled)"
 else

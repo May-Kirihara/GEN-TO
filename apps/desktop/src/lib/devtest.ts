@@ -438,6 +438,78 @@ function wheelViewerBridge(
   }
 }
 
+/**
+ * FIX-VIEWERNAV-1: 実クリックのpointer配列を再現するclickヘルパ。
+ * 素朴な .click() はpointerdown/upを経由しないため、祖先要素のpointer
+ * captureがclickを壊すbugクラス (ビューア送りボタン) を検出できない。
+ * 実ブラウザと同じ意味論で合成する: pointerdownで祖先がsetPointerCapture
+ * を呼んだ場合はpointerupをcapture要素へリターゲットし、clickはdown/up
+ * 両対象の最近共通祖先で発火させる (合成pointerIdへのNotFound回避のため
+ * 操作中のみprototypeをpatch — dragSequenceと同じ規約)。
+ */
+function realClick(target: HTMLElement): void {
+  const originalCapture = Element.prototype.setPointerCapture;
+  let captureEl: Element | null = null;
+  const noteCapture = (el: Element): void => {
+    if (captureEl === null) {
+      captureEl = el;
+    }
+  };
+  Element.prototype.setPointerCapture = function patch(this: Element, pointerId: number) {
+    void pointerId;
+    noteCapture(this);
+    return undefined;
+  } as typeof Element.prototype.setPointerCapture;
+  try {
+    target.dispatchEvent(
+      new PointerEvent("pointerdown", {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        pointerId: 9,
+        isPrimary: true,
+        button: 0,
+        buttons: 1,
+      }),
+    );
+    const upTarget = captureEl ?? target;
+    upTarget.dispatchEvent(
+      new PointerEvent("pointerup", {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        pointerId: 9,
+        isPrimary: true,
+        button: 0,
+        buttons: 0,
+      }),
+    );
+    // click対象 = down/up対象の最近共通祖先 (実ブラウザの決定規則)
+    const bChain = new Set<Node>();
+    for (let n: Node | null = upTarget; n !== null; n = n.parentNode) {
+      bChain.add(n);
+    }
+    let clickTarget: Node = document.body;
+    for (let n: Node | null = target; n !== null; n = n.parentNode) {
+      if (bChain.has(n)) {
+        clickTarget = n;
+        break;
+      }
+    }
+    clickTarget.dispatchEvent(
+      new MouseEvent("click", {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        view: window,
+        button: 0,
+      }),
+    );
+  } finally {
+    Element.prototype.setPointerCapture = originalCapture;
+  }
+}
+
 /** rAF間隔でpointerdown→移動→up。同期パンのフレーム計測ループを real frames で駆動する。 */
 async function dragSequence(
   el: HTMLElement,
@@ -1415,12 +1487,24 @@ export function installDevBridge(stores: DevBridgeStores): void {
         wheelAt(el, 0.25, 0.35, 3, -100);
       }
     },
-    /** ビューア左右端の送りボタン (V-4)。本物のbutton click。 */
+    /** ビューア左右端の送りボタン (V-4)。実クリック配列 (pointerdown→
+     *  pointerup→click) で駆動 — FIX-VIEWERNAV-1: stageのpointer captureが
+     *  ボタンのclickを壊す回帰をE2Eでも検出できるようにする。 */
     viewerNavPrevBtn: () => {
-      document.querySelector<HTMLButtonElement>('[data-testid="viewer-nav-prev"]')?.click();
+      const btn = document.querySelector<HTMLButtonElement>(
+        '[data-testid="viewer-nav-prev"]',
+      );
+      if (btn !== null) {
+        realClick(btn);
+      }
     },
     viewerNavNextBtn: () => {
-      document.querySelector<HTMLButtonElement>('[data-testid="viewer-nav-next"]')?.click();
+      const btn = document.querySelector<HTMLButtonElement>(
+        '[data-testid="viewer-nav-next"]',
+      );
+      if (btn !== null) {
+        realClick(btn);
+      }
     },
   };
 

@@ -136,6 +136,12 @@
     if (event.button !== 0) {
       return;
     }
+    // stage内のインタラクティブ要素 (送りボタン等) はパン対象外。captureすると
+    // pointerup/clickがstageへリターゲットされ、ボタン自身のclickが発火
+    // しなくなる (FIX-VIEWERNAV-1)
+    if ((event.target as Element).closest("button, a, input, select, textarea") !== null) {
+      return;
+    }
     drag = { pointerId: event.pointerId, lastX: event.clientX, lastY: event.clientY };
     (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
   }
