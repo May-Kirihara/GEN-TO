@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, onMount } from "svelte";
+  import { onDestroy, onMount, tick } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -43,12 +43,14 @@
     type SessionOriginDetail,
   } from "./lib/session/selection-session";
   import {
+    DEFAULT_LAYOUT_PREFS,
     LayoutPrefsStore,
     clampPaneWidth,
     type LeftPaneTab,
   } from "./lib/ui/layout-prefs";
   import { FolderPrefsStore, LIBRARY_SORT_KEY } from "./lib/ui/folder-prefs";
   import { copyText } from "./lib/ui/clipboard";
+  import { collapsedSearchSummary } from "./lib/ui/search-summary";
   import { KeyDispatcher } from "./lib/keys";
   import {
     MetadataStore,
@@ -166,6 +168,8 @@
   let leftTab = $state<LeftPaneTab>("folders");
   /** ホイールスクロール速度係数 (1.0=ネイティブ=ハンドラ実質無効)。 */
   let scrollSpeed = $state(1);
+  /** UIUX-3 V-3: 検索行の折りたたみ (true=展開)。layout-prefsへ永続化。 */
+  let searchExpanded = $state(true);
 
   // ===== 閲覧状態 =====
 
@@ -557,12 +561,20 @@
     node.select();
   }
 
-  /** ツールバーの速度スライダー (入力時に即時反映・changeで永続化)。 */
+  /** スクロール速度 (UIUX-3 V-1: 設定dialog表示タブから編集。即時反映・
+   * changeで永続化・「既定に戻す」=明示2.0書込。UIUX-1のtoolbarスライダー
+   * から移設 — dialogはstore所有権を持たせずcallbackで受ける)。 */
   function onScrollSpeedInput(value: number): void {
     scrollSpeed = value;
   }
 
-  function onScrollSpeedCommit(): void {
+  function onScrollSpeedCommit(value: number): void {
+    void value;
+    saveLayout();
+  }
+
+  function onScrollSpeedReset(): void {
+    scrollSpeed = DEFAULT_LAYOUT_PREFS.scrollSpeed;
     saveLayout();
   }
 
@@ -1082,6 +1094,18 @@
   /** 検索結果表示中 (カタログはsearchソース)。 */
   let searchActive = $state(false);
   let searchNotice = $state("");
+  /**
+    * UIUX-3 V-3: 最終実行の検索状態スナップショット (折りたたみ要約の原料)。
+    * 確定済み状態のみ — searchInput (入力途中) は使わない。scopeは実行時の
+    * 実態 (解決済みroot path / コレクション名) を記録する。
+    */
+  let lastSearchMeta = $state<{
+    kind: "query" | "similar";
+    query: string;
+    scopeLabel: string | null;
+    weightPercent: number;
+    filtersActive: boolean;
+  } | null>(null);
   /** evidence写像の変化通知 (InfoPanel・ツールチップ再評価用)。 */
   let searchEvidenceTick = $state(0);
   // ===== 意味検索 (WP-12) =====
@@ -1156,6 +1180,19 @@
     return {};
   }
 
+  /** 検索scopeの実態名 (UIUX-3 V-3: 折りたたみbadge用。「現在のフォルダ」は
+   * 実際の範囲 (登録ルート全体) と不一致のため使わない)。 */
+  function searchScopeLabelOf(scope: { rootId?: string; collectionId?: string }): string {
+    if (scope.rootId !== undefined) {
+      const root = libraryRoots.find((candidate) => candidate.id === scope.rootId);
+      return `登録ルート: ${root?.path ?? scope.rootId}`;
+    }
+    if (scope.collectionId !== undefined) {
+      return `コレクション: ${activeCollection?.name ?? scope.collectionId}`;
+    }
+    return "ライブラリ全体";
+  }
+
   /** 検索実行 → 結果をカタログのsearchソースへ表示。 */
   async function runSearch(): Promise<void> {
     const scope = resolveSearchScope();
@@ -1171,6 +1208,13 @@
       return;
     }
     searchActive = true;
+    lastSearchMeta = {
+      kind: "query",
+      query: searchInput,
+      scopeLabel: searchScopeLabelOf(scope),
+      weightPercent: Math.round(weight * 100),
+      filtersActive: filtersActive(searchFilters),
+    };
     // 検索結果は安定AssetIdのLibrary系表示 (api-contract §42。backendも
     // CatalogMode::Library)。コレクション表示 (showCollection) と同じ扱いに
     // して、一時走査ビューから検索しても編集・詳細取得を無効化しない。
@@ -1182,7 +1226,8 @@
     await catalog.loadPage(0);
   }
 
-  /** 類似画像検索 (WP-12): 対象assetの意味近傍を検索表示する。 */
+  /** 類似画像検索 (WP-12): 対象assetの意味近傍を検索表示する。
+   * backendはlibrary全体から近傍を取る (scope引数なし)。 */
   async function runSimilarSearch(assetId: string): Promise<void> {
     searchNotice = "";
     const ok = await searchStore.runSimilar(assetId);
@@ -1191,6 +1236,13 @@
       return;
     }
     searchActive = true;
+    lastSearchMeta = {
+      kind: "similar",
+      query: "",
+      scopeLabel: "ライブラリ全体",
+      weightPercent: 100,
+      filtersActive: false,
+    };
     catalogSource = "library";
     activeCollection = null;
     collectionNotes = {};
@@ -1245,6 +1297,42 @@
     }
     const ok = await searchStore.save(name.trim(), queryJson);
     searchNotice = ok ? "保存しました (左ペインの「保存済み検索」に表示されます)" : searchStore.lastError ?? "保存できませんでした";
+  }
+
+  // ===== 検索行の折りたたみ (UIUX-3 V-3) =====
+
+  /** 折りたたみ行の要約 (確定済み検索状態から構築 — search-summary参照)。 */
+  const collapsedSearchLine = $derived.by(() => {
+    void searchEvidenceTick; // SearchStore変化 (running/lastResult) で再評価
+    const committed = searchStore.lastResult !== null;
+    return collapsedSearchSummary({
+      kind: !committed ? "none" : searchStore.lastKind,
+      query: searchStore.lastQuery,
+      scopeLabel: lastSearchMeta?.scopeLabel ?? null,
+      semanticWeightPercent: lastSearchMeta?.weightPercent ?? 0,
+      filtersActive: lastSearchMeta?.filtersActive ?? false,
+      running: searchStore.running,
+      active: searchActive,
+    });
+  });
+
+  /** 折りたたみトグル。展開時はDOM挿入後に検索inputへfocus (tick後)。 */
+  function toggleSearchExpanded(): void {
+    searchExpanded = !searchExpanded;
+    saveLayout();
+    if (searchExpanded) {
+      void tick().then(() => {
+        document.querySelector<HTMLInputElement>('[data-testid="search-input"]')?.focus();
+      });
+    }
+  }
+
+  /** 折りたたみ行のクリア (✕): 入力を空にし、検索結果表示中なら解除。 */
+  function clearSearchFromCollapsed(): void {
+    searchInput = "";
+    if (searchActive) {
+      void exitSearch();
+    }
   }
 
   /** 検索表示中の一致根拠 (フォーカス + 先頭ページ分。未取得のみ取得)。 */
@@ -2424,6 +2512,7 @@
       thumbSize: cellClass,
       scrollSpeed,
       leftTab,
+      searchExpanded,
     });
   }
 
@@ -2500,6 +2589,7 @@
     cellClass = layout.thumbSize;
     leftTab = layout.leftTab;
     scrollSpeed = layout.scrollSpeed;
+    searchExpanded = layout.searchExpanded;
     grid.setSizeClass(cellClass);
 
     registerKeys();
@@ -3250,21 +3340,8 @@
             oninput={(event) => onSizeSlider(Number(event.currentTarget.value))}
           />
         </label>
-        <!-- UIUX-1 (R-C): スクロール速度。1.0=ネイティブ (ハンドラ未登録)。 -->
-        <label class="size-label" title="ホイール1目盛りのスクロール量 (1.0=標準・デバイス毎に保存)">
-          速度
-          <input
-            type="range"
-            min="0.5"
-            max="5"
-            step="0.1"
-            value={scrollSpeed}
-            data-testid="scroll-speed-slider"
-            oninput={(event) => onScrollSpeedInput(Number(event.currentTarget.value))}
-            onchange={() => onScrollSpeedCommit()}
-          />
-        </label>
-        <span class="speed-value" data-testid="scroll-speed-value">{scrollSpeed.toFixed(1)}×</span>
+        <!-- UIUX-3 V-1: スクロール速度スライダーはツールバーから撤去し
+             設定dialog表示タブへ移設 (xsp=はdialog表示タブ展開時のみ読める) -->
         <span class="viewer-choice">
           <button class:active={viewerChoice === "single"} onclick={() => (viewerChoice = "single")}>
             単一
@@ -3296,6 +3373,53 @@
         </span>
       </div>
       <div class="search-bar" role="search" data-testid="search-bar">
+        {#if !searchExpanded}
+          <!-- UIUX-3 V-3: 折りたたみ1行。確定済み検索表現 + scope実態 + フィルタ/
+               意味重み + 実行中/表示中のクリア操作 -->
+          <button
+            class="search-toggle"
+            data-testid="search-toggle"
+            aria-expanded="false"
+            aria-label="検索を展開"
+            title="検索行を展開"
+            onclick={toggleSearchExpanded}
+          >🔍 ▸</button>
+          <span class="search-summary" data-testid="search-summary">
+            {#if collapsedSearchLine.queryText !== ""}
+              <span class="search-summary-query" data-testid="search-summary-query">{collapsedSearchLine.queryText}</span>
+            {:else}
+              <span class="search-summary-empty">検索</span>
+            {/if}
+          </span>
+          {#if collapsedSearchLine.scopeLabel !== null}
+            <span class="search-scope-badge" data-testid="search-scope-badge" data-scope-kind={searchScopeMode}>
+              {collapsedSearchLine.scopeLabel}
+            </span>
+          {/if}
+          {#each collapsedSearchLine.badges as badge (badge)}
+            <span class="search-scope-badge">{badge}</span>
+          {/each}
+          {#if searchStore.running}
+            <span class="search-summary-running">検索中…</span>
+          {/if}
+          {#if collapsedSearchLine.showClear}
+            <button
+              class="search-summary-clear"
+              data-testid="search-clear"
+              aria-label="検索を解除"
+              title="検索語を消し、検索結果表示を解除"
+              onclick={clearSearchFromCollapsed}
+            >✕</button>
+          {/if}
+        {:else}
+        <button
+          class="search-toggle"
+          data-testid="search-toggle"
+          aria-expanded="true"
+          aria-label="検索を折りたたむ"
+          title="検索行を折りたたむ"
+          onclick={toggleSearchExpanded}
+        >🔍 ▾</button>
         <input
           type="search"
           class="search-input"
@@ -3471,6 +3595,7 @@
             <button onclick={() => (searchFilters = { ...EMPTY_FILTERS })}>クリア</button>
           </div>
         {/if}
+        {/if}
       </div>
       {#if searchNotice}
         <p class="toolbar-notice error" role="alert" data-testid="search-notice">{searchNotice}</p>
@@ -3511,7 +3636,6 @@
             {cellClass}
             overscanRows={overscanChoice}
             scrollSpeed={scrollSpeed}
-            showStats={devBridgeActive}
             onOpen={(index) => void openViewerForChoice(index)}
             onSelectionChange={onGridSelectionChange}
             onContextMenu={openGridContextMenu}
@@ -3628,6 +3752,7 @@
       {fetchedAt}
       onRefreshHealth={() => void refreshHealth()}
       onCacheCleared={(cacheGeneration) => grid.noteCacheCleared(cacheGeneration)}
+      getGridStats={() => gridComponent?.getStatsSnapshot() ?? null}
     />
   {/if}
 </div>
@@ -3736,6 +3861,9 @@
     displayInfo={settingsDisplayInfo}
     initialTab={settingsInitialTab}
     onClose={() => (settingsOpen = false)}
+    onScrollSpeedInput={onScrollSpeedInput}
+    onScrollSpeedChange={onScrollSpeedCommit}
+    onScrollSpeedReset={onScrollSpeedReset}
   />
 {/if}
 
@@ -3930,6 +4058,72 @@
     gap: 0.4rem;
     padding: 0.25rem 0.6rem;
     border-bottom: 1px solid light-dark(#d0d7de, #30363d);
+  }
+
+  /* UIUX-3 V-3: 折りたたみトグル + 1行要約 */
+  .search-toggle {
+    flex: none;
+    border: 1px solid light-dark(#d0d7de, #30363d);
+    background: light-dark(#f6f8fa, #21262d);
+    color: inherit;
+    font: inherit;
+    font-size: 0.78rem;
+    padding: 0.15rem 0.5rem;
+    border-radius: 0.375rem;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .search-summary {
+    flex: 1 1 10rem;
+    min-width: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.8rem;
+    overflow: hidden;
+  }
+
+  .search-summary-query {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .search-summary-empty {
+    color: light-dark(#57606a, #8b949e);
+    font-size: 0.78rem;
+  }
+
+  .search-scope-badge {
+    flex: none;
+    display: inline-block;
+    padding: 0 0.45rem;
+    border: 1px solid light-dark(#d0d7de, #30363d);
+    border-radius: 999px;
+    font-size: 0.72rem;
+    color: light-dark(#57606a, #8b949e);
+    white-space: nowrap;
+    max-width: 22rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .search-summary-running {
+    flex: none;
+    font-size: 0.75rem;
+    color: light-dark(#0969da, #58a6ff);
+  }
+
+  .search-summary-clear {
+    flex: none;
+    border: 1px solid light-dark(#d0d7de, #30363d);
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    padding: 0.05rem 0.45rem;
+    border-radius: 0.375rem;
+    cursor: pointer;
   }
 
   .search-input {
@@ -4174,14 +4368,6 @@
   .crumb-path-button {
     font-size: 0.85rem;
     padding: 0.1rem 0.35rem;
-  }
-
-  /* UIUX-1 (R-C): スクロール速度の現在値表示 */
-  .speed-value {
-    font-size: 0.72rem;
-    font-variant-numeric: tabular-nums;
-    color: light-dark(#57606a, #8b949e);
-    min-width: 2.2rem;
   }
 
   /* UIUX-1: ツール>ルートのバックアップ… の選択ダイアログ

@@ -170,6 +170,11 @@ export class ViewerStore {
     await this.showInternal(index);
   }
 
+  /** 表示対象の総数 (UIUX-3: 送りボタンの端disabled判定用)。navと同じclamp。 */
+  total(): number {
+    return this.items.total();
+  }
+
   /** 前/次へ移動。表示indexは即時に切替え、ロードは世代IDで管理する。 */
   nav(delta: number): void {
     if (delta === 0) {

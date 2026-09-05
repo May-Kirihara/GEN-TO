@@ -4,7 +4,10 @@
     *
     * - 表示: 現行レイヤー + 保持 (retained) レイヤーの積層。新画像のonloadまで
     *   旧画像を表示し続ける (空白を出さない)
-    * - 操作: ホイール=ズーム (ポインタ中心)、ドラッグ=パン、ダブルクリック=fit⇔actual、
+    * - 操作: ホイール=画像送り (UIUX-3 V-4: 平常wheelで前/次。
+    *   1ジェスチャ=1送りのaccumulator)。Alt/Ctrl/Meta+ホイール=ズーム
+    *   (ポインタ中心・pinch=ctrl+wheelを保存)、左右端の‹ ›ボタン=送り
+    *   (端でdisabled)、ドラッグ=パン、ダブルクリック=fit⇔actual、
     *   ←/→=前/次画像、+/-/0/1/r、Esc=閉じる
     * - WP-5 高速選別モード (トグル): 数字1-5=星評価、0=評価解除、X=除外、
     *   P/A=採用。入力後自動的に次の画像へ送る。OFF中は既存のズームキー
@@ -15,6 +18,7 @@
     */
   import { onDestroy, onMount } from "svelte";
   import { toCss, type ViewTransform } from "./transform";
+  import { advanceWheelNav, initialWheelNavState, type WheelNavState } from "./wheel-nav";
   import {
     backgroundCss,
     backgroundLabel,
@@ -90,7 +94,11 @@
     };
   });
 
-  // ホイールはpassive:falseで防止済みリスナーを手動登録する
+  // ホイール (UIUX-3 V-4): 修飾キー (Alt/Ctrl/Meta) 付き=ズーム (pinch=ctrl保存)、
+  // 平常=画像送り (accumulator: 1ジェスチャ=1送り)。ビューアがジェスチャを
+  // 握る間は常にpreventDefault (passive:falseで手動登録)。
+  // CompareView (2/4枚比較) のwheelは別listenerで本変更の対象外。
+  let wheelNav: WheelNavState = initialWheelNavState();
   $effect(() => {
     const element = stageEl;
     if (element === null) {
@@ -98,11 +106,21 @@
     }
     const onWheel = (event: WheelEvent) => {
       event.preventDefault();
-      const rect = element.getBoundingClientRect();
-      store.zoomAt(
-        { x: event.clientX - rect.left, y: event.clientY - rect.top },
-        Math.exp(-event.deltaY * 0.0015),
-      );
+      if (event.altKey || event.ctrlKey || event.metaKey) {
+        // modifierジェスチャはplain累積を引き継がない
+        wheelNav = initialWheelNavState();
+        const rect = element.getBoundingClientRect();
+        store.zoomAt(
+          { x: event.clientX - rect.left, y: event.clientY - rect.top },
+          Math.exp(-event.deltaY * 0.0015),
+        );
+        return;
+      }
+      const out = advanceWheelNav(wheelNav, event.deltaY, performance.now());
+      wheelNav = out.state;
+      if (out.step !== 0) {
+        store.nav(out.step);
+      }
     };
     element.addEventListener("wheel", onWheel, { passive: false });
     return () => {
@@ -300,6 +318,17 @@
     return `読み込み中… (${store.displayIndex + 1})`;
   }
 
+  /** UIUX-3 V-4: 送りボタンの端disabled (navと同じ非wrap clamp)。 */
+  function navTotal(): number {
+    void viewerTick;
+    return store.total();
+  }
+
+  function navIndex(): number {
+    void viewerTick;
+    return store.displayIndex;
+  }
+
   function statusLine(): string {
     void viewerTick;
     return (
@@ -414,6 +443,22 @@
     {#if triageFeedback !== null}
       <div class="triage-feedback" class:triage-ng={!triageFeedback.ok}>{triageFeedback.label}</div>
     {/if}
+    <!-- UIUX-3 V-4: 左右端の送りボタン (半透明・大的確。フルスクリーンでも表示)。
+         total≤1では両方disabledで描画 (枚数による出現/消滅のちらつきを避ける) -->
+    <button
+      class="viewer-nav viewer-nav-prev"
+      data-testid="viewer-nav-prev"
+      aria-label="前の画像"
+      disabled={navIndex() <= 0}
+      onclick={() => store.nav(-1)}
+    >‹</button>
+    <button
+      class="viewer-nav viewer-nav-next"
+      data-testid="viewer-nav-next"
+      aria-label="次の画像"
+      disabled={navIndex() >= navTotal() - 1}
+      onclick={() => store.nav(1)}
+    >›</button>
   </div>
 
   <div class="viewer-stats">
@@ -506,6 +551,56 @@
     color: #ffffff;
     font-size: 0.85rem;
     pointer-events: none;
+  }
+
+  /* UIUX-3 V-4: 左右端の送りボタン。半透明の大的確ヒットエリアでホバー時強調 */
+  .viewer-nav {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 18%;
+    min-width: 64px;
+    z-index: 1;
+    border: none;
+    background: transparent;
+    color: light-dark(#ffffff, #f0f6fc);
+    font-size: 3rem;
+    line-height: 1;
+    opacity: 0.35;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-shadow: 0 1px 6px rgba(0, 0, 0, 0.8);
+    transition: opacity 120ms ease;
+    user-select: none;
+    padding: 0;
+  }
+
+  .viewer-nav:not(:disabled):hover,
+  .viewer-nav:not(:disabled):focus-visible {
+    opacity: 0.9;
+  }
+
+  .viewer-nav:not(:disabled):hover {
+    background: linear-gradient(to right, rgba(0, 0, 0, 0.28), transparent);
+  }
+
+  .viewer-nav-next:not(:disabled):hover {
+    background: linear-gradient(to left, rgba(0, 0, 0, 0.28), transparent);
+  }
+
+  .viewer-nav:disabled {
+    opacity: 0.08;
+    cursor: default;
+  }
+
+  .viewer-nav-prev {
+    left: 0;
+  }
+
+  .viewer-nav-next {
+    right: 0;
   }
 
   .triage-feedback.triage-ng {

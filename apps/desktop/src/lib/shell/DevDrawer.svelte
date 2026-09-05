@@ -11,6 +11,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import type { CatalogStore, CatalogPage, CatalogSummary } from "../catalog";
+  import type { GridStatsSnapshot } from "../grid/grid-stats";
   import {
     ThumbnailStore,
     formatBytes,
@@ -31,6 +32,7 @@
     fetchedAt,
     onRefreshHealth,
     onCacheCleared,
+    getGridStats = null,
   }: {
     catalog: CatalogStore;
     thumbnails: ThumbnailStore;
@@ -39,6 +41,9 @@
     fetchedAt: string;
     onRefreshHealth: () => void;
     onCacheCleared: (cacheGeneration: number) => void;
+    /** UIUX-3 V-2: グリッド統計のpull源 (ThumbnailGrid.getStatsSnapshot)。
+     * 開いている間だけpoll (表示中でなければ取得しない)。 */
+    getGridStats?: (() => GridStatsSnapshot | null) | null;
   } = $props();
 
   let open = $state(true);
@@ -52,6 +57,25 @@
   let smokeLines: string[] = $state([]);
   let smokeRunning = $state(false);
   let smokeResult = $state("");
+  /** グリッド統計 (UIUX-3 V-2)。パネル開中表示中のみ最新値を保持。 */
+  let gridStats: GridStatsSnapshot | null = $state(null);
+
+  // UIUX-3 V-2: 統計はAppの$stateへliftせずpull型 — パネルを開いている間だけ
+  // 400ms poll (閉じている間の取得・再描画ゼロ。計画書「改訂」§2)。
+  $effect(() => {
+    if (!open) {
+      gridStats = null;
+      return;
+    }
+    const poll = () => {
+      gridStats = getGridStats?.() ?? null;
+    };
+    poll();
+    const timer = window.setInterval(poll, 400);
+    return () => {
+      window.clearInterval(timer);
+    };
+  });
 
   // svelte-ignore state_referenced_locally
   const stopThumbNotification = thumbnails.onChange(() => {
@@ -321,6 +345,37 @@
         {#if scanNotice}
           <p class="dev-error">{scanNotice}</p>
         {/if}
+      </section>
+
+      <section>
+        <h4>グリッド統計 (UIUX-3)</h4>
+        {#if gridStats === null}
+          <p class="dev-line">統計源なし (グリッド未マウント)</p>
+        {:else}
+          <div class="dev-stats" data-testid="dev-grid-stats">
+            <div>
+              DOMセル数 <strong data-testid="dev-grid-stats-dom">{gridStats.domCells.toLocaleString()}</strong>
+              / 可視row {gridStats.visStart === null ? "—" : `${gridStats.visStart}..${gridStats.visEnd}`}
+              / overscan {gridStats.overscanRows} / 列 {gridStats.columns}
+              <span data-testid="dev-grid-stats-total">{gridStats.total.toLocaleString()}</span>
+            </div>
+            <div>
+              scrollTop {gridStats.scrollTop.toLocaleString()} /
+              選択 {gridStats.selectionCount.toLocaleString()}
+            </div>
+            <div>
+              需要 要求 {gridStats.demand.requested.toLocaleString()}
+              / 拒否 {gridStats.demand.rejectedFull.toLocaleString()}
+              / キャンセル {gridStats.demand.cancelled.toLocaleString()}
+              / ready受信 {gridStats.demand.readyReceived.toLocaleString()}
+              / 失敗 {gridStats.demand.failedReceived.toLocaleString()}
+            </div>
+          </div>
+        {/if}
+        <p class="dev-line">
+          主UIのオーバーレイ表示はUIUX-3で廃止 — このパネルを開いている間だけ
+          400ms間隔で取得する。
+        </p>
       </section>
 
       <section>

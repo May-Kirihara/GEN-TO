@@ -13,6 +13,9 @@
     * - 診断: 5領域スナップショット (更新ボタン) と診断bundle生成
     *   (秘密・実パス除外はbackendが担保)。
     * - 表示タブは既存の表示系pref (folder-prefs) の現状値の表示のみ。
+    *   ただしスクロール速度 (layout-prefs) はUIUX-3でこのタブから編集可能
+    *   (即時反映+永続化。ツールバーから移設 — cacheタブの上限変更と同じ
+    *   「local保存の実用値はここで変えられる」例外)。
     * - このアプリについて (WP-18 E2): バージョン・ビルド情報 (about_info)、
     *   ライセンス情報、更新履歴 (bundle resourcesのCHANGELOG.md)。
     */
@@ -43,6 +46,9 @@
     displayInfo,
     initialTab = "general",
     onClose,
+    onScrollSpeedInput,
+    onScrollSpeedChange,
+    onScrollSpeedReset,
   }: {
     roots: LibraryRoot[];
     profiles: AiProfile[];
@@ -55,6 +61,12 @@
     /** UIUX-1: 初期タブ (ヘルプ>「このアプリについて」からのAbout直開等)。 */
     initialTab?: Tab;
     onClose: () => void;
+    /** UIUX-3: 速度スライダー入力の即時反映 (ドラッグ中。Appが状態を保持)。 */
+    onScrollSpeedInput?: (value: number) => void;
+    /** UIUX-3: 速度スライダー確定 (change) の永続化。 */
+    onScrollSpeedChange?: (value: number) => void;
+    /** UIUX-3: 「既定に戻す」(明示的に既定2.0を書き込む)。 */
+    onScrollSpeedReset?: () => void;
   } = $props();
 
   type Tab = "general" | "display" | "cache" | "ai" | "search" | "backup" | "diagnostics" | "about";
@@ -337,8 +349,39 @@
     {:else if tab === "display"}
       <section data-testid="settings-display">
         <p class="picker-sub">
-          表示設定は現在の値の確認のみ行います (変更は各画面から)。
+          スクロール速度はここで変更できます (即時反映・永続化)。他の表示設定は
+          現在の値の確認のみです (変更は各画面から)。
         </p>
+        <!-- UIUX-3: スクロール速度の編集は表示タブ規約「確認のみ」の例外。
+             根拠: 既存キャッシュタブが上限変更 (即時適用) を受け入れている
+             前例にならい、local保存の表示系prefを直接編集する導線を1箇所に集約
+             (ツールバーからの移設)。dialogはstore所有権を持たずcallbackで
+             Appへ編集を委譲する。 -->
+        <div class="field">
+          <label for="scroll-speed-slider">
+            スクロール速度 (ホイール1目盛りのスクロール量): {displayInfo.scrollSpeed.toFixed(1)}倍
+          </label>
+          <input
+            id="scroll-speed-slider"
+            type="range"
+            min="0.5"
+            max="5"
+            step="0.1"
+            value={displayInfo.scrollSpeed}
+            data-testid="scroll-speed-slider"
+            aria-label="スクロール速度"
+            oninput={(event) => onScrollSpeedInput?.(Number(event.currentTarget.value))}
+            onchange={(event) => onScrollSpeedChange?.(Number(event.currentTarget.value))}
+          />
+          <span class="picker-sub" data-testid="scroll-speed-value">
+            {displayInfo.scrollSpeed.toFixed(1)}倍 (1.0=標準)
+          </span>
+          <div class="picker-actions">
+            <button onclick={() => onScrollSpeedReset?.()} data-testid="scroll-speed-reset">
+              既定に戻す (2.0)
+            </button>
+          </div>
+        </div>
         <dl class="kv">
           <dt>前回のフォルダ</dt>
           <dd class="mono">{displayInfo.lastFolder ?? "(未設定)"}</dd>
@@ -346,8 +389,6 @@
           <dd>{displayInfo.expandedCount.toLocaleString()}</dd>
           <dt>現在のソート</dt>
           <dd>{displayInfo.sortLabel ?? "(既定)"}</dd>
-          <dt>スクロール速度 (UIUX-1)</dt>
-          <dd>{displayInfo.scrollSpeed.toFixed(1)}倍 (ツールバー「速度」で変更)</dd>
         </dl>
       </section>
     {:else if tab === "cache"}

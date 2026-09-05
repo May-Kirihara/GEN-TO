@@ -11,11 +11,11 @@ import {
 } from "./wheel-speed";
 
 describe("coerceScrollSpeed", () => {
-  it("既定は1.0 (ネイティブ挙動)", () => {
-    expect(coerceScrollSpeed(undefined)).toBe(1);
-    expect(coerceScrollSpeed(null)).toBe(1);
-    expect(coerceScrollSpeed(Number.NaN)).toBe(1);
-    expect(coerceScrollSpeed("x")).toBe(1);
+  it("既定は2.0 (UIUX-3で1.0→2.0へ。不正値は既定へフォールバック)", () => {
+    expect(coerceScrollSpeed(undefined)).toBe(2);
+    expect(coerceScrollSpeed(null)).toBe(2);
+    expect(coerceScrollSpeed(Number.NaN)).toBe(2);
+    expect(coerceScrollSpeed("x")).toBe(2);
   });
 
   it("範囲クランプと0.1刻み丸め", () => {

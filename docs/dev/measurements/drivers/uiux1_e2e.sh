@@ -29,8 +29,18 @@
 #  11) ツール実操作: AIパネル (xai) / 開発パネル (xdd) /
 #      全DBバックアップ (xln=1) / 復元dialog (xdlg)
 #  12) 実Quit: ファイル>終了 → window closeでプロセス終了 (SIGTERMと区別)
+#  13) UIUX-3 V-1: スクロール速度 既定2.0・設定dialog表示タブでの編集/
+#      永続化・「既定に戻す」・dialog閉時xsp=-1 (toolbar撤去)
+#  14) UIUX-3 V-3: 検索行折りたたみ (要約=確定済み検索語+scope実態badge+
+#      実行中表示中の✕クリア)・展開focus・再起動後も状態永続化
+#  15) UIUX-3 V-4: ビューア送りボタン (端disabled)・平常wheel=送り
+#      (accumulator: 3ノッチ=1送り)・Alt+wheelズーム・pinch (ctrl)ズーム
+#  16) UIUX-3 V-2: 開発パネルのグリッド統計セクション (開中のみpoll)・
+#      主UIオーバーレイ (.grid-stats) 撤去
 #
 # 運用ノート: uxlib1と同じ方針 (専用Xディスプレイ :6 = Xephyr。無ければ起動)。
+# vw = 素F12のビューアwheel/navモード / u3 = 素F1のUIUX-3 UIモード
+# (shift+字母キーはXephyr/WebKitへ到達しないため小文字専用モードを分離)。
 set -uo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -147,10 +157,24 @@ graceful_stop() {
 trap '[[ -n "$APP_PID" ]] && kill -9 "$APP_PID" 2>/dev/null; true' EXIT
 
 # コマンドモードhelpers: ux=shift+F1 (UIUX-1) / coll=ctrl+shift+F1 (WP-6) /
-# fo=ctrl+shift+F12 (WP-7)。いずれもモーメンタリ (1回のアクションで自動退出)
+# fo=ctrl+shift+F12 (WP-7) / vw=素F12 (UIUX-3: ビューアwheel/nav) /
+# u3=素F1 (UIUX-3: 設定速度/検索折りたたみ。shift+字母はXephyr/WebKitへ
+# 到達しないため小文字専用の別モード)。
+# いずれもモーメンタリ (1回のアクションで自動退出)
 ux() { xdotool key shift+F1; sleep 0.4; xdotool key "$1"; sleep "${2:-1.2}"; }
 coll() { xdotool key ctrl+shift+F1; sleep 0.4; xdotool key "$1"; sleep "${2:-1.2}"; }
 fo() { xdotool key ctrl+shift+F12; sleep 0.4; xdotool key "$1"; sleep "${2:-1.2}"; }
+vw() { xdotool key F12; sleep 0.4; xdotool key "$1"; sleep "${2:-1.0}"; }
+u3() { xdotool key F1; sleep 0.4; xdotool key "$1"; sleep "${2:-1.2}"; }
+
+# 検索S行のキー抽出 (セッション行も「S act=」を持つためq=入りの検索行形で
+# 文脈grep — wp9_e2e.shのstotと同じ規約)
+svalue() {
+  local seg
+  seg=$(sed 's/\x1b\[[0-9;]*m//g' "$WORK/logs/app.log" 2>/dev/null | grep -a "devtest:" | tail -1 \
+    | grep -oE 'S act=[0-9] q="[^"]*"[^|]*')
+  echo "$seg" | grep -oE "$1=[-0-9A-Za-z_.]*" | head -1 | cut -d= -f2
+}
 
 # ========== 起動 (未登録 dataset = adhoc) ==========
 launch
@@ -613,6 +637,176 @@ else
   fail "11) RestoreDialogが開かない (xdlg=$(devtest_value xdlg || echo -))"
 fi
 shot 13-tools-misc
+
+# ========== 13) スクロール速度: 既定2.0・設定dialog表示タブで編集 (UIUX-3 V-1) ==========
+# toolbarスライダーは撤去済み — xsp=は「u3 s (ツール>設定…→表示タブ直開)」後に
+# 読む契約 (dialog閉時-1が正常値)。
+u3 s 1.8
+if [[ "$(devtest_value xdlg || true)" == "1" ]] && wait_value xsp 2 10; then
+  pass "13) 設定表示タブで初期速度2.0 (xsp=2 — 既定2.0化・dialog移設)"
+else
+  fail "13) 初期速度/移設不正 (xdlg=$(devtest_value xdlg || echo -) xsp=$(devtest_value xsp || echo -))"
+fi
+shot 17-settings-display-speed
+ux v 0.6    # dialog内のスライダーへfocus
+xdotool key Right; sleep 0.25; xdotool key Right; sleep 0.25; xdotool key Right; sleep 0.9
+if wait_value xsp 2.3 10; then
+  pass "13) スライダー矢印編集 2.0→2.3 (input即時反映)"
+else
+  fail "13) スライダー編集不全 (xsp=$(devtest_value xsp || echo -) 期待=2.3)"
+fi
+xdotool key Escape; sleep 0.8
+if wait_value xdlg 0 10 && wait_value xsp -1 10; then
+  pass "13) dialog閉でスライダー不在 (xsp=-1 — toolbar撤去後の読み取り契約)"
+else
+  fail "13) dialog閉後もスライダーが見える (xdlg=$(devtest_value xdlg || echo -) xsp=$(devtest_value xsp || echo -))"
+fi
+u3 s 1.8
+if wait_value xsp 2.3 10; then
+  pass "13) 2.3が永続化 (change確定でlocalStorage保存・再オープンで復元)"
+else
+  fail "13) 速度永続化不全 (xsp=$(devtest_value xsp || echo -) 期待=2.3)"
+fi
+u3 r 1.2    # 「既定に戻す (2.0)」= 明示2.0書込
+if wait_value xsp 2 10; then
+  pass "13) 既定に戻す→2.0"
+else
+  fail "13) 既定に戻す不全 (xsp=$(devtest_value xsp || echo -))"
+fi
+xdotool key Escape; sleep 0.8
+wait_value xdlg 0 10 || true
+
+# ========== 14) 検索行折りたたみ (UIUX-3 V-3) ==========
+# library表示 (605件) で検索「sub」を実行 → 確定済み検索状態を作ってから折りたたむ
+fo h 0.8    # srFocusInput (展開中のみinputが存在)
+xdotool type --delay 20 "sub"; sleep 0.3
+xdotool key Return; sleep 1.8
+sub_tot=$(svalue tot || echo -1)
+if [[ "$(svalue act || true)" == "1" ]] && (( sub_tot > 0 )); then
+  pass "14) 検索「sub」実行 (S act=1 tot=$sub_tot)"
+else
+  fail "14) 検索実行不全 (act=$(svalue act || echo -) tot=$sub_tot)"
+fi
+u3 e 1.4    # uxSearchToggle → 折りたたみ
+if wait_value xsec 0 10; then
+  pass "14) 検索行折りたたみ (xsec=0)"
+else
+  fail "14) 折りたたみ不全 (xsec=$(devtest_value xsec || echo -))"
+fi
+if [[ "$(devtest_value xsq || true)" == "3" && "$(devtest_value xssp || true)" == "l" ]] \
+  && [[ "$(devtest_value xcl || true)" == "1" ]]; then
+  pass "14) 折りたたみ要約: 確定済み検索語 (xsq=3='sub') + scope実態「ライブラリ全体」(xssp=l) + ✕クリア表示 (xcl=1)"
+else
+  fail "14) 折りたたみ要約不正 (xsq=$(devtest_value xsq || echo -) xssp=$(devtest_value xssp || echo -) xcl=$(devtest_value xcl || echo -))"
+fi
+shot 18-search-collapsed
+u3 c 1.5    # ✕ 検索を解除 (入力クリア + 検索結果表示解除)
+# 注: S行のact=はlastResult保持で1のまま — 解除はカタログがlibraryへ戻る
+# ことで観測する (tot=605=登録ルート全件) + ✕ボタン消滅 (xcl=0)
+if wait_value xcl 0 10 && wait_value tot $((BIG + 1)) 15; then
+  pass "14) 折りたたみから✕クリア (検索結果表示を解除→library $((BIG + 1))件・✕消滅)"
+else
+  fail "14) ✕クリア不全 (tot=$(devtest_value tot || echo -) xcl=$(devtest_value xcl || echo -))"
+fi
+u3 e 1.4    # 再展開
+if wait_value xsec 1 10 && [[ "$(devtest_value xrole || true)" == "input" ]]; then
+  pass "14) 展開で検索inputへfocus (xsec=1 xrole=input)"
+else
+  fail "14) 展開focus不全 (xsec=$(devtest_value xsec || echo -) xrole=$(devtest_value xrole || echo -))"
+fi
+shot 19-search-expanded
+
+# ========== 15) ビューア: 送りボタン・wheel送り・Alt/pinchズーム (UIUX-3 V-4) ==========
+fo 1 1.5    # library表示へ戻す (検索解除済み)
+wait_value mode library 15 || fail "15) library表示へ戻れない (mode=$(devtest_value mode || echo -))"
+xdotool key ctrl+shift+F4; sleep 0.8   # focusCell0 → 単一選択
+xdotool key F3; sleep 1.6              # openViewer (単一ビューア)
+if [[ "$(devtest_value xvn || true)" == "2" && "$(devtest_value xvd || true)" == "1" ]]; then
+  pass "15) 送りボタン表示・idx=0で前=disabled/次=有効 (xvn=2 xvd=1)"
+else
+  fail "15) 送りボタン初期状態不正 (xvn=$(devtest_value xvn || echo -) xvd=$(devtest_value xvd || echo -))"
+fi
+shot 20-viewer-nav
+vw f 1.2    # 次ボタン
+if wait_value idx 1 10 && wait_value xvd 0 10; then
+  pass "15) 次ボタンでidx 0→1 (中間は両方有効)"
+else
+  fail "15) 次ボタン不全 (idx=$(devtest_value idx || echo -) xvd=$(devtest_value xvd || echo -))"
+fi
+vw b 1.2    # 前ボタン
+if wait_value idx 0 10 && wait_value xvd 1 10; then
+  pass "15) 前ボタンでidx 1→0 (先頭で前=disabled)"
+else
+  fail "15) 前ボタン不全 (idx=$(devtest_value idx || echo -) xvd=$(devtest_value xvd || echo -))"
+fi
+vw n 1.2    # 平常wheel (下) = 次へ。3ノッチdispatchでもaccumulatorで1枚だけ
+if wait_value idx 1 10; then
+  pass "15) 平常wheel=送り (idx 0→1・1ジェスチャ=1送り)"
+else
+  fail "15) wheel送り不全 (idx=$(devtest_value idx || echo -))"
+fi
+vw p 1.2    # 平常wheel (上) = 前へ
+if wait_value idx 0 10; then
+  pass "15) 平常wheel (上) =前の画像 (idx 1→0)"
+else
+  fail "15) wheel前送り不全 (idx=$(devtest_value idx || echo -))"
+fi
+zf0=$(devtest_value zf || echo -1)
+vw i 1.2    # Alt+wheelズームイン
+zf1=$(devtest_value zf || echo -1)
+if [[ "$(devtest_value idx || true)" == "0" ]] && awk "BEGIN{exit !($zf1 > $zf0)}"; then
+  pass "15) Alt+wheel=ズーム (zf $zf0→$zf1・idx不変)"
+else
+  fail "15) Altズーム不全 (idx=$(devtest_value idx || echo -) zf=$zf0→$zf1)"
+fi
+vw c 1.2    # ctrl+wheel (pinch) ズームイン
+zf2=$(devtest_value zf || echo -1)
+if [[ "$(devtest_value idx || true)" == "0" ]] && awk "BEGIN{exit !($zf2 > $zf1)}"; then
+  pass "15) ctrl+wheel (pinch) もズームとして保存 (zf $zf1→$zf2)"
+else
+  fail "15) pinchズーム不全 (idx=$(devtest_value idx || echo -) zf=$zf1→$zf2)"
+fi
+xdotool key Escape; sleep 1.0
+wait_value xvn -1 10 && pass "15) ビューア閉で送りボタン消滅 (xvn=-1)" \
+  || fail "15) ビューア閉後もボタン残存 (xvn=$(devtest_value xvn || echo -))"
+
+# ========== 16) 開発パネル: グリッド統計セクション (UIUX-3 V-2) ==========
+# 開発パネルはセクション11で開状態 (xdd=1)。統計はパネル開中のみpoll表示。
+xgs_v=$(devtest_value xgs || echo -1)
+if (( xgs_v > 0 )); then
+  pass "16) 開発パネルにグリッド統計表示 (xgs=$xgs_v — pull型poll)"
+else
+  fail "16) グリッド統計不出現 (xgs=$xgs_v)"
+fi
+if [[ "$(devtest_value xol || true)" == "0" ]]; then
+  pass "16) 主UIに旧統計オーバーレイ無し (xol=0)"
+else
+  fail "16) オーバーレイ残存 (xol=$(devtest_value xol || echo -))"
+fi
+shot 21-devdrawer-grid-stats
+# パネルを閉じると統計セクションも消える (poll停止)
+ux g 1.4    # ツール>開発パネル (トグル→閉)
+if wait_value xdd 0 10 && wait_value xgs -1 10; then
+  pass "16) パネル閉で統計セクション消滅 (xdd=0 xgs=-1)"
+else
+  fail "16) パネル閉後の統計残存 (xdd=$(devtest_value xdd || echo -) xgs=$(devtest_value xgs || echo -))"
+fi
+ux g 1.4    # 再び開 (後続セクション・Quitのため)
+wait_value xdd 1 10 || true
+
+# ========== 14b) 検索折りたたみ状態の再起動永続化 (UIUX-3 V-3) ==========
+u3 e 1.2    # 折りたたみへ
+wait_value xsec 0 10 || fail "14) 永続化前の折りたたみ化に失敗 (xsec=$(devtest_value xsec || echo -))"
+graceful_stop
+launch
+wait_log "devtest:" 30 || fail "14) 再起動後にdev bridgeが流れない"
+if wait_value xsec 0 15; then
+  pass "14) 折りたたみ状態が再起動後も復元 (xsec=0 — layout-prefs永続化)"
+else
+  fail "14) 折りたたみ永続化不全 (xsec=$(devtest_value xsec || echo -))"
+fi
+u3 e 1.2    # 展開へ戻す
+wait_value xsec 1 15 || fail "14) 再展開不全 (xsec=$(devtest_value xsec || echo -))"
 
 # ========== 12) 実Quit: ファイル>終了 → プロセス終了 (r1 — SIGTERMと区別) ==========
 ux q 2.0    # uxMenuQuit → getCurrentWindow().close()

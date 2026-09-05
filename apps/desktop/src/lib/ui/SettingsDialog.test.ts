@@ -135,6 +135,9 @@ async function mountDialog(
     about?: unknown;
     onClose?: () => void;
     initialTab?: string;
+    onScrollSpeedInput?: (value: number) => void;
+    onScrollSpeedChange?: (value: number) => void;
+    onScrollSpeedReset?: () => void;
   } = {},
 ): Promise<void> {
   const {
@@ -144,6 +147,9 @@ async function mountDialog(
     about = ABOUT_INFO,
     onClose = () => {},
     initialTab,
+    onScrollSpeedInput,
+    onScrollSpeedChange,
+    onScrollSpeedReset,
   } = options;
   target = document.createElement("div");
   document.body.appendChild(target);
@@ -189,6 +195,9 @@ async function mountDialog(
         scrollSpeed: 1,
       },
       onClose,
+      onScrollSpeedInput,
+      onScrollSpeedChange,
+      onScrollSpeedReset,
       // 不正なタブidも意図的に渡すため、コンポーネント側のTab unionへは表明付きで渡す
       initialTab: initialTab as "general",
     },
@@ -362,7 +371,7 @@ describe("SettingsDialog", () => {
     });
   });
 
-  it("表示タブ: 現在の表示prefを読み取り専用で表示", async () => {
+  it("表示タブ: 現在の表示prefを表示 (速度以外は読み取り専用)", async () => {
     await mountDialog();
     const tabs = Array.from(target!.querySelectorAll<HTMLElement>(".tabs button"));
     tabs.find((b) => b.textContent === "表示")!.click();
@@ -371,8 +380,53 @@ describe("SettingsDialog", () => {
     expect(text).toContain("/photos/2026");
     expect(text).toContain("7");
     expect(text).toContain("名前順");
-    // UIUX-1: スクロール速度の現在値も読み取り専用で表示
+    // UIUX-1: スクロール速度の現在値も表示
     expect(text).toContain("1.0倍");
+  });
+
+  it("UIUX-3: 表示タブのスクロール速度スライダー編集 (input即時・change永続化のcallback)", async () => {
+    const calls: Array<[string, number]> = [];
+    await mountDialog({
+      onScrollSpeedInput: (v) => calls.push(["input", v]),
+      onScrollSpeedChange: (v) => calls.push(["change", v]),
+      onScrollSpeedReset: () => calls.push(["reset", 2]),
+    });
+    const tabs = Array.from(target!.querySelectorAll<HTMLElement>(".tabs button"));
+    tabs.find((b) => b.textContent === "表示")!.click();
+    flushSync();
+    const slider = target!.querySelector<HTMLInputElement>(
+      "[data-testid='scroll-speed-slider']",
+    );
+    expect(slider).not.toBeNull();
+    expect(slider!.value).toBe("1");
+    expect(slider!.min).toBe("0.5");
+    expect(slider!.max).toBe("5");
+    // input = 即時反映callback (ドラッグ中)
+    slider!.value = "2.4";
+    slider!.dispatchEvent(new Event("input", { bubbles: true }));
+    flushSync();
+    expect(calls).toContainEqual(["input", 2.4]);
+    // change = 永続化callback (確定)
+    slider!.dispatchEvent(new Event("change", { bubbles: true }));
+    flushSync();
+    expect(calls).toContainEqual(["change", 2.4]);
+    // 「既定に戻す」= 明示2.0書込みのcallback
+    click("[data-testid='scroll-speed-reset']");
+    expect(calls).toContainEqual(["reset", 2]);
+  });
+
+  it("UIUX-3: 速度callback未渡しでも描画・編集操作が落ちない", async () => {
+    await mountDialog();
+    const tabs = Array.from(target!.querySelectorAll<HTMLElement>(".tabs button"));
+    tabs.find((b) => b.textContent === "表示")!.click();
+    flushSync();
+    const slider = target!.querySelector<HTMLInputElement>(
+      "[data-testid='scroll-speed-slider']",
+    )!;
+    slider.value = "3";
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+    flushSync();
+    click("[data-testid='scroll-speed-reset']");
   });
 
   it("このアプリについてタブ: バージョン・ビルド情報・更新履歴・ライセンス情報を表示する", async () => {

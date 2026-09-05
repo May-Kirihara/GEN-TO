@@ -37,6 +37,7 @@ describe("LayoutPrefsStore", () => {
       thumbSize: "s512",
       scrollSpeed: 3.2,
       leftTab: "collections",
+      searchExpanded: false,
     });
     expect(store.load()).toEqual({
       leftVisible: false,
@@ -46,6 +47,7 @@ describe("LayoutPrefsStore", () => {
       thumbSize: "s512",
       scrollSpeed: 3.2,
       leftTab: "collections",
+      searchExpanded: false,
     });
   });
 
@@ -60,6 +62,7 @@ describe("LayoutPrefsStore", () => {
       thumbSize: DEFAULT_LAYOUT_PREFS.thumbSize,
       scrollSpeed: DEFAULT_LAYOUT_PREFS.scrollSpeed,
       leftTab: DEFAULT_LAYOUT_PREFS.leftTab,
+      searchExpanded: DEFAULT_LAYOUT_PREFS.searchExpanded,
     });
     // 未知のサムネイルサイズは既定へ (前方互換)
     const future = parseLayoutPrefs('{"thumbSize":"s1024"}');
@@ -75,11 +78,15 @@ describe("LayoutPrefsStore", () => {
     expect(parsed?.rightWidth).toBe(PANE_MAX_WIDTH);
   });
 
-  describe("scrollSpeed (UIUX-1)", () => {
-    it("未保存・欠損時は既定1.0 (ネイティブ挙動)", () => {
-      expect(DEFAULT_LAYOUT_PREFS.scrollSpeed).toBe(1);
-      expect(parseLayoutPrefs("{}")?.scrollSpeed).toBe(1);
-      expect(parseLayoutPrefs('{"scrollSpeed":"x"}')?.scrollSpeed).toBe(1);
+  describe("scrollSpeed (UIUX-1 / UIUX-3 既定2.0)", () => {
+    it("未保存・欠損時は既定2.0 (UIUX-3で1.0→2.0へ変更)", () => {
+      expect(DEFAULT_LAYOUT_PREFS.scrollSpeed).toBe(2);
+      expect(parseLayoutPrefs("{}")?.scrollSpeed).toBe(2);
+      expect(parseLayoutPrefs('{"scrollSpeed":"x"}')?.scrollSpeed).toBe(2);
+    });
+
+    it("保存済み1.0は保持 (no-migration: ユーザー明示選択を壊さない)", () => {
+      expect(parseLayoutPrefs('{"scrollSpeed":1}')?.scrollSpeed).toBe(1);
     });
 
     it("保存→復元の往復", () => {
@@ -115,6 +122,22 @@ describe("LayoutPrefsStore", () => {
       expect(store.load().leftTab).toBe("library");
       // 旧バージョン保存値 (leftTab無し) との前方互換: 既定へ
       expect(parseLayoutPrefs('{"leftVisible":true}')?.leftTab).toBe("folders");
+    });
+  });
+
+  describe("searchExpanded (UIUX-3: 検索行の折りたたみ)", () => {
+    it("未保存・欠損・不正値は既定true (展開)", () => {
+      expect(DEFAULT_LAYOUT_PREFS.searchExpanded).toBe(true);
+      expect(parseLayoutPrefs("{}")?.searchExpanded).toBe(true);
+      expect(parseLayoutPrefs('{"searchExpanded":"yes"}')?.searchExpanded).toBe(true);
+    });
+
+    it("折りたたみ (false) の保存→復元の往復", () => {
+      const storage = makeStorage();
+      const store = new LayoutPrefsStore(storage);
+      store.save({ ...DEFAULT_LAYOUT_PREFS, searchExpanded: false });
+      expect(store.load().searchExpanded).toBe(false);
+      expect(parseLayoutPrefs('{"searchExpanded":false}')?.searchExpanded).toBe(false);
     });
   });
 });

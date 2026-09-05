@@ -136,10 +136,13 @@ t0 = time.monotonic()
 key("F2"); time.sleep(0.4)
 key("F3")
 # original昇格 (比較スロットでなく単一ビューアの原寸)。ズームインで原寸化を促す
+# (UIUX-3: 単一ビューアの平常wheelは画像送りに変わったため、ズームは
+#  vwCmdMode=素F12 → i のAlt+wheel橋アクションを使う。旧ctrl+F4は
+#  metaRate5へroutingされておりwheelではなかった — F4bug修正済み)
 time.sleep(5)
 zoom_start = time.monotonic()
 for _ in range(6):
-    key("ctrl+F4")  # wheelAt zoom (dev bridge F4)
+    key("F12"); time.sleep(0.4); key("i")  # viewerAltZoomIn (dev bridge)
     time.sleep(0.5)
 time.sleep(4)
 after = last_snap()

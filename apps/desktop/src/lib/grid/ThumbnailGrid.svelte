@@ -32,6 +32,7 @@
     type MoveAction,
   } from "./selection";
   import { applyWheelScroll, conditionalWheel } from "./wheel-speed";
+  import type { GridStatsSnapshot } from "./grid-stats";
   import type { GridStore } from "./grid-store";
   import type { ScrollPositionStore } from "./scroll-position";
   import type { ImageListItem } from "../catalog-types";
@@ -46,7 +47,6 @@
     onOpen,
     onSelectionChange,
     onContextMenu,
-    showStats = true,
     renameId = null,
     renameInitial = "",
     onRenameCommit,
@@ -68,8 +68,6 @@
     onSelectionChange?: (snapshot: { ids: string[]; focusIndex: number | null }) => void;
     /** セルのコンテキストメニュー要求 (WP-4)。 */
     onContextMenu?: (event: MouseEvent, index: number) => void;
-    /** 診断行 (DOMセル数等) の表示。製品UIでは通常false。 */
-    showStats?: boolean;
     /** WP-7: リネーム中の項目id (F2インライン編集)。 */
     renameId?: string | null;
     /** WP-7: リネーム編集の初期値 (元の表示名)。 */
@@ -483,14 +481,32 @@
     return cells;
   }
 
-  function statsLine(): string {
+  /**
+    * UIUX-3 V-2: グリッド統計のスナップショット (同期・純読取)。
+    * 主UIのオーバーレイ表示は廃止 — DevDrawerが開いている間だけpollして
+    * 表示する。gridTickを読むことで需要統計 (GridStore.stats) の変化も
+    * 最新値として返す (旧オーバーレイのstatsLineと同じ規約)。
+    */
+  export function getStatsSnapshot(): GridStatsSnapshot {
     void gridTick;
     const stats = grid.stats;
-    return (
-      `要求 ${stats.requested.toLocaleString()} / 拒否 ${stats.rejectedFull.toLocaleString()}` +
-      ` / キャンセル ${stats.cancelled.toLocaleString()}` +
-      ` / ready受信 ${stats.readyReceived.toLocaleString()} / 失敗 ${stats.failedReceived.toLocaleString()}`
-    );
+    return {
+      domCells,
+      visStart: visRange === null ? null : visRange.start,
+      visEnd: visRange === null ? null : visRange.end,
+      overscanRows,
+      columns,
+      total,
+      scrollTop: Math.round(scrollTop),
+      selectionCount: sel.selected.size,
+      demand: {
+        requested: stats.requested,
+        rejectedFull: stats.rejectedFull,
+        cancelled: stats.cancelled,
+        readyReceived: stats.readyReceived,
+        failedReceived: stats.failedReceived,
+      },
+    };
   }
 
   /** 開発パネルの「位置復元」: localStorageの値へ明示的に戻す。 */
@@ -523,19 +539,6 @@
 </script>
 
 <div class="grid-root">
-  {#if showStats}
-    <div class="grid-stats">
-      <span>DOMセル数 <strong>{domCells}</strong></span>
-      <span>可視row {visRange === null ? "—" : `${visRange.start}..${visRange.end}`}</span>
-      <span>overscan {overscanRows}</span>
-      <span>列 {columns}</span>
-      <span>total {total.toLocaleString()}</span>
-      <span>scrollTop {Math.round(scrollTop)}</span>
-      <span>選択 {sel.selected.size.toLocaleString()}</span>
-      <span>需要 {statsLine()}</span>
-    </div>
-  {/if}
-
   <div
     bind:this={scrollEl}
     class="grid-scroll"
@@ -627,15 +630,6 @@
     flex-direction: column;
     height: 100%;
     min-height: 0;
-  }
-
-  .grid-stats {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.75rem;
-    font-size: 0.75rem;
-    font-family: monospace;
-    padding: 0.25rem 0;
   }
 
   .grid-scroll {

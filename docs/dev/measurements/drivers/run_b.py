@@ -378,6 +378,8 @@ def session_C_warm():
         key("ctrl+F6")
         time.sleep(0.5)
         before = last_snap(read_log(log_path))
+        # UIUX-3: 比較ビューのwheelズームは不変 (F4素押し=slot0へ平常wheel)。
+        # 単一ビューアでのズームはvwCmdMode (素F12) のi/oを使う。
         key("F4")
         time.sleep(0.8)
         key("F5")

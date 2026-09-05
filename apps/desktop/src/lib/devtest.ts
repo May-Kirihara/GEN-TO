@@ -2,7 +2,7 @@
  * 実機検証用の開発限定ブリッジ (WP-6 + WP-7計測拡張)。
  *
  * 目的: 検証環境のデスクトップがセッション共有でポインタ自動操作
- * (xdotool mousemove/click) の到達が安定しないため、キーボード (F2〜F11)
+ * (xdotool mousemove/click) の到達が安定しないため、キーボード (F1〜F12)
  * から本物のDOMイベントを生成して生産コードパスを駆動し、
  * 機械可読な状態リードアウト (画面右上) で数値を実測する。
  *
@@ -399,7 +399,14 @@ function interactionEl(): HTMLElement | null {
   );
 }
 
-function wheelAt(el: HTMLElement, xFrac: number, yFrac: number, notches: number, delta: number): void {
+function wheelAt(
+  el: HTMLElement,
+  xFrac: number,
+  yFrac: number,
+  notches: number,
+  delta: number,
+  mods: { alt?: boolean; ctrl?: boolean; meta?: boolean } = {},
+): void {
   const rect = el.getBoundingClientRect();
   const x = rect.left + rect.width * xFrac;
   const y = rect.top + rect.height * yFrac;
@@ -411,8 +418,23 @@ function wheelAt(el: HTMLElement, xFrac: number, yFrac: number, notches: number,
         clientX: x,
         clientY: y,
         deltaY: delta,
+        altKey: mods.alt ?? false,
+        ctrlKey: mods.ctrl ?? false,
+        metaKey: mods.meta ?? false,
       }),
     );
+  }
+}
+
+/** UIUX-3: ビューアstageへ合成wheel 3ノッチ (modifier指定可)。本物の
+ * ImageViewer wheel listenerを通る。 */
+function wheelViewerBridge(
+  delta: number,
+  mods: { alt?: boolean; ctrl?: boolean },
+): void {
+  const el = document.querySelector<HTMLElement>(".viewer-stage");
+  if (el !== null) {
+    wheelAt(el, 0.25, 0.35, 3, delta, mods);
   }
 }
 
@@ -529,6 +551,12 @@ export function installDevBridge(stores: DevBridgeStores): void {
   let foCmdMode = false;
   // UIUX-1 E2E: メニュー/タブ/右クリック/パンくずコマンドモード (shift+F1で入る)
   let uxCmdMode = false;
+  // UIUX-3 E2E: ビューアwheel/navコマンドモード (F12素押しで入る。
+  // F-key修飾付きは既存WP-5/WP-7ブロックが使用済みのため素F12を採用)
+  let vwCmdMode = false;
+  // UIUX-3 E2E: 設定/検索折りたたみコマンドモード (素F1で入る。shift+字母は
+  // この環境のXephyr/WebKitへ到達しないため小文字専用の別モードを用意)
+  let ux3CmdMode = false;
 
   // UIUX-1 r1 E2E: 非アクティブタブパネル (hidden) 内のfocus試行結果。
   // 0=focus拒否 (hidden実効・正常) / 1=着地 (不良) / -1=未実施 or 対象なし。
@@ -1342,6 +1370,58 @@ export function installDevBridge(stores: DevBridgeStores): void {
         );
       }
     },
+    /** UIUX-3 E2E: ツール>設定… を開き**表示タブ**へ切替 (速度スライダーは
+     *  dialog表示タブ内に移設されたため、xsp=読み取りはこのアクション後に
+     *  行う契約。閉時のxsp=-1は正常値)。 */
+    uxSettingsDisplay: () => {
+      runMenuItem("ツール", "設定…");
+      setTimeout(() => {
+        const tab = Array.from(
+          document.querySelectorAll<HTMLButtonElement>(".settings-picker .tabs button"),
+        ).find((b) => (b.textContent ?? "").trim() === "表示");
+        tab?.click();
+      }, 350);
+    },
+    /** UIUX-3 E2E: 検索行の折りたたみトグル (data-testid=search-toggle)。 */
+    uxSearchToggle: () => {
+      document.querySelector<HTMLButtonElement>('[data-testid="search-toggle"]')?.click();
+    },
+    /** UIUX-3 E2E: 設定表示タブの「既定に戻す (2.0)」ボタン。 */
+    uxScrollSpeedReset: () => {
+      document.querySelector<HTMLButtonElement>('[data-testid="scroll-speed-reset"]')?.click();
+    },
+    /** UIUX-3 E2E: 折りたたみ行の「✕ 検索を解除」ボタン。 */
+    uxSearchClear: () => {
+      document.querySelector<HTMLButtonElement>('[data-testid="search-clear"]')?.click();
+    },
+    // ===== UIUX-3 E2E: ビューアwheel/navの分離アクション (V-4橋分離) =====
+    // 平常wheel=送り・Alt/Ctrl(modifier)wheel=ズーム。viewer-stageへ本物の
+    // listener (ImageViewer) を通る合成WheelEvent。3ノッチ連続dispatchは
+    // accumulatorにより1ジェスチャ=1送りになる (生産semanticsの検証を兼ねる)。
+    /** viewerWheelNext: 平常wheel (deltaY+) で次の画像へ1枚。 */
+    viewerWheelNext: () => wheelViewerBridge(100, {}),
+    /** viewerWheelPrev: 平常wheel (deltaY-) で前の画像へ1枚。 */
+    viewerWheelPrev: () => wheelViewerBridge(-100, {}),
+    /** viewerAltZoomIn / Out: Alt+wheelズーム (V-4の主要ズーム経路)。 */
+    viewerAltZoomIn: () => wheelViewerBridge(-100, { alt: true }),
+    viewerAltZoomOut: () => wheelViewerBridge(100, { alt: true }),
+    /** viewerPinchIn / Out: ctrl+wheel (トラックパッドpinch) のズーム保存検証。 */
+    viewerPinchIn: () => wheelViewerBridge(-100, { ctrl: true }),
+    viewerPinchOut: () => wheelViewerBridge(100, { ctrl: true }),
+    /** 比較ビューslot0への平常wheel (比較ズームはUIUX-3で不変 — 確認用)。 */
+    compareWheelZoom: () => {
+      const el = document.querySelector<HTMLElement>(".compare-overlay .slot[data-slot='0']");
+      if (el !== null) {
+        wheelAt(el, 0.25, 0.35, 3, -100);
+      }
+    },
+    /** ビューア左右端の送りボタン (V-4)。本物のbutton click。 */
+    viewerNavPrevBtn: () => {
+      document.querySelector<HTMLButtonElement>('[data-testid="viewer-nav-prev"]')?.click();
+    },
+    viewerNavNextBtn: () => {
+      document.querySelector<HTMLButtonElement>('[data-testid="viewer-nav-next"]')?.click();
+    },
   };
 
   function gridLines(): string[] {
@@ -1515,8 +1595,12 @@ export function installDevBridge(stores: DevBridgeStores): void {
    * / xra=ルート追加path入力文字数 / xes=エクスポートdialog入力元(c/s/-)
    * / xsc=ファイルメニュー走査項目(r=実行/c=中止/-) / xti=登録内バッジ数
    * / xdd=開発パネル / xai=AIパネル / xln=DBバックアップ完了通知
-   * / xrc=危険パス登録確認dialog / xrt=登録ルート行数 / xtt=省略タブ数
-   * (UIUX-2) */
+    * / xrc=危険パス登録確認dialog / xrt=登録ルート行数 / xtt=省略タブ数
+    * (UIUX-2) / xsec=検索行展開(1/0/-1)・xsq=折りたたみ検索語文字数(-1=展開中)
+    * / xssp=scope badge種(l/f/c/-) / xvn=ビューア送りボタン数(2/-1)
+    * / xvd=送りボタンdisabled bit(0=両方有効 1=前無効 2=次無効 3=両方/-1)
+    * / xgs=開発パネルグリッド統計total(-1=未表示) / xcl=折りたたみ✕操作(1/0)
+    * / xol=旧grid-statsオーバーレイ残存(0=正常) (UIUX-3) */
   function uiuxLines(): string[] {
     const tabBtn = document.querySelector<HTMLButtonElement>(
       ".left-tabs [role='tab'][aria-selected='true']",
@@ -1541,6 +1625,8 @@ export function installDevBridge(stores: DevBridgeStores): void {
     const speedSlider = document.querySelector<HTMLInputElement>(
       '[data-testid="scroll-speed-slider"]',
     );
+    // UIUX-3: スライダーは設定dialog表示タブ内へ移設。dialog閉時は-1
+    // (読み取りは「S: uxSettingsDisplay」からの契約)。
     const xsp = speedSlider === null ? "-1" : speedSlider.value;
     const active = document.activeElement;
     const xrole =
@@ -1602,12 +1688,35 @@ export function installDevBridge(stores: DevBridgeStores): void {
         xed = exportItem.disabled ? 1 : 0;
       }
     }
+    // UIUX-3: 検索折りたたみ (xsec=1展開/0折りたたみ/-1検索行なし) と
+    // 折りたたみ要約 (xsq=検索語文字数・xssp=scope badge種 l/f/c/-)
+    const searchBar = document.querySelector<HTMLElement>('[data-testid="search-bar"]');
+    const xsec = searchBar === null ? -1 : searchBar.querySelector('[data-testid="search-input"]') !== null ? 1 : 0;
+    const summaryQuery = document.querySelector<HTMLElement>('[data-testid="search-summary-query"]');
+    const xsq = summaryQuery === null ? -1 : (summaryQuery.textContent ?? "").length;
+    const scopeBadge = document.querySelector<HTMLElement>('[data-testid="search-scope-badge"]');
+    const xssp = scopeBadge === null ? "-" : scopeBadge.dataset.scopeKind === "folder" ? "f" : scopeBadge.dataset.scopeKind === "collection" ? "c" : "l";
+    // UIUX-3: ビューア送りボタン (xvn=数/xvd=disabled bit0=前 bit1=次)
+    const navPrev = document.querySelector<HTMLButtonElement>('[data-testid="viewer-nav-prev"]');
+    const navNext = document.querySelector<HTMLButtonElement>('[data-testid="viewer-nav-next"]');
+    const xvn = navPrev === null || navNext === null ? -1 : 2;
+    const xvd =
+      navPrev === null || navNext === null ? -1 : (navPrev.disabled ? 1 : 0) + (navNext.disabled ? 2 : 0);
+    // UIUX-3: 開発パネルのグリッド統計 (xgs=total値。未表示/-1)
+    const devStatsTotal = document.querySelector<HTMLElement>('[data-testid="dev-grid-stats-total"]');
+    const xgs = devStatsTotal === null ? -1 : Number((devStatsTotal.textContent ?? "").replaceAll(",", ""));
+    // UIUX-3: 折りたたみ行のクリア (✕) 操作の存在 (V-3 acceptance)
+    const xcl = document.querySelector('[data-testid="search-clear"]') !== null ? 1 : 0;
+    // UIUX-3: 旧グリッド統計オーバーレイ (.grid-stats) は主UIから撤去済みが正常
+    const xol = document.querySelector(".grid-stats") !== null ? 1 : 0;
     return [
       `UX xtab=${xtab} xmen=${xmen} xmi=${xmi} xdlg=${xdlg} xab=${xab}` +
         ` xcr=${xcr} xcm=${xcm} xbi=${xbi} xbc=${xbc} xed=${xed} xerr=${xerr} xsp=${xsp}` +
         ` xrole=${xrole} xlp=${xlp} xrp=${xrp} xhid=${xhid} xhf=${uxHiddenFocusResult}` +
         ` xrn=${xrn} xra=${xra} xes=${xes} xsc=${xsc} xti=${xti} xdd=${xdd} xai=${xai} xln=${xln}` +
-        ` xrc=${xrc} xrt=${xrt} xtt=${xtt}`,
+        ` xrc=${xrc} xrt=${xrt} xtt=${xtt}` +
+        ` xsec=${xsec} xsq=${xsq} xssp=${xssp} xvn=${xvn} xvd=${xvd} xgs=${xgs}` +
+        ` xcl=${xcl} xol=${xol}`,
     ];
   }
 
@@ -1909,12 +2018,60 @@ export function installDevBridge(stores: DevBridgeStores): void {
           o: "uxFocusRootPathInput",
           v: "uxFocusSpeedSlider",
           w: "uxWheelGrid",
+          // UIUX-3: 大文字 (shift+字母) 割当 — Xephyr環境ではshift+字母が
+          // WebKitへ到達しないためdriverはux3CmdMode (素F1) を使う。
+          // 実ブラウザ寄りの環境向けに残置
+          S: "uxSettingsDisplay",
+          E: "uxSearchToggle",
+          R: "uxScrollSpeedReset",
+          C: "uxSearchClear",
         };
         const action = uxKeys[event.key];
         if (action !== undefined) {
           actions[action]?.();
         }
         uxCmdMode = false;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        setTimeout(dump, 600);
+        return;
+      }
+      if (vwCmdMode) {
+        // UIUX-3: ビューアwheel/nav分離アクション (モーメンタリ。viewer要open)
+        const vwKeys: Record<string, string> = {
+          n: "viewerWheelNext",
+          p: "viewerWheelPrev",
+          i: "viewerAltZoomIn",
+          o: "viewerAltZoomOut",
+          c: "viewerPinchIn",
+          d: "viewerPinchOut",
+          b: "viewerNavPrevBtn",
+          f: "viewerNavNextBtn",
+          m: "compareWheelZoom",
+        };
+        const action = vwKeys[event.key];
+        if (action !== undefined) {
+          actions[action]?.();
+        }
+        vwCmdMode = false;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        setTimeout(dump, 600);
+        return;
+      }
+      if (ux3CmdMode) {
+        // UIUX-3: 設定dialog速度・検索折りたたみ (モーメンタリ)
+        const ux3Keys: Record<string, string> = {
+          s: "uxSettingsDisplay",
+          e: "uxSearchToggle",
+          r: "uxScrollSpeedReset",
+          c: "uxSearchClear",
+        };
+        const action = ux3Keys[event.key];
+        if (action !== undefined) {
+          actions[action]?.();
+        }
+        ux3CmdMode = false;
         event.preventDefault();
         event.stopImmediatePropagation();
         setTimeout(dump, 600);
@@ -1970,6 +2127,25 @@ export function installDevBridge(stores: DevBridgeStores): void {
       // (shift+F1で入る。ctrl+shift+F1はcollCmdModeが使用済みのため)。
       if (event.shiftKey && !event.ctrlKey && !event.altKey && key === "F1") {
         uxCmdMode = true;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        setTimeout(dump, 300);
+        return;
+      }
+      // UIUX-3 E2E: ビューアwheel/navコマンドモード (素F12で入る。
+      // ctrl+F12=jumpEnd・shift+F12=metaToggleTriage・ctrl+shift+F12=foCmdMode
+      // が使用済みのため修飾なしF12を採用)。
+      if (!event.ctrlKey && !event.shiftKey && !event.altKey && key === "F12") {
+        vwCmdMode = true;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        setTimeout(dump, 300);
+        return;
+      }
+      // UIUX-3 E2E: 設定速度/検索折りたたみコマンドモード (素F1で入る。
+      // shift+字母キーが環境 (Xephyr/WebKit) へ到達しないため小文字専用モード)。
+      if (!event.ctrlKey && !event.shiftKey && !event.altKey && key === "F1") {
+        ux3CmdMode = true;
         event.preventDefault();
         event.stopImmediatePropagation();
         setTimeout(dump, 300);
@@ -2041,6 +2217,13 @@ export function installDevBridge(stores: DevBridgeStores): void {
           }
           break;
         case "F4": {
+          // UIUX-3: ctrl+F4=metaRate5 (wp7/wp8/uxlib1ドライバが使用) は不変。
+          // 旧実装はここに `event.ctrlKey ? 100 : -100` のctrl分岐を置いていたが、
+          // ctrlKey=trueなら上のmetaRate5へrouting済みで**到達不能な死に分岐**だった
+          // (wp16_s4_viewer.pyの「ctrl+F4=wheelAt zoom」主張と不一致 — F4bug)。
+          // 平常wheelの意味変更 (V-4) に伴い: 単一ビューアのズーム検証は
+          // vwCmdMode (F12) のAlt/pinchズームへ、送りは同n/pへ分離した。
+          // 比較ビュー (interactionEl=slot0) は別listenerのままズーム不変。
           if (event.ctrlKey) {
             actions.metaRate5();
             break;
@@ -2051,7 +2234,7 @@ export function installDevBridge(stores: DevBridgeStores): void {
           }
           const el = interactionEl();
           if (el !== null) {
-            wheelAt(el, 0.25, 0.35, 3, event.ctrlKey ? 100 : -100);
+            wheelAt(el, 0.25, 0.35, 3, -100);
           }
           break;
         }

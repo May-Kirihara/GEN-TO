@@ -15,7 +15,8 @@ export const LAYOUT_STORAGE_KEY = "gento:layout:v1";
 export const PANE_MIN_WIDTH = 160;
 export const PANE_MAX_WIDTH = 520;
 
-/** UIUX-1: ホイールスクロール速度係数の範囲と刻み。既定1.0=ネイティブ。 */
+/** UIUX-1: ホイールスクロール速度係数の範囲と刻み。UIUX-3で既定を2.0へ
+ * (1.0=ネイティブ。保存済み値は移行しない — no-migration)。 */
 export const SCROLL_SPEED_MIN = 0.5;
 export const SCROLL_SPEED_MAX = 5;
 
@@ -30,6 +31,8 @@ export type LayoutPrefs = {
   thumbSize: ThumbCellClass;
   scrollSpeed: number;
   leftTab: LeftPaneTab;
+  /** UIUX-3: 検索行の折りたたみ (true=展開)。 */
+  searchExpanded: boolean;
 };
 
 export const DEFAULT_LAYOUT_PREFS: LayoutPrefs = {
@@ -38,8 +41,9 @@ export const DEFAULT_LAYOUT_PREFS: LayoutPrefs = {
   leftWidth: 240,
   rightWidth: 280,
   thumbSize: "s256",
-  scrollSpeed: 1,
+  scrollSpeed: 2,
   leftTab: "folders",
+  searchExpanded: true,
 };
 
 export type KeyValueStorage = {
@@ -101,6 +105,7 @@ export function parseLayoutPrefs(raw: string | null): LayoutPrefs | null {
       thumbSize: coerceThumbSize(value.thumbSize),
       scrollSpeed: coerceScrollSpeed(value.scrollSpeed),
       leftTab: coerceLeftTab(value.leftTab),
+      searchExpanded: coerceBool(value.searchExpanded, DEFAULT_LAYOUT_PREFS.searchExpanded),
     };
   } catch {
     return null;
@@ -127,6 +132,7 @@ export class LayoutPrefsStore {
         thumbSize: prefs.thumbSize,
         scrollSpeed: coerceScrollSpeed(prefs.scrollSpeed),
         leftTab: coerceLeftTab(prefs.leftTab),
+        searchExpanded: coerceBool(prefs.searchExpanded, DEFAULT_LAYOUT_PREFS.searchExpanded),
       }),
     );
   }
