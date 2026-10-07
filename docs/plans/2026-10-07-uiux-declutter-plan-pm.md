@@ -154,3 +154,13 @@ WP1 (トークン) → WP2 → WP3 → WP4 → WP5 → WP6 → **E2E checkpoint*
 ## ロールバック
 
 UI専用・WP毎にgit commit分離 (implementerはcommitしない — PM指示待ち。実際はユーザーcommit方針に従う)。WP単位のrevertで復旧可能な構造で進める。
+
+## 完了記録 (2026-10-07)
+
+**完了 (done-with-notes)**。実装 WP1-13 (Codex final blocker修正3 WP + QA指摘小改修2 WP込み)。
+
+- vitest 711/711 (baseline 679+32) / svelte-check 0 error・12 warn (baseline同一) / eslint 0 / build✓
+- E2E実機 (最終状態で再実行): uiux1 74/74・qa_wp4 11項目・wp6 17項目
+- Codex final: **approve** (4回目 — 通知トーストのblockerをWP8-10の3段で解消)
+- QA: **pass-with-notes・出荷可** (出荷条件2件=docs完成・gitignoreは対応済み)
+- follow-ups (次バッチ候補): ビューアエラー常駐経路 (QA Minor-1) / チップ行とpopoverの重なりanchor分離 / トークン正規化 (visual review要) — `docs/handoff/2026-10-07-uiux-5.md` 参照
