@@ -74,16 +74,16 @@
     display: flex;
     flex-direction: column;
     gap: 0.55rem;
-    background: light-dark(#ffffff, #1c2128);
-    border: 1px solid light-dark(#d0d7de, #444c56);
-    border-radius: 0.6rem;
+    background: var(--color-surface-raised);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-xl);
     box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
-    padding: 0.9rem 1rem;
-    font-size: 0.85rem;
+    padding: var(--space-90) var(--space-100);
+    font-size: var(--font-size-85);
   }
 
   h2 {
-    font-size: 1rem;
+    font-size: var(--font-size-100);
     margin: 0;
   }
 
@@ -93,31 +93,31 @@
 
   .note {
     margin: 0;
-    font-size: 0.75rem;
-    color: light-dark(#57606a, #8b949e);
+    font-size: var(--font-size-75);
+    color: var(--color-text-muted);
   }
 
   .confirm {
     display: flex;
     align-items: center;
-    gap: 0.35rem;
-    font-size: 0.82rem;
-    color: light-dark(#cf222e, #f85149);
+    gap: var(--space-35);
+    font-size: var(--font-size-82);
+    color: var(--color-danger);
     font-weight: 600;
   }
 
   .actions {
     display: flex;
     justify-content: flex-end;
-    gap: 0.4rem;
+    gap: var(--space-40);
   }
 
   .danger {
-    background: light-dark(#cf222e, #da3633);
+    background: var(--color-danger-emphasis);
     color: #ffffff;
     border: none;
-    border-radius: 0.375rem;
-    padding: 0.3rem 0.8rem;
+    border-radius: var(--radius-sm);
+    padding: var(--space-30) var(--space-80);
     cursor: pointer;
   }
 

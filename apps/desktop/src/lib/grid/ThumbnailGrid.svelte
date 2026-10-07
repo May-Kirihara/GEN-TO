@@ -636,14 +636,14 @@
     flex: 1;
     min-height: 0;
     overflow-y: auto;
-    border: 1px solid light-dark(#d0d7de, #30363d);
-    border-radius: 0.5rem;
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-lg);
     outline: none;
     box-sizing: border-box;
   }
 
   .grid-scroll:focus-visible {
-    border-color: light-dark(#0969da, #58a6ff);
+    border-color: var(--color-accent);
   }
 
   .grid-inner {
@@ -657,9 +657,9 @@
 
   .cell {
     position: relative;
-    border-radius: 0.25rem;
-    background: light-dark(#eaeef2, #21262d);
-    border: 1px solid light-dark(#d0d7de, #30363d);
+    border-radius: var(--radius-xs);
+    background: var(--color-bg-subtle);
+    border: 1px solid var(--color-border-strong);
     overflow: hidden;
     box-sizing: border-box;
   }
@@ -669,13 +669,13 @@
   }
 
   .cell-selected {
-    border-color: light-dark(#0969da, #58a6ff);
-    box-shadow: 0 0 0 2px light-dark(#0969da, #58a6ff);
+    border-color: var(--color-accent);
+    box-shadow: 0 0 0 2px var(--color-accent);
   }
 
   /* 生成失敗セル (WP-7 A2): プレースホルダーと区別される失敗表示 */
   .cell-failed {
-    border-color: light-dark(#cf222e, #f85149);
+    border-color: var(--color-danger);
     background: light-dark(#fdf0f1, #2d1517);
   }
 
@@ -684,14 +684,14 @@
     inset: 0;
     display: grid;
     place-items: center;
-    color: light-dark(#cf222e, #f85149);
+    color: var(--color-danger);
     font-weight: bold;
     font-size: 1.25rem;
     user-select: none;
   }
 
   .cell-focus {
-    border-color: light-dark(#bf8700, #d29922);
+    border-color: var(--color-attention-border);
   }
 
   .cell img {
@@ -719,7 +719,7 @@
     align-items: center;
     padding: 0 4px;
     border-radius: 4px;
-    font-size: 0.68rem;
+    font-size: var(--font-size-68);
     line-height: 1.3;
     color: light-dark(#ffffff, #f0f6fc);
     background: light-dark(#000000aa, #000000aa);
@@ -749,10 +749,10 @@
     right: 2px;
     bottom: 2px;
     z-index: 2;
-    font-size: 0.72rem;
+    font-size: var(--font-size-72);
     padding: 0.1rem 0.25rem;
-    border: 1px solid light-dark(#0969da, #58a6ff);
-    border-radius: 0.25rem;
+    border: 1px solid var(--color-accent);
+    border-radius: var(--radius-xs);
     background: light-dark(#ffffff, #0d1117);
     color: inherit;
     min-width: 0;

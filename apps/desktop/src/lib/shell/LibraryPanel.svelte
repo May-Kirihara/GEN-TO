@@ -141,26 +141,26 @@
   .roots-pane {
     display: flex;
     flex-direction: column;
-    gap: 0.35rem;
-    padding: 0.5rem 0.75rem;
-    border-top: 1px solid light-dark(#d0d7de, #30363d);
-    font-size: 0.8rem;
+    gap: var(--space-35);
+    padding: var(--space-50) var(--space-75);
+    border-top: 1px solid var(--color-border-strong);
+    font-size: var(--font-size-80);
   }
 
   .roots-pane h3 {
-    font-size: 0.8rem;
+    font-size: var(--font-size-80);
     margin: 0;
   }
 
   .roots-add {
     display: flex;
-    gap: 0.3rem;
+    gap: var(--space-30);
   }
 
   .roots-add input {
     flex: 1;
     min-width: 0;
-    font-size: 0.78rem;
+    font-size: var(--font-size-78);
   }
 
   .roots-list {
@@ -169,7 +169,7 @@
     padding: 0;
     display: flex;
     flex-direction: column;
-    gap: 0.25rem;
+    gap: var(--space-25);
     max-height: 10rem;
     overflow-y: auto;
   }
@@ -177,9 +177,9 @@
   .roots-list li {
     display: flex;
     flex-direction: column;
-    gap: 0.1rem;
-    border: 1px solid light-dark(#d0d7de, #30363d);
-    border-radius: 0.375rem;
+    gap: var(--space-10);
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-sm);
   }
 
   /* 行主要部 (パス+状態) の切替ボタン (UXLIB-1)。押せる範囲を行全体へ
@@ -188,73 +188,73 @@
   .roots-open {
     display: flex;
     flex-direction: column;
-    gap: 0.1rem;
-    padding: 0.25rem;
+    gap: var(--space-10);
+    padding: var(--space-25);
     border: none;
     background: none;
     color: inherit;
     font: inherit;
     text-align: left;
     cursor: pointer;
-    border-radius: 0.375rem;
+    border-radius: var(--radius-sm);
   }
 
   .roots-open:hover {
-    background: light-dark(#eaeef2, #21262d);
+    background: var(--color-bg-subtle);
   }
 
   .roots-actions {
     display: flex;
-    gap: 0.3rem;
+    gap: var(--space-30);
     padding: 0 0.25rem 0.25rem;
   }
 
   .roots-list li.root-unavailable {
-    border-color: light-dark(#bf8700, #d29922);
+    border-color: var(--color-attention-border);
   }
 
   .roots-path {
     font-family: monospace;
-    font-size: 0.72rem;
+    font-size: var(--font-size-72);
     overflow-wrap: anywhere;
   }
 
   .roots-state {
-    font-size: 0.7rem;
-    color: light-dark(#57606a, #8b949e);
+    font-size: var(--font-size-70);
+    color: var(--color-text-muted);
   }
 
   .root-unavailable .roots-state {
-    color: light-dark(#9a6700, #d29922);
+    color: var(--color-warning);
     font-weight: bold;
   }
 
   .roots-actions button {
-    font-size: 0.7rem;
+    font-size: var(--font-size-70);
     padding: 0.05rem 0.4rem;
   }
 
   .roots-controls {
     display: flex;
-    gap: 0.3rem;
+    gap: var(--space-30);
     flex-wrap: wrap;
   }
 
   .roots-status {
     margin: 0;
-    font-size: 0.7rem;
-    color: light-dark(#57606a, #8b949e);
+    font-size: var(--font-size-70);
+    color: var(--color-text-muted);
   }
 
   .roots-notice {
     margin: 0;
-    font-size: 0.72rem;
-    color: light-dark(#57606a, #8b949e);
+    font-size: var(--font-size-72);
+    color: var(--color-text-muted);
   }
 
   .roots-error {
     margin: 0;
-    font-size: 0.72rem;
-    color: light-dark(#cf222e, #f85149);
+    font-size: var(--font-size-72);
+    color: var(--color-danger);
   }
 </style>

@@ -35,7 +35,7 @@
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 0.5rem;
+    gap: var(--space-50);
     text-align: center;
     padding: 2rem;
     pointer-events: none;
@@ -48,8 +48,8 @@
 
   .lead {
     margin: 0;
-    font-size: 0.82rem;
-    color: light-dark(#57606a, #8b949e);
+    font-size: var(--font-size-82);
+    color: var(--color-text-muted);
   }
 
   .steps {
@@ -63,23 +63,23 @@
   }
 
   .step {
-    border: 1px solid light-dark(#d0d7de, #444c56);
-    border-radius: 0.5rem;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
     padding: 0.55rem 0.8rem;
-    background: light-dark(#ffffff, #1c2128);
+    background: var(--color-surface-raised);
     text-align: left;
   }
 
   .step-title {
     margin: 0 0 0.2rem;
     font-weight: 600;
-    font-size: 0.85rem;
+    font-size: var(--font-size-85);
   }
 
   .step-body {
     margin: 0 0 0.25rem;
     font-size: 0.76rem;
-    color: light-dark(#57606a, #8b949e);
+    color: var(--color-text-muted);
     overflow-wrap: anywhere;
   }
 
@@ -90,10 +90,10 @@
   }
 
   .step-status.done {
-    color: light-dark(#1a7f37, #3fb950);
+    color: var(--color-success);
   }
 
   .step-status.todo {
-    color: light-dark(#bc4c00, #d29922);
+    color: var(--color-attention-text);
   }
 </style>

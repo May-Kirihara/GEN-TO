@@ -10,6 +10,9 @@
 /apps/desktop/src-tauri/gen/schemas
 /apps/desktop/.tauri/
 
+# E2E実行生成物 (playwright-mcp)
+/apps/desktop/.playwright-mcp/
+
 # 実データセット (docs/implementation-plan.md §4.1)
 sample/dataset/
 

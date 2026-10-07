@@ -69,26 +69,26 @@
     display: flex;
     flex-direction: column;
     gap: 0.55rem;
-    background: light-dark(#ffffff, #1c2128);
-    border: 1px solid light-dark(#d0d7de, #444c56);
-    border-radius: 0.6rem;
+    background: var(--color-surface-raised);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-xl);
     box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
-    padding: 0.9rem 1rem;
-    font-size: 0.85rem;
+    padding: var(--space-90) var(--space-100);
+    font-size: var(--font-size-85);
   }
 
   h2 {
-    font-size: 1rem;
+    font-size: var(--font-size-100);
     margin: 0;
   }
 
   .path {
     margin: 0;
     font-family: monospace;
-    font-size: 0.78rem;
+    font-size: var(--font-size-78);
     overflow-wrap: anywhere;
-    background: light-dark(#eaeef2, #21262d);
-    border-radius: 0.25rem;
+    background: var(--color-bg-subtle);
+    border-radius: var(--radius-xs);
     padding: 0.2rem 0.35rem;
   }
 
@@ -99,15 +99,15 @@
   .actions {
     display: flex;
     justify-content: flex-end;
-    gap: 0.4rem;
+    gap: var(--space-40);
   }
 
   .primary {
-    background: light-dark(#0969da, #1f6feb);
+    background: var(--color-accent-emphasis);
     color: #ffffff;
     border: none;
-    border-radius: 0.375rem;
-    padding: 0.3rem 0.8rem;
+    border-radius: var(--radius-sm);
+    padding: var(--space-30) var(--space-80);
     cursor: pointer;
   }
 </style>

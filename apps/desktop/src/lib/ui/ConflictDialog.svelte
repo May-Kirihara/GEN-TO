@@ -158,65 +158,65 @@
     overflow-y: auto;
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
-    background: light-dark(#ffffff, #1c2128);
-    border: 1px solid light-dark(#d0d7de, #444c56);
-    border-radius: 0.6rem;
+    gap: var(--space-50);
+    background: var(--color-surface-raised);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-xl);
     box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
-    padding: 0.9rem 1rem;
-    font-size: 0.85rem;
+    padding: var(--space-90) var(--space-100);
+    font-size: var(--font-size-85);
   }
 
   h2 {
-    font-size: 1rem;
+    font-size: var(--font-size-100);
     margin: 0;
   }
 
   .sub {
     margin: 0;
-    font-size: 0.78rem;
-    color: light-dark(#57606a, #8b949e);
+    font-size: var(--font-size-78);
+    color: var(--color-text-muted);
     overflow-wrap: anywhere;
   }
 
   .compare {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 0.6rem;
+    gap: var(--space-60);
   }
 
   .pane {
-    border: 1px solid light-dark(#d0d7de, #30363d);
-    border-radius: 0.375rem;
-    padding: 0.4rem;
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-sm);
+    padding: var(--space-40);
     display: flex;
     flex-direction: column;
-    gap: 0.3rem;
+    gap: var(--space-30);
   }
 
   .pane-title {
     font-weight: 600;
-    font-size: 0.78rem;
+    font-size: var(--font-size-78);
   }
 
   .pane img {
     width: 100%;
     height: 10rem;
     object-fit: contain;
-    background: light-dark(#eaeef2, #21262d);
-    border-radius: 0.25rem;
+    background: var(--color-bg-subtle);
+    border-radius: var(--radius-xs);
   }
 
   .no-preview {
     height: 10rem;
     display: grid;
     place-items: center;
-    background: light-dark(#eaeef2, #21262d);
-    border-radius: 0.25rem;
-    color: light-dark(#8b949e, #6e7681);
-    font-size: 0.75rem;
+    background: var(--color-bg-subtle);
+    border-radius: var(--radius-xs);
+    color: var(--color-text-subtle);
+    font-size: var(--font-size-75);
     text-align: center;
-    padding: 0.4rem;
+    padding: var(--space-40);
   }
 
   dl {
@@ -224,11 +224,11 @@
     display: grid;
     grid-template-columns: auto 1fr;
     gap: 0.1rem 0.4rem;
-    font-size: 0.72rem;
+    font-size: var(--font-size-72);
   }
 
   dt {
-    color: light-dark(#57606a, #8b949e);
+    color: var(--color-text-muted);
   }
 
   dd {
@@ -238,36 +238,36 @@
 
   .hash {
     margin: 0;
-    font-size: 0.8rem;
+    font-size: var(--font-size-80);
     font-weight: 600;
   }
 
   .keep-note {
     margin: 0;
-    font-size: 0.72rem;
-    color: light-dark(#57606a, #8b949e);
+    font-size: var(--font-size-72);
+    color: var(--color-text-muted);
     overflow-wrap: anywhere;
   }
 
   .apply-all {
     display: flex;
     align-items: center;
-    gap: 0.35rem;
-    font-size: 0.8rem;
+    gap: var(--space-35);
+    font-size: var(--font-size-80);
   }
 
   .actions {
     display: flex;
     justify-content: flex-end;
-    gap: 0.4rem;
+    gap: var(--space-40);
   }
 
   .danger {
-    background: light-dark(#cf222e, #da3633);
+    background: var(--color-danger-emphasis);
     color: #ffffff;
     border: none;
-    border-radius: 0.375rem;
-    padding: 0.3rem 0.8rem;
+    border-radius: var(--radius-sm);
+    padding: var(--space-30) var(--space-80);
     cursor: pointer;
   }
 </style>

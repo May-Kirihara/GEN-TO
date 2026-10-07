@@ -117,7 +117,7 @@
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 0.75rem;
+    gap: var(--space-75);
   }
 
   .quick-preview-stage {
@@ -128,7 +128,7 @@
     justify-content: center;
     background:
       repeating-conic-gradient(#808080 0% 25%, transparent 0% 50%) 0 0 / 24px 24px;
-    border-radius: 0.5rem;
+    border-radius: var(--radius-lg);
     overflow: hidden;
     box-shadow: 0 12px 48px rgba(0, 0, 0, 0.5);
   }
@@ -146,8 +146,8 @@
     color: #f0f3f6;
     font-size: 0.95rem;
     background: rgba(0, 0, 0, 0.45);
-    padding: 0.35rem 0.75rem;
-    border-radius: 0.5rem;
+    padding: var(--space-35) var(--space-75);
+    border-radius: var(--radius-lg);
   }
 
   .qp-meta {
@@ -156,7 +156,7 @@
 
   .quick-preview-hint {
     color: #9aa4b2;
-    font-size: 0.8rem;
+    font-size: var(--font-size-80);
   }
 
   .qp-note {

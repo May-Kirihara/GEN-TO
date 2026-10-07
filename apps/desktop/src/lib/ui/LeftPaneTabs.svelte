@@ -77,10 +77,10 @@
   .left-tabs {
     flex: none;
     display: flex;
-    gap: 0.15rem;
+    gap: var(--space-15);
     padding: 0.2rem 0.3rem 0;
-    border-bottom: 1px solid light-dark(#d0d7de, #30363d);
-    font-size: 0.78rem;
+    border-bottom: 1px solid var(--color-border-strong);
+    font-size: var(--font-size-78);
   }
 
   .left-tabs button {
@@ -103,12 +103,12 @@
   }
 
   .left-tabs button:hover {
-    background: light-dark(#eaeef2, #21262d);
+    background: var(--color-bg-subtle);
   }
 
   .left-tabs button.active {
-    background: light-dark(#ddf4ff, #121d2f);
-    border-color: light-dark(#0969da, #1f6feb);
+    background: var(--color-accent-subtle);
+    border-color: var(--color-accent-emphasis);
     font-weight: 600;
   }
 </style>

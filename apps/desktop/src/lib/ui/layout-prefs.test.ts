@@ -6,6 +6,7 @@ import {
   PANE_MIN_WIDTH,
   clampPaneWidth,
   parseLayoutPrefs,
+  toggleSection,
 } from "./layout-prefs";
 
 type StorageLike = { getItem(k: string): string | null; setItem(k: string, v: string): void };
@@ -38,6 +39,7 @@ describe("LayoutPrefsStore", () => {
       scrollSpeed: 3.2,
       leftTab: "collections",
       searchExpanded: false,
+      infoPanelCollapsed: ["section-file", "section-session"],
     });
     expect(store.load()).toEqual({
       leftVisible: false,
@@ -48,6 +50,7 @@ describe("LayoutPrefsStore", () => {
       scrollSpeed: 3.2,
       leftTab: "collections",
       searchExpanded: false,
+      infoPanelCollapsed: ["section-file", "section-session"],
     });
   });
 
@@ -63,6 +66,7 @@ describe("LayoutPrefsStore", () => {
       scrollSpeed: DEFAULT_LAYOUT_PREFS.scrollSpeed,
       leftTab: DEFAULT_LAYOUT_PREFS.leftTab,
       searchExpanded: DEFAULT_LAYOUT_PREFS.searchExpanded,
+      infoPanelCollapsed: DEFAULT_LAYOUT_PREFS.infoPanelCollapsed,
     });
     // 未知のサムネイルサイズは既定へ (前方互換)
     const future = parseLayoutPrefs('{"thumbSize":"s1024"}');
@@ -138,6 +142,84 @@ describe("LayoutPrefsStore", () => {
       store.save({ ...DEFAULT_LAYOUT_PREFS, searchExpanded: false });
       expect(store.load().searchExpanded).toBe(false);
       expect(parseLayoutPrefs('{"searchExpanded":false}')?.searchExpanded).toBe(false);
+    });
+  });
+
+  describe("infoPanelCollapsed (UIUX-5 WP5: InfoPanel折りたたみ)", () => {
+    it("キー無し・フィールド無しは既定 (メタ3種+メモを折りたたみ)", () => {
+      expect(DEFAULT_LAYOUT_PREFS.infoPanelCollapsed).toEqual([
+        "section-meta-photo",
+        "section-meta-generation",
+        "section-meta-raw",
+        "section-memo",
+      ]);
+      expect(parseLayoutPrefs("{}")?.infoPanelCollapsed).toEqual(
+        DEFAULT_LAYOUT_PREFS.infoPanelCollapsed,
+      );
+      // 旧バージョン保存値 (フィールド無し) との前方互換: 既定へ
+      expect(parseLayoutPrefs('{"leftVisible":true}')?.infoPanelCollapsed).toEqual(
+        DEFAULT_LAYOUT_PREFS.infoPanelCollapsed,
+      );
+    });
+
+    it("保存値保持: 保存→復元の往復 (全展開=空配列も保持)", () => {
+      const storage = makeStorage();
+      const store = new LayoutPrefsStore(storage);
+      store.save({ ...DEFAULT_LAYOUT_PREFS, infoPanelCollapsed: [] });
+      expect(store.load().infoPanelCollapsed).toEqual([]);
+      store.save({
+        ...DEFAULT_LAYOUT_PREFS,
+        infoPanelCollapsed: ["section-file", "session-x", "section-session"],
+      });
+      // 保存時にも未知IDは除外される (serialize契約)
+      expect(store.load().infoPanelCollapsed).toEqual(["section-file", "section-session"]);
+    });
+
+    it("破損 (非配列・JSON全体) は既定へ", () => {
+      expect(parseLayoutPrefs("{oops")).toBeNull();
+      expect(parseLayoutPrefs('{"infoPanelCollapsed":"x"}')?.infoPanelCollapsed).toEqual(
+        DEFAULT_LAYOUT_PREFS.infoPanelCollapsed,
+      );
+      expect(parseLayoutPrefs('{"infoPanelCollapsed":{}}')?.infoPanelCollapsed).toEqual(
+        DEFAULT_LAYOUT_PREFS.infoPanelCollapsed,
+      );
+    });
+
+    it("未知ID除外・重複除去 (前方互換)", () => {
+      expect(
+        parseLayoutPrefs(
+          '{"infoPanelCollapsed":["section-file","section-unknown","section-triage"]}',
+        )?.infoPanelCollapsed,
+      ).toEqual(["section-file", "section-triage"]);
+      expect(
+        parseLayoutPrefs('{"infoPanelCollapsed":["section-memo","section-memo"]}')
+          ?.infoPanelCollapsed,
+      ).toEqual(["section-memo"]);
+    });
+  });
+
+  describe("toggleSection (WP5: 折りたたみ排他トグル)", () => {
+    it("不在なら追加・在れば除去", () => {
+      expect(toggleSection([], "section-memo")).toEqual(["section-memo"]);
+      expect(toggleSection(["section-memo"], "section-memo")).toEqual([]);
+    });
+
+    it("追加は末尾へ (既存順序を保存)", () => {
+      expect(toggleSection(["section-memo"], "section-file")).toEqual([
+        "section-memo",
+        "section-file",
+      ]);
+    });
+
+    it("未知のセクションIDは不変", () => {
+      expect(toggleSection([], "section-unknown")).toEqual([]);
+      expect(toggleSection(["section-memo"], "section-unknown")).toEqual(["section-memo"]);
+    });
+
+    it("元の配列を変更しない (純粋関数)", () => {
+      const original = ["section-memo"];
+      toggleSection(original, "section-file");
+      expect(original).toEqual(["section-memo"]);
     });
   });
 });

@@ -168,36 +168,36 @@
     max-height: 80vh;
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
-    background: light-dark(#ffffff, #1c2128);
-    border: 1px solid light-dark(#d0d7de, #444c56);
-    border-radius: 0.6rem;
+    gap: var(--space-50);
+    background: var(--color-surface-raised);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-xl);
     box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
-    padding: 0.9rem 1rem;
-    font-size: 0.85rem;
+    padding: var(--space-90) var(--space-100);
+    font-size: var(--font-size-85);
   }
 
   .picker h2 {
-    font-size: 1rem;
+    font-size: var(--font-size-100);
     margin: 0;
   }
 
   .picker-sub {
     margin: 0;
-    font-size: 0.75rem;
-    color: light-dark(#57606a, #8b949e);
+    font-size: var(--font-size-75);
+    color: var(--color-text-muted);
   }
 
   .picker-done {
     margin: 0;
-    font-size: 0.78rem;
-    color: light-dark(#1a7f37, #3fb950);
+    font-size: var(--font-size-78);
+    color: var(--color-success);
   }
 
   .picker-error {
     margin: 0;
-    font-size: 0.78rem;
-    color: light-dark(#cf222e, #f85149);
+    font-size: var(--font-size-78);
+    color: var(--color-danger);
     overflow-wrap: anywhere;
   }
 
@@ -207,16 +207,16 @@
     max-height: 18rem;
     display: flex;
     flex-direction: column;
-    gap: 0.2rem;
+    gap: var(--space-20);
   }
 
   .picker-row {
     display: flex;
     align-items: center;
-    gap: 0.4rem;
+    gap: var(--space-40);
     padding: 0.35rem 0.5rem;
-    border: 1px solid light-dark(#d0d7de, #30363d);
-    border-radius: 0.375rem;
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-sm);
     background: transparent;
     color: inherit;
     font: inherit;
@@ -225,11 +225,11 @@
   }
 
   .picker-row:hover:not(:disabled) {
-    background: light-dark(#ddf4ff, #121d2f);
+    background: var(--color-accent-subtle);
   }
 
   .picker-kind {
-    color: light-dark(#0969da, #58a6ff);
+    color: var(--color-accent);
   }
 
   .picker-name {
@@ -241,32 +241,32 @@
   }
 
   .picker-count {
-    font-size: 0.72rem;
-    color: light-dark(#57606a, #8b949e);
+    font-size: var(--font-size-72);
+    color: var(--color-text-muted);
   }
 
   .picker-empty {
     margin: 0;
-    font-size: 0.78rem;
-    color: light-dark(#8b949e, #6e7681);
+    font-size: var(--font-size-78);
+    color: var(--color-text-subtle);
   }
 
   .picker-new {
     display: flex;
-    gap: 0.4rem;
+    gap: var(--space-40);
   }
 
   .picker-new input {
     flex: 1;
     min-width: 0;
     font: inherit;
-    font-size: 0.8rem;
+    font-size: var(--font-size-80);
   }
 
   .picker-note {
     margin: 0;
-    font-size: 0.7rem;
-    color: light-dark(#8b949e, #6e7681);
+    font-size: var(--font-size-70);
+    color: var(--color-text-subtle);
   }
 
   .picker-actions {

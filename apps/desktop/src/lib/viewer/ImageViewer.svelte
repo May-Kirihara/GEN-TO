@@ -490,9 +490,9 @@
     display: flex;
     align-items: center;
     flex-wrap: wrap;
-    gap: 0.5rem;
-    padding: 0.5rem 0.75rem;
-    border-bottom: 1px solid light-dark(#d0d7de, #30363d);
+    gap: var(--space-50);
+    padding: var(--space-50) var(--space-75);
+    border-bottom: 1px solid var(--color-border-strong);
   }
 
   .viewer-toolbar .spacer {
@@ -540,7 +540,7 @@
     transform: translate(-50%, -50%);
     z-index: 2;
     padding: 0.5rem 1rem;
-    border-radius: 0.5rem;
+    border-radius: var(--radius-lg);
     background: light-dark(#ffffffdd, #1e1e1edd);
     font-size: 0.9rem;
   }
@@ -551,11 +551,11 @@
     right: 12px;
     top: 12px;
     z-index: 2;
-    padding: 0.3rem 0.8rem;
-    border-radius: 0.5rem;
+    padding: var(--space-30) var(--space-80);
+    border-radius: var(--radius-lg);
     background: light-dark(#1a7f37dd, #238636dd);
     color: #ffffff;
-    font-size: 0.85rem;
+    font-size: var(--font-size-85);
     pointer-events: none;
   }
 
@@ -614,7 +614,7 @@
   }
 
   .triage-on {
-    border-color: light-dark(#1a7f37, #238636);
+    border-color: var(--color-success-emphasis);
     font-weight: bold;
   }
 
@@ -622,10 +622,10 @@
     display: flex;
     flex-wrap: wrap;
     gap: 0.25rem 1rem;
-    padding: 0.35rem 0.75rem;
-    border-top: 1px solid light-dark(#d0d7de, #30363d);
+    padding: var(--space-35) var(--space-75);
+    border-top: 1px solid var(--color-border-strong);
     font-family: monospace;
-    font-size: 0.75rem;
+    font-size: var(--font-size-75);
     white-space: nowrap;
   }
 </style>

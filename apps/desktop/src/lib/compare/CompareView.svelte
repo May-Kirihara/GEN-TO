@@ -452,9 +452,9 @@
     display: flex;
     align-items: center;
     flex-wrap: wrap;
-    gap: 0.5rem;
-    padding: 0.5rem 0.75rem;
-    border-bottom: 1px solid light-dark(#d0d7de, #30363d);
+    gap: var(--space-50);
+    padding: var(--space-50) var(--space-75);
+    border-bottom: 1px solid var(--color-border-strong);
   }
 
   .compare-toolbar .spacer {
@@ -462,7 +462,7 @@
   }
 
   .compare-toolbar button.active {
-    border-color: light-dark(#0969da, #58a6ff);
+    border-color: var(--color-accent);
     font-weight: bold;
   }
 
@@ -498,7 +498,7 @@
   }
 
   .slot-active {
-    border-color: light-dark(#0969da, #58a6ff);
+    border-color: var(--color-accent);
   }
 
   .layer {
@@ -524,9 +524,9 @@
     transform: translate(-50%, -50%);
     z-index: 2;
     padding: 0.25rem 0.75rem;
-    border-radius: 0.5rem;
+    border-radius: var(--radius-lg);
     background: light-dark(#ffffffdd, #1e1e1edd);
-    font-size: 0.85rem;
+    font-size: var(--font-size-85);
   }
 
   .slot-label {
@@ -535,10 +535,10 @@
     top: 0.25rem;
     z-index: 2;
     padding: 0.1rem 0.4rem;
-    border-radius: 0.25rem;
+    border-radius: var(--radius-xs);
     background: light-dark(#ffffffcc, #000000aa);
     font-family: monospace;
-    font-size: 0.7rem;
+    font-size: var(--font-size-70);
     white-space: nowrap;
     pointer-events: none;
   }
@@ -550,32 +550,32 @@
     bottom: 0.35rem;
     z-index: 2;
     display: flex;
-    gap: 0.3rem;
+    gap: var(--space-30);
   }
 
   .slot-cull button {
-    font-size: 0.75rem;
+    font-size: var(--font-size-75);
     padding: 0.1rem 0.55rem;
   }
 
   .slot-cull .cull-pick {
-    border-color: light-dark(#1a7f37, #238636);
-    color: light-dark(#1a7f37, #3fb950);
+    border-color: var(--color-success-emphasis);
+    color: var(--color-success);
   }
 
   .slot-cull .cull-reject {
-    border-color: light-dark(#cf222e, #f85149);
-    color: light-dark(#cf222e, #f85149);
+    border-color: var(--color-danger);
+    color: var(--color-danger);
   }
 
   .compare-stats {
     display: flex;
     flex-wrap: wrap;
     gap: 0.25rem 1rem;
-    padding: 0.35rem 0.75rem;
-    border-top: 1px solid light-dark(#d0d7de, #30363d);
+    padding: var(--space-35) var(--space-75);
+    border-top: 1px solid var(--color-border-strong);
     font-family: monospace;
-    font-size: 0.75rem;
+    font-size: var(--font-size-75);
     white-space: nowrap;
   }
 </style>

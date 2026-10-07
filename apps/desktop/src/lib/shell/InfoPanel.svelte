@@ -70,6 +70,8 @@
     assetMetadata = null,
     aiRuns = [],
     onEnqueueAi = undefined,
+    collapsedSections,
+    onToggleSection,
   }: {
     item: ImageListItem | null;
     selectionCount: number;
@@ -125,6 +127,10 @@
     aiRuns?: AiRun[];
     /** WP-10: 選択項目へのAI生成ジョブ投入。 */
     onEnqueueAi?: () => void;
+    /** UIUX-5 WP5: 折りたたみ中のセクションID列 (正本はApp — layout-prefsで永続化)。 */
+    collapsedSections: string[];
+    /** UIUX-5 WP5: セクション見出しの折りたたみ切替。 */
+    onToggleSection: (id: string) => void;
   } = $props();
 
   const DB_STATE_LABELS: Record<string, string> = {
@@ -404,6 +410,15 @@
     return collectionMemoDraft !== (collectionMemoNote ?? "");
   }
 
+  // ===== UIUX-5 WP5: セクションアコーディオン =====
+
+  /** contentはDOM常駐のままhidden属性で隠す (LeftPaneTabsと同一手段 —
+   * devtestのdata-meta-section存在判定・clickButtonの全button走査が
+   * DOM前提のため描画削除は不可)。 */
+  function sectionCollapsed(id: string): boolean {
+    return collapsedSections.includes(id);
+  }
+
   // ===== WP-9: 埋め込み画像メタデータ (表示・折りたたみ・コピー) =====
 
   /** 折りたたみ状態 (既定折りたたみ — 巨大workflowでパネルを止めないため
@@ -462,465 +477,556 @@
 </script>
 
 <div class="info-pane">
-  <section class="info-section">
-    <h3>ファイル情報 {selectionCount > 1 ? ` (${selectionCount.toLocaleString()}件選択)` : ""}</h3>
-    {#if item === null}
-      <p class="info-empty">画像を選択すると詳細を表示します</p>
-    {:else}
-      <dl class="info-list">
-        <dt>ファイル名</dt>
-        <dd title={item.displayName}>{item.displayName}</dd>
-        <dt>パス</dt>
-        <dd class="info-path" title={item.path}>{item.path}</dd>
-        <dt>寸法</dt>
-        <dd>{item.width !== null && item.height !== null ? `${item.width} × ${item.height}` : "—"}</dd>
-        <dt>容量</dt>
-        <dd>{formatBytes(item.byteSize)}</dd>
-        <dt>形式</dt>
-        <dd>{item.mimeType ?? "—"}</dd>
-        <dt>更新日時</dt>
-        <dd>{formatTimestamp(item.mtimeMs)}</dd>
-        <dt>DB状態</dt>
-        <dd>{dbStateLabel(item)}</dd>
-        <dt>スキャン状態</dt>
-        <dd>{SCAN_STATE_LABELS[item.state] ?? item.state}</dd>
-        <dt>選別</dt>
-        <dd>
-          {#if detail !== null}
-            {detail.triage === "picked" ? "採用" : detail.triage === "rejected" ? "除外" : "未選別"}
-          {:else}
-            {item.triage === "keep" ? "採用" : item.triage === "reject" ? "除外" : "未選別"}
-          {/if}
-        </dd>
-      </dl>
-      {#if searchEvidence !== null && searchEvidence.length > 0}
-        <div class="search-evidence" data-testid="search-evidence">
-          <h4>検索一致</h4>
-          <ul>
-            {#each searchEvidence as match (match.field)}
-              <li>
-                <span class="evidence-field">{EVIDENCE_FIELD_LABELS[match.field] ?? match.field}</span>
-                <span class="evidence-snippet" title={match.snippet}>{match.snippet}</span>
-              </li>
-            {/each}
-          </ul>
-        </div>
+  <section class="info-section" id="section-file">
+    <h3>
+      <button
+        type="button"
+        class="section-toggle"
+        aria-expanded={!sectionCollapsed("section-file")}
+        aria-controls="section-file-content"
+        onclick={() => onToggleSection("section-file")}
+      >
+        <span class="section-title">ファイル情報 {selectionCount > 1 ? ` (${selectionCount.toLocaleString()}件選択)` : ""}</span>
+        <span class="section-chevron" aria-hidden="true">{sectionCollapsed("section-file") ? "▸" : "▾"}</span>
+      </button>
+    </h3>
+    <div class="section-content" id="section-file-content" hidden={sectionCollapsed("section-file")}>
+      {#if item === null}
+        <p class="info-empty">画像を選択すると詳細を表示します</p>
+      {:else}
+        <dl class="info-list">
+          <dt>ファイル名</dt>
+          <dd title={item.displayName}>{item.displayName}</dd>
+          <dt>パス</dt>
+          <dd class="info-path" title={item.path}>{item.path}</dd>
+          <dt>寸法</dt>
+          <dd>{item.width !== null && item.height !== null ? `${item.width} × ${item.height}` : "—"}</dd>
+          <dt>容量</dt>
+          <dd>{formatBytes(item.byteSize)}</dd>
+          <dt>形式</dt>
+          <dd>{item.mimeType ?? "—"}</dd>
+          <dt>更新日時</dt>
+          <dd>{formatTimestamp(item.mtimeMs)}</dd>
+          <dt>DB状態</dt>
+          <dd>{dbStateLabel(item)}</dd>
+          <dt>スキャン状態</dt>
+          <dd>{SCAN_STATE_LABELS[item.state] ?? item.state}</dd>
+          <dt>選別</dt>
+          <dd>
+            {#if detail !== null}
+              {detail.triage === "picked" ? "採用" : detail.triage === "rejected" ? "除外" : "未選別"}
+            {:else}
+              {item.triage === "keep" ? "採用" : item.triage === "reject" ? "除外" : "未選別"}
+            {/if}
+          </dd>
+        </dl>
+        {#if searchEvidence !== null && searchEvidence.length > 0}
+          <div class="search-evidence" data-testid="search-evidence">
+            <h4>検索一致</h4>
+            <ul>
+              {#each searchEvidence as match (match.field)}
+                <li>
+                  <span class="evidence-field">{EVIDENCE_FIELD_LABELS[match.field] ?? match.field}</span>
+                  <span class="evidence-snippet" title={match.snippet}>{match.snippet}</span>
+                </li>
+              {/each}
+            </ul>
+          </div>
+        {/if}
+        {#if semanticScore !== null}
+          <div class="semantic-score" data-testid="semantic-score">
+            <h4>{semanticLabel}</h4>
+            <p>{semanticLabel} {semanticPercent(semanticScore)}</p>
+          </div>
+        {/if}
+        {#if item !== null && item.dbState === "asset"}
+          <button
+            class="similar-button"
+            disabled={!canSimilarSearch}
+            title={canSimilarSearch
+              ? "この画像に意味的に近い画像を検索します"
+              : "自然言語検索 (埋め込み+索引) が利用可能になると実行できます"}
+            onclick={() => onSimilarSearch?.()}
+            data-testid="similar-search-button"
+          >
+            類似画像を検索
+          </button>
+        {/if}
       {/if}
-      {#if semanticScore !== null}
-        <div class="semantic-score" data-testid="semantic-score">
-          <h4>{semanticLabel}</h4>
-          <p>{semanticLabel} {semanticPercent(semanticScore)}</p>
-        </div>
-      {/if}
-      {#if item !== null && item.dbState === "asset"}
-        <button
-          class="similar-button"
-          disabled={!canSimilarSearch}
-          title={canSimilarSearch
-            ? "この画像に意味的に近い画像を検索します"
-            : "自然言語検索 (埋め込み+索引) が利用可能になると実行できます"}
-          onclick={() => onSimilarSearch?.()}
-          data-testid="similar-search-button"
-        >
-          類似画像を検索
-        </button>
-      {/if}
-    {/if}
+    </div>
   </section>
 
   {#if item !== null && hasPhotoSection(assetMetadata)}
     <!-- WP-9: 写真メタデータ (EXIF系。読み取り専用) -->
-    <section class="info-section" data-meta-section="photo">
-      <h3>写真メタデータ</h3>
-      <dl class="info-list">
-        {#each photoMetaRows as row (row.label)}
-          <dt>{row.label}</dt>
-          <dd title={row.title ?? row.value}>{row.value}</dd>
-        {/each}
-      </dl>
-      {#if photoMetaRows.some((r) => r.label === "GPS")}
-        <p class="meta-note" title="GPSの外部AI送信可否は登録ルートごとの設定 (WP-10で接続)">
-          GPSのAI送信設定は登録ルート単位です (現在は表示のみ)
-        </p>
-      {/if}
+    <section class="info-section" id="section-meta-photo" data-meta-section="photo">
+      <h3>
+        <button
+          type="button"
+          class="section-toggle"
+          aria-expanded={!sectionCollapsed("section-meta-photo")}
+          aria-controls="section-meta-photo-content"
+          onclick={() => onToggleSection("section-meta-photo")}
+        >
+          <span class="section-title">写真メタデータ</span>
+          <span class="section-chevron" aria-hidden="true">{sectionCollapsed("section-meta-photo") ? "▸" : "▾"}</span>
+        </button>
+      </h3>
+      <div class="section-content" id="section-meta-photo-content" hidden={sectionCollapsed("section-meta-photo")}>
+        <dl class="info-list">
+          {#each photoMetaRows as row (row.label)}
+            <dt>{row.label}</dt>
+            <dd title={row.title ?? row.value}>{row.value}</dd>
+          {/each}
+        </dl>
+        {#if photoMetaRows.some((r) => r.label === "GPS")}
+          <p class="meta-note" title="GPSの外部AI送信可否は登録ルートごとの設定 (WP-10で接続)">
+            GPSのAI送信設定は登録ルート単位です (現在は表示のみ)
+          </p>
+        {/if}
+      </div>
     </section>
   {/if}
 
   {#if item !== null && hasGenerationSection(assetMetadata)}
     <!-- WP-9: 生成メタデータ (SD/Comfy/NAI。プロンプトとworkflowは折りたたみ) -->
-    <section class="info-section" data-meta-section="generation">
-      <h3>生成メタデータ</h3>
-      {#if generationMetaRows.length > 0}
-        <dl class="info-list">
-          {#each generationMetaRows as row (row.label)}
-            <dt>{row.label}</dt>
-            <dd title={row.title ?? row.value}>{row.value}</dd>
-          {/each}
-        </dl>
-      {/if}
+    <section class="info-section" id="section-meta-generation" data-meta-section="generation">
+      <h3>
+        <button
+          type="button"
+          class="section-toggle"
+          aria-expanded={!sectionCollapsed("section-meta-generation")}
+          aria-controls="section-meta-generation-content"
+          onclick={() => onToggleSection("section-meta-generation")}
+        >
+          <span class="section-title">生成メタデータ</span>
+          <span class="section-chevron" aria-hidden="true">{sectionCollapsed("section-meta-generation") ? "▸" : "▾"}</span>
+        </button>
+      </h3>
+      <div class="section-content" id="section-meta-generation-content" hidden={sectionCollapsed("section-meta-generation")}>
+        {#if generationMetaRows.length > 0}
+          <dl class="info-list">
+            {#each generationMetaRows as row (row.label)}
+              <dt>{row.label}</dt>
+              <dd title={row.title ?? row.value}>{row.value}</dd>
+            {/each}
+          </dl>
+        {/if}
 
-      {#if assetMetadata?.normalized.positivePrompt}
-        {@const text = assetMetadata.normalized.positivePrompt}
-        <div class="meta-fold" data-meta-fold="positive-prompt">
-          <button class="fold-toggle" onclick={() => toggleMeta("positive")} aria-expanded={metaOpen("positive")}>
-            Positive prompt ({text.length.toLocaleString()}文字) {metaOpen("positive") ? "▾" : "▸"}
-          </button>
-          {#if metaOpen("positive")}
-            <pre class="meta-pre">{preview(text).text}{preview(text).truncated ? "…" : ""}</pre>
-            <div class="fold-controls">
-              <button onclick={() => void copyMetaText("positive", text)}>
-                {copiedKey === "positive" ? "コピーしました" : "コピー"}
-              </button>
-            </div>
-          {/if}
-        </div>
-      {/if}
-
-      {#if assetMetadata?.normalized.negativePrompt}
-        {@const text = assetMetadata.normalized.negativePrompt}
-        <div class="meta-fold" data-meta-fold="negative-prompt">
-          <button class="fold-toggle" onclick={() => toggleMeta("negative")} aria-expanded={metaOpen("negative")}>
-            Negative prompt ({text.length.toLocaleString()}文字) {metaOpen("negative") ? "▾" : "▸"}
-          </button>
-          {#if metaOpen("negative")}
-            <pre class="meta-pre">{preview(text).text}{preview(text).truncated ? "…" : ""}</pre>
-            <div class="fold-controls">
-              <button onclick={() => void copyMetaText("negative", text)}>
-                {copiedKey === "negative" ? "コピーしました" : "コピー"}
-              </button>
-            </div>
-          {/if}
-        </div>
-      {/if}
-
-      {#if workflowText !== null}
-        <div class="meta-fold" data-meta-fold="workflow">
-          <button class="fold-toggle" onclick={() => toggleMeta("workflow")} aria-expanded={metaOpen("workflow")}>
-            ComfyUI workflow JSON ({workflowText.length.toLocaleString()}文字) {metaOpen("workflow") ? "▾" : "▸"}
-          </button>
-          {#if metaOpen("workflow")}
-            {@const p = preview(workflowText)}
-            <pre class="meta-pre">{p.text}{p.truncated ? "…" : ""}</pre>
-            <p class="meta-note" data-meta="workflow-note">
-              {p.truncated ? `プレビューは先頭${p.text.length.toLocaleString()}文字 (全体${p.totalLength.toLocaleString()}文字)` : "全文表示中"}
-            </p>
-            <div class="fold-controls">
-              <button data-meta="workflow-copy" onclick={() => void copyMetaText("workflow", workflowText)}>
-                {copiedKey === "workflow" ? "コピーしました" : "JSONをコピー"}
-              </button>
-            </div>
-          {/if}
-        </div>
-      {/if}
-    </section>
-  {/if}
-
-  {#if item !== null && hasRawSection(assetMetadata)}
-    <!-- WP-9: Rawメタデータ (未知形式も破棄せず表示・コピー) -->
-    <section class="info-section" data-meta-section="raw">
-      <h3>Rawメタデータ</h3>
-      {#each assetMetadata?.parsers ?? [] as parser (parser.parserName)}
-        {@const slots = rawSlots(parser)}
-        {#if slots.length > 0}
-          <div class="meta-fold" data-meta-fold="raw-{parser.parserName}">
-            <button class="fold-toggle" onclick={() => toggleMeta(`raw-${parser.parserName}`)} aria-expanded={metaOpen(`raw-${parser.parserName}`)}>
-              {parserLabel(parser.parserName)}@{parser.parserVersion} ({slots.length}項目) {metaOpen(`raw-${parser.parserName}`) ? "▾" : "▸"}
+        {#if assetMetadata?.normalized.positivePrompt}
+          {@const text = assetMetadata.normalized.positivePrompt}
+          <div class="meta-fold" data-meta-fold="positive-prompt">
+            <button class="fold-toggle" onclick={() => toggleMeta("positive")} aria-expanded={metaOpen("positive")}>
+              Positive prompt ({text.length.toLocaleString()}文字) {metaOpen("positive") ? "▾" : "▸"}
             </button>
-            {#if metaOpen(`raw-${parser.parserName}`)}
-              {#each slots as slot (slot.label)}
-                {@const p = preview(slot.value)}
-                <p class="meta-raw-label">{slot.label}</p>
-                <pre class="meta-pre">{p.text}{p.truncated ? "…" : ""}</pre>
-              {/each}
+            {#if metaOpen("positive")}
+              <pre class="meta-pre">{preview(text).text}{preview(text).truncated ? "…" : ""}</pre>
               <div class="fold-controls">
-                <button onclick={() => void copyMetaText(`raw-${parser.parserName}`, rowList(slots))}>
-                  {copiedKey === `raw-${parser.parserName}` ? "コピーしました" : "コピー"}
+                <button onclick={() => void copyMetaText("positive", text)}>
+                  {copiedKey === "positive" ? "コピーしました" : "コピー"}
                 </button>
               </div>
             {/if}
           </div>
         {/if}
-      {/each}
-    </section>
-  {/if}
 
-  <section class="info-section">
-    <h3>評価・選別・タグ・キャプション</h3>
-    {#if item === null}
-      <p class="placeholder-note">画像を選択すると編集できます</p>
-    {:else if !canEdit}
-      <p class="placeholder-note">{lockReason ?? "この項目は編集できません"}</p>
-    {:else}
-      {#if bulk}
-        <p class="bulk-note">選択 {selectionCount.toLocaleString()}件へ一括適用します (適用前に確認します)</p>
-      {/if}
-
-      {#if pendingBulk !== null}
-        <div class="bulk-confirm" role="alertdialog" aria-label="一括適用の確認">
-          <p>{pendingBulk.label}</p>
-          <div class="session-controls">
-            <button class="primary" onclick={confirmBulk} disabled={busy}>適用</button>
-            <button onclick={() => (pendingBulk = null)}>取消</button>
+        {#if assetMetadata?.normalized.negativePrompt}
+          {@const text = assetMetadata.normalized.negativePrompt}
+          <div class="meta-fold" data-meta-fold="negative-prompt">
+            <button class="fold-toggle" onclick={() => toggleMeta("negative")} aria-expanded={metaOpen("negative")}>
+              Negative prompt ({text.length.toLocaleString()}文字) {metaOpen("negative") ? "▾" : "▸"}
+            </button>
+            {#if metaOpen("negative")}
+              <pre class="meta-pre">{preview(text).text}{preview(text).truncated ? "…" : ""}</pre>
+              <div class="fold-controls">
+                <button onclick={() => void copyMetaText("negative", text)}>
+                  {copiedKey === "negative" ? "コピーしました" : "コピー"}
+                </button>
+              </div>
+            {/if}
           </div>
-        </div>
-      {/if}
+        {/if}
 
-      <!-- 評価 -->
-      <div class="meta-row" data-meta="rating">
-        <span class="meta-label">評価</span>
-        <span class="star-row" role="radiogroup" aria-label="星評価">
-          {#each [1, 2, 3, 4, 5] as star (star)}
-            <button
-              class="star"
-              class:filled={(detail?.rating ?? item.rating) >= star}
-              onclick={() => applyRating((detail?.rating ?? item.rating) === star ? 0 : star)}
-              disabled={busy}
-              title={star === 0 ? "評価解除" : `★${star}`}
-              aria-label={`評価 ${star}`}
-            >★</button>
-          {/each}
-          <span class="meta-value">{(detail?.rating ?? item.rating) || "—"}</span>
-        </span>
-      </div>
-
-      <!-- 選別状態 -->
-      <div class="meta-row" data-meta="cull">
-        <span class="meta-label">選別</span>
-        <span class="cull-row">
-          <button
-            class:cull-active={(detail?.triage ?? "unselected") === "picked"}
-            onclick={() => applyCull("picked")}
-            disabled={busy}
-          >採用 (P)</button>
-          <button
-            class:cull-active={(detail?.triage ?? "unselected") === "rejected"}
-            onclick={() => applyCull("rejected")}
-            disabled={busy}
-          >除外 (X)</button>
-          <button
-            class:cull-active={(detail?.triage ?? "unselected") === "unselected"}
-            onclick={() => applyCull("unselected")}
-            disabled={busy}
-          >未選別</button>
-        </span>
-      </div>
-
-      <!-- お気に入り -->
-      <div class="meta-row" data-meta="favorite">
-        <span class="meta-label">お気に入り</span>
-        <button
-          class="fav"
-          class:fav-on={detail?.favorite ?? item.favorite}
-          onclick={() => applyFavorite(!(detail?.favorite ?? item.favorite))}
-          disabled={busy}
-        >{detail?.favorite ?? item.favorite ? "♥ お気に入り済み" : "♡ 登録"}</button>
-      </div>
-
-      <!-- タグ -->
-      <div class="meta-row meta-col" data-meta="tags">
-        <span class="meta-label">タグ</span>
-        <div class="tag-list">
-          {#each detail?.tags ?? [] as tag (tag.id)}
-            <span class="tag-chip" title="使用数: {tag.usage_count.toLocaleString()} · クリックで解除">
-              {tag.name}
-              {#if tag.source === "ai"}<span class="tag-ai" title="AI生成 (WP-10)">AI</span>{/if}
-              {#if tag.manually_edited}<span class="tag-manual" title="手動編集済み (AI再生成で保護)">✎</span>{/if}
-              <button
-                class="tag-remove"
-                onclick={() => removeTag(tag.id)}
-                disabled={busy}
-                aria-label="{tag.name}を解除"
-              >×</button>
-            </span>
-          {:else}
-            <span class="placeholder-note">タグなし</span>
-          {/each}
-        </div>
-        <div class="tag-input-row">
-          <input
-            type="text"
-            placeholder="タグ名 (カンマ区切り可)"
-            value={tagInput}
-            oninput={(event) => (tagInput = event.currentTarget.value)}
-            onkeydown={(event) => {
-              if (event.key === "Enter") {
-                event.preventDefault();
-                submitTags();
-              }
-            }}
-            disabled={busy}
-            list="gento-tag-suggestions"
-          />
-          <button onclick={submitTags} disabled={busy || tagInput.trim().length === 0}>追加</button>
-        </div>
-        {#if suggestBusy}
-          <p class="placeholder-note">候補を検索中…</p>
-        {:else if suggestions.length > 0 && tagInput.trim().length > 0}
-          <div class="tag-suggest" data-meta="tag-suggest">
-            {#each suggestions as tag (tag.id)}
-              <button
-                class="tag-suggest-item"
-                onclick={() => {
-                  tagInput = tag.name;
-                  submitTags();
-                }}
-                disabled={busy}
-              >{tag.name} <span class="tag-usage">{tag.usage_count.toLocaleString()}</span></button>
-            {/each}
+        {#if workflowText !== null}
+          <div class="meta-fold" data-meta-fold="workflow">
+            <button class="fold-toggle" onclick={() => toggleMeta("workflow")} aria-expanded={metaOpen("workflow")}>
+              ComfyUI workflow JSON ({workflowText.length.toLocaleString()}文字) {metaOpen("workflow") ? "▾" : "▸"}
+            </button>
+            {#if metaOpen("workflow")}
+              {@const p = preview(workflowText)}
+              <pre class="meta-pre">{p.text}{p.truncated ? "…" : ""}</pre>
+              <p class="meta-note" data-meta="workflow-note">
+                {p.truncated ? `プレビューは先頭${p.text.length.toLocaleString()}文字 (全体${p.totalLength.toLocaleString()}文字)` : "全文表示中"}
+              </p>
+              <div class="fold-controls">
+                <button data-meta="workflow-copy" onclick={() => void copyMetaText("workflow", workflowText)}>
+                  {copiedKey === "workflow" ? "コピーしました" : "JSONをコピー"}
+                </button>
+              </div>
+            {/if}
           </div>
         {/if}
       </div>
+    </section>
+  {/if}
 
-      <!-- キャプション3種 (フォーカス項目のみ) -->
-      {#if !bulk}
-        {#each CAPTION_KINDS as { kind, label, hint } (kind)}
-          {@const current = captionOf(kind)}
-          <div class="meta-row meta-col" data-meta="caption-{kind}">
-            <span class="meta-label">
-              {label}
-              <span class="meta-hint">{hint}</span>
-              {#if current?.source === "ai"}<span class="tag-ai" title="AI生成 (WP-10)">AI</span>{/if}
-              {#if current?.manuallyEdited}
-                <span class="tag-manual" title="手動編集済み (AI再生成で上書きされません)">✎手動編集済み</span>
-              {/if}
-            </span>
-            <textarea
-              rows={kind === "sd_tags" ? 2 : 3}
-              placeholder="{label}を入力"
-              bind:value={captionDrafts[kind]}
-              disabled={busy}
-            ></textarea>
-            <div class="caption-controls">
-              <button
-                onclick={() => saveCaption(kind)}
-                disabled={busy || !captionDirty(kind)}
-              >保存</button>
-              {#if captionDirty(kind)}
-                <button
-                  onclick={() => {
-                    captionDrafts[kind] = current?.body ?? "";
-                  }}
-                  disabled={busy}
-                >元に戻す</button>
+  {#if item !== null && hasRawSection(assetMetadata)}
+    <!-- WP-9: Rawメタデータ (未知形式も破棄せず表示・コピー) -->
+    <section class="info-section" id="section-meta-raw" data-meta-section="raw">
+      <h3>
+        <button
+          type="button"
+          class="section-toggle"
+          aria-expanded={!sectionCollapsed("section-meta-raw")}
+          aria-controls="section-meta-raw-content"
+          onclick={() => onToggleSection("section-meta-raw")}
+        >
+          <span class="section-title">Rawメタデータ</span>
+          <span class="section-chevron" aria-hidden="true">{sectionCollapsed("section-meta-raw") ? "▸" : "▾"}</span>
+        </button>
+      </h3>
+      <div class="section-content" id="section-meta-raw-content" hidden={sectionCollapsed("section-meta-raw")}>
+        {#each assetMetadata?.parsers ?? [] as parser (parser.parserName)}
+          {@const slots = rawSlots(parser)}
+          {#if slots.length > 0}
+            <div class="meta-fold" data-meta-fold="raw-{parser.parserName}">
+              <button class="fold-toggle" onclick={() => toggleMeta(`raw-${parser.parserName}`)} aria-expanded={metaOpen(`raw-${parser.parserName}`)}>
+                {parserLabel(parser.parserName)}@{parser.parserVersion} ({slots.length}項目) {metaOpen(`raw-${parser.parserName}`) ? "▾" : "▸"}
+              </button>
+              {#if metaOpen(`raw-${parser.parserName}`)}
+                {#each slots as slot (slot.label)}
+                  {@const p = preview(slot.value)}
+                  <p class="meta-raw-label">{slot.label}</p>
+                  <pre class="meta-pre">{p.text}{p.truncated ? "…" : ""}</pre>
+                {/each}
+                <div class="fold-controls">
+                  <button onclick={() => void copyMetaText(`raw-${parser.parserName}`, rowList(slots))}>
+                    {copiedKey === `raw-${parser.parserName}` ? "コピーしました" : "コピー"}
+                  </button>
+                </div>
               {/if}
             </div>
-          </div>
+          {/if}
         {/each}
-      {:else}
-        <p class="placeholder-note">キャプション編集は単一選択時のみ (フォーカス項目へ適用されます)</p>
-      {/if}
-
-      <!-- Undo (メタデータ操作のみ。ファイル操作はWP-7) -->
-      <div class="meta-row" data-meta="undo">
-        <button onclick={() => actions.undo()} disabled={busy || undoLabel === null} title="Ctrl+Z">
-          {undoLabel === null ? "元に戻す (履歴なし)" : `元に戻す: ${undoLabel}`}
-        </button>
       </div>
+    </section>
+  {/if}
 
-      <!-- WP-10: AI生成投入 + 実行履歴 -->
-      {#if onEnqueueAi !== undefined}
-        <div class="meta-row meta-col" data-meta="ai">
-          <div class="ai-controls">
-            <button
-              onclick={() => onEnqueueAi?.()}
-              disabled={busy}
-              title="選択項目のタグ・キャプションをAIで生成 (未処理のみ。実行はバックグラウンド)"
-            >
-              AI: タグ・キャプション生成
-            </button>
-            <span class="meta-hint">手動編集済みの情報は上書きされません</span>
+  <section class="info-section" id="section-triage">
+    <h3>
+      <button
+        type="button"
+        class="section-toggle"
+        aria-expanded={!sectionCollapsed("section-triage")}
+        aria-controls="section-triage-content"
+        onclick={() => onToggleSection("section-triage")}
+      >
+        <span class="section-title">評価・選別・タグ・キャプション</span>
+        <span class="section-chevron" aria-hidden="true">{sectionCollapsed("section-triage") ? "▸" : "▾"}</span>
+      </button>
+    </h3>
+    <div class="section-content" id="section-triage-content" hidden={sectionCollapsed("section-triage")}>
+      {#if item === null}
+        <p class="placeholder-note">画像を選択すると編集できます</p>
+      {:else if !canEdit}
+        <p class="placeholder-note">{lockReason ?? "この項目は編集できません"}</p>
+      {:else}
+        {#if bulk}
+          <p class="bulk-note">選択 {selectionCount.toLocaleString()}件へ一括適用します (適用前に確認します)</p>
+        {/if}
+
+        {#if pendingBulk !== null}
+          <div class="bulk-confirm" role="alertdialog" aria-label="一括適用の確認">
+            <p>{pendingBulk.label}</p>
+            <div class="session-controls">
+              <button class="primary" onclick={confirmBulk} disabled={busy}>適用</button>
+              <button onclick={() => (pendingBulk = null)}>取消</button>
+            </div>
           </div>
-          {#if aiRuns.length > 0}
-            <details class="ai-runs" data-testid="ai-runs">
-              <summary>AI実行履歴 ({aiRuns.length.toLocaleString()}件)</summary>
-              <ul>
-                {#each aiRuns.slice(0, 10) as run (run.id)}
-                  <li>
-                    <span class="ai-run-status" data-status={run.status}>
-                      {run.status === "succeeded" ? "成功" : run.status === "failed" ? "失敗" : "実行中"}
-                    </span>
-                    <span class="ai-run-meta">pv{run.promptVersion} · {run.startedAt}</span>
-                    {#if run.error}<span class="ai-run-error" title={run.error}>{run.error}</span>{/if}
-                  </li>
-                {/each}
-              </ul>
-            </details>
+        {/if}
+
+        <!-- 評価 -->
+        <div class="meta-row" data-meta="rating">
+          <span class="meta-label">評価</span>
+          <span class="star-row" role="radiogroup" aria-label="星評価">
+            {#each [1, 2, 3, 4, 5] as star (star)}
+              <button
+                class="star"
+                class:filled={(detail?.rating ?? item.rating) >= star}
+                onclick={() => applyRating((detail?.rating ?? item.rating) === star ? 0 : star)}
+                disabled={busy}
+                title={star === 0 ? "評価解除" : `★${star}`}
+                aria-label={`評価 ${star}`}
+              >★</button>
+            {/each}
+            <span class="meta-value">{(detail?.rating ?? item.rating) || "—"}</span>
+          </span>
+        </div>
+
+        <!-- 選別状態 -->
+        <div class="meta-row" data-meta="cull">
+          <span class="meta-label">選別</span>
+          <span class="cull-row">
+            <button
+              class:cull-active={(detail?.triage ?? "unselected") === "picked"}
+              onclick={() => applyCull("picked")}
+              disabled={busy}
+            >採用 (P)</button>
+            <button
+              class:cull-active={(detail?.triage ?? "unselected") === "rejected"}
+              onclick={() => applyCull("rejected")}
+              disabled={busy}
+            >除外 (X)</button>
+            <button
+              class:cull-active={(detail?.triage ?? "unselected") === "unselected"}
+              onclick={() => applyCull("unselected")}
+              disabled={busy}
+            >未選別</button>
+          </span>
+        </div>
+
+        <!-- お気に入り -->
+        <div class="meta-row" data-meta="favorite">
+          <span class="meta-label">お気に入り</span>
+          <button
+            class="fav"
+            class:fav-on={detail?.favorite ?? item.favorite}
+            onclick={() => applyFavorite(!(detail?.favorite ?? item.favorite))}
+            disabled={busy}
+          >{detail?.favorite ?? item.favorite ? "♥ お気に入り済み" : "♡ 登録"}</button>
+        </div>
+
+        <!-- タグ -->
+        <div class="meta-row meta-col" data-meta="tags">
+          <span class="meta-label">タグ</span>
+          <div class="tag-list">
+            {#each detail?.tags ?? [] as tag (tag.id)}
+              <span class="tag-chip" title="使用数: {tag.usage_count.toLocaleString()} · クリックで解除">
+                {tag.name}
+                {#if tag.source === "ai"}<span class="tag-ai" title="AI生成 (WP-10)">AI</span>{/if}
+                {#if tag.manually_edited}<span class="tag-manual" title="手動編集済み (AI再生成で保護)">✎</span>{/if}
+                <button
+                  class="tag-remove"
+                  onclick={() => removeTag(tag.id)}
+                  disabled={busy}
+                  aria-label="{tag.name}を解除"
+                >×</button>
+              </span>
+            {:else}
+              <span class="placeholder-note">タグなし</span>
+            {/each}
+          </div>
+          <div class="tag-input-row">
+            <input
+              type="text"
+              placeholder="タグ名 (カンマ区切り可)"
+              value={tagInput}
+              oninput={(event) => (tagInput = event.currentTarget.value)}
+              onkeydown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  submitTags();
+                }
+              }}
+              disabled={busy}
+              list="gento-tag-suggestions"
+            />
+            <button onclick={submitTags} disabled={busy || tagInput.trim().length === 0}>追加</button>
+          </div>
+          {#if suggestBusy}
+            <p class="placeholder-note">候補を検索中…</p>
+          {:else if suggestions.length > 0 && tagInput.trim().length > 0}
+            <div class="tag-suggest" data-meta="tag-suggest">
+              {#each suggestions as tag (tag.id)}
+                <button
+                  class="tag-suggest-item"
+                  onclick={() => {
+                    tagInput = tag.name;
+                    submitTags();
+                  }}
+                  disabled={busy}
+                >{tag.name} <span class="tag-usage">{tag.usage_count.toLocaleString()}</span></button>
+              {/each}
+            </div>
           {/if}
         </div>
+
+        <!-- キャプション3種 (フォーカス項目のみ) -->
+        {#if !bulk}
+          {#each CAPTION_KINDS as { kind, label, hint } (kind)}
+            {@const current = captionOf(kind)}
+            <div class="meta-row meta-col" data-meta="caption-{kind}">
+              <span class="meta-label">
+                {label}
+                <span class="meta-hint">{hint}</span>
+                {#if current?.source === "ai"}<span class="tag-ai" title="AI生成 (WP-10)">AI</span>{/if}
+                {#if current?.manuallyEdited}
+                  <span class="tag-manual" title="手動編集済み (AI再生成で上書きされません)">✎手動編集済み</span>
+                {/if}
+              </span>
+              <textarea
+                rows={kind === "sd_tags" ? 2 : 3}
+                placeholder="{label}を入力"
+                bind:value={captionDrafts[kind]}
+                disabled={busy}
+              ></textarea>
+              <div class="caption-controls">
+                <button
+                  onclick={() => saveCaption(kind)}
+                  disabled={busy || !captionDirty(kind)}
+                >保存</button>
+                {#if captionDirty(kind)}
+                  <button
+                    onclick={() => {
+                      captionDrafts[kind] = current?.body ?? "";
+                    }}
+                    disabled={busy}
+                  >元に戻す</button>
+                {/if}
+              </div>
+            </div>
+          {/each}
+        {:else}
+          <p class="placeholder-note">キャプション編集は単一選択時のみ (フォーカス項目へ適用されます)</p>
+        {/if}
+
+        <!-- Undo (メタデータ操作のみ。ファイル操作はWP-7) -->
+        <div class="meta-row" data-meta="undo">
+          <button onclick={() => actions.undo()} disabled={busy || undoLabel === null} title="Ctrl+Z">
+            {undoLabel === null ? "元に戻す (履歴なし)" : `元に戻す: ${undoLabel}`}
+          </button>
+        </div>
+
+        <!-- WP-10: AI生成投入 + 実行履歴 -->
+        {#if onEnqueueAi !== undefined}
+          <div class="meta-row meta-col" data-meta="ai">
+            <div class="ai-controls">
+              <button
+                onclick={() => onEnqueueAi?.()}
+                disabled={busy}
+                title="選択項目のタグ・キャプションをAIで生成 (未処理のみ。実行はバックグラウンド)"
+              >
+                AI: タグ・キャプション生成
+              </button>
+              <span class="meta-hint">手動編集済みの情報は上書きされません</span>
+            </div>
+            {#if aiRuns.length > 0}
+              <details class="ai-runs" data-testid="ai-runs">
+                <summary>AI実行履歴 ({aiRuns.length.toLocaleString()}件)</summary>
+                <ul>
+                  {#each aiRuns.slice(0, 10) as run (run.id)}
+                    <li>
+                      <span class="ai-run-status" data-status={run.status}>
+                        {run.status === "succeeded" ? "成功" : run.status === "failed" ? "失敗" : "実行中"}
+                      </span>
+                      <span class="ai-run-meta">pv{run.promptVersion} · {run.startedAt}</span>
+                      {#if run.error}<span class="ai-run-error" title={run.error}>{run.error}</span>{/if}
+                    </li>
+                  {/each}
+                </ul>
+              </details>
+            {/if}
+          </div>
+        {/if}
       {/if}
-    {/if}
-    {#if metaBusy}
-      <p class="placeholder-note">読み込み中…</p>
-    {/if}
-    {#if notice}
-      <p class="info-error">{notice}</p>
-    {/if}
-    {#if metaError}
-      <p class="info-error">{metaError}</p>
-    {/if}
+      {#if metaBusy}
+        <p class="placeholder-note">読み込み中…</p>
+      {/if}
+      {#if notice}
+        <p class="info-error">{notice}</p>
+      {/if}
+      {#if metaError}
+        <p class="info-error">{metaError}</p>
+      {/if}
+    </div>
   </section>
 
   {#if collectionMemoContext !== null}
-    <section class="info-section">
-      <h3>コレクション内メモ</h3>
-      <p class="placeholder-note">「{collectionMemoContext}」内でのみ表示されるメモです</p>
-      <div class="caption-edit" data-meta="collection-memo">
-        <textarea
-          rows="3"
-          placeholder="このコレクションでのメモ (任意)"
-          value={collectionMemoDraft}
-          oninput={(event) => (collectionMemoDraft = event.currentTarget.value)}
-          disabled={busy}
-        ></textarea>
-        <div class="caption-controls">
-          <button class="primary" onclick={saveCollectionMemo} disabled={busy || !collectionMemoDirty()}>
-            保存
-          </button>
+    <section class="info-section" id="section-memo">
+      <h3>
+        <button
+          type="button"
+          class="section-toggle"
+          aria-expanded={!sectionCollapsed("section-memo")}
+          aria-controls="section-memo-content"
+          onclick={() => onToggleSection("section-memo")}
+        >
+          <span class="section-title">コレクション内メモ</span>
+          <span class="section-chevron" aria-hidden="true">{sectionCollapsed("section-memo") ? "▸" : "▾"}</span>
+        </button>
+      </h3>
+      <div class="section-content" id="section-memo-content" hidden={sectionCollapsed("section-memo")}>
+        <p class="placeholder-note">「{collectionMemoContext}」内でのみ表示されるメモです</p>
+        <div class="caption-edit" data-meta="collection-memo">
+          <textarea
+            rows="3"
+            placeholder="このコレクションでのメモ (任意)"
+            value={collectionMemoDraft}
+            oninput={(event) => (collectionMemoDraft = event.currentTarget.value)}
+            disabled={busy}
+          ></textarea>
+          <div class="caption-controls">
+            <button class="primary" onclick={saveCollectionMemo} disabled={busy || !collectionMemoDirty()}>
+              保存
+            </button>
+          </div>
         </div>
       </div>
     </section>
   {/if}
 
-  <section class="info-section">
-    <h3>選別セッション</h3>
-    {#if sessionCounts !== null}
-      <div class="session-progress">
-        <div class="session-line">
-          位置 <strong>{sessionCounts.position + 1}</strong>/{sessionCounts.total.toLocaleString()}
-          · 確認済み <strong>{sessionCounts.confirmed.toLocaleString()}</strong>
+  <section class="info-section" id="section-session">
+    <h3>
+      <button
+        type="button"
+        class="section-toggle"
+        aria-expanded={!sectionCollapsed("section-session")}
+        aria-controls="section-session-content"
+        onclick={() => onToggleSection("section-session")}
+      >
+        <span class="section-title">選別セッション</span>
+        <span class="section-chevron" aria-hidden="true">{sectionCollapsed("section-session") ? "▸" : "▾"}</span>
+      </button>
+    </h3>
+    <div class="section-content" id="section-session-content" hidden={sectionCollapsed("section-session")}>
+      {#if sessionCounts !== null}
+        <div class="session-progress">
+          <div class="session-line">
+            位置 <strong>{sessionCounts.position + 1}</strong>/{sessionCounts.total.toLocaleString()}
+            · 確認済み <strong>{sessionCounts.confirmed.toLocaleString()}</strong>
+          </div>
+          <div class="session-line">
+            採用 {sessionCounts.keep.toLocaleString()} /
+            除外 {sessionCounts.reject.toLocaleString()} /
+            保留 {sessionCounts.undecided.toLocaleString()}
+          </div>
+          <p class="session-origin">{sessionOrigin}</p>
+          <div class="session-controls">
+            <button onclick={() => onSessionMove(-1)}>← 前へ</button>
+            <button onclick={() => onSessionMove(1)}>次へ →</button>
+            <button class="danger" onclick={onEnd}>終了</button>
+          </div>
+          <p class="session-note">ビューワで 1-5=評価 / X=除外 / P=採用 (高速選別モード)</p>
         </div>
-        <div class="session-line">
-          採用 {sessionCounts.keep.toLocaleString()} /
-          除外 {sessionCounts.reject.toLocaleString()} /
-          保留 {sessionCounts.undecided.toLocaleString()}
-        </div>
-        <p class="session-origin">{sessionOrigin}</p>
+      {:else}
         <div class="session-controls">
-          <button onclick={() => onSessionMove(-1)}>← 前へ</button>
-          <button onclick={() => onSessionMove(1)}>次へ →</button>
-          <button class="danger" onclick={onEnd}>終了</button>
-        </div>
-        <p class="session-note">ビューアで 1-5=評価 / X=除外 / P=採用 (高速選別モード)</p>
-      </div>
-    {:else}
-      <div class="session-controls">
-        <button onclick={onStartFolder}>現在の一覧で開始</button>
-        <button onclick={onStartSelection} disabled={selectionCount === 0}>
-          選択画像で開始
-        </button>
-        {#if resumable !== null}
-          <button onclick={onResume} title={resumable.origin}>
-            再開 ({resumable.count.toLocaleString()}件)
+          <button onclick={onStartFolder}>現在の一覧で開始</button>
+          <button onclick={onStartSelection} disabled={selectionCount === 0}>
+            選択画像で開始
           </button>
+          {#if resumable !== null}
+            <button onclick={onResume} title={resumable.origin}>
+              再開 ({resumable.count.toLocaleString()}件)
+            </button>
+          {/if}
+        </div>
+        {#if resumable !== null}
+          <p class="session-origin">前回: {resumable.origin}</p>
         {/if}
-      </div>
-      {#if resumable !== null}
-        <p class="session-origin">前回: {resumable.origin}</p>
       {/if}
-    {/if}
-    {#if sessionNotice}
-      <p class="info-error">{sessionNotice}</p>
-    {/if}
+      {#if sessionNotice}
+        <p class="info-error">{sessionNotice}</p>
+      {/if}
+    </div>
   </section>
 </div>
 
@@ -934,23 +1040,61 @@
   .info-pane {
     display: flex;
     flex-direction: column;
-    gap: 0.75rem;
+    gap: var(--space-75);
     height: 100%;
     min-height: 0;
     overflow-y: auto;
-    padding: 0.5rem 0.75rem;
-    font-size: 0.85rem;
+    padding: var(--space-50) var(--space-75);
+    font-size: var(--font-size-85);
   }
 
   .info-section h3 {
-    font-size: 0.85rem;
+    font-size: var(--font-size-85);
     margin: 0 0 0.4rem;
-    border-bottom: 1px solid light-dark(#d0d7de, #30363d);
-    padding-bottom: 0.25rem;
+    border-bottom: 1px solid var(--color-border-strong);
+  }
+
+  /* UIUX-5 WP5: 見出しbutton=アコーディオンのトリガ。contentはDOM常駐のまま
+   * hidden属性で隠す (LeftPaneTabsと同一手段 — devtestのdata-meta-section
+   * 存在判定・clickButton駆動がDOM前提)。 */
+  .section-toggle {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-20);
+    width: 100%;
+    padding: 0.1rem 0 var(--space-25);
+    background: none;
+    border: none;
+    color: inherit;
+    font: inherit;
+    font-size: var(--font-size-85);
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .section-toggle:hover .section-title,
+  .section-toggle:focus-visible .section-title {
+    color: var(--color-accent);
+  }
+
+  .section-title {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .section-chevron {
+    flex: none;
+    color: var(--color-text-muted);
+    font-size: var(--font-size-75);
+  }
+
+  .section-content[hidden] {
+    display: none;
   }
 
   .info-empty {
-    color: light-dark(#57606a, #8b949e);
+    color: var(--color-text-muted);
     margin: 0.5rem 0;
   }
 
@@ -962,7 +1106,7 @@
   }
 
   .info-list dt {
-    color: light-dark(#57606a, #8b949e);
+    color: var(--color-text-muted);
   }
 
   .info-list dd {
@@ -972,12 +1116,12 @@
   }
 
   .search-evidence {
-    margin-top: 0.5rem;
+    margin-top: var(--space-50);
   }
 
   /* WP-12: 意味スコア・類似画像検索 */
   .semantic-score {
-    margin-top: 0.5rem;
+    margin-top: var(--space-50);
   }
 
   .semantic-score p {
@@ -998,57 +1142,57 @@
   .fold-toggle {
     background: none;
     border: none;
-    color: light-dark(#0969da, #58a6ff);
+    color: var(--color-accent);
     cursor: pointer;
-    font-size: 0.8rem;
+    font-size: var(--font-size-80);
     padding: 0.1rem 0;
     text-align: left;
   }
 
   .meta-pre {
     background: light-dark(#f6f8fa, #161b22);
-    border: 1px solid light-dark(#d0d7de, #30363d);
+    border: 1px solid var(--color-border-strong);
     border-radius: 4px;
-    font-size: 0.72rem;
+    font-size: var(--font-size-72);
     margin: 0.25rem 0;
     max-height: 16rem;
     overflow: auto;
-    padding: 0.4rem;
+    padding: var(--space-40);
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
 
   .fold-controls {
     display: flex;
-    gap: 0.4rem;
+    gap: var(--space-40);
   }
 
   .meta-note {
-    color: light-dark(#57606a, #8b949e);
-    font-size: 0.72rem;
-    margin: 0.2rem 0;
+    color: var(--color-text-muted);
+    font-size: var(--font-size-72);
+    margin: var(--space-20) 0;
   }
 
   .meta-raw-label {
-    color: light-dark(#57606a, #8b949e);
-    font-size: 0.72rem;
+    color: var(--color-text-muted);
+    font-size: var(--font-size-72);
     margin: 0.3rem 0 0;
   }
 
   .search-evidence h4 {
     margin: 0 0 0.25rem;
-    font-size: 0.75rem;
+    font-size: var(--font-size-75);
   }
 
   .search-evidence ul {
     margin: 0;
     padding-left: 1rem;
-    font-size: 0.75rem;
+    font-size: var(--font-size-75);
   }
 
   .search-evidence li {
     display: flex;
-    gap: 0.4rem;
+    gap: var(--space-40);
     align-items: baseline;
   }
 
@@ -1066,86 +1210,86 @@
 
   .info-path {
     font-family: monospace;
-    font-size: 0.78rem;
+    font-size: var(--font-size-78);
   }
 
   .session-progress {
     display: flex;
     flex-direction: column;
-    gap: 0.3rem;
+    gap: var(--space-30);
   }
 
   .session-line {
-    font-size: 0.85rem;
+    font-size: var(--font-size-85);
   }
 
   .session-origin {
     margin: 0;
-    font-size: 0.75rem;
-    color: light-dark(#57606a, #8b949e);
+    font-size: var(--font-size-75);
+    color: var(--color-text-muted);
     overflow-wrap: anywhere;
   }
 
   .session-controls {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.4rem;
+    gap: var(--space-40);
   }
 
   .session-note {
     margin: 0;
-    font-size: 0.72rem;
-    color: light-dark(#8b949e, #6e7681);
+    font-size: var(--font-size-72);
+    color: var(--color-text-subtle);
   }
 
   .info-error {
     margin: 0.3rem 0 0;
-    font-size: 0.78rem;
-    color: light-dark(#cf222e, #f85149);
+    font-size: var(--font-size-78);
+    color: var(--color-danger);
     overflow-wrap: anywhere;
   }
 
   .placeholder-note {
     margin: 0.2rem 0 0;
-    font-size: 0.75rem;
-    color: light-dark(#8b949e, #6e7681);
+    font-size: var(--font-size-75);
+    color: var(--color-text-subtle);
   }
 
   button.danger {
-    border-color: light-dark(#cf222e, #f85149);
-    color: light-dark(#cf222e, #f85149);
+    border-color: var(--color-danger);
+    color: var(--color-danger);
   }
 
   button.primary {
-    border-color: light-dark(#1a7f37, #238636);
-    color: light-dark(#1a7f37, #3fb950);
+    border-color: var(--color-success-emphasis);
+    color: var(--color-success);
     font-weight: bold;
   }
 
   .bulk-note {
     margin: 0 0 0.3rem;
-    font-size: 0.75rem;
-    color: light-dark(#9a6700, #d29922);
+    font-size: var(--font-size-75);
+    color: var(--color-warning);
   }
 
   .bulk-confirm {
-    border: 1px solid light-dark(#9a6700, #d29922);
-    border-radius: 0.4rem;
-    padding: 0.4rem;
+    border: 1px solid var(--color-warning);
+    border-radius: var(--radius-md);
+    padding: var(--space-40);
     margin: 0.3rem 0;
     background: light-dark(#fff8c5, #25170a);
   }
 
   .bulk-confirm p {
     margin: 0 0 0.3rem;
-    font-size: 0.78rem;
+    font-size: var(--font-size-78);
     overflow-wrap: anywhere;
   }
 
   .meta-row {
     display: flex;
     align-items: center;
-    gap: 0.4rem;
+    gap: var(--space-40);
     margin: 0.35rem 0;
     flex-wrap: wrap;
   }
@@ -1156,8 +1300,8 @@
   }
 
   .meta-label {
-    color: light-dark(#57606a, #8b949e);
-    font-size: 0.78rem;
+    color: var(--color-text-muted);
+    font-size: var(--font-size-78);
     min-width: 5.5rem;
   }
 
@@ -1166,20 +1310,20 @@
   }
 
   .meta-hint {
-    font-size: 0.7rem;
-    color: light-dark(#8b949e, #6e7681);
+    font-size: var(--font-size-70);
+    color: var(--color-text-subtle);
     margin-left: 0.3rem;
   }
 
   .meta-value {
-    font-size: 0.78rem;
-    color: light-dark(#57606a, #8b949e);
+    font-size: var(--font-size-78);
+    color: var(--color-text-muted);
   }
 
   .star-row {
     display: inline-flex;
     align-items: center;
-    gap: 0.1rem;
+    gap: var(--space-10);
   }
 
   .star {
@@ -1188,7 +1332,7 @@
     padding: 0 0.05rem;
     font-size: 1.05rem;
     line-height: 1;
-    color: light-dark(#d0d7de, #30363d);
+    color: var(--color-border-strong);
     cursor: pointer;
   }
 
@@ -1198,51 +1342,51 @@
 
   .cull-row {
     display: inline-flex;
-    gap: 0.3rem;
+    gap: var(--space-30);
     flex-wrap: wrap;
   }
 
   .cull-active {
-    border-color: light-dark(#0969da, #58a6ff);
+    border-color: var(--color-accent);
     font-weight: bold;
   }
 
   .fav {
-    font-size: 0.8rem;
+    font-size: var(--font-size-80);
   }
 
   .fav-on {
-    color: light-dark(#cf222e, #f85149);
-    border-color: light-dark(#cf222e, #f85149);
+    color: var(--color-danger);
+    border-color: var(--color-danger);
   }
 
   .tag-list {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.25rem;
+    gap: var(--space-25);
   }
 
   .tag-chip {
     display: inline-flex;
     align-items: center;
-    gap: 0.2rem;
-    border: 1px solid light-dark(#d0d7de, #30363d);
-    border-radius: 999px;
+    gap: var(--space-20);
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-pill);
     padding: 0.05rem 0.45rem;
-    font-size: 0.78rem;
-    background: light-dark(#eaeef2, #21262d);
+    font-size: var(--font-size-78);
+    background: var(--color-bg-subtle);
   }
 
   .tag-manual {
-    color: light-dark(#9a6700, #d29922);
-    font-size: 0.7rem;
+    color: var(--color-warning);
+    font-size: var(--font-size-70);
   }
 
   /* WP-10: AI由来バッジ */
   .tag-ai {
-    color: light-dark(#0969da, #58a6ff);
-    border: 1px solid light-dark(#0969da, #58a6ff);
-    border-radius: 0.25rem;
+    color: var(--color-accent);
+    border: 1px solid var(--color-accent);
+    border-radius: var(--radius-xs);
     font-size: 0.62rem;
     line-height: 1;
     padding: 0.05rem 0.2rem;
@@ -1252,14 +1396,14 @@
   .ai-controls {
     display: flex;
     align-items: center;
-    gap: 0.4rem;
+    gap: var(--space-40);
     flex-wrap: wrap;
   }
 
   .ai-runs summary {
     cursor: pointer;
-    font-size: 0.75rem;
-    color: light-dark(#57606a, #8b949e);
+    font-size: var(--font-size-75);
+    color: var(--color-text-muted);
   }
 
   .ai-runs ul {
@@ -1268,13 +1412,13 @@
     padding: 0;
     display: flex;
     flex-direction: column;
-    gap: 0.15rem;
-    font-size: 0.72rem;
+    gap: var(--space-15);
+    font-size: var(--font-size-72);
   }
 
   .ai-runs li {
     display: flex;
-    gap: 0.4rem;
+    gap: var(--space-40);
     align-items: baseline;
     flex-wrap: wrap;
   }
@@ -1284,20 +1428,20 @@
   }
 
   .ai-run-status[data-status="succeeded"] {
-    color: light-dark(#1a7f37, #3fb950);
+    color: var(--color-success);
   }
 
   .ai-run-status[data-status="failed"] {
-    color: light-dark(#cf222e, #f85149);
+    color: var(--color-danger);
   }
 
   .ai-run-meta {
-    color: light-dark(#8b949e, #6e7681);
+    color: var(--color-text-subtle);
   }
 
   .ai-run-error {
     flex-basis: 100%;
-    color: light-dark(#8b949e, #6e7681);
+    color: var(--color-text-subtle);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -1306,60 +1450,60 @@
   .tag-remove {
     border: none;
     background: transparent;
-    color: light-dark(#57606a, #8b949e);
+    color: var(--color-text-muted);
     padding: 0;
-    font-size: 0.85rem;
+    font-size: var(--font-size-85);
     line-height: 1;
     cursor: pointer;
   }
 
   .tag-remove:hover {
-    color: light-dark(#cf222e, #f85149);
+    color: var(--color-danger);
   }
 
   .tag-input-row {
     display: flex;
-    gap: 0.3rem;
+    gap: var(--space-30);
     margin-top: 0.25rem;
   }
 
   .tag-input-row input {
     flex: 1;
     min-width: 0;
-    font-size: 0.8rem;
+    font-size: var(--font-size-80);
   }
 
   .tag-suggest {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.25rem;
+    gap: var(--space-25);
     margin-top: 0.25rem;
   }
 
   .tag-suggest-item {
-    font-size: 0.75rem;
+    font-size: var(--font-size-75);
     display: inline-flex;
-    gap: 0.3rem;
+    gap: var(--space-30);
     align-items: baseline;
   }
 
   .tag-usage {
-    color: light-dark(#8b949e, #6e7681);
-    font-size: 0.68rem;
+    color: var(--color-text-subtle);
+    font-size: var(--font-size-68);
   }
 
   .meta-col textarea {
     width: 100%;
     box-sizing: border-box;
     font: inherit;
-    font-size: 0.8rem;
+    font-size: var(--font-size-80);
     resize: vertical;
     min-height: 2.2rem;
   }
 
   .caption-controls {
     display: flex;
-    gap: 0.3rem;
+    gap: var(--space-30);
     margin-top: 0.2rem;
   }
 </style>

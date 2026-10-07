@@ -111,19 +111,19 @@
     position: fixed;
     z-index: 600;
     min-width: 14rem;
-    padding: 0.25rem;
-    background: light-dark(#ffffff, #1c2128);
-    border: 1px solid light-dark(#d0d7de, #444c56);
-    border-radius: 0.5rem;
+    padding: var(--space-25);
+    background: var(--color-surface-raised);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
   }
 
   .context-menu button {
     display: block;
     width: 100%;
-    padding: 0.4rem 0.6rem;
+    padding: var(--space-40) var(--space-60);
     border: none;
-    border-radius: 0.375rem;
+    border-radius: var(--radius-sm);
     background: transparent;
     color: inherit;
     text-align: left;
@@ -132,7 +132,7 @@
   }
 
   .context-menu button:hover:not(:disabled) {
-    background: light-dark(#0969da, #1f6feb);
+    background: var(--color-accent-emphasis);
     color: #ffffff;
   }
 

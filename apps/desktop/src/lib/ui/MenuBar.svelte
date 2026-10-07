@@ -238,10 +238,10 @@
   .menubar {
     display: flex;
     align-items: stretch;
-    gap: 0.1rem;
+    gap: var(--space-10);
     padding: 0 0.4rem;
-    font-size: 0.82rem;
-    border-bottom: 1px solid light-dark(#d0d7de, #30363d);
+    font-size: var(--font-size-82);
+    border-bottom: 1px solid var(--color-border-strong);
   }
 
   .menubar-top {
@@ -261,7 +261,7 @@
   .menubar-button:hover,
   .menubar-button:focus-visible,
   .menubar-button[aria-expanded="true"] {
-    background: light-dark(#eaeef2, #21262d);
+    background: var(--color-bg-subtle);
   }
 
   .menu-popover {
@@ -272,10 +272,10 @@
     min-width: 15rem;
     max-height: 70vh;
     overflow-y: auto;
-    padding: 0.25rem;
-    background: light-dark(#ffffff, #1c2128);
-    border: 1px solid light-dark(#d0d7de, #444c56);
-    border-radius: 0.5rem;
+    padding: var(--space-25);
+    background: var(--color-surface-raised);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
   }
 
@@ -284,7 +284,7 @@
     width: 100%;
     padding: 0.35rem 0.6rem;
     border: none;
-    border-radius: 0.375rem;
+    border-radius: var(--radius-sm);
     background: transparent;
     color: inherit;
     text-align: left;
@@ -294,7 +294,7 @@
 
   .menu-popover button:hover:not(:disabled),
   .menu-popover button:focus-visible {
-    background: light-dark(#0969da, #1f6feb);
+    background: var(--color-accent-emphasis);
     color: #ffffff;
   }
 

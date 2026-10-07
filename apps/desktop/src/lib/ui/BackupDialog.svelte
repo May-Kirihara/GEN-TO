@@ -229,64 +229,64 @@
     max-height: 80vh;
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
-    background: light-dark(#ffffff, #1c2128);
-    border: 1px solid light-dark(#d0d7de, #444c56);
-    border-radius: 0.6rem;
+    gap: var(--space-50);
+    background: var(--color-surface-raised);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-xl);
     box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
-    padding: 0.9rem 1rem;
-    font-size: 0.85rem;
+    padding: var(--space-90) var(--space-100);
+    font-size: var(--font-size-85);
   }
 
   .picker h2 {
-    font-size: 1rem;
+    font-size: var(--font-size-100);
     margin: 0;
   }
 
   .picker-sub {
     margin: 0;
-    font-size: 0.75rem;
-    color: light-dark(#57606a, #8b949e);
+    font-size: var(--font-size-75);
+    color: var(--color-text-muted);
     overflow-wrap: anywhere;
   }
 
   .mono {
     font-family: monospace;
-    font-size: 0.72rem;
+    font-size: var(--font-size-72);
   }
 
   .picker-error {
     margin: 0;
-    font-size: 0.78rem;
-    color: light-dark(#cf222e, #f85149);
+    font-size: var(--font-size-78);
+    color: var(--color-danger);
     overflow-wrap: anywhere;
   }
 
   .dest-label {
     display: flex;
     flex-direction: column;
-    gap: 0.2rem;
-    font-size: 0.78rem;
+    gap: var(--space-20);
+    font-size: var(--font-size-78);
   }
 
   .dest-label input {
     font: inherit;
-    font-size: 0.8rem;
+    font-size: var(--font-size-80);
   }
 
   .tree {
     overflow-y: auto;
     min-height: 5rem;
     max-height: 16rem;
-    border: 1px solid light-dark(#d0d7de, #30363d);
-    border-radius: 0.375rem;
-    padding: 0.25rem;
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-sm);
+    padding: var(--space-25);
   }
 
   .node-row {
     display: flex;
     align-items: center;
-    gap: 0.15rem;
+    gap: var(--space-15);
   }
 
   .node-toggle {
@@ -306,8 +306,8 @@
     background: transparent;
     color: inherit;
     font: inherit;
-    padding: 0.15rem 0.3rem;
-    border-radius: 0.25rem;
+    padding: var(--space-15) var(--space-30);
+    border-radius: var(--radius-xs);
     cursor: pointer;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -315,33 +315,33 @@
   }
 
   .node-label:hover {
-    background: light-dark(#eaeef2, #21262d);
+    background: var(--color-bg-subtle);
   }
 
   .node-selected {
-    background: light-dark(#ddf4ff, #121d2f);
+    background: var(--color-accent-subtle);
     font-weight: 600;
   }
 
   .picker-path {
     margin: 0;
-    font-size: 0.72rem;
-    color: light-dark(#57606a, #8b949e);
+    font-size: var(--font-size-72);
+    color: var(--color-text-muted);
     overflow-wrap: anywhere;
   }
 
   .picker-actions {
     display: flex;
     justify-content: flex-end;
-    gap: 0.4rem;
+    gap: var(--space-40);
   }
 
   .primary {
-    background: light-dark(#0969da, #1f6feb);
+    background: var(--color-accent-emphasis);
     color: #ffffff;
     border: none;
-    border-radius: 0.375rem;
-    padding: 0.3rem 0.8rem;
+    border-radius: var(--radius-sm);
+    padding: var(--space-30) var(--space-80);
     cursor: pointer;
   }
 

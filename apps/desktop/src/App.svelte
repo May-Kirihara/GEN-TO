@@ -46,11 +46,13 @@
     DEFAULT_LAYOUT_PREFS,
     LayoutPrefsStore,
     clampPaneWidth,
+    toggleSection,
     type LeftPaneTab,
   } from "./lib/ui/layout-prefs";
   import { FolderPrefsStore, LIBRARY_SORT_KEY } from "./lib/ui/folder-prefs";
   import { copyText } from "./lib/ui/clipboard";
   import { collapsedSearchSummary } from "./lib/ui/search-summary";
+  import { filterChips, withoutFilter, type FilterChipKey } from "./lib/ui/filter-chips";
   import { KeyDispatcher } from "./lib/keys";
   import {
     MetadataStore,
@@ -71,13 +73,11 @@
     EMPTY_FILTERS,
     SearchStore,
     filtersActive,
-    weightLabel,
     type GuiFilters,
     type SearchFieldMatch,
   } from "./lib/search";
   import {
     VectorIndexStore,
-    indexProgressText,
     semanticSearchAvailable,
     semanticUnavailableReason,
     type VectorIndexProgress,
@@ -130,6 +130,20 @@
   import DevDrawer from "./lib/shell/DevDrawer.svelte";
   // WP-10: AI統合 (プロファイル・ジョブキュー・自動処理)
   import AiPanel from "./lib/shell/AiPanel.svelte";
+  // UIUX-5/WP7a: App.svelte分割 — shell小成分 (状态・storeはApp残置)
+  import ToastStack from "./lib/shell/ToastStack.svelte";
+  import {
+    EMPTY_TOAST_QUEUE,
+    enqueueToast,
+    withoutToast,
+    type ToastKind,
+  } from "./lib/ui/toast-queue";
+  import SessionModeBar from "./lib/shell/SessionModeBar.svelte";
+  import NoticeStrip from "./lib/shell/NoticeStrip.svelte";
+  import AppHeader from "./lib/shell/AppHeader.svelte";
+  // UIUX-5/WP7b: App.svelte分割 — toolbar/search-bar抽出 (状態・storeはApp残置)
+  import Toolbar from "./lib/shell/Toolbar.svelte";
+  import SearchBar from "./lib/shell/SearchBar.svelte";
   import { AiStore, type AiProfile, type AiRun } from "./lib/ai";
 
   // ===== IPC・ストア (既存資産) =====
@@ -170,6 +184,8 @@
   let scrollSpeed = $state(1);
   /** UIUX-3 V-3: 検索行の折りたたみ (true=展開)。layout-prefsへ永続化。 */
   let searchExpanded = $state(true);
+  /** UIUX-5 WP5: InfoPanel折りたたみ中のセクションID列 (layout-prefsへ永続化)。 */
+  let infoPanelCollapsed = $state<string[]>([...DEFAULT_LAYOUT_PREFS.infoPanelCollapsed]);
 
   // ===== 閲覧状態 =====
 
@@ -190,7 +206,6 @@
   let viewerMode: "single" | "compare2" | "compare4" | null = $state(null);
   let viewerStore: ViewerStore | null = $state(null);
   let compareStore: CompareStore | null = $state(null);
-  let viewerNotice = $state("");
   let gridSelection = $state<{ ids: string[]; focusIndex: number | null }>({
     ids: [],
     focusIndex: null,
@@ -245,17 +260,18 @@
   async function enqueueAiForSelection(): Promise<void> {
     const ids = stableSelectionIds();
     if (ids.length === 0) {
-      metaNotice = "AI生成はライブラリ表示中の確定済み画像に対して実行します";
+      showMetaNotice("AI生成はライブラリ表示中の確定済み画像に対して実行します");
       return;
     }
     try {
       const n = await aiStore.enqueue(ids, false);
-      metaNotice =
+      showMetaNotice(
         n > 0
           ? `AI生成を${n.toLocaleString()}件キューへ投入しました`
-          : "対象はすべて処理済みです (再生成はAI設定から)";
+          : "対象はすべて処理済みです (再生成はAI設定から)",
+      );
     } catch (error) {
-      metaNotice = error instanceof Error ? error.message : String(error);
+      showMetaNotice(error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -317,6 +333,52 @@
   let renameId = $state<string | null>(null);
   let renameInitial = $state("");
   let disposeFileOpsProgress: (() => void) | null = null;
+
+  // ===== トースト通知 (UIUX-5/WP4) =====
+
+  /**
+   * 揮発性noticeのトースト表示経路 (4秒で自動消滅。キュー遷移自体は
+   * lib/ui/toast-queue.tsの純粋関数)。fileops系トーストは元noticeと同じ
+   * testid・roleを持ち、可視中のみDOMに存在する。
+   * 全kind (viewer/fileOps/meta/os) とも設定箇所のshowXxxNoticeヘルパーが
+   * 明示pushする (WP10)。$effectミラーは (1) effect内でtoastQueueを
+   * read+writeするため自身の依存となり、非空noticeがあると更新深度超過
+   * まで無限pushする潜在バグ、(2) 同一文言の連続設定はstate不変で再発火
+   * しない、の両方を抱えるため廃止 (Codex review 2026-10-07 3回目
+   * blocker)。クリア (空文字設定) はトースト不要のため直接代入のまま。
+   * header popoverが閉じている間やshowMetaNoticeの2.5秒自動消滅後も
+   * フィードバックが保証される。エラー性は文面から判定できないため
+   * 色分けなし (info相当の既定スタイルで統一)。
+   */
+  let toastQueue = $state(EMPTY_TOAST_QUEUE);
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity -- 期限管理のみで描画に使わない
+  const toastTimers = new Map<number, ReturnType<typeof setTimeout>>();
+
+  function pushToast(kind: ToastKind, text: string): void {
+    toastQueue = enqueueToast(toastQueue, kind, text);
+    const id = toastQueue.seq; // enqueueToastが割り当てた直近id
+    toastTimers.set(id, setTimeout(() => dismissToast(id), 4000));
+  }
+
+  function dismissToast(id: number): void {
+    const timer = toastTimers.get(id);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      toastTimers.delete(id);
+    }
+    toastQueue = withoutToast(toastQueue, id);
+  }
+
+  function showViewerNotice(text: string): void {
+    // viewerNotice $stateは読み取り側が存在しない (表示面はトーストのみ)
+    // ため持たない — pushだけが表示経路。
+    pushToast("viewer", text);
+  }
+
+  function showFileOpsNotice(text: string): void {
+    fileOpsNotice = text;
+    pushToast("fileops", text);
+  }
 
   // ===== バックアップと復元 (WP-13) =====
 
@@ -555,12 +617,6 @@
     saveLayout();
   }
 
-  /** パンくずのパス入力をDOM挿入時にフォーカス・全選択 (Svelte action)。 */
-  function autofocusSelect(node: HTMLInputElement): void {
-    node.focus();
-    node.select();
-  }
-
   /** スクロール速度 (UIUX-3 V-1: 設定dialog表示タブから編集。即時反映・
    * changeで永続化・「既定に戻す」=明示2.0書込。UIUX-1のtoolbarスライダー
    * から移設 — dialogはstore所有権を持たせずcallbackで受ける)。 */
@@ -613,11 +669,11 @@
   /** ライブラリモードで無い旨の通知 (操作ガード共通)。 */
   function requireLibraryMode(): boolean {
     if (catalogSource !== "library") {
-      fileOpsNotice = "ファイル操作はライブラリ表示中のみ利用できます";
+      showFileOpsNotice("ファイル操作はライブラリ表示中のみ利用できます");
       return false;
     }
     if (fileOpsBusy) {
-      fileOpsNotice = "別のファイル操作が実行中です";
+      showFileOpsNotice("別のファイル操作が実行中です");
       return false;
     }
     return true;
@@ -630,7 +686,7 @@
     }
     const paths = selectedLibraryPaths();
     if (paths.length === 0) {
-      fileOpsNotice = "対象ファイルを選択してください";
+      showFileOpsNotice("対象ファイルを選択してください");
       return;
     }
     fileOpsNotice = "";
@@ -670,7 +726,7 @@
     fileOpsProgress = null;
     try {
       const outcome = await executeFileOp(fileOpsIpc, args);
-      fileOpsNotice = outcomeNotice(outcome);
+      showFileOpsNotice(outcomeNotice(outcome));
       if (outcome.undoable) {
         registerFileOpsUndo(outcome);
       }
@@ -712,7 +768,7 @@
     }
     const paths = selectedLibraryPaths();
     if (paths.length === 0) {
-      fileOpsNotice = "対象ファイルを選択してください";
+      showFileOpsNotice("対象ファイルを選択してください");
       return;
     }
     void runPlannedOp({ kind: "trash", paths });
@@ -728,7 +784,7 @@
     }
     const paths = selectedLibraryPaths();
     if (paths.length === 0) {
-      fileOpsNotice = "対象ファイルを選択してください";
+      showFileOpsNotice("対象ファイルを選択してください");
       return;
     }
     fileOpsError = null;
@@ -766,12 +822,12 @@
       return;
     }
     if (gridSelection.ids.length !== 1) {
-      fileOpsNotice = "リネームは1ファイルずつ行います (1件を選択してください)";
+      showFileOpsNotice("リネームは1ファイルずつ行います (1件を選択してください)");
       return;
     }
     const focus = focusLibraryPath();
     if (focus === null) {
-      fileOpsNotice = "対象ファイルを選択してください";
+      showFileOpsNotice("対象ファイルを選択してください");
       return;
     }
     renameInitial = focus.displayName;
@@ -809,7 +865,7 @@
         ? (libraryRoots.find((root) => root.available)?.path ?? null)
         : currentFolder;
     if (parent === null) {
-      fileOpsNotice = "登録ルートがありません";
+      showFileOpsNotice("登録ルートがありません");
       return;
     }
     const name = window.prompt("新しいフォルダ名", "");
@@ -825,7 +881,7 @@
         fileOpsError = outcome.steps[0]?.error ?? "フォルダを作成できませんでした";
         return;
       }
-      fileOpsNotice = `「${name.trim()}」を作成しました`;
+      showFileOpsNotice(`「${name.trim()}」を作成しました`);
     } catch (error) {
       fileOpsError = toErrorMessage(error);
     }
@@ -942,6 +998,7 @@
       searchActive = false;
       gridSelection = { ids: [], focusIndex: null };
       collectionPositionInput = "";
+      collectionToolsOpen = false;
       if (collection.kind === "manual") {
         await refreshCollectionNotes(collection.id);
       } else {
@@ -979,6 +1036,7 @@
       activeCollection = null;
       searchActive = false;
       collectionNotes = {};
+      collectionToolsOpen = false;
       await catalog.refreshSummary();
       await catalog.loadPage(0);
     } else {
@@ -1089,7 +1147,12 @@
   const searchStore = new SearchStore(ipc);
   let searchInput = $state("");
   let searchFilters = $state<GuiFilters>({ ...EMPTY_FILTERS });
+  /** フィルタpopoverの開閉 (正本はApp — レイアウト系。SearchBarへprops+callback)。 */
   let searchFiltersOpen = $state(false);
+  /** UIUX-5/WP3: manual collection操作のオーバーフローpopover開閉。
+   * state正本はここ (App) — Toolbarへprops+callbackで授受し、
+   * showCollection/exitCollectionでのresetはApp側関数で実施。 */
+  let collectionToolsOpen = $state(false);
   let searchScopeMode = $state<"library" | "folder" | "collection">("library");
   /** 検索結果表示中 (カタログはsearchソース)。 */
   let searchActive = $state(false);
@@ -1316,8 +1379,12 @@
     });
   });
 
-  /** 折りたたみトグル。展開時はDOM挿入後に検索inputへfocus (tick後)。 */
+  /** 折りたたみトグル。折りたたみ時はfilters popoverも閉じる (開いたまま畳むと再展開で復活する)。
+    * 展開時はDOM挿入後に検索inputへfocus (tick後)。 */
   function toggleSearchExpanded(): void {
+    if (searchExpanded) {
+      searchFiltersOpen = false;
+    }
     searchExpanded = !searchExpanded;
     saveLayout();
     if (searchExpanded) {
@@ -1398,6 +1465,15 @@
 
   let contextMenu: { x: number; y: number; actions: MenuAction[] } | null = $state(null);
   let osNotice = $state("");
+
+  /**
+   * OS連携 (reveal/open/copy-path) の通知: header表示 + 設定時の明示トースト
+   * (WP9 — 同一文言の連続設定は$effectミラーで検出できないため)。
+   */
+  function showOsNotice(text: string): void {
+    osNotice = text;
+    pushToast("os", text);
+  }
 
   // ===== キー一元化 (WP-4) =====
 
@@ -1641,8 +1717,48 @@
     (summaryNow()?.scanning ?? false) || libraryScanBusy,
   );
 
+  /**
+   * notice-stripの表示条件。エラー系 (search/folder/collection/fileOpsError) は
+   * 常に生DOMへ (devtest xerr は .toolbar-notice.error の存在を読む)。
+   * viewer/fileOpsの平文noticeはトースト経由のためstripには含めない。
+   */
+  const noticeStripActive = $derived(
+    searchNotice !== "" ||
+      folderNotice !== "" ||
+      collectionNotice !== "" ||
+      fileOpsError !== null ||
+      (fileOpsBusy && fileOpsProgress !== null),
+  );
+
+  // ===== ヘッダーステータス (UIUX-5/WP4) =====
+  // 走査/警告インジケータとヘッダーnoticeを1個のステータスボタン+popoverへ集約。
+
+  let headerStatusOpen = $state(false);
+
+  /** 忙碌色の条件 (スキャン/ハッシュ待ち/索引構築のいずれかが進行中)。 */
+  const headerStatusBusy = $derived(
+    scanBusy || library.status.pending_hash > 0 || indexProgress !== null,
+  );
+  /** 警告色の条件 (忙碌色より優先)。 */
+  const headerStatusWarn = $derived(library.status.watch_degraded);
+  /** popover内に表示すべき行があるか (無い場合は空き状態案内)。 */
+  const headerStatusHasRows = $derived(
+    headerStatusBusy ||
+      headerStatusWarn ||
+      metaNotice !== "" ||
+      osNotice !== "",
+  );
+
   /** GUIフィルタに未適用の設定があるか (フィルターボタンの強調用)。 */
   const searchFiltersActive = $derived(filtersActive(searchFilters));
+
+  /** 設定済み (ドラフト) フィルタのチップ列挙 (UIUX-5/WP2)。 */
+  const searchFilterChipList = $derived(filterChips(searchFilters));
+
+  /** チップ×: 当該フィルタのみ既定値へ戻す (ドラフト更新)。 */
+  function removeSearchFilterChip(key: FilterChipKey): void {
+    searchFilters = withoutFilter(searchFilters, key);
+  }
 
   // ===== ビューア (スパイク資産・Enter/ダブルクリック/ボタン) =====
 
@@ -1655,7 +1771,6 @@
   }
 
   async function openViewerForChoice(index: number): Promise<void> {
-    viewerNotice = "";
     const focus = gridSelection.focusIndex ?? index;
     try {
       if (viewerChoice === "single") {
@@ -1677,7 +1792,18 @@
         await store.open(count, gridSelection.ids, focus);
       }
     } catch (error) {
-      viewerNotice = toErrorMessage(error);
+      showViewerNotice(toErrorMessage(error));
+    }
+  }
+
+  /** toolbar「開く」ボタン (WP7b抽出): 選択フォーカスがあればビューアへ、
+   * 無ければガイドnotice (gridSelectionの正本はApp。noticeはトースト表示)。 */
+  function openViewerFromToolbar(): void {
+    const focus = gridSelection.focusIndex;
+    if (focus !== null) {
+      void openViewerForChoice(focus);
+    } else {
+      showViewerNotice("グリッドで項目を選択してください");
     }
   }
 
@@ -1929,6 +2055,29 @@
     sessionCounts = null;
   }
 
+  /**
+   * モードバーの採用/除外 (UIUX-5/WP6)。対象はセッション現在位置の画像。
+   * 編集可否はhandleTriageActionと同一基準 (Library表示 + stable AssetId)。
+   * 適用成功時のみ次へ進む — 失敗時は位置を動かさない。
+   */
+  async function sessionTriage(value: "picked" | "rejected"): Promise<void> {
+    const id = session.currentId();
+    if (id === null) {
+      return;
+    }
+    if (catalogSource !== "library" || !gridPagerHasId(id)) {
+      sessionNotice = "セッション選別はライブラリ表示中の確定済み画像に対して実行します";
+      return;
+    }
+    try {
+      await applyCull([id], value);
+    } catch (error) {
+      sessionNotice = error instanceof Error ? error.message : String(error);
+      return;
+    }
+    sessionMove(1);
+  }
+
   // ===== メタデータ編集 (WP-5) =====
 
   /** セッション保存失敗等のlastErrorを通知へ出す (QA-WP4 Minor-7)。 */
@@ -1972,6 +2121,8 @@
 
   function showMetaNotice(text: string): void {
     metaNotice = text;
+    // WP9: ミラーだと同一文言の再設定でトーストが出ないため設定時に明示push
+    pushToast("meta", text);
     setTimeout(() => {
       metaNotice = "";
     }, 2500);
@@ -2340,7 +2491,7 @@
           try {
             await invoke("reveal_in_file_manager", { path: focus.path });
           } catch (error) {
-            osNotice = toErrorMessage(error);
+            showOsNotice(toErrorMessage(error));
           }
         },
       },
@@ -2352,7 +2503,7 @@
           try {
             await invoke("open_with_default_app", { path: focus.path });
           } catch (error) {
-            osNotice = toErrorMessage(error);
+            showOsNotice(toErrorMessage(error));
           }
         },
       },
@@ -2364,9 +2515,11 @@
             : "パスをコピー",
         run: async () => {
           const ok = await copyText(items.map((entry) => entry.path).join("\n"));
-          osNotice = ok
-            ? `パスをコピーしました (${items.length.toLocaleString()}件)`
-            : "クリップボードへのコピーに失敗しました";
+          showOsNotice(
+            ok
+              ? `パスをコピーしました (${items.length.toLocaleString()}件)`
+              : "クリップボードへのコピーに失敗しました",
+          );
         },
       },
     );
@@ -2503,6 +2656,12 @@
     saveLayout();
   }
 
+  /** InfoPanelセクションの折りたたみ切替 (UIUX-5 WP5 — layout-prefsへ永続化)。 */
+  function toggleInfoPanelSection(id: string): void {
+    infoPanelCollapsed = toggleSection(infoPanelCollapsed, id);
+    saveLayout();
+  }
+
   function saveLayout(): void {
     layoutStore.save({
       leftVisible,
@@ -2513,6 +2672,7 @@
       scrollSpeed,
       leftTab,
       searchExpanded,
+      infoPanelCollapsed,
     });
   }
 
@@ -2590,6 +2750,7 @@
     leftTab = layout.leftTab;
     scrollSpeed = layout.scrollSpeed;
     searchExpanded = layout.searchExpanded;
+    infoPanelCollapsed = layout.infoPanelCollapsed;
     grid.setSizeClass(cellClass);
 
     registerKeys();
@@ -2776,6 +2937,10 @@
     disposeVectorIndexReady?.();
     disposeVectorIndexProgress?.();
     disposeFileOpsProgress?.();
+    for (const timer of toastTimers.values()) {
+      clearTimeout(timer);
+    }
+    toastTimers.clear();
     stopChangeNotification();
     stopGridNotifyForPerf();
     stopLibraryNotification();
@@ -3005,65 +3170,26 @@
 </script>
 
 <div class="app-shell">
-  <header class="app-header">
-    <h1 class="app-title">GEN-TO</h1>
-    <span
-      class="health-dot"
-      class:ok={healthStatus?.kind === "ok"}
-      class:ng={healthStatus?.kind === "error"}
-      role="status"
-      aria-label={healthStatus?.kind === "ok"
-        ? `DB: ${healthStatus.dbOpen ? "接続" : "未接続"}`
-        : healthStatus?.kind === "error"
-          ? `エラー: ${healthStatus.message}`
-          : "接続確認中"}
-      title={healthStatus?.kind === "ok"
-        ? `DB: ${healthStatus.dbOpen ? "接続" : "未接続"} / ${rawHealth?.dataset_path ?? ""}`
-        : healthStatus?.kind === "error"
-          ? healthStatus.message
-          : "接続確認中"}
-    ></span>
-    <span
-      class="source-badge"
-      class:library={catalogSource === "library"}
-      class:search={searchActive}
-    >
-      {searchActive ? "検索結果" : catalogSource === "library" ? "ライブラリ" : "一時走査"}
-    </span>
-    {#if scanBusy}
-      <span class="scan-indicator" title="スキャン進行中">
-        スキャン中
-        {progress?.found.toLocaleString() ?? summary?.scanned_count.toLocaleString() ?? 0}件
-      </span>
-    {/if}
-    {#if library.status.pending_hash > 0}
-      <span class="scan-indicator" title="BLAKE3ハッシュ計算の残件数">
-        ハッシュ待ち {library.status.pending_hash.toLocaleString()}
-      </span>
-    {/if}
-    {#if indexProgress !== null}
-      <span
-        class="scan-indicator"
-        title="USearch索引のバックグラウンド構築進捗 (検索・閲覧は引き続き利用できます)"
-        data-testid="vector-index-progress"
-      >
-        {indexProgressText(indexProgress)}
-      </span>
-    {/if}
-    {#if library.status.watch_degraded}
-      <span class="warn-indicator" title="フォルダ監視が未確立の登録ルートがあります (ポーリング再スキャンで運用中)">
-        ⚠ 監視劣化
-      </span>
-    {/if}
-    <div class="header-spacer"></div>
-    {#if metaNotice}
-      <span class="header-notice">{metaNotice}</span>
-    {/if}
-    {#if osNotice}
-      <span class="header-notice">{osNotice}</span>
-    {/if}
-    <!-- UIUX-1 (R-A): 操作ボタン類はメニューバーへ移動。headerは状態表示のみ。 -->
-  </header>
+  <AppHeader
+    {healthStatus}
+    {rawHealth}
+    {catalogSource}
+    {searchActive}
+    {headerStatusOpen}
+    {headerStatusBusy}
+    {headerStatusWarn}
+    {headerStatusHasRows}
+    {scanBusy}
+    {progress}
+    {summary}
+    pendingHash={library.status.pending_hash}
+    watchDegraded={library.status.watch_degraded}
+    {indexProgress}
+    {metaNotice}
+    {osNotice}
+    onToggleStatus={() => (headerStatusOpen = !headerStatusOpen)}
+    onCloseStatus={() => (headerStatusOpen = false)}
+  />
 
   <MenuBar {menus} />
 
@@ -3139,491 +3265,104 @@
     {/if}
 
     <section class="center-pane">
-      <div class="toolbar">
-        <nav class="breadcrumb" aria-label="現在場所">
-          {#if searchActive}
-            <span class="coll-current">
-              <span class="coll-current-kind" aria-hidden="true">
-                {searchStore.lastKind === "similar" ? "◈" : "⌕"}
-              </span>
-              {searchStore.lastKind === "similar" ? "類似画像" : "検索結果"}
-              <span class="coll-current-count" data-testid="search-status">
-                ({(searchStore.lastResult?.total ?? 0).toLocaleString()}件・
-                {(searchStore.lastResult?.elapsedMs ?? 0).toLocaleString()}ms)
-              </span>
-            </span>
-            <button
-              class="crumb"
-              title="検索条件を新しいDB状態で再実行"
-              onclick={() => void refreshSearch()}
-              disabled={searchStore.running}
-            >
-              再実行
-            </button>
-            <button
-              class="crumb"
-              title="通常のライブラリ表示へ戻る"
-              onclick={() => void exitSearch()}
-            >
-              閉じる
-            </button>
-          {:else if activeCollection !== null}
-            <span class="coll-current">
-              <span class="coll-current-kind" aria-hidden="true">
-                {activeCollection.kind === "smart" ? "✦" : "▤"}
-              </span>
-              コレクション「{activeCollection.name}」
-              <span class="coll-current-count">
-                ({activeCollection.item_count.toLocaleString()}件
-                {activeCollection.kind === "smart" ? "・評価結果" : ""})
-              </span>
-            </span>
-            <button
-              class="crumb"
-              title="通常のライブラリ表示へ戻る"
-              onclick={() => void exitCollection()}
-            >
-              閉じる
-            </button>
-          {:else if catalogSource === "library"}
-            <span
-              class="crumb-current"
-              title="ライブラリ表示は登録ルート全体を表示します (フォルダーの絞り込みは検索scopeで実行できます)"
-            >
-              ライブラリ (登録ルート全体)
-            </span>
-            <span class="crumb-hint" title="フォルダー単位の絞り込みは検索scope (フォルダ) で実行できます">
-              絞り込みは検索scope
-            </span>
-          {:else}
-            {#each crumbs as crumb, index (crumb.path)}
-              {#if index > 0}<span class="crumb-sep">›</span>{/if}
-              <button class="crumb" onclick={() => void selectFolder(crumb.path)}>
-                {crumb.name}
-              </button>
-            {/each}
-            <!-- UIUX-1 (R-E): パス直接入力。Enterで移動・ESCで取消。 -->
-            {#if pathInputOpen}
-              <input
-                class="crumb-input"
-                data-testid="breadcrumb-path-input"
-                type="text"
-                aria-label="移動先フォルダーの絶対パス"
-                placeholder="/絶対パス (Enterで移動・Escで取消)"
-                value={pathInputValue}
-                oninput={(event) => (pathInputValue = event.currentTarget.value)}
-                onkeydown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault();
-                    commitPathInput();
-                  } else if (event.key === "Escape") {
-                    event.preventDefault();
-                    cancelPathInput();
-                  }
-                }}
-                onblur={() => cancelPathInput()}
-                use:autofocusSelect
-              />
-            {:else}
-              <button
-                class="crumb crumb-path-button"
-                data-testid="breadcrumb-path-button"
-                aria-label="パスを入力して移動"
-                title="パスを入力して移動 (絶対パス)"
-                onclick={() => openPathInput()}
-              >
-                ✏
-              </button>
-            {/if}
-          {/if}
-        </nav>
-        {#if activeCollection === null}
-          <label class="sort-label">
-            ソート
-            <select
-              value={sortValue}
-              onchange={(event) => onSortChange(event.currentTarget.value as CatalogSort)}
-            >
-              <option value="name">名前</option>
-              <option value="date_desc">更新日時</option>
-              <option value="size_desc">容量</option>
-            </select>
-          </label>
-        {:else if activeCollection.kind === "manual"}
-          <span class="collection-tools" role="group" aria-label="コレクション内の並び替え">
-            <button
-              disabled={collectionBusy || gridSelection.ids.length === 0}
-              title="選択項目をコレクションの先頭へ移動"
-              onclick={() => void moveSelectedInCollection("front")}
-            >
-              選択を先頭へ
-            </button>
-            <button
-              disabled={collectionBusy || gridSelection.ids.length === 0}
-              title="選択項目をコレクションの末尾へ移動"
-              onclick={() => void moveSelectedInCollection("back")}
-            >
-              選択を末尾へ
-            </button>
-            <span class="position-move">
-              <input
-                type="number"
-                min="1"
-                placeholder="位置"
-                aria-label="移動先の位置 (1-based)"
-                value={collectionPositionInput}
-                oninput={(event) => (collectionPositionInput = event.currentTarget.value)}
-                onkeydown={(event) => {
-                  if (event.key === "Enter") {
-                    void moveSelectedInCollection("position");
-                  }
-                }}
-              />
-              <button
-                disabled={collectionBusy || gridSelection.ids.length === 0}
-                title="選択項目を指定位置へ移動"
-                onclick={() => void moveSelectedInCollection("position")}
-              >
-                へ移動
-              </button>
-            </span>
-            <button
-              disabled={collectionBusy || gridSelection.ids.length === 0}
-              title="選択項目をこのコレクションから除外 (元画像は影響しません)"
-              onclick={() => void removeSelectedFromCollection()}
-            >
-              コレクションから除外
-            </button>
-          </span>
-        {:else}
-          <span class="collection-tools" role="group" aria-label="スマートコレクション操作">
-            <button
-              disabled={collectionBusy}
-              title="検索条件を再評価して内容を更新 (評価・タグ等の変更後)"
-              onclick={() => void refreshActiveSmartCollection()}
-            >
-              再評価
-            </button>
-          </span>
-        {/if}
-        {#if activeCollection !== null}
-          <button
-            class="export-entry"
-            title="このコレクションの画像と.txtをSD学習用データセットとして書き出します"
-            onclick={() => {
-              const collection = activeCollection;
-              if (collection !== null) {
-                void startExportForCollection(collection);
-              }
-            }}
-          >
-            エクスポート…
-          </button>
-        {/if}
-        <button
-          class="toolbar-folder"
-          disabled={catalogSource !== "library" || fileOpsBusy}
-          title="現在の登録ルートに新しいフォルダを作成"
-          onclick={() => void startNewFolder()}
-        >
-          + 新規フォルダ
-        </button>
-        <div class="toolbar-spacer"></div>
-        <label class="size-label" title="サムネイルサイズ">
-          サイズ
-          <input
-            type="range"
-            min="0"
-            max="1"
-            step="1"
-            value={sizeSliderValue()}
-            oninput={(event) => onSizeSlider(Number(event.currentTarget.value))}
-          />
-        </label>
-        <!-- UIUX-3 V-1: スクロール速度スライダーはツールバーから撤去し
-             設定dialog表示タブへ移設 (xsp=はdialog表示タブ展開時のみ読める) -->
-        <span class="viewer-choice">
-          <button class:active={viewerChoice === "single"} onclick={() => (viewerChoice = "single")}>
-            単一
-          </button>
-          <button
-            class:active={viewerChoice === "compare2"}
-            onclick={() => (viewerChoice = "compare2")}
-          >
-            2枚比較
-          </button>
-          <button
-            class:active={viewerChoice === "compare4"}
-            onclick={() => (viewerChoice = "compare4")}
-          >
-            4枚比較
-          </button>
-          <button
-            onclick={() => {
-              const focus = gridSelection.focusIndex;
-              if (focus !== null) {
-                void openViewerForChoice(focus);
-              } else {
-                viewerNotice = "グリッドで項目を選択してください";
-              }
-            }}
-          >
-            開く
-          </button>
-        </span>
-      </div>
-      <div class="search-bar" role="search" data-testid="search-bar">
-        {#if !searchExpanded}
-          <!-- UIUX-3 V-3: 折りたたみ1行。確定済み検索表現 + scope実態 + フィルタ/
-               意味重み + 実行中/表示中のクリア操作 -->
-          <button
-            class="search-toggle"
-            data-testid="search-toggle"
-            aria-expanded="false"
-            aria-label="検索を展開"
-            title="検索行を展開"
-            onclick={toggleSearchExpanded}
-          >🔍 ▸</button>
-          <span class="search-summary" data-testid="search-summary">
-            {#if collapsedSearchLine.queryText !== ""}
-              <span class="search-summary-query" data-testid="search-summary-query">{collapsedSearchLine.queryText}</span>
-            {:else}
-              <span class="search-summary-empty">検索</span>
-            {/if}
-          </span>
-          {#if collapsedSearchLine.scopeLabel !== null}
-            <span class="search-scope-badge" data-testid="search-scope-badge" data-scope-kind={searchScopeMode}>
-              {collapsedSearchLine.scopeLabel}
-            </span>
-          {/if}
-          {#each collapsedSearchLine.badges as badge (badge)}
-            <span class="search-scope-badge">{badge}</span>
-          {/each}
-          {#if searchStore.running}
-            <span class="search-summary-running">検索中…</span>
-          {/if}
-          {#if collapsedSearchLine.showClear}
-            <button
-              class="search-summary-clear"
-              data-testid="search-clear"
-              aria-label="検索を解除"
-              title="検索語を消し、検索結果表示を解除"
-              onclick={clearSearchFromCollapsed}
-            >✕</button>
-          {/if}
-        {:else}
-        <button
-          class="search-toggle"
-          data-testid="search-toggle"
-          aria-expanded="true"
-          aria-label="検索を折りたたむ"
-          title="検索行を折りたたむ"
-          onclick={toggleSearchExpanded}
-        >🔍 ▾</button>
-        <input
-          type="search"
-          class="search-input"
-          placeholder="検索 (例: 青い髪の少女 tag:night rating:>=3 type:png)"
-          aria-label="検索クエリ"
-          data-testid="search-input"
-          value={searchInput}
-          oninput={(event) => (searchInput = event.currentTarget.value)}
-          onkeydown={(event) => {
-            if (event.key === "Enter") {
-              event.preventDefault();
-              void runSearch();
-            }
-          }}
+      <!-- UIUX-5/WP7b: toolbar抽出。DOM・class・testidはApp.svelte時代と
+           不変 (状態正本はApp — props/callbackでのみ授受)。 -->
+      <Toolbar
+        {searchActive}
+        searchRunning={searchStore.running}
+        searchKind={searchStore.lastKind}
+        searchResultTotal={searchStore.lastResult?.total ?? 0}
+        searchResultElapsedMs={searchStore.lastResult?.elapsedMs ?? 0}
+        onRefreshSearch={refreshSearch}
+        onExitSearch={exitSearch}
+        {activeCollection}
+        onExitCollection={exitCollection}
+        {catalogSource}
+        {crumbs}
+        onSelectFolder={selectFolder}
+        {pathInputOpen}
+        {pathInputValue}
+        onOpenPathInput={openPathInput}
+        onPathInput={(value) => (pathInputValue = value)}
+        onCommitPathInput={commitPathInput}
+        onCancelPathInput={cancelPathInput}
+        {sortValue}
+        {onSortChange}
+        {collectionToolsOpen}
+        onToggleCollectionTools={() => (collectionToolsOpen = !collectionToolsOpen)}
+        onCloseCollectionTools={() => (collectionToolsOpen = false)}
+        {collectionBusy}
+        selectionCount={gridSelection.ids.length}
+        {collectionPositionInput}
+        onCollectionPositionInput={(value) => (collectionPositionInput = value)}
+        onMoveSelectedInCollection={moveSelectedInCollection}
+        onRemoveSelectedFromCollection={removeSelectedFromCollection}
+        onRefreshActiveSmartCollection={refreshActiveSmartCollection}
+        {fileOpsBusy}
+        onStartNewFolder={startNewFolder}
+        sizeValue={sizeSliderValue()}
+        {onSizeSlider}
+        {viewerChoice}
+        onViewerChoice={(choice) => (viewerChoice = choice)}
+        onOpenViewer={openViewerFromToolbar}
+      />
+      <!-- UIUX-5/WP7b: search-bar抽出。DOM・class・testidはApp.svelte時代と
+           不変 (data-testid="search-input"はsearch-bar内 — devtest srFocusInput契約)。 -->
+      <SearchBar
+        {searchExpanded}
+        onToggleSearchExpanded={toggleSearchExpanded}
+        {collapsedSearchLine}
+        onClearSearchFromCollapsed={clearSearchFromCollapsed}
+        searchRunning={searchStore.running}
+        {searchInput}
+        onSearchInput={(value) => (searchInput = value)}
+        onRunSearch={() => void runSearch()}
+        {searchScopeMode}
+        onSearchScopeChange={(mode) => (searchScopeMode = mode)}
+        semanticAvailable={semanticAvailable()}
+        semanticReason={semanticReason()}
+        {semanticWeightPercent}
+        onSemanticWeightInput={(value) => (semanticWeightPercent = value)}
+        {searchFiltersOpen}
+        onToggleSearchFilters={() => (searchFiltersOpen = !searchFiltersOpen)}
+        onCloseSearchFilters={() => (searchFiltersOpen = false)}
+        {searchFiltersActive}
+        searchWarnings={searchStore.lastResult?.warnings ?? []}
+        canSaveSearch={searchStore.lastResult !== null}
+        onSaveCurrentSearch={() => void saveCurrentSearch()}
+        {searchFilters}
+        onSearchFiltersChange={(filters) => (searchFilters = filters)}
+        {searchFilterChipList}
+        onRemoveSearchFilterChip={removeSearchFilterChip}
+      />
+      {#if noticeStripActive}
+        <!-- UIUX-5/WP4: 6種のnotice行を1行stripへ集約 (エラー最優先)。各要素の
+             class・testid・roleは集約前そのまま — 活性エラーは常に生DOMに存在
+             する契約 (devtest xerr)。viewer/fileOpsの平文noticeはトースト経由。 -->
+        <NoticeStrip
+          {searchNotice}
+          {folderNotice}
+          {collectionNotice}
+          {fileOpsError}
+          {fileOpsBusy}
+          {fileOpsProgress}
+          {conflictOf}
+          onCancelFileOps={() => cancelFileOps(fileOpsIpc)}
         />
-        <select
-          class="search-scope"
-          aria-label="検索範囲"
-          title="検索範囲。「現在のフォルダ」は選択フォルダを含む登録ルート全体 (サブフォルダ単位の絞り込みはなし)"
-          value={searchScopeMode}
-          onchange={(event) =>
-            (searchScopeMode = event.currentTarget.value as typeof searchScopeMode)}
-        >
-          <option value="library">ライブラリ全体</option>
-          <option value="folder">現在のフォルダ（登録ルート全体）</option>
-          <option value="collection">表示中コレクション</option>
-        </select>
-        <label
-          class="search-semantic"
-          data-testid="search-semantic"
-          title={semanticAvailable()
-            ? "キーワード検索と意味検索 (自然言語) の重み。左=キーワードのみ / 右=意味のみ"
-            : semanticReason()}
-        >
-          <span class="semantic-end">キーワード</span>
-          <input
-            type="range"
-            min="0"
-            max="100"
-            step="5"
-            value={semanticWeightPercent}
-            disabled={!semanticAvailable()}
-            aria-label="意味検索の重み"
-            data-testid="search-semantic-weight"
-            oninput={(event) => (semanticWeightPercent = Number(event.currentTarget.value))}
-          />
-          <span class="semantic-end">意味</span>
-          <span class="semantic-value" data-testid="search-semantic-value">
-            {semanticWeightPercent > 0
-              ? `${weightLabel(semanticWeightPercent / 100)} ${semanticWeightPercent}%`
-              : "キーワード"}
-          </span>
-        </label>
-        <button
-          class:active={searchFiltersOpen || searchFiltersActive}
-          onclick={() => (searchFiltersOpen = !searchFiltersOpen)}
-          title="評価・選別・お気に入り・形式・タグ・日付で絞り込み (検索語とAND合成)"
-          data-testid="search-filter-toggle"
-        >
-          フィルター{searchFiltersActive ? " ●" : ""}
-        </button>
-        <button
-          onclick={() => void runSearch()}
-          disabled={searchStore.running}
-          data-testid="search-run"
-        >
-          {searchStore.running ? "検索中…" : "検索"}
-        </button>
-        <button
-          onclick={() => void saveCurrentSearch()}
-          disabled={searchStore.lastResult === null}
-          title="現在の検索条件を保存済み検索 (スマートコレクション) として保存"
-          data-testid="search-save"
-        >
-          保存
-        </button>
-        {#if searchStore.lastResult !== null && searchStore.lastResult.warnings.length > 0}
-          <span class="search-warn" title={searchStore.lastResult.warnings.join("\n")}>
-            ⚠ {searchStore.lastResult.warnings.length}件の警告
-          </span>
-        {/if}
-        {#if searchFiltersOpen}
-          <div class="search-filters" data-testid="search-filters">
-            <label>
-              評価≥
-              <select
-                value={searchFilters.ratingMin === null ? "" : String(searchFilters.ratingMin)}
-                onchange={(event) => {
-                  const value = event.currentTarget.value;
-                  searchFilters = {
-                    ...searchFilters,
-                    ratingMin: value === "" ? null : Number(value),
-                  };
-                }}
-              >
-                <option value="">-</option>
-                {#each [1, 2, 3, 4, 5] as rating (rating)}
-                  <option value={rating}>★{rating}</option>
-                {/each}
-              </select>
-            </label>
-            <label>
-              選別
-              <select
-                value={searchFilters.cull ?? ""}
-                onchange={(event) => {
-                  const value = event.currentTarget.value;
-                  searchFilters = {
-                    ...searchFilters,
-                    cull:
-                      value === "picked" || value === "rejected" || value === "unselected"
-                        ? value
-                        : null,
-                  };
-                }}
-              >
-                <option value="">-</option>
-                <option value="picked">採用</option>
-                <option value="rejected">除外</option>
-                <option value="unselected">未選別</option>
-              </select>
-            </label>
-            <label>
-              <input
-                type="checkbox"
-                checked={searchFilters.favorite === true}
-                onchange={(event) =>
-                  (searchFilters = {
-                    ...searchFilters,
-                    favorite: event.currentTarget.checked ? true : null,
-                  })}
-              />
-              ♥ お気に入り
-            </label>
-            <label>
-              形式
-              <select
-                value={searchFilters.type}
-                onchange={(event) =>
-                  (searchFilters = { ...searchFilters, type: event.currentTarget.value })}
-              >
-                {#each ["", "png", "jpg", "webp", "gif", "avif", "bmp", "tiff"] as format (format)}
-                  <option value={format}>{format === "" ? "-" : format}</option>
-                {/each}
-              </select>
-            </label>
-            <label>
-              タグ
-              <input
-                type="text"
-                placeholder="tag"
-                value={searchFilters.tag}
-                oninput={(event) =>
-                  (searchFilters = { ...searchFilters, tag: event.currentTarget.value })}
-              />
-            </label>
-            <label>
-              追加日
-              <input
-                type="date"
-                value={searchFilters.addedFrom}
-                onchange={(event) =>
-                  (searchFilters = { ...searchFilters, addedFrom: event.currentTarget.value })}
-              />
-              〜
-              <input
-                type="date"
-                value={searchFilters.addedTo}
-                onchange={(event) =>
-                  (searchFilters = { ...searchFilters, addedTo: event.currentTarget.value })}
-              />
-            </label>
-            <button onclick={() => (searchFilters = { ...EMPTY_FILTERS })}>クリア</button>
-          </div>
-        {/if}
-        {/if}
-      </div>
-      {#if searchNotice}
-        <p class="toolbar-notice error" role="alert" data-testid="search-notice">{searchNotice}</p>
       {/if}
-      {#if viewerNotice}
-        <p class="toolbar-notice">{viewerNotice}</p>
-      {/if}
-      {#if folderNotice}
-        <p class="toolbar-notice error">{folderNotice}</p>
-      {/if}
-      {#if collectionNotice}
-        <p class="toolbar-notice error" role="status">{collectionNotice}</p>
-      {/if}
-      {#if fileOpsNotice}
-        <p class="toolbar-notice" role="status" data-testid="fileops-notice">{fileOpsNotice}</p>
-      {/if}
-      {#if fileOpsError !== null}
-        <p class="toolbar-notice error" role="alert" data-testid="fileops-error">{fileOpsError}</p>
-      {/if}
-      {#if fileOpsBusy && fileOpsProgress !== null}
-        <div class="fileops-progress" role="status" data-testid="fileops-progress">
-          <span>
-            {describeKind(conflictOf?.args.kind ?? "copy")}中
-            {fileOpsProgress.index + 1}/{fileOpsProgress.total}
-          </span>
-          <progress max={fileOpsProgress.total} value={fileOpsProgress.index + 1}></progress>
-          <button onclick={() => void cancelFileOps(fileOpsIpc)}>キャンセル</button>
-        </div>
+
+      {#if sessionSnapshot.active}
+        <!-- UIUX-5/WP6: 選別セッションのモードバー。InfoPanelを開かなくても選別操作
+             できるようにする。次へボタンを「次へ →」で始めるとdevtest sessionNext
+             (clickButtonは文書順最初のprefix一致) がInfoPanel側を押せなくなるため
+             「次へ ▶」としている。 -->
+        <SessionModeBar
+          {sessionCounts}
+          {sessionNotice}
+          onSessionMove={sessionMove}
+          onSessionTriage={sessionTriage}
+          onEndSession={endSession}
+        />
       {/if}
 
       <div class="grid-wrap">
@@ -3738,6 +3477,8 @@
           }}
           aiRuns={focusInfo !== null && metaDetail?.id === focusInfo.id ? aiRuns : []}
           onEnqueueAi={() => void enqueueAiForSelection()}
+          collapsedSections={infoPanelCollapsed}
+          onToggleSection={toggleInfoPanelSection}
         />
       </aside>
     {/if}
@@ -3821,7 +3562,7 @@
     onChoose={onConflictChoose}
     onCancel={() => {
       conflictOf = null;
-      fileOpsNotice = "操作を中止しました";
+      showFileOpsNotice("操作を中止しました");
     }}
   />
 {/if}
@@ -3991,218 +3732,17 @@
   <CompareView store={compareStore} onClose={closeViewer} onCullSlot={handleCullSlot} />
 {/if}
 
+<!-- UIUX-5/WP4: 揮発性noticeのトースト (画面右下・4秒自動消滅)。fileops系は
+     元noticeのtestid・roleを引き継ぐ (可視中のみDOM)。ビューア表示中も出す
+     ためルート階層に置く。 -->
+<ToastStack toasts={toastQueue.toasts} onDismissToast={dismissToast} />
+
 <style>
   .app-shell {
     display: flex;
     flex-direction: column;
     height: 100%;
     min-height: 0;
-  }
-
-  .app-header {
-    flex: none;
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-    padding: 0.4rem 0.75rem;
-    border-bottom: 1px solid light-dark(#d0d7de, #30363d);
-    font-size: 0.85rem;
-    /* UIUX-1 (R-A): 状態表示のみになったheader。狭幅では折返し (省略なし) */
-    flex-wrap: wrap;
-  }
-
-  .app-title {
-    font-size: 1rem;
-    margin: 0;
-  }
-
-  .health-dot {
-    width: 0.6rem;
-    height: 0.6rem;
-    border-radius: 50%;
-    background: light-dark(#8b949e, #6e7681);
-  }
-
-  .health-dot.ok {
-    background: light-dark(#1a7f37, #3fb950);
-  }
-
-  .health-dot.ng {
-    background: light-dark(#cf222e, #f85149);
-  }
-
-  .source-badge {
-    padding: 0.1rem 0.5rem;
-    border-radius: 999px;
-    font-size: 0.72rem;
-    border: 1px solid light-dark(#d0d7de, #30363d);
-    color: light-dark(#57606a, #8b949e);
-  }
-
-  .source-badge.library {
-    border-color: light-dark(#1a7f37, #238636);
-    color: light-dark(#1a7f37, #3fb950);
-  }
-
-  .source-badge.search {
-    border-color: light-dark(#8250df, #a371f7);
-    color: light-dark(#8250df, #a371f7);
-  }
-
-  /* WP-8: 検索バー */
-  .search-bar {
-    flex: none;
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 0.4rem;
-    padding: 0.25rem 0.6rem;
-    border-bottom: 1px solid light-dark(#d0d7de, #30363d);
-  }
-
-  /* UIUX-3 V-3: 折りたたみトグル + 1行要約 */
-  .search-toggle {
-    flex: none;
-    border: 1px solid light-dark(#d0d7de, #30363d);
-    background: light-dark(#f6f8fa, #21262d);
-    color: inherit;
-    font: inherit;
-    font-size: 0.78rem;
-    padding: 0.15rem 0.5rem;
-    border-radius: 0.375rem;
-    cursor: pointer;
-    white-space: nowrap;
-  }
-
-  .search-summary {
-    flex: 1 1 10rem;
-    min-width: 0;
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4rem;
-    font-size: 0.8rem;
-    overflow: hidden;
-  }
-
-  .search-summary-query {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .search-summary-empty {
-    color: light-dark(#57606a, #8b949e);
-    font-size: 0.78rem;
-  }
-
-  .search-scope-badge {
-    flex: none;
-    display: inline-block;
-    padding: 0 0.45rem;
-    border: 1px solid light-dark(#d0d7de, #30363d);
-    border-radius: 999px;
-    font-size: 0.72rem;
-    color: light-dark(#57606a, #8b949e);
-    white-space: nowrap;
-    max-width: 22rem;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .search-summary-running {
-    flex: none;
-    font-size: 0.75rem;
-    color: light-dark(#0969da, #58a6ff);
-  }
-
-  .search-summary-clear {
-    flex: none;
-    border: 1px solid light-dark(#d0d7de, #30363d);
-    background: transparent;
-    color: inherit;
-    font: inherit;
-    padding: 0.05rem 0.45rem;
-    border-radius: 0.375rem;
-    cursor: pointer;
-  }
-
-  .search-input {
-    flex: 1 1 16rem;
-    min-width: 12rem;
-  }
-
-  .search-scope {
-    flex: none;
-  }
-
-  /* WP-12: キーワード⇔意味の重みスライダー */
-  .search-semantic {
-    flex: none;
-    display: inline-flex;
-    align-items: center;
-    gap: 0.35rem;
-    font-size: 0.75rem;
-    white-space: nowrap;
-  }
-
-  .search-semantic input[type="range"] {
-    width: 7rem;
-  }
-
-  .search-semantic:has(input:disabled) {
-    opacity: 0.55;
-  }
-
-  .semantic-value {
-    min-width: 6.5rem;
-    font-variant-numeric: tabular-nums;
-    text-align: left;
-  }
-
-  .search-warn {
-    font-size: 0.75rem;
-    color: light-dark(#9a6700, #d29922);
-  }
-
-  .search-filters {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 0.6rem;
-    width: 100%;
-    padding: 0.3rem 0.2rem;
-    font-size: 0.78rem;
-    border-top: 1px dashed light-dark(#d0d7de, #30363d);
-  }
-
-  .search-filters label {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.3rem;
-  }
-
-  .scan-indicator {
-    font-size: 0.75rem;
-    color: light-dark(#0969da, #58a6ff);
-  }
-
-  .warn-indicator {
-    font-size: 0.75rem;
-    color: light-dark(#9a6700, #d29922);
-    font-weight: bold;
-  }
-
-  .header-spacer {
-    flex: 1;
-  }
-
-  .header-notice {
-    font-size: 0.75rem;
-    color: light-dark(#57606a, #8b949e);
-    max-width: 24rem;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
   }
 
   .app-panes {
@@ -4220,7 +3760,7 @@
   }
 
   .side-pane.left {
-    border-right: 1px solid light-dark(#d0d7de, #30363d);
+    border-right: 1px solid var(--color-border-strong);
     font-size: 0.875rem;
   }
 
@@ -4246,7 +3786,7 @@
   }
 
   .side-pane.right {
-    border-left: 1px solid light-dark(#d0d7de, #30363d);
+    border-left: 1px solid var(--color-border-strong);
   }
 
   .pane-resizer {
@@ -4268,108 +3808,6 @@
     flex-direction: column;
   }
 
-  .toolbar {
-    flex: none;
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-    padding: 0.3rem 0.6rem;
-    font-size: 0.8rem;
-    flex-wrap: wrap;
-  }
-
-  .breadcrumb {
-    display: flex;
-    align-items: center;
-    gap: 0.15rem;
-    min-width: 0;
-    overflow: hidden;
-    flex-wrap: wrap;
-  }
-
-  .crumb {
-    border: none;
-    background: transparent;
-    color: light-dark(#0969da, #58a6ff);
-    font: inherit;
-    padding: 0.1rem 0.25rem;
-    border-radius: 0.25rem;
-    cursor: pointer;
-  }
-
-  .crumb:hover {
-    background: light-dark(#eaeef2, #21262d);
-  }
-
-  .crumb-current {
-    font-weight: bold;
-  }
-
-  /* UXLIB-1: ライブラリ表示の現仕様 (全体表示・絞り込みなし) の一案内 */
-  .crumb-hint {
-    font-size: 0.7rem;
-    color: light-dark(#57606a, #8b949e);
-  }
-
-  .coll-current {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.25rem;
-    font-weight: bold;
-  }
-
-  .coll-current-kind {
-    color: light-dark(#0969da, #58a6ff);
-  }
-
-  .coll-current-count {
-    font-weight: normal;
-    font-size: 0.72rem;
-    color: light-dark(#57606a, #8b949e);
-  }
-
-  .collection-tools {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.3rem;
-    flex-wrap: wrap;
-  }
-
-  .position-move {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.2rem;
-  }
-
-  .position-move input {
-    width: 4.5rem;
-    font: inherit;
-    font-size: 0.78rem;
-  }
-
-  .export-entry:disabled {
-    opacity: 0.55;
-  }
-
-  .crumb-sep {
-    color: light-dark(#8b949e, #6e7681);
-  }
-
-  /* UIUX-1 (R-E): パンくずのパス直接入力 */
-  .crumb-input {
-    font: inherit;
-    font-size: 0.78rem;
-    font-family: monospace;
-    min-width: 14rem;
-    flex: 0 1 auto;
-    padding: 0.1rem 0.3rem;
-  }
-
-  .crumb-path-button {
-    font-size: 0.85rem;
-    padding: 0.1rem 0.35rem;
-  }
-
   /* UIUX-1: ツール>ルートのバックアップ… の選択ダイアログ
    * (他ダイアログと同じpicker様式 — SettingsDialog等と共通の見た目) */
   .picker-backdrop {
@@ -4385,20 +3823,20 @@
   .backup-root-picker {
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
+    gap: var(--space-50);
     width: min(40rem, 92vw);
     max-height: 70vh;
     overflow-y: auto;
-    background: light-dark(#ffffff, #1c2128);
-    border: 1px solid light-dark(#d0d7de, #444c56);
-    border-radius: 0.6rem;
+    background: var(--color-surface-raised);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-xl);
     box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
-    padding: 0.9rem 1rem;
-    font-size: 0.85rem;
+    padding: var(--space-90) var(--space-100);
+    font-size: var(--font-size-85);
   }
 
   .backup-root-picker h2 {
-    font-size: 1rem;
+    font-size: var(--font-size-100);
     margin: 0;
   }
 
@@ -4408,17 +3846,17 @@
     padding: 0;
     display: flex;
     flex-direction: column;
-    gap: 0.25rem;
+    gap: var(--space-25);
   }
 
   .backup-root-list button {
     display: flex;
     flex-direction: column;
     align-items: flex-start;
-    gap: 0.15rem;
+    gap: var(--space-15);
     padding: 0.3rem 0.4rem;
-    border: 1px solid light-dark(#d0d7de, #444c56);
-    border-radius: 0.375rem;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
     background: transparent;
     color: inherit;
     font: inherit;
@@ -4427,94 +3865,32 @@
   }
 
   .backup-root-list button:hover {
-    background: light-dark(#eaeef2, #21262d);
+    background: var(--color-bg-subtle);
   }
 
   .backup-root-list button.unavailable {
-    border-color: light-dark(#bf8700, #d29922);
+    border-color: var(--color-attention-border);
   }
 
   .backup-root-path {
     font-family: monospace;
-    font-size: 0.75rem;
+    font-size: var(--font-size-75);
     overflow-wrap: anywhere;
   }
 
   .backup-root-state {
-    font-size: 0.7rem;
-    color: light-dark(#57606a, #8b949e);
+    font-size: var(--font-size-70);
+    color: var(--color-text-muted);
   }
 
   .backup-root-picker .picker-actions {
     display: flex;
     justify-content: flex-end;
-    gap: 0.4rem;
-  }
-
-  .sort-label,
-  .size-label {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.3rem;
-    color: light-dark(#57606a, #8b949e);
-    font-size: 0.78rem;
-  }
-
-  .toolbar-spacer {
-    flex: 1;
-  }
-
-  .viewer-choice {
-    display: inline-flex;
-    gap: 0.3rem;
+    gap: var(--space-40);
   }
 
   button {
-    font-size: 0.8rem;
-  }
-
-  button.active {
-    border-color: light-dark(#0969da, #58a6ff);
-    font-weight: bold;
-  }
-
-  .toolbar-notice {
-    flex: none;
-    margin: 0;
-    padding: 0 0.6rem;
-    font-size: 0.75rem;
-    color: light-dark(#57606a, #8b949e);
-  }
-
-  .fileops-progress {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    font-size: 0.78rem;
-  }
-
-  .fileops-progress progress {
-    width: 10rem;
-  }
-
-  .toolbar-folder {
-    font: inherit;
-    font-size: 0.78rem;
-    padding: 0.15rem 0.5rem;
-    border-radius: 0.375rem;
-    border: 1px solid light-dark(#d0d7de, #30363d);
-    background: transparent;
-    color: inherit;
-    cursor: pointer;
-  }
-
-  .toolbar-folder:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
-
-  .toolbar-notice.error {
-    color: light-dark(#cf222e, #f85149);
+    font-size: var(--font-size-80);
   }
 
   .grid-wrap {
@@ -4531,7 +3907,7 @@
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 0.4rem;
+    gap: var(--space-40);
     pointer-events: none;
     text-align: center;
     padding: 2rem;
@@ -4539,14 +3915,14 @@
 
   .empty-message {
     margin: 0;
-    font-size: 1rem;
-    color: light-dark(#57606a, #8b949e);
+    font-size: var(--font-size-100);
+    color: var(--color-text-muted);
   }
 
   .empty-detail {
     margin: 0;
-    font-size: 0.8rem;
-    color: light-dark(#8b949e, #6e7681);
+    font-size: var(--font-size-80);
+    color: var(--color-text-subtle);
     font-family: monospace;
     overflow-wrap: anywhere;
   }
@@ -4555,15 +3931,15 @@
     flex: none;
     display: flex;
     align-items: center;
-    gap: 0.75rem;
+    gap: var(--space-75);
     padding: 0.25rem 0.75rem;
-    border-top: 1px solid light-dark(#d0d7de, #30363d);
-    font-size: 0.75rem;
-    color: light-dark(#57606a, #8b949e);
+    border-top: 1px solid var(--color-border-strong);
+    font-size: var(--font-size-75);
+    color: var(--color-text-muted);
   }
 
   .status-error {
-    color: light-dark(#cf222e, #f85149);
+    color: var(--color-danger);
   }
 
   .status-spacer {
@@ -4571,7 +3947,7 @@
   }
 
   .status-hint {
-    color: light-dark(#8b949e, #6e7681);
+    color: var(--color-text-subtle);
   }
 
   .retry-backdrop {
@@ -4589,17 +3965,17 @@
     max-height: 70vh;
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
-    background: light-dark(#ffffff, #1c2128);
-    border: 1px solid light-dark(#d0d7de, #444c56);
-    border-radius: 0.6rem;
+    gap: var(--space-50);
+    background: var(--color-surface-raised);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-xl);
     box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
-    padding: 0.9rem 1rem;
-    font-size: 0.85rem;
+    padding: var(--space-90) var(--space-100);
+    font-size: var(--font-size-85);
   }
 
   .retry h2 {
-    font-size: 1rem;
+    font-size: var(--font-size-100);
     margin: 0;
   }
 
@@ -4609,8 +3985,8 @@
     overflow-y: auto;
     display: flex;
     flex-direction: column;
-    gap: 0.25rem;
-    font-size: 0.78rem;
+    gap: var(--space-25);
+    font-size: var(--font-size-78);
   }
 
   .retry-list li {
@@ -4623,22 +3999,22 @@
   }
 
   .retry-error {
-    color: light-dark(#cf222e, #f85149);
+    color: var(--color-danger);
     overflow-wrap: anywhere;
   }
 
   .retry-actions {
     display: flex;
     justify-content: flex-end;
-    gap: 0.4rem;
+    gap: var(--space-40);
   }
 
   .retry-actions .primary {
-    background: light-dark(#0969da, #1f6feb);
+    background: var(--color-accent-emphasis);
     color: #ffffff;
     border: none;
-    border-radius: 0.375rem;
-    padding: 0.3rem 0.8rem;
+    border-radius: var(--radius-sm);
+    padding: var(--space-30) var(--space-80);
     cursor: pointer;
   }
 </style>

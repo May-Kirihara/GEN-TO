@@ -380,42 +380,42 @@
     display: flex;
     flex-direction: column;
     min-height: 0;
-    border-top: 1px solid light-dark(#d0d7de, #30363d);
+    border-top: 1px solid var(--color-border-strong);
     padding: 0.35rem 0.5rem 0.5rem;
-    font-size: 0.8rem;
+    font-size: var(--font-size-80);
   }
 
   .coll-header {
     display: flex;
     align-items: center;
-    gap: 0.4rem;
+    gap: var(--space-40);
   }
 
   .coll-header h3 {
-    font-size: 0.8rem;
-    margin: 0.2rem 0;
+    font-size: var(--font-size-80);
+    margin: var(--space-20) 0;
     flex: 1;
   }
 
   .coll-actions {
     display: inline-flex;
-    gap: 0.25rem;
+    gap: var(--space-25);
   }
 
   button {
-    font-size: 0.75rem;
+    font-size: var(--font-size-75);
   }
 
   .coll-create {
     display: flex;
     flex-direction: column;
-    gap: 0.3rem;
+    gap: var(--space-30);
     padding: 0.35rem 0;
   }
 
   .coll-name-input {
     font: inherit;
-    font-size: 0.8rem;
+    font-size: var(--font-size-80);
     width: 100%;
     box-sizing: border-box;
   }
@@ -428,24 +428,24 @@
   .coll-builder {
     display: flex;
     flex-direction: column;
-    gap: 0.25rem;
+    gap: var(--space-25);
   }
 
   .coll-condition {
     display: flex;
     align-items: center;
-    gap: 0.25rem;
+    gap: var(--space-25);
   }
 
   .coll-condition select {
-    font-size: 0.75rem;
+    font-size: var(--font-size-75);
     min-width: 0;
     flex: 1;
   }
 
   .coll-tag-input {
     font: inherit;
-    font-size: 0.75rem;
+    font-size: var(--font-size-75);
     flex: 1;
     min-width: 0;
   }
@@ -461,19 +461,19 @@
 
   .coll-builder-hint {
     margin: 0;
-    font-size: 0.68rem;
-    color: light-dark(#57606a, #8b949e);
+    font-size: var(--font-size-68);
+    color: var(--color-text-muted);
   }
 
   .coll-create-actions {
     display: flex;
-    gap: 0.3rem;
+    gap: var(--space-30);
   }
 
   .coll-error {
-    margin: 0.2rem 0;
-    font-size: 0.72rem;
-    color: light-dark(#cf222e, #f85149);
+    margin: var(--space-20) 0;
+    font-size: var(--font-size-72);
+    color: var(--color-danger);
     overflow-wrap: anywhere;
   }
 
@@ -490,14 +490,14 @@
   }
 
   .coll-row.row-selected .coll-label {
-    background: light-dark(#ddf4ff, #121d2f);
+    background: var(--color-accent-subtle);
     font-weight: bold;
   }
 
   .coll-label {
     display: inline-flex;
     align-items: center;
-    gap: 0.3rem;
+    gap: var(--space-30);
     flex: 1;
     min-width: 0;
     border: none;
@@ -505,20 +505,20 @@
     color: inherit;
     font: inherit;
     padding: 0.15rem 0.25rem;
-    border-radius: 0.25rem;
+    border-radius: var(--radius-xs);
     cursor: pointer;
     overflow: hidden;
   }
 
   .coll-label:hover {
-    background: light-dark(#eaeef2, #21262d);
+    background: var(--color-bg-subtle);
   }
 
   .coll-kind {
     flex: none;
     width: 1rem;
     text-align: center;
-    color: light-dark(#0969da, #58a6ff);
+    color: var(--color-accent);
   }
 
   .coll-name {
@@ -532,14 +532,14 @@
 
   .coll-count {
     flex: none;
-    font-size: 0.68rem;
-    color: light-dark(#57606a, #8b949e);
+    font-size: var(--font-size-68);
+    color: var(--color-text-muted);
   }
 
   .coll-row-actions {
     display: none;
     flex: none;
-    gap: 0.1rem;
+    gap: var(--space-10);
   }
 
   .coll-row:hover .coll-row-actions,
@@ -550,23 +550,23 @@
   .coll-icon-button {
     border: none;
     background: transparent;
-    color: light-dark(#57606a, #8b949e);
+    color: var(--color-text-muted);
     cursor: pointer;
     padding: 0.05rem 0.2rem;
-    font-size: 0.75rem;
-    border-radius: 0.25rem;
+    font-size: var(--font-size-75);
+    border-radius: var(--radius-xs);
   }
 
   .coll-icon-button:hover {
-    background: light-dark(#eaeef2, #21262d);
+    background: var(--color-bg-subtle);
     color: inherit;
   }
 
   .coll-query {
     flex-basis: 100%;
     padding: 0 0.25rem 0.15rem 1.6rem;
-    font-size: 0.68rem;
-    color: light-dark(#57606a, #8b949e);
+    font-size: var(--font-size-68);
+    color: var(--color-text-muted);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -574,7 +574,7 @@
 
   .coll-empty {
     margin: 0.3rem 0;
-    font-size: 0.72rem;
-    color: light-dark(#8b949e, #6e7681);
+    font-size: var(--font-size-72);
+    color: var(--color-text-subtle);
   }
 </style>

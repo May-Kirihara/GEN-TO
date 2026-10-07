@@ -311,23 +311,23 @@
   .tree-row {
     display: flex;
     align-items: center;
-    gap: 0.15rem;
+    gap: var(--space-15);
     white-space: nowrap;
   }
 
   .tree-row.row-selected {
-    background: light-dark(#ddf4ff, #121d2f);
+    background: var(--color-accent-subtle);
   }
 
   /* WP-7: ドロップ先ハイライト */
   .tree-row.row-drop-target {
-    outline: 2px dashed light-dark(#0969da, #58a6ff);
+    outline: 2px dashed var(--color-accent);
     outline-offset: -2px;
-    border-radius: 0.25rem;
+    border-radius: var(--radius-xs);
   }
 
   .tree-row.row-error .tree-name {
-    color: light-dark(#8b949e, #6e7681);
+    color: var(--color-text-subtle);
   }
 
   .tree-expander {
@@ -341,7 +341,7 @@
     background: transparent;
     color: inherit;
     cursor: pointer;
-    font-size: 0.7rem;
+    font-size: var(--font-size-70);
   }
 
   .tree-dot {
@@ -355,13 +355,13 @@
   .tree-label {
     display: inline-flex;
     align-items: center;
-    gap: 0.35rem;
+    gap: var(--space-35);
     border: none;
     background: transparent;
     color: inherit;
     font: inherit;
     padding: 0.15rem 0.35rem 0.15rem 0;
-    border-radius: 0.25rem;
+    border-radius: var(--radius-xs);
     cursor: pointer;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -369,25 +369,25 @@
   }
 
   .tree-label:hover {
-    background: light-dark(#eaeef2, #21262d);
+    background: var(--color-bg-subtle);
   }
 
   .tree-badge {
     flex: none;
     font-size: 0.65rem;
     padding: 0.05rem 0.3rem;
-    border-radius: 0.5rem;
-    background: light-dark(#1a7f37, #238636);
+    border-radius: var(--radius-lg);
+    background: var(--color-success-emphasis);
     color: #ffffff;
   }
 
   .tree-loading {
-    color: light-dark(#57606a, #8b949e);
+    color: var(--color-text-muted);
   }
 
   .tree-error-row {
-    font-size: 0.75rem;
-    color: light-dark(#cf222e, #f85149);
+    font-size: var(--font-size-75);
+    color: var(--color-danger);
     padding-top: 0.1rem;
     padding-bottom: 0.2rem;
     white-space: nowrap;
@@ -395,13 +395,13 @@
 
   .tree-empty {
     padding: 0.75rem;
-    color: light-dark(#57606a, #8b949e);
-    font-size: 0.85rem;
+    color: var(--color-text-muted);
+    font-size: var(--font-size-85);
   }
 
   .tree-note {
     margin: 0.25rem 0.5rem;
-    font-size: 0.75rem;
-    color: light-dark(#57606a, #8b949e);
+    font-size: var(--font-size-75);
+    color: var(--color-text-muted);
   }
 </style>

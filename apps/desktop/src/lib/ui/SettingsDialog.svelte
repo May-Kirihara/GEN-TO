@@ -725,49 +725,49 @@
   .picker {
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
-    background: light-dark(#ffffff, #1c2128);
-    border: 1px solid light-dark(#d0d7de, #444c56);
-    border-radius: 0.6rem;
+    gap: var(--space-50);
+    background: var(--color-surface-raised);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-xl);
     box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
-    padding: 0.9rem 1rem;
-    font-size: 0.85rem;
+    padding: var(--space-90) var(--space-100);
+    font-size: var(--font-size-85);
   }
 
   .picker h2 {
-    font-size: 1rem;
+    font-size: var(--font-size-100);
     margin: 0;
   }
 
   .picker h3 {
-    font-size: 0.82rem;
+    font-size: var(--font-size-82);
     margin: 0.4rem 0 0.1rem;
   }
 
   .picker-sub {
     margin: 0;
-    font-size: 0.75rem;
-    color: light-dark(#57606a, #8b949e);
+    font-size: var(--font-size-75);
+    color: var(--color-text-muted);
     overflow-wrap: anywhere;
   }
 
   .picker-error {
     margin: 0;
-    font-size: 0.78rem;
-    color: light-dark(#cf222e, #f85149);
+    font-size: var(--font-size-78);
+    color: var(--color-danger);
     overflow-wrap: anywhere;
   }
 
   .mono {
     font-family: monospace;
-    font-size: 0.72rem;
+    font-size: var(--font-size-72);
   }
 
   .tabs {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.25rem;
-    border-bottom: 1px solid light-dark(#d0d7de, #30363d);
+    gap: var(--space-25);
+    border-bottom: 1px solid var(--color-border-strong);
     padding-bottom: 0.4rem;
   }
 
@@ -776,28 +776,28 @@
     background: transparent;
     color: inherit;
     font: inherit;
-    font-size: 0.78rem;
+    font-size: var(--font-size-78);
     padding: 0.2rem 0.55rem;
-    border-radius: 0.375rem;
+    border-radius: var(--radius-sm);
     cursor: pointer;
   }
 
   .tabs button.active {
-    background: light-dark(#ddf4ff, #121d2f);
-    border-color: light-dark(#0969da, #1f6feb);
+    background: var(--color-accent-subtle);
+    border-color: var(--color-accent-emphasis);
     font-weight: 600;
   }
 
   .field {
     display: flex;
     flex-direction: column;
-    gap: 0.2rem;
-    font-size: 0.78rem;
+    gap: var(--space-20);
+    font-size: var(--font-size-78);
   }
 
   .field input {
     font: inherit;
-    font-size: 0.8rem;
+    font-size: var(--font-size-80);
   }
 
   fieldset.field {
@@ -808,7 +808,7 @@
 
   fieldset.field legend {
     padding: 0;
-    font-size: 0.78rem;
+    font-size: var(--font-size-78);
   }
 
   .radio-row {
@@ -820,35 +820,35 @@
   .radio-label {
     display: inline-flex;
     align-items: center;
-    gap: 0.25rem;
-    font-size: 0.78rem;
+    gap: var(--space-25);
+    font-size: var(--font-size-78);
   }
 
   .picker-actions {
     display: flex;
     justify-content: flex-end;
-    gap: 0.4rem;
+    gap: var(--space-40);
   }
 
   .picker-actions button {
     font: inherit;
-    font-size: 0.78rem;
+    font-size: var(--font-size-78);
     padding: 0.25rem 0.7rem;
-    border-radius: 0.375rem;
-    border: 1px solid light-dark(#d0d7de, #444c56);
-    background: light-dark(#f6f8fa, #21262d);
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--color-border);
+    background: var(--color-bg-inset);
     color: inherit;
     cursor: pointer;
   }
 
   .picker-actions button.primary {
-    background: light-dark(#0969da, #1f6feb);
+    background: var(--color-accent-emphasis);
     color: #ffffff;
     border: none;
   }
 
   .picker-actions button.danger {
-    background: light-dark(#cf222e, #da3633);
+    background: var(--color-danger-emphasis);
     color: #ffffff;
     border: none;
   }
@@ -863,11 +863,11 @@
     grid-template-columns: minmax(8rem, 14rem) 1fr;
     gap: 0.15rem 0.8rem;
     margin: 0;
-    font-size: 0.78rem;
+    font-size: var(--font-size-78);
   }
 
   .kv dt {
-    color: light-dark(#57606a, #8b949e);
+    color: var(--color-text-muted);
   }
 
   .kv dd {
@@ -877,14 +877,14 @@
 
   .usage-bar {
     height: 0.5rem;
-    border-radius: 0.25rem;
-    background: light-dark(#eaeef2, #21262d);
+    border-radius: var(--radius-xs);
+    background: var(--color-bg-subtle);
     overflow: hidden;
   }
 
   .usage-fill {
     height: 100%;
-    background: light-dark(#0969da, #1f6feb);
+    background: var(--color-accent-emphasis);
   }
 
   .plain-list {
@@ -893,46 +893,46 @@
     padding: 0;
     display: flex;
     flex-direction: column;
-    gap: 0.2rem;
-    font-size: 0.78rem;
+    gap: var(--space-20);
+    font-size: var(--font-size-78);
   }
 
   .endpoint-badge {
     display: inline-block;
     margin-left: 0.4rem;
     padding: 0 0.4rem;
-    border-radius: 0.6rem;
-    font-size: 0.7rem;
-    background: light-dark(#eaeef2, #21262d);
-    color: light-dark(#57606a, #8b949e);
+    border-radius: var(--radius-xl);
+    font-size: var(--font-size-70);
+    background: var(--color-bg-subtle);
+    color: var(--color-text-muted);
   }
 
   .endpoint-badge.local {
     background: light-dark(#dafbe1, #12261e);
-    color: light-dark(#1a7f37, #3fb950);
+    color: var(--color-success);
   }
 
   .endpoint-badge.external {
     background: light-dark(#fff1e5, #2d1d10);
-    color: light-dark(#bc4c00, #d29922);
+    color: var(--color-attention-text);
   }
 
   .matrix {
     width: 100%;
     border-collapse: collapse;
-    font-size: 0.75rem;
+    font-size: var(--font-size-75);
   }
 
   .matrix th,
   .matrix td {
     text-align: left;
     padding: 0.15rem 0.4rem;
-    border-bottom: 1px solid light-dark(#eaeef2, #21262d);
+    border-bottom: 1px solid var(--color-bg-subtle);
     overflow-wrap: anywhere;
   }
 
   .matrix th {
-    color: light-dark(#57606a, #8b949e);
+    color: var(--color-text-muted);
     font-weight: 600;
   }
 
@@ -943,8 +943,8 @@
   }
 
   .mono-full {
-    font-size: 0.66rem;
-    color: light-dark(#57606a, #8b949e);
+    font-size: var(--font-size-66);
+    color: var(--color-text-muted);
     overflow-wrap: anywhere;
   }
 
@@ -952,10 +952,10 @@
     margin: 0;
     padding: 0.5rem 0.6rem;
     border: 1px solid light-dark(#eaeef2, #30363d);
-    border-radius: 0.4rem;
-    background: light-dark(#f6f8fa, #21262d);
+    border-radius: var(--radius-md);
+    background: var(--color-bg-inset);
     font-family: monospace;
-    font-size: 0.68rem;
+    font-size: var(--font-size-68);
     line-height: 1.45;
     white-space: pre-wrap;
     overflow-wrap: anywhere;

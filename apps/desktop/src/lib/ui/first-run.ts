@@ -59,7 +59,7 @@ export function deriveFirstRunGuide(input: {
     {
       key: "ai",
       title: "AI設定 (任意)",
-      body: "ヘッダーの「AI」からOpenAI互換endpoint (llama.cpp等) のプロファイルを登録できます。AIを設定しなくてもファイラー機能 (閲覧・選別・タグ・検索・コレクション・ファイル操作) はすべて使用できます。",
+      body: "メニューバー「ツール>AIパネル…」からOpenAI互換endpoint (llama.cpp等) のプロファイルを登録できます。AIを設定しなくてもファイラー機能 (閲覧・選別・タグ・検索・コレクション・ファイル操作) はすべて使用できます。",
       status: aiStatus,
       done: input.aiProfilesCount === null ? null : input.aiProfilesCount > 0,
     },

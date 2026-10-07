@@ -518,9 +518,9 @@
 
 <style>
   .dev-drawer {
-    border-top: 1px solid light-dark(#d0d7de, #30363d);
+    border-top: 1px solid var(--color-border-strong);
     background: light-dark(#f6f8fa, #0d1117);
-    font-size: 0.8rem;
+    font-size: var(--font-size-80);
     flex: none;
     max-height: 40vh;
     display: flex;
@@ -533,7 +533,7 @@
 
   .dev-header {
     flex: none;
-    padding: 0.15rem 0.5rem;
+    padding: var(--space-15) var(--space-50);
   }
 
   .dev-toggle {
@@ -554,37 +554,37 @@
   }
 
   .dev-body h4 {
-    margin: 0.2rem 0;
-    font-size: 0.8rem;
+    margin: var(--space-20) 0;
+    font-size: var(--font-size-80);
   }
 
   .dev-line {
-    margin: 0.2rem 0;
+    margin: var(--space-20) 0;
   }
 
   .dev-stats {
     display: grid;
-    gap: 0.25rem;
-    font-size: 0.75rem;
+    gap: var(--space-25);
+    font-size: var(--font-size-75);
   }
 
   .dev-pre {
     background: light-dark(#f5f5f5, #1e1e1e);
     padding: 0.5rem;
-    border-radius: 0.5rem;
+    border-radius: var(--radius-lg);
     overflow-x: auto;
-    font-size: 0.72rem;
+    font-size: var(--font-size-72);
     margin: 0.25rem 0;
   }
 
   .dev-log {
-    margin-top: 0.5rem;
-    border: 1px solid light-dark(#d0d7de, #30363d);
-    border-radius: 0.5rem;
+    margin-top: var(--space-50);
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-lg);
     max-height: 8rem;
     overflow-y: auto;
     padding: 0.5rem;
-    font-size: 0.7rem;
+    font-size: var(--font-size-70);
   }
 
   .dev-log-line {
@@ -593,17 +593,17 @@
   }
 
   .dev-ok {
-    color: light-dark(#1a7f37, #3fb950);
+    color: var(--color-success);
     font-weight: bold;
   }
 
   .dev-error {
-    color: light-dark(#cf222e, #f85149);
+    color: var(--color-danger);
     font-weight: bold;
   }
 
   button.active {
-    border-color: light-dark(#0969da, #58a6ff);
+    border-color: var(--color-accent);
     font-weight: bold;
   }
 
