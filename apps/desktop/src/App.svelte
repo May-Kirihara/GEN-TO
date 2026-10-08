@@ -52,6 +52,13 @@
   import { FolderPrefsStore, LIBRARY_SORT_KEY } from "./lib/ui/folder-prefs";
   import { copyText } from "./lib/ui/clipboard";
   import { collapsedSearchSummary } from "./lib/ui/search-summary";
+  import {
+    MODE_WEIGHT_PERCENT,
+    SemanticModeStore,
+    searchBadgeLabel,
+    type SemanticMode,
+  } from "./lib/ui/search-mode";
+  import { suggestsSemantic } from "./lib/ui/semantic-suggest";
   import { filterChips, withoutFilter, type FilterChipKey } from "./lib/ui/filter-chips";
   import { KeyDispatcher } from "./lib/keys";
   import {
@@ -172,6 +179,8 @@
 
   const layoutStore = new LayoutPrefsStore(localStorage);
   const folderStore = new FolderPrefsStore(localStorage);
+  // UIUX-7: 検索モード (キーワード/ハイブリッド/意味) の永続化
+  const semanticModeStore = new SemanticModeStore(localStorage);
   let leftVisible = $state(true);
   let rightVisible = $state(true);
   let leftWidth = $state(240);
@@ -1178,18 +1187,16 @@
   } | null>(null);
   /** evidence写像の変化通知 (InfoPanel・ツールチップ再評価用)。 */
   let searchEvidenceTick = $state(0);
-  // ===== 意味検索 (WP-12) =====
+  // ===== 意味検索 (WP-12 / UIUX-7: 3モードセグメント化) =====
   const vectorIndex = new VectorIndexStore({ invoke, listen });
   const embeddingProbe = new EmbeddingStore({ invoke, listen });
-  /** 意味重みスライダー値 (0..100%。0 = 純キーワード)。 */
-  let semanticWeightPercent = $state(0);
   let vectorIndexStatus = $state<VectorIndexStatus | null>(null);
   let embeddingEnabled = $state(false);
   let indexProgress = $state<VectorIndexProgress | null>(null);
-  /** 索引状態の変化通知 (スライダーdisabled判定の再評価用)。 */
+  /** 索引状態の変化通知 (モードセグメントdisabled・サジェスト判定の再評価用)。 */
   let semanticStateTick = $state(0);
 
-  /** 意味検索が現在使えるか (スライダー・類似検索の可用性)。 */
+  /** 意味検索が現在使えるか (モードセグメント・類似検索の可用性)。 */
   function semanticAvailable(): boolean {
     void semanticStateTick;
     return semanticSearchAvailable(embeddingEnabled, vectorIndexStatus);
@@ -1198,6 +1205,76 @@
   function semanticReason(): string {
     void semanticStateTick;
     return semanticUnavailableReason(embeddingEnabled, vectorIndexStatus);
+  }
+
+  /** UIUX-7: 検索モード (keyword/hybrid/semantic)。実行重みはMODE_WEIGHT_PERCENTで導出。 */
+  let semanticMode = $state<SemanticMode>(semanticModeStore.load());
+
+  /** UIUX-7: 検索モード切替 (永続化のみ — 実行は検索ボタン/Enterで明示的に)。 */
+  function setSemanticMode(mode: SemanticMode): void {
+    semanticMode = mode;
+    semanticModeStore.save(mode);
+  }
+
+  /**
+    * UIUX-7/C: 意味検索サジェストチップの表示判定。検索実行後の確定値
+    * (lastSearchMeta.query) のみで判定する — 入力中の逐次表示はしない。
+    * WP3: チップclickで却下された同一クエリでは出さない (再実行が失敗/
+    * 遅延しても旧メタのまま出し続けない)。検索実行中も出さない。
+    * WP4: 検索結果表示中 (searchActive) のみ — exitSearchは折りたたみ
+    * 要約のためにlastSearchMetaを残すため、ここで検索終了後の表示を断つ。
+    */
+  let semanticSuggestDismissedQuery = $state<string | null>(null);
+  const semanticSuggestVisible = $derived.by(() => {
+    void searchEvidenceTick; // searchStore.running変化 (onChange) で再評価
+    const meta = lastSearchMeta;
+    return (
+      meta !== null &&
+      meta.kind === "query" &&
+      suggestsSemantic(meta.query, meta.weightPercent, semanticAvailable(), {
+        dismissedQuery: semanticSuggestDismissedQuery,
+        running: searchStore.running,
+        searchActive,
+      })
+    );
+  });
+
+  /**
+    * UIUX-7/C: チップclick — hybridへ切替え、確定済みクエリで再実行する。
+    * WP3: 対象クエリを却下済みに記録してから再実行する。成功なら
+    * weightPercent>0で、失敗・遅延なら却下済みquery一致で、それぞれ
+    * チップは消滅する (新しいクエリの検索では再表示される)。
+    */
+  async function trySemanticSearch(): Promise<void> {
+    const meta = lastSearchMeta;
+    if (meta === null) {
+      return;
+    }
+    semanticSuggestDismissedQuery = meta.query;
+    setSemanticMode("hybrid");
+    searchInput = meta.query;
+    await runSearch();
+  }
+
+  /** UIUX-7/D: 索引ready通知の表示済みフラグ (1回限り表示の担保)。 */
+  const SEMANTIC_READY_NOTICE_KEY = "gento.semanticReadyNotice.v1";
+
+  /**
+    * UIUX-7/D: 索引準備完了トースト。vector-index:readyイベント到着時と
+    * (イベントが購読前に発火済みの場合の) 現在状態判定 (WP3) の両経路から
+    * 呼ばれる — localStorageフラグでアプリ生涯1回限りとする。$effect内で
+    * なく明示的操作 (Svelte 5: effect内read+writeは無限ループ —
+    * toast-queue.tsのWP10契約と同一理由)。
+    */
+  function notifySemanticReadyOnce(): void {
+    if (localStorage.getItem(SEMANTIC_READY_NOTICE_KEY) !== null) {
+      return;
+    }
+    localStorage.setItem(SEMANTIC_READY_NOTICE_KEY, "1");
+    pushToast(
+      "os",
+      "自然言語検索の準備ができました — 検索バーのモードを「ハイブリッド/意味」に切り替えると使えます",
+    );
   }
 
   /** 埋め込み有効化・索引状態の再取得 (起動時・索引readyイベント後)。 */
@@ -1214,7 +1291,7 @@
         verifiedCount: embedding.packages.filter((pkg) => pkg.state === "verified").length,
       };
     } catch {
-      // 状態取得失敗はスライダーdisabled側へ吸収される
+      // 状態取得失敗はモードセグメントdisabled側へ吸収される
     }
     semanticStateTick++;
   }
@@ -1271,7 +1348,8 @@
       return;
     }
     searchNotice = "";
-    const weight = semanticAvailable() ? semanticWeightPercent / 100 : 0;
+    // UIUX-7: 実行重みはモードから導出 (keyword=0 / hybrid=0.5 / semantic=1)。
+    const weight = semanticAvailable() ? MODE_WEIGHT_PERCENT[semanticMode] / 100 : 0;
     const ok = await searchStore.run(searchInput, searchFilters, scope, weight);
     if (!ok) {
       searchNotice = searchStore.lastError ?? "検索に失敗しました";
@@ -1375,15 +1453,25 @@
   const collapsedSearchLine = $derived.by(() => {
     void searchEvidenceTick; // SearchStore変化 (running/lastResult) で再評価
     const committed = searchStore.lastResult !== null;
-    return collapsedSearchSummary({
+    // UIUX-7: 意味重みのbadgeは「意味 x%」(search-summary) から
+    // モードラベル (キーワード/ハイブリッド/意味/類似) へ変更するため、
+    // search-summaryへは0を渡して旧badgeを出させずApp側で付ける。
+    const summary = collapsedSearchSummary({
       kind: !committed ? "none" : searchStore.lastKind,
       query: searchStore.lastQuery,
       scopeLabel: lastSearchMeta?.scopeLabel ?? null,
-      semanticWeightPercent: lastSearchMeta?.weightPercent ?? 0,
+      semanticWeightPercent: 0,
       filtersActive: lastSearchMeta?.filtersActive ?? false,
       running: searchStore.running,
       active: searchActive,
     });
+    if (!committed || lastSearchMeta === null) {
+      return summary;
+    }
+    return {
+      ...summary,
+      badges: [...summary.badges, searchBadgeLabel(lastSearchMeta.kind, lastSearchMeta.weightPercent)],
+    };
   });
 
   /** 折りたたみトグル。折りたたみ時はfilters popoverも閉じる (開いたまま畳むと再展開で復活する)。
@@ -2799,11 +2887,23 @@
       disposeVectorIndexReady = await vectorIndex.subscribeReady(() => {
         indexProgress = null;
         void refreshSemanticState();
+        notifySemanticReadyOnce();
       });
       disposeVectorIndexProgress = await vectorIndex.subscribeProgress((progress) => {
         indexProgress = progress;
         semanticStateTick++;
       });
+      // UIUX-7/WP3: 起動時の既存索引ロードでreadyイベントがこの購読より前に
+      // 発火済みの場合がある (vectorindex.rs ensure_ready → emit_ready)。
+      // 取得済みの現在状態でも通知を判定する (イベント経路と同じ1回限り
+      // フラグを通すため二重表示しない)。
+      if (
+        vectorIndexStatus !== null &&
+        vectorIndexStatus.ready &&
+        vectorIndexStatus.indexedCount > 0
+      ) {
+        notifySemanticReadyOnce();
+      }
     });
     void catalog.init().then(async (dispose) => {
       disposeCatalog = dispose;
@@ -3336,8 +3436,10 @@
         onSearchScopeChange={(mode) => (searchScopeMode = mode)}
         semanticAvailable={semanticAvailable()}
         semanticReason={semanticReason()}
-        {semanticWeightPercent}
-        onSemanticWeightInput={(value) => (semanticWeightPercent = value)}
+        {semanticMode}
+        onSemanticModeChange={setSemanticMode}
+        showSemanticSuggest={semanticSuggestVisible}
+        onSemanticSuggestClick={() => void trySemanticSearch()}
         {searchFiltersOpen}
         onToggleSearchFilters={() => (searchFiltersOpen = !searchFiltersOpen)}
         onCloseSearchFilters={() => (searchFiltersOpen = false)}

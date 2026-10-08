@@ -7,9 +7,10 @@
     * searchFiltersPopover (閉じaction) は要素と同じcomponent内にあるため
     * ここへ移設 (window listenerのためscoped制約なし — WP7a契約踏襲)。
     */
-  import { EMPTY_FILTERS, weightLabel, type GuiFilters } from "../search";
+  import { EMPTY_FILTERS, type GuiFilters } from "../search";
   import type { CollapsedSearchSummary } from "../ui/search-summary";
   import type { FilterChip, FilterChipKey } from "../ui/filter-chips";
+  import type { SemanticMode } from "../ui/search-mode";
 
   let {
     searchExpanded,
@@ -24,8 +25,10 @@
     onSearchScopeChange,
     semanticAvailable,
     semanticReason,
-    semanticWeightPercent,
-    onSemanticWeightInput,
+    semanticMode,
+    onSemanticModeChange,
+    showSemanticSuggest,
+    onSemanticSuggestClick,
     searchFiltersOpen,
     onToggleSearchFilters,
     onCloseSearchFilters,
@@ -51,8 +54,13 @@
     onSearchScopeChange: (mode: "library" | "folder" | "collection") => void;
     semanticAvailable: boolean;
     semanticReason: string;
-    semanticWeightPercent: number;
-    onSemanticWeightInput: (value: number) => void;
+    /** UIUX-7: 検索モード (3値 — 実行重みはAppがMODE_WEIGHT_PERCENTで導出)。 */
+    semanticMode: SemanticMode;
+    onSemanticModeChange: (mode: SemanticMode) => void;
+    /** 意味検索サジェストチップの表示 (判定はApp — 検索実行後の確定値のみ)。 */
+    showSemanticSuggest: boolean;
+    /** チップclick → mode=hybrid設定+同クエリ再実行 (AppのtrySemanticSearch)。 */
+    onSemanticSuggestClick: () => void;
     /** フィルタpopoverの開閉state (正本はApp — レイアウト系)。 */
     searchFiltersOpen: boolean;
     onToggleSearchFilters: () => void;
@@ -72,6 +80,15 @@
   /** popoverの外クリック判定用 (トグルボタン・チップ行上では閉じない)。 */
   let searchFilterToggleEl: HTMLElement | null = $state(null);
   let searchFilterChipsEl: HTMLElement | null = $state(null);
+
+  /**
+    * UIUX-7/WP5 (QA Major): 意味検索不可の理由はボタン自身のtitleに機能説明へ
+    * 改行連結して出す — セグメントspanのtitleは子buttonのtitleが優先され
+    * ホバーで出ないため (旧スライダーの理由tooltip契約の復帰)。
+    */
+  function modeTitle(description: string): string {
+    return semanticAvailable ? description : `${description}\n${semanticReason}`;
+  }
 
   /**
     * UIUX-5/WP2: フィルタpopoverの閉じ取りまとめ (ContextMenu precedent)。
@@ -112,7 +129,8 @@
 <div class="search-bar" role="search" data-testid="search-bar">
   {#if !searchExpanded}
     <!-- UIUX-3 V-3: 折りたたみ1行。確定済み検索表現 + scope実態 + フィルタ/
-         意味重み + 実行中/表示中のクリア操作 -->
+         検索モードbadge (UIUX-7: キーワード/ハイブリッド/意味/類似) +
+         実行中/表示中のクリア操作 -->
     <button
       class="search-toggle"
       data-testid="search-toggle"
@@ -160,7 +178,7 @@
   <input
     type="search"
     class="search-input"
-    placeholder="検索 (例: 青い髪の少女 tag:night rating:>=3 type:png)"
+    placeholder="検索 (自然言語OK: 夕暮れの海岸 / 構文: tag:night rating:>=3)"
     aria-label="検索クエリ"
     data-testid="search-input"
     value={searchInput}
@@ -184,32 +202,43 @@
     <option value="folder">現在のフォルダ（登録ルート全体）</option>
     <option value="collection">表示中コレクション</option>
   </select>
-  <label
-    class="search-semantic"
-    data-testid="search-semantic"
+  <!-- UIUX-7/A: 意味重みスライダーを3モードセグメントへ置換 (Toolbarの
+       size-toggleと同一パターン)。不可用时も表示しhybrid/semanticは
+       disabled — 不可の理由は各ボタンのtitleへ機能説明に連結 (modeTitle)。
+       keywordは意味検索に依存せず常に使えるため常時有効 (UIUX-7/WP2)。 -->
+  <span
+    class="search-mode-segment"
+    role="group"
+    aria-label="検索モード"
+    data-testid="search-mode-segment"
     title={semanticAvailable
-      ? "キーワード検索と意味検索 (自然言語) の重み。左=キーワードのみ / 右=意味のみ"
+      ? "検索モード: キーワード (0%) / ハイブリッド (50%) / 意味 (100%)"
       : semanticReason}
   >
-    <span class="semantic-end">キーワード</span>
-    <input
-      type="range"
-      min="0"
-      max="100"
-      step="5"
-      value={semanticWeightPercent}
+    <button
+      aria-pressed={semanticMode === "keyword"}
+      class:active={semanticMode === "keyword"}
+      title="構文・タグ・評価などのキーワード検索 (意味検索を使わない)"
+      data-testid="search-mode-keyword"
+      onclick={() => onSemanticModeChange("keyword")}
+    >キーワード</button>
+    <button
+      aria-pressed={semanticMode === "hybrid"}
+      class:active={semanticMode === "hybrid"}
       disabled={!semanticAvailable}
-      aria-label="意味検索の重み"
-      data-testid="search-semantic-weight"
-      oninput={(event) => onSemanticWeightInput(Number(event.currentTarget.value))}
-    />
-    <span class="semantic-end">意味</span>
-    <span class="semantic-value" data-testid="search-semantic-value">
-      {semanticWeightPercent > 0
-        ? `${weightLabel(semanticWeightPercent / 100)} ${semanticWeightPercent}%`
-        : "キーワード"}
-    </span>
-  </label>
+      title={modeTitle("キーワード検索と意味検索 (自然言語) を半々で融合")}
+      data-testid="search-mode-hybrid"
+      onclick={() => onSemanticModeChange("hybrid")}
+    >ハイブリッド</button>
+    <button
+      aria-pressed={semanticMode === "semantic"}
+      class:active={semanticMode === "semantic"}
+      disabled={!semanticAvailable}
+      title={modeTitle("自然言語の意味の近さだけで検索 (キーワード一致は使わない)")}
+      data-testid="search-mode-semantic"
+      onclick={() => onSemanticModeChange("semantic")}
+    >意味</button>
+  </span>
   <button
     bind:this={searchFilterToggleEl}
     class:active={searchFiltersOpen || searchFiltersActive}
@@ -240,6 +269,17 @@
     <span class="search-warn" title={searchWarnings.join("\n")}>
       ⚠ {searchWarnings.length}件の警告
     </span>
+  {/if}
+  {#if showSemanticSuggest}
+    <!-- UIUX-7/C: 意味検索サジェストチップ。判定・再実行はApp — ここは
+         表示とclickの受け渡しのみ (入力中は出さない)。 -->
+    <button
+      class="semantic-suggest-chip"
+      data-testid="semantic-suggest-chip"
+      aria-label="意味検索を試す"
+      title="キーワードモードで実行しました。同じクエリをハイブリッド (キーワード+意味) で再検索します"
+      onclick={onSemanticSuggestClick}
+    >🧠 意味検索を試す</button>
   {/if}
   {#if searchFiltersOpen}
     <div class="search-filters" data-testid="search-filters" use:searchFiltersPopover>
@@ -451,28 +491,64 @@
     flex: none;
   }
 
-  /* WP-12: キーワード⇔意味の重みスライダー */
-  .search-semantic {
+  /* UIUX-7/A: 検索モード3択セグメント (Toolbarのsize-toggleと同一パターン・
+     同デザイントークン。選択側はbutton.active + aria-pressed)。 */
+  .search-mode-segment {
     flex: none;
     display: inline-flex;
-    align-items: center;
-    gap: var(--space-35);
+    align-items: stretch;
     font-size: var(--font-size-75);
     white-space: nowrap;
   }
 
-  .search-semantic input[type="range"] {
-    width: 7rem;
+  .search-mode-segment button {
+    border: 1px solid var(--color-border-strong);
+    border-radius: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    font-size: var(--font-size-75);
+    padding: var(--space-15) var(--space-50);
+    cursor: pointer;
+    position: relative;
   }
 
-  .search-semantic:has(input:disabled) {
+  .search-mode-segment button:first-of-type {
+    border-radius: var(--radius-sm) 0 0 var(--radius-sm);
+  }
+
+  .search-mode-segment button:nth-of-type(2),
+  .search-mode-segment button:last-of-type {
+    margin-left: -1px;
+  }
+
+  .search-mode-segment button:last-of-type {
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  }
+
+  /* 選択中/hoverの枠は隣接ボタンとのborder重なりに塗り潰されないよう手前に */
+  .search-mode-segment button.active,
+  .search-mode-segment button:hover:not(:disabled) {
+    z-index: 1;
+  }
+
+  .search-mode-segment button:disabled {
     opacity: 0.55;
+    cursor: default;
   }
 
-  .semantic-value {
-    min-width: 6.5rem;
-    font-variant-numeric: tabular-nums;
-    text-align: left;
+  /* UIUX-7/C: 意味検索サジェストチップ (検索実行後のみ表示) */
+  .semantic-suggest-chip {
+    flex: none;
+    border: 1px solid var(--color-accent);
+    background: transparent;
+    color: var(--color-accent);
+    font: inherit;
+    font-size: var(--font-size-75);
+    padding: 0 0.45rem;
+    border-radius: var(--radius-pill);
+    cursor: pointer;
+    white-space: nowrap;
   }
 
   .search-warn {
