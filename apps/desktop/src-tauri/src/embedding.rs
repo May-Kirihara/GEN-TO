@@ -17,7 +17,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::BufReader;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -52,6 +52,8 @@ const JOB_POLL: Duration = Duration::from_millis(500);
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// 1回の掃討でhash比較するasset上限。
 const SWEEP_PAGE: usize = 2000;
+/// 掃討の1ページ読み取り件数 (present_asset_idsへのlimit)。
+const SWEEP_READ_PAGE: u32 = 256;
 /// リクエストのタイムアウト (初回ロードはモデル280MBのmmapを伴う)。
 const LOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const EMBED_TIMEOUT: Duration = Duration::from_secs(300);
@@ -179,6 +181,11 @@ pub struct EmbeddingService {
     load_gate: Mutex<()>,
     /// 埋め込みupsertフック (WP-12: USearch索引増分追加。setup後に接続)。
     vector_sink: Mutex<Option<VectorSink>>,
+    /// 差分掃討の走査位置 (最後に検査したasset_id。0=先頭から)。
+    /// 1回の掃討はSWEEP_PAGE上限で途中までしか進まないため、終端到達で
+    /// 0へ巻き戻しつつ次回はこの位置から継続する — 常時先頭走査だと
+    /// id順末尾のassetが毎回上限の裏に隠れて永久に検査されない。
+    sweep_cursor: AtomicI64,
 }
 
 impl EmbeddingService {
@@ -241,6 +248,7 @@ impl EmbeddingService {
             crash_notified: AtomicBool::new(false),
             load_gate: Mutex::new(()),
             vector_sink: Mutex::new(None),
+            sweep_cursor: AtomicI64::new(0),
         });
         // ジョブ実行スレッド (enabled時のみ仕事をする)
         {
@@ -898,6 +906,11 @@ impl EmbeddingService {
 
     /// 差分掃討: 検索文書hashが変わった (または未埋め込みの) assetをenqueue。
     /// 戻り値 = 投入件数。
+    ///
+    /// 走査は前回終了位置 ([`Self::sweep_cursor`]) からの継続走査で、
+    /// テーブル終端 (空ページ) で先頭へ巻き戻す。1回の呼び出しで
+    /// `limit`+繰上げ件数しか検査しないため、定期スイープ (SWEEP_INTERVAL)
+    /// の繰り返しでライブラリ全体を巡回する。
     pub fn sweep_enqueues_pending(&self, limit: usize) -> usize {
         let model = self.selected_model();
         let revision = model_revision_of(&model);
@@ -913,18 +926,23 @@ impl EmbeddingService {
             PRIORITY_NEW_ASSET
         };
         let mut enqueued = 0usize;
-        let mut after_id = 0i64;
+        let mut after_id = self.sweep_cursor.load(Ordering::SeqCst);
         let mut examined = 0usize;
         while examined < limit {
             let page: Vec<i64> = self
                 .db
-                .with_reader(|repos| repos.present_asset_ids(after_id, 256))
+                .with_reader(|repos| repos.present_asset_ids(after_id, SWEEP_READ_PAGE))
                 .unwrap_or_default();
             if page.is_empty() {
+                // テーブル終端: 次回は先頭から (前半の差分再検査の巡回)
+                self.sweep_cursor.store(0, Ordering::SeqCst);
                 break;
             }
             after_id = *page.last().unwrap();
             examined += page.len();
+            // limit到達で打ち切った位置を次回の継続地点へ保存
+            // (最後のページが同時に終端でも次回の空ページで巻き戻る)
+            self.sweep_cursor.store(after_id, Ordering::SeqCst);
             let work: Vec<(i64, String)> = self
                 .db
                 .with_reader(
@@ -1571,5 +1589,307 @@ mod tests {
             "07a8b0aba47d29d2ca21f89b915c1efe2c23d1cc"
         );
         assert_eq!(model_revision_of("unknown-model"), "unknown");
+    }
+
+    // ===== 差分掃討スイープ (実DB) =====
+
+    use std::collections::HashSet;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "gento-tauri-embed-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+            ));
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// スイープ経路でワーカーspawnが起きないことの担保 (spawn試行=
+    /// 設計違反で即パニック)。
+    fn panicking_worker_factory() -> WorkerCommandFactory {
+        Box::new(|_path: &PathBuf| -> Command {
+            panic!("スイープはワーカーを起動しない (spawn試行 = 設計違反)");
+        })
+    }
+
+    /// presentなFileを持つassetを一括投入 (search.rs性能テストと同じ
+    /// 合成行SQL。空でないdisplay_nameを持つため全員が空でない検索文書を
+    /// 持つ)。uuid/hash/パスは `start` からの一意連番。昇順id列を返す。
+    fn seed_present_assets(db: &gento_db::Db, start: i64, count: i64) -> Vec<i64> {
+        use gento_core::repo::LibraryRootRepo;
+        db.with_writer(|repos| {
+            let root = repos.list_roots()?.into_iter().next().unwrap_or_else(|| {
+                repos
+                    .add_root(std::path::Path::new("/tmp/gento-sweep-test"))
+                    .unwrap()
+            });
+            let conn = repos.conn();
+            conn.execute_batch("BEGIN").unwrap();
+            let ts = "2026-10-08T00:00:00.000Z";
+            let mut ids = Vec::with_capacity(count as usize);
+            for i in start..start + count {
+                conn.execute(
+                    "INSERT INTO assets (uuid, content_hash, hash_algorithm, byte_size, \
+                     mime_type, created_at, updated_at) \
+                     VALUES (?1, ?2, 'blake3', 100, 'image/png', ?3, ?3)",
+                    (
+                        format!("00000000-0000-7000-8000-{i:012}"),
+                        format!("blake3:sweep{i:08x}"),
+                        ts,
+                    ),
+                )
+                .unwrap();
+                let asset_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO files (uuid, root_id, asset_id, rel_path, path_encoding, \
+                     display_name, extension, byte_size, mtime_ms, last_seen_at, \
+                     created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, CAST(?4 AS BLOB), 'utf8', ?5, 'png', 100, 1, ?6, ?6, ?6)",
+                    (
+                        format!("00000000-0000-7000-9000-{i:012}"),
+                        root.id,
+                        asset_id,
+                        format!("dir/sweep{i:06}.png"),
+                        format!("sweep{i:06}.png"),
+                        ts,
+                    ),
+                )
+                .unwrap();
+                ids.push(asset_id);
+            }
+            conn.execute_batch("COMMIT").unwrap();
+            Ok(ids)
+        })
+        .unwrap()
+    }
+
+    /// queued埋め込みジョブをすべて消化模擬 (claim → 埋め込みupsert → 完了。
+    /// run_one_batchの成功経路と同じmeta保存)。消化した (asset_id, priority)
+    /// を `out` へ追記し、消化件数を返す。
+    fn drain_embedding_jobs(service: &EmbeddingService, out: &mut Vec<(i64, i64)>) -> usize {
+        let model = service.selected_model();
+        let revision = model_revision_of(&model);
+        let mut count = 0usize;
+        loop {
+            let now = rfc3339_after_now(0);
+            let claimed = service
+                .db
+                .with_writer(|repos| repos.claim_next_job_of_type(&now, JOB_TYPE_EMBEDDING))
+                .unwrap_or(None);
+            let Some(job) = claimed else { break };
+            let hash = payload_hash_of(&job);
+            let vector = vec![0.25f32; 4];
+            service
+                .db
+                .with_writer(|repos| {
+                    repos.embedding_upsert(
+                        job.target_id,
+                        &model,
+                        &revision,
+                        vector.len(),
+                        "f32",
+                        &hash,
+                        &vector,
+                    )
+                })
+                .unwrap();
+            service
+                .db
+                .with_writer(|repos| repos.complete_job(job.id))
+                .unwrap();
+            out.push((job.target_id, job.priority));
+            count += 1;
+        }
+        count
+    }
+
+    /// assetをpresentでなくす (ファイル消失相当: scan_state='missing')。
+    fn mark_assets_missing(db: &gento_db::Db, ids: &[i64]) {
+        db.with_writer(|repos| {
+            for id in ids {
+                repos
+                    .conn()
+                    .execute(
+                        "UPDATE files SET scan_state = 'missing' WHERE asset_id = ?1",
+                        (id,),
+                    )
+                    .unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// 回帰: SWEEP_PAGE上限を超えるライブラリで定期スイープを繰り返すと
+    /// 全present assetがいずれかのスイープでエンキューされる。常時先頭から
+    /// 走査する実装だと id順末尾が毎回上限の裏に隠れて永久に検査されない。
+    #[test]
+    fn sweep_enqueues_all_present_assets_across_repeated_sweeps() {
+        let tmp = TempDir::new("sweep-all");
+        let db = Arc::new(gento_db::Db::open(tmp.0.join("db.sqlite3")).unwrap());
+        let all_ids = seed_present_assets(&db, 0, 2100);
+        let notices = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let recorded = Arc::clone(&notices);
+        let service = EmbeddingService::start_with(
+            Arc::clone(&db),
+            tmp.0.join("models"),
+            Arc::new(move |event: &str, payload: &str| {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push((event.to_string(), payload.to_string()));
+            }),
+            panicking_worker_factory(),
+        );
+        // 1スイープの作業量上限: SWEEP_PAGE(2000)を256/pageで消費すると
+        // 8ページ=2048件で打ち切り (ページ繰上げ契約)
+        let first_sweep_cap =
+            SWEEP_PAGE.div_ceil(SWEEP_READ_PAGE as usize) * SWEEP_READ_PAGE as usize;
+        assert_eq!(first_sweep_cap, 2048);
+        let enqueued1 = service.sweep_enqueues_pending(SWEEP_PAGE);
+        assert_eq!(
+            enqueued1, first_sweep_cap,
+            "初回スイープは上限+繰上げの2048件で打ち切る"
+        );
+        let mut round1 = Vec::new();
+        assert_eq!(drain_embedding_jobs(&service, &mut round1), first_sweep_cap);
+        assert!(
+            round1.iter().all(|(_, p)| *p == PRIORITY_INITIAL),
+            "モデル埋め込み0件の初回はINITIAL優先度"
+        );
+        // 定期スイープ (SWEEP_INTERVAL毎の想定) を繰り返して残りを拾う
+        let mut seen: HashSet<i64> = round1.iter().map(|(a, _)| *a).collect();
+        let mut later = Vec::new();
+        let mut zero_rounds = 0;
+        for _ in 0..8 {
+            let enqueued = service.sweep_enqueues_pending(SWEEP_PAGE);
+            let drained = drain_embedding_jobs(&service, &mut later);
+            if enqueued == 0 && drained == 0 {
+                zero_rounds += 1;
+                if zero_rounds >= 2 {
+                    break; // 2連続で新規なし = 定常状態
+                }
+            } else {
+                zero_rounds = 0;
+            }
+        }
+        seen.extend(later.iter().map(|(a, _)| *a));
+        let missing: Vec<i64> = all_ids
+            .iter()
+            .copied()
+            .filter(|id| !seen.contains(id))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "スイープで拾えなかったasset {missing:?} ({}/{}件しかエンキューされていない)",
+            seen.len(),
+            all_ids.len()
+        );
+        assert!(
+            later.iter().all(|(_, p)| *p == PRIORITY_NEW_ASSET),
+            "埋め込み済みが存在する状態の差分はNEW_ASSET優先度"
+        );
+        assert!(
+            notices.lock().unwrap().is_empty(),
+            "スイープ経路で通知イベントは出ない"
+        );
+        service.shutdown();
+    }
+
+    /// 終端巻き戻し: テーブル終端に達したスイープは次回先頭から再検査する。
+    /// 2周目は末尾追加の新規assetに加え、既存assetの検索文書変化 (ファイル名
+    /// 変更) も拾う — 巻き戻さない前半は二度と差分検査されない。
+    #[test]
+    fn sweep_rewinds_at_table_end_and_reexamines_earlier_assets() {
+        let tmp = TempDir::new("sweep-rewind");
+        let db = Arc::new(gento_db::Db::open(tmp.0.join("db.sqlite3")).unwrap());
+        let base = seed_present_assets(&db, 0, 300);
+        let service = EmbeddingService::start_with(
+            Arc::clone(&db),
+            tmp.0.join("models"),
+            Arc::new(|_: &str, _: &str| {}),
+            panicking_worker_factory(),
+        );
+        // 300件 < 上限 → 1回のスイープで終端到達 (次回は先頭から)
+        assert_eq!(service.sweep_enqueues_pending(SWEEP_PAGE), 300);
+        let mut round1 = Vec::new();
+        assert_eq!(drain_embedding_jobs(&service, &mut round1), 300);
+        // 末尾に新規3件 + 既存の先頭付近1件を変更 (検索文書のhash変化)
+        let mut expected = seed_present_assets(&db, 300, 3);
+        let changed = base[1];
+        db.with_writer(|repos| {
+            repos
+                .conn()
+                .execute(
+                    "UPDATE files SET display_name = 'renamed.png' WHERE asset_id = ?1",
+                    (changed,),
+                )
+                .map_err(|e| gento_core::repo::RepoError::Db(e.to_string()))?;
+            Ok(())
+        })
+        .unwrap();
+        expected.push(changed);
+        expected.sort_unstable();
+        // 2周目: 新規3件 + 変更1件がエンキューされる
+        let enqueued2 = service.sweep_enqueues_pending(SWEEP_PAGE);
+        assert_eq!(enqueued2, expected.len());
+        let mut round2 = Vec::new();
+        drain_embedding_jobs(&service, &mut round2);
+        let mut got: Vec<i64> = round2.iter().map(|(a, _)| *a).collect();
+        got.sort_unstable();
+        assert_eq!(got, expected);
+        // 3周目: 全件unchanged → 追加エンキューなし
+        assert_eq!(service.sweep_enqueues_pending(SWEEP_PAGE), 0);
+        service.shutdown();
+    }
+
+    /// カーソル継続は削除済み (present喪失) assetの混在で破綻しない:
+    /// keyset (asset_id > cursor) 走査なので欠落は読み飛ばされる。
+    #[test]
+    fn sweep_continues_across_missing_assets_beyond_cursor() {
+        let tmp = TempDir::new("sweep-missing");
+        let db = Arc::new(gento_db::Db::open(tmp.0.join("db.sqlite3")).unwrap());
+        let all = seed_present_assets(&db, 0, 600);
+        let service = EmbeddingService::start_with(
+            Arc::clone(&db),
+            tmp.0.join("models"),
+            Arc::new(|_: &str, _: &str| {}),
+            panicking_worker_factory(),
+        );
+        // limit=300 → 2ページ (512件) で打ち切り、カーソルは512件目に残る
+        let first_cap = 300usize.div_ceil(SWEEP_READ_PAGE as usize) * SWEEP_READ_PAGE as usize;
+        assert_eq!(first_cap, 512);
+        assert_eq!(service.sweep_enqueues_pending(300), first_cap);
+        let mut round1 = Vec::new();
+        assert_eq!(drain_embedding_jobs(&service, &mut round1), first_cap);
+        // カーソル位置を跨ぐように present喪失 (id 450..560相当)
+        mark_assets_missing(&db, &all[449..560]);
+        // 継続スイープ: カーソルより後の生存asset (末尾40件) を欠落なく検査
+        let survivors: Vec<i64> = all[560..600].to_vec();
+        let enqueued2 = service.sweep_enqueues_pending(300);
+        assert_eq!(enqueued2, survivors.len());
+        let mut round2 = Vec::new();
+        drain_embedding_jobs(&service, &mut round2);
+        let mut got: Vec<i64> = round2.iter().map(|(a, _)| *a).collect();
+        got.sort_unstable();
+        assert_eq!(got, survivors);
+        // 全件消失しても破綻しない (空ページ → 巻き戻し → 終了)
+        mark_assets_missing(&db, &all);
+        assert_eq!(service.sweep_enqueues_pending(300), 0);
+        service.shutdown();
     }
 }
