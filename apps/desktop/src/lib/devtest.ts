@@ -916,10 +916,26 @@ export function installDevBridge(stores: DevBridgeStores): void {
     collMoveBack: () => clickButton("選択を末尾へ"),
     /** スマート「再評価」ボタン。 */
     collRefresh: () => clickButton("再評価"),
-    /** コレクション内メモのtextareaへフォーカス。 */
+    /** コレクション内メモのtextareaへフォーカス。UIUX-5でセクションは
+     * 既定折りたたみのため、hidden中はsection-toggleで展開してから着地
+     * (hiddenなtextareaへのfocusは無音no-opになる。セクション未描画はno-op)。 */
     focusCollectionMemo: () => {
-      document.querySelector<HTMLTextAreaElement>('[data-meta="collection-memo"] textarea')
-        ?.focus();
+      const focusMemoTextarea = (): void => {
+        document.querySelector<HTMLTextAreaElement>('[data-meta="collection-memo"] textarea')
+          ?.focus();
+      };
+      const content = document.querySelector<HTMLElement>("#section-memo-content");
+      if (content === null) {
+        return;
+      }
+      if (content.hidden) {
+        document
+          .querySelector<HTMLButtonElement>("#section-memo .section-toggle")
+          ?.click();
+        setTimeout(focusMemoTextarea, 150);
+        return;
+      }
+      focusMemoTextarea();
     },
     collSaveMemo: () => {
       document
