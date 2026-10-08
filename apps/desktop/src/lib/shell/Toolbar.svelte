@@ -454,7 +454,7 @@
 
   .coll-current-count {
     font-weight: normal;
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
     color: var(--color-text-muted);
   }
 
@@ -474,7 +474,7 @@
   .position-move input {
     width: 4.5rem;
     font: inherit;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
   }
 
   /* UIUX-5/WP3: manual collection操作のオーバーフロー (popoverの位置基準) */
@@ -486,7 +486,7 @@
 
   .collection-overflow-toggle {
     font: inherit;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     padding: var(--space-15) var(--space-60);
     border-radius: var(--radius-sm);
     border: 1px solid var(--color-border-strong);
@@ -508,7 +508,7 @@
     gap: var(--space-30);
     min-width: 16rem;
     padding: var(--space-60) var(--space-75);
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     background: var(--color-surface-raised);
     border: 1px solid var(--color-border);
     border-radius: var(--radius-lg);
@@ -521,7 +521,7 @@
 
   .collection-popover button {
     font: inherit;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     padding: var(--space-15) var(--space-50);
     border-radius: var(--radius-sm);
     border: 1px solid var(--color-border-strong);
@@ -543,7 +543,7 @@
   /* UIUX-1 (R-E): パンくずのパス直接入力 */
   .crumb-input {
     font: inherit;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     font-family: monospace;
     min-width: 14rem;
     flex: 0 1 auto;
@@ -561,7 +561,7 @@
     align-items: center;
     gap: var(--space-30);
     color: var(--color-text-muted);
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
   }
 
   /* UIUX-5/WP3: サイズ2値 (小/大) のセグメントトグル。選択側は
@@ -613,7 +613,7 @@
     background: transparent;
     color: inherit;
     font: inherit;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     padding: var(--space-15) var(--space-50);
     cursor: pointer;
     position: relative;
@@ -654,7 +654,7 @@
 
   .toolbar-folder {
     font: inherit;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     padding: var(--space-15) var(--space-50);
     border-radius: var(--radius-sm);
     border: 1px solid var(--color-border-strong);

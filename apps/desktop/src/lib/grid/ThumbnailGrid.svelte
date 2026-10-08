@@ -719,7 +719,7 @@
     align-items: center;
     padding: 0 4px;
     border-radius: 4px;
-    font-size: var(--font-size-68);
+    font-size: var(--font-size-70);
     line-height: 1.3;
     color: light-dark(#ffffff, #f0f6fc);
     background: light-dark(#000000aa, #000000aa);
@@ -749,7 +749,7 @@
     right: 2px;
     bottom: 2px;
     z-index: 2;
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
     padding: 0.1rem 0.25rem;
     border: 1px solid var(--color-accent);
     border-radius: var(--radius-xs);

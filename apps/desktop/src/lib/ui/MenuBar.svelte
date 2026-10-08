@@ -240,7 +240,7 @@
     align-items: stretch;
     gap: var(--space-10);
     padding: 0 0.4rem;
-    font-size: var(--font-size-82);
+    font-size: var(--font-size-85);
     border-bottom: 1px solid var(--color-border-strong);
   }
 

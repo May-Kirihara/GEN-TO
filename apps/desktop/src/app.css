@@ -1,5 +1,5 @@
-/* デザイントークン (UIUX-5/WP1) — 値保存的導入:
-   各トークンの値は置換前の scoped CSS リテラルと完全同一 (正規化・丸めなし)。
+/* デザイントークン (UIUX-5/WP1 で導入、UIUX-6/WP2 で正規化):
+   font-size は 70/75/80/85/100 の5段階、radius は xs/sm/lg/xl/pill の5段階。
    --space-* / --font-size-* の数値サフィックス = rem値×100 (例: 25 → 0.25rem)。 */
 :root {
   font-family:
@@ -33,7 +33,6 @@
   /* 隅丸 */
   --radius-xs: 0.25rem;
   --radius-sm: 0.375rem;
-  --radius-md: 0.4rem;
   --radius-lg: 0.5rem;
   --radius-xl: 0.6rem;
   --radius-pill: 999px;
@@ -55,14 +54,9 @@
   --space-110: 1.1rem;
 
   /* 文字サイズ (サフィックス = rem×100) */
-  --font-size-66: 0.66rem;
-  --font-size-68: 0.68rem;
   --font-size-70: 0.7rem;
-  --font-size-72: 0.72rem;
   --font-size-75: 0.75rem;
-  --font-size-78: 0.78rem;
   --font-size-80: 0.8rem;
-  --font-size-82: 0.82rem;
   --font-size-85: 0.85rem;
   --font-size-100: 1rem;
 

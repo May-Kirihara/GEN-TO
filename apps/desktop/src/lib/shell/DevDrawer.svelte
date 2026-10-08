@@ -573,7 +573,7 @@
     padding: 0.5rem;
     border-radius: var(--radius-lg);
     overflow-x: auto;
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
     margin: 0.25rem 0;
   }
 

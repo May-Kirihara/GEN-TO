@@ -206,6 +206,9 @@
   let viewerMode: "single" | "compare2" | "compare4" | null = $state(null);
   let viewerStore: ViewerStore | null = $state(null);
   let compareStore: CompareStore | null = $state(null);
+  /** ビューアオープン失敗の常駐エラー (UIUX-6/WP1, WP3: エラー=strip常駐+
+   *  toast併用 / ガイド=toastのみ。オーバーレイ下でもtoastが見える)。 */
+  let viewerError: string | null = $state(null);
   let gridSelection = $state<{ ids: string[]; focusIndex: number | null }>({
     ids: [],
     focusIndex: null,
@@ -341,7 +344,10 @@
    * lib/ui/toast-queue.tsの純粋関数)。fileops系トーストは元noticeと同じ
    * testid・roleを持ち、可視中のみDOMに存在する。
    * 全kind (viewer/fileOps/meta/os) とも設定箇所のshowXxxNoticeヘルパーが
-   * 明示pushする (WP10)。$effectミラーは (1) effect内でtoastQueueを
+   * 明示pushする (WP10)。viewerのみ2経路 (UIUX-6/WP1, WP3): オープン失敗
+   * エラーはviewerError (notice-strip常駐) +toast併用、非エラーガイドは
+   * toastのみ。
+   * $effectミラーは (1) effect内でtoastQueueを
    * read+writeするため自身の依存となり、非空noticeがあると更新深度超過
    * まで無限pushする潜在バグ、(2) 同一文言の連続設定はstate不変で再発火
    * しない、の両方を抱えるため廃止 (Codex review 2026-10-07 3回目
@@ -370,8 +376,9 @@
   }
 
   function showViewerNotice(text: string): void {
-    // viewerNotice $stateは読み取り側が存在しない (表示面はトーストのみ)
-    // ため持たない — pushだけが表示経路。
+    // 非エラーガイド (openViewerFromToolbarの «グリッドで項目を選択
+    // してください») 専用のtoast経路。オープン失敗エラーは
+    // openViewerForChoiceのcatchがstrip+toast併用で出す (UIUX-6/WP1, WP3)。
     pushToast("viewer", text);
   }
 
@@ -1718,15 +1725,17 @@
   );
 
   /**
-   * notice-stripの表示条件。エラー系 (search/folder/collection/fileOpsError) は
-   * 常に生DOMへ (devtest xerr は .toolbar-notice.error の存在を読む)。
-   * viewer/fileOpsの平文noticeはトースト経由のためstripには含めない。
+   * notice-stripの表示条件。エラー系 (search/folder/collection/fileOpsError/
+   * viewerError) は常に生DOMへ (devtest xerr は .toolbar-notice.error の
+   * 存在を読む)。viewer/fileOpsの平文noticeはトースト経由のためstripには
+   * 含めない。
    */
   const noticeStripActive = $derived(
     searchNotice !== "" ||
       folderNotice !== "" ||
       collectionNotice !== "" ||
       fileOpsError !== null ||
+      viewerError !== null ||
       (fileOpsBusy && fileOpsProgress !== null),
   );
 
@@ -1771,6 +1780,7 @@
   }
 
   async function openViewerForChoice(index: number): Promise<void> {
+    viewerError = null;
     const focus = gridSelection.focusIndex ?? index;
     try {
       if (viewerChoice === "single") {
@@ -1792,7 +1802,12 @@
         await store.open(count, gridSelection.ids, focus);
       }
     } catch (error) {
-      showViewerNotice(toErrorMessage(error));
+      // エラー=strip常駐 (永続) + toast (即時)。toastも出す理由: 失敗時も全画面
+      // ビューアオーバーレイ (z-100) が残りstripが背後に隠れるため、オーバーレイ上
+      // (z-600) に出るtoastで即時フィードバックを保証する (UIUX-6/WP3)。
+      // fileOpsErrorと違いtoast併用なのはこのオーバーレイ構造の違いによる。
+      viewerError = toErrorMessage(error);
+      pushToast("viewer", toErrorMessage(error));
     }
   }
 
@@ -3343,6 +3358,7 @@
           {searchNotice}
           {folderNotice}
           {collectionNotice}
+          {viewerError}
           {fileOpsError}
           {fileOpsBusy}
           {fileOpsProgress}
@@ -3986,7 +4002,7 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-25);
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
   }
 
   .retry-list li {

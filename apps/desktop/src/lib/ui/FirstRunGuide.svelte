@@ -48,7 +48,7 @@
 
   .lead {
     margin: 0;
-    font-size: var(--font-size-82);
+    font-size: var(--font-size-85);
     color: var(--color-text-muted);
   }
 

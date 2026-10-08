@@ -190,13 +190,13 @@
 
   .picker-done {
     margin: 0;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     color: var(--color-success);
   }
 
   .picker-error {
     margin: 0;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     color: var(--color-danger);
     overflow-wrap: anywhere;
   }
@@ -241,13 +241,13 @@
   }
 
   .picker-count {
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
     color: var(--color-text-muted);
   }
 
   .picker-empty {
     margin: 0;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     color: var(--color-text-subtle);
   }
 

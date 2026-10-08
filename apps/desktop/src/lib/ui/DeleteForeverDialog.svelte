@@ -101,7 +101,7 @@
     display: flex;
     align-items: center;
     gap: var(--space-35);
-    font-size: var(--font-size-82);
+    font-size: var(--font-size-85);
     color: var(--color-danger);
     font-weight: 600;
   }

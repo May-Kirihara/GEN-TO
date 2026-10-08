@@ -770,12 +770,14 @@
               class:cull-active={(detail?.triage ?? "unselected") === "picked"}
               onclick={() => applyCull("picked")}
               disabled={busy}
-            >採用 (P)</button>
+              title="ビューアの高速選別モードでは P / X キーでも同じ操作ができます"
+            >採用</button>
             <button
               class:cull-active={(detail?.triage ?? "unselected") === "rejected"}
               onclick={() => applyCull("rejected")}
               disabled={busy}
-            >除外 (X)</button>
+              title="ビューアの高速選別モードでは P / X キーでも同じ操作ができます"
+            >除外</button>
             <button
               class:cull-active={(detail?.triage ?? "unselected") === "unselected"}
               onclick={() => applyCull("unselected")}
@@ -1153,7 +1155,7 @@
     background: light-dark(#f6f8fa, #161b22);
     border: 1px solid var(--color-border-strong);
     border-radius: 4px;
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
     margin: 0.25rem 0;
     max-height: 16rem;
     overflow: auto;
@@ -1169,13 +1171,13 @@
 
   .meta-note {
     color: var(--color-text-muted);
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
     margin: var(--space-20) 0;
   }
 
   .meta-raw-label {
     color: var(--color-text-muted);
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
     margin: 0.3rem 0 0;
   }
 
@@ -1210,7 +1212,7 @@
 
   .info-path {
     font-family: monospace;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
   }
 
   .session-progress {
@@ -1238,13 +1240,13 @@
 
   .session-note {
     margin: 0;
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
     color: var(--color-text-subtle);
   }
 
   .info-error {
     margin: 0.3rem 0 0;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     color: var(--color-danger);
     overflow-wrap: anywhere;
   }
@@ -1274,7 +1276,7 @@
 
   .bulk-confirm {
     border: 1px solid var(--color-warning);
-    border-radius: var(--radius-md);
+    border-radius: var(--radius-sm);
     padding: var(--space-40);
     margin: 0.3rem 0;
     background: light-dark(#fff8c5, #25170a);
@@ -1282,7 +1284,7 @@
 
   .bulk-confirm p {
     margin: 0 0 0.3rem;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     overflow-wrap: anywhere;
   }
 
@@ -1301,7 +1303,7 @@
 
   .meta-label {
     color: var(--color-text-muted);
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     min-width: 5.5rem;
   }
 
@@ -1316,7 +1318,7 @@
   }
 
   .meta-value {
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     color: var(--color-text-muted);
   }
 
@@ -1373,7 +1375,7 @@
     border: 1px solid var(--color-border-strong);
     border-radius: var(--radius-pill);
     padding: 0.05rem 0.45rem;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     background: var(--color-bg-subtle);
   }
 
@@ -1413,7 +1415,7 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-15);
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
   }
 
   .ai-runs li {
@@ -1489,7 +1491,7 @@
 
   .tag-usage {
     color: var(--color-text-subtle);
-    font-size: var(--font-size-68);
+    font-size: var(--font-size-70);
   }
 
   .meta-col textarea {

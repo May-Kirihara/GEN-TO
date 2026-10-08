@@ -57,10 +57,10 @@
     max-width: 28rem;
     padding: var(--space-40) var(--space-60);
     border: 1px solid var(--color-border);
-    border-radius: var(--radius-md);
+    border-radius: var(--radius-sm);
     background: var(--color-surface-raised);
     box-shadow: var(--shadow-popover);
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
   }
 
   .toast-message {

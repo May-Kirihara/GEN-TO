@@ -218,7 +218,7 @@
   .source-badge {
     padding: 0.1rem 0.5rem;
     border-radius: var(--radius-pill);
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
     border: 1px solid var(--color-border-strong);
     color: var(--color-text-muted);
   }
@@ -278,7 +278,7 @@
     gap: var(--space-25);
     padding: var(--space-60);
     border: 1px solid var(--color-border);
-    border-radius: var(--radius-md);
+    border-radius: var(--radius-sm);
     background: var(--color-surface-raised);
     box-shadow: var(--shadow-popover);
     z-index: 600;
@@ -298,7 +298,7 @@
   .header-status-detail {
     margin: 0;
     color: var(--color-text-muted);
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
   }
 
   .header-status-empty {

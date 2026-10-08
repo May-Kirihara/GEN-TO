@@ -461,7 +461,7 @@
 
   .coll-builder-hint {
     margin: 0;
-    font-size: var(--font-size-68);
+    font-size: var(--font-size-70);
     color: var(--color-text-muted);
   }
 
@@ -472,7 +472,7 @@
 
   .coll-error {
     margin: var(--space-20) 0;
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
     color: var(--color-danger);
     overflow-wrap: anywhere;
   }
@@ -532,7 +532,7 @@
 
   .coll-count {
     flex: none;
-    font-size: var(--font-size-68);
+    font-size: var(--font-size-70);
     color: var(--color-text-muted);
   }
 
@@ -565,7 +565,7 @@
   .coll-query {
     flex-basis: 100%;
     padding: 0 0.25rem 0.15rem 1.6rem;
-    font-size: var(--font-size-68);
+    font-size: var(--font-size-70);
     color: var(--color-text-muted);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -574,7 +574,7 @@
 
   .coll-empty {
     margin: 0.3rem 0;
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
     color: var(--color-text-subtle);
   }
 </style>

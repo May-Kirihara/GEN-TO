@@ -351,12 +351,12 @@
 
   .mono {
     font-family: monospace;
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
   }
 
   .picker-error {
     margin: 0;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     color: var(--color-danger);
     overflow-wrap: anywhere;
   }
@@ -416,7 +416,7 @@
 
   .picker-path {
     margin: 0;
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
     color: var(--color-text-muted);
     overflow-wrap: anywhere;
   }
@@ -436,14 +436,14 @@
 
   .warnings-title {
     margin: 0 0 0.2rem;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     font-weight: 600;
   }
 
   .skip-list {
     margin: 0;
     padding-left: var(--space-110);
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
     max-height: 9rem;
     overflow-y: auto;
     overflow-wrap: anywhere;
@@ -457,7 +457,7 @@
   .entry-list {
     margin: 0;
     padding-left: var(--space-110);
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
     max-height: 12rem;
     overflow-y: auto;
   }
@@ -472,7 +472,7 @@
     flex: none;
     min-width: 4rem;
     text-align: center;
-    font-size: var(--font-size-66);
+    font-size: var(--font-size-70);
     border-radius: var(--radius-xs);
     padding: 0 0.2rem;
     background: var(--color-bg-subtle);
@@ -485,7 +485,7 @@
 
   .entry-match {
     flex: none;
-    font-size: var(--font-size-66);
+    font-size: var(--font-size-70);
     color: var(--color-text-muted);
   }
 

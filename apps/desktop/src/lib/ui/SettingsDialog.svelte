@@ -740,7 +740,7 @@
   }
 
   .picker h3 {
-    font-size: var(--font-size-82);
+    font-size: var(--font-size-85);
     margin: 0.4rem 0 0.1rem;
   }
 
@@ -753,14 +753,14 @@
 
   .picker-error {
     margin: 0;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     color: var(--color-danger);
     overflow-wrap: anywhere;
   }
 
   .mono {
     font-family: monospace;
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
   }
 
   .tabs {
@@ -776,7 +776,7 @@
     background: transparent;
     color: inherit;
     font: inherit;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     padding: 0.2rem 0.55rem;
     border-radius: var(--radius-sm);
     cursor: pointer;
@@ -792,7 +792,7 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-20);
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
   }
 
   .field input {
@@ -808,7 +808,7 @@
 
   fieldset.field legend {
     padding: 0;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
   }
 
   .radio-row {
@@ -821,7 +821,7 @@
     display: inline-flex;
     align-items: center;
     gap: var(--space-25);
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
   }
 
   .picker-actions {
@@ -832,7 +832,7 @@
 
   .picker-actions button {
     font: inherit;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     padding: 0.25rem 0.7rem;
     border-radius: var(--radius-sm);
     border: 1px solid var(--color-border);
@@ -863,7 +863,7 @@
     grid-template-columns: minmax(8rem, 14rem) 1fr;
     gap: 0.15rem 0.8rem;
     margin: 0;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
   }
 
   .kv dt {
@@ -894,7 +894,7 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-20);
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
   }
 
   .endpoint-badge {
@@ -943,7 +943,7 @@
   }
 
   .mono-full {
-    font-size: var(--font-size-66);
+    font-size: var(--font-size-70);
     color: var(--color-text-muted);
     overflow-wrap: anywhere;
   }
@@ -952,10 +952,10 @@
     margin: 0;
     padding: 0.5rem 0.6rem;
     border: 1px solid light-dark(#eaeef2, #30363d);
-    border-radius: var(--radius-md);
+    border-radius: var(--radius-sm);
     background: var(--color-bg-inset);
     font-family: monospace;
-    font-size: var(--font-size-68);
+    font-size: var(--font-size-70);
     line-height: 1.45;
     white-space: pre-wrap;
     overflow-wrap: anywhere;

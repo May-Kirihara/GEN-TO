@@ -981,13 +981,13 @@
 
   .notice {
     margin: 0;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     color: var(--color-success);
   }
 
   .error {
     margin: 0;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     color: var(--color-danger);
     overflow-wrap: anywhere;
   }
@@ -997,7 +997,7 @@
     flex-direction: column;
     gap: var(--space-50);
     border: 1px solid var(--color-border-strong);
-    border-radius: var(--radius-md);
+    border-radius: var(--radius-sm);
     padding: 0.6rem;
   }
 
@@ -1053,7 +1053,7 @@
 
   .profile-url {
     font-family: monospace;
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
     color: var(--color-text-muted);
   }
 
@@ -1066,7 +1066,7 @@
   }
 
   .profile-key {
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
     color: var(--color-text-subtle);
   }
 
@@ -1074,14 +1074,14 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-15);
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     color: var(--color-text-muted);
   }
 
   .field input,
   .field select {
     font: inherit;
-    font-size: var(--font-size-82);
+    font-size: var(--font-size-85);
     color: light-dark(#1f2328, #e6edf3);
   }
 
@@ -1100,7 +1100,7 @@
     display: inline-flex;
     align-items: center;
     gap: var(--space-30);
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
   }
 
   .privacy {
@@ -1151,12 +1151,12 @@
 
   .counts {
     margin: 0;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     color: var(--color-text-muted);
   }
 
   .job-row {
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
   }
 
   .job-status {
@@ -1173,7 +1173,7 @@
 
   .job-error {
     flex-basis: 100%;
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
     color: var(--color-text-subtle);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1194,7 +1194,7 @@
 
   .inline-dialog {
     border: 1px solid var(--color-warning);
-    border-radius: var(--radius-md);
+    border-radius: var(--radius-sm);
     padding: 0.5rem 0.6rem;
     background: light-dark(#fff8c5, #25170a);
   }

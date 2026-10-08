@@ -174,7 +174,7 @@
 
   .sub {
     margin: 0;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     color: var(--color-text-muted);
     overflow-wrap: anywhere;
   }
@@ -196,7 +196,7 @@
 
   .pane-title {
     font-weight: 600;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
   }
 
   .pane img {
@@ -224,7 +224,7 @@
     display: grid;
     grid-template-columns: auto 1fr;
     gap: 0.1rem 0.4rem;
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
   }
 
   dt {
@@ -244,7 +244,7 @@
 
   .keep-note {
     margin: 0;
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
     color: var(--color-text-muted);
     overflow-wrap: anywhere;
   }

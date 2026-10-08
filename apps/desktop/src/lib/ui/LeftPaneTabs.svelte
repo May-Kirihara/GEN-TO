@@ -80,7 +80,7 @@
     gap: var(--space-15);
     padding: 0.2rem 0.3rem 0;
     border-bottom: 1px solid var(--color-border-strong);
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
   }
 
   .left-tabs button {

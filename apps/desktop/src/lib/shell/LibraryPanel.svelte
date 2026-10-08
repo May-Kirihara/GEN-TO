@@ -160,7 +160,7 @@
   .roots-add input {
     flex: 1;
     min-width: 0;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
   }
 
   .roots-list {
@@ -215,7 +215,7 @@
 
   .roots-path {
     font-family: monospace;
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
     overflow-wrap: anywhere;
   }
 
@@ -248,13 +248,13 @@
 
   .roots-notice {
     margin: 0;
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
     color: var(--color-text-muted);
   }
 
   .roots-error {
     margin: 0;
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
     color: var(--color-danger);
   }
 </style>

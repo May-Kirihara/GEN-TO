@@ -441,12 +441,12 @@
 
   .mono {
     font-family: monospace;
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
   }
 
   .picker-error {
     margin: 0;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     color: var(--color-danger);
     overflow-wrap: anywhere;
   }
@@ -455,7 +455,7 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-20);
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
   }
 
   .dest-label input {
@@ -514,7 +514,7 @@
 
   .picker-path {
     margin: 0;
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
     color: var(--color-text-muted);
     overflow-wrap: anywhere;
   }
@@ -525,18 +525,18 @@
     padding: var(--space-30) var(--space-60);
     display: flex;
     gap: 1rem;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
   }
 
   .structure legend {
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
     padding: 0 0.25rem;
   }
 
   .summary {
     margin: 0;
     padding-left: 1.2rem;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
   }
 
   .issues {
@@ -568,7 +568,7 @@
   .preview-table {
     width: 100%;
     border-collapse: collapse;
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
   }
 
   .preview-table th,

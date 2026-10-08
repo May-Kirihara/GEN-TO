@@ -383,7 +383,7 @@
     background: var(--color-bg-inset);
     color: inherit;
     font: inherit;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     padding: var(--space-15) var(--space-50);
     border-radius: var(--radius-sm);
     cursor: pointer;
@@ -408,7 +408,7 @@
 
   .search-summary-empty {
     color: var(--color-text-muted);
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
   }
 
   .search-scope-badge {
@@ -417,7 +417,7 @@
     padding: 0 0.45rem;
     border: 1px solid var(--color-border-strong);
     border-radius: var(--radius-pill);
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
     color: var(--color-text-muted);
     white-space: nowrap;
     max-width: 22rem;
@@ -492,7 +492,7 @@
     flex-wrap: wrap;
     gap: var(--space-60);
     padding: var(--space-60) var(--space-75);
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     background: var(--color-surface-raised);
     border: 1px solid var(--color-border);
     border-radius: var(--radius-lg);
@@ -522,7 +522,7 @@
     padding: 0 0.45rem;
     border: 1px solid var(--color-border-strong);
     border-radius: var(--radius-pill);
-    font-size: var(--font-size-72);
+    font-size: var(--font-size-75);
     color: var(--color-text-muted);
     white-space: nowrap;
   }

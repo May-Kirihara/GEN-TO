@@ -10,6 +10,7 @@
     searchNotice,
     folderNotice,
     collectionNotice,
+    viewerError,
     fileOpsError,
     fileOpsBusy,
     fileOpsProgress,
@@ -19,6 +20,8 @@
     searchNotice: string;
     folderNotice: string;
     collectionNotice: string;
+    /** ビューアオープン失敗の常駐エラー (UIUX-6/WP1。AppのviewerError)。 */
+    viewerError: string | null;
     fileOpsError: string | null;
     fileOpsBusy: boolean;
     fileOpsProgress: { index: number; total: number; from: string } | null;
@@ -37,6 +40,9 @@
   {/if}
   {#if collectionNotice}
     <p class="toolbar-notice error" role="status">{collectionNotice}</p>
+  {/if}
+  {#if viewerError !== null}
+    <p class="toolbar-notice error" role="alert" data-testid="viewer-error">{viewerError}</p>
   {/if}
   {#if fileOpsError !== null}
     <p class="toolbar-notice error" role="alert" data-testid="fileops-error">{fileOpsError}</p>
@@ -81,7 +87,7 @@
     display: flex;
     align-items: center;
     gap: var(--space-40);
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
   }
 
   .fileops-progress progress {

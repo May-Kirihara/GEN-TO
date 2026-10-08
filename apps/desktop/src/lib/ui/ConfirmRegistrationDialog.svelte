@@ -85,7 +85,7 @@
   .path {
     margin: 0;
     font-family: monospace;
-    font-size: var(--font-size-78);
+    font-size: var(--font-size-80);
     overflow-wrap: anywhere;
     background: var(--color-bg-subtle);
     border-radius: var(--radius-xs);
