@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+// @vitest-environment happy-dom
+import { afterEach, describe, expect, it } from "vitest";
 import { originalUrl, previewUrl, thumbUrl } from "./protocol";
 
 describe("thumbUrl", () => {
@@ -70,5 +71,54 @@ describe("originalUrl", () => {
   it("不正なIDを拒否する", () => {
     expect(() => originalUrl("../etc/passwd", 1)).toThrow();
     expect(() => originalUrl("1%2F2", 1)).toThrow();
+  });
+});
+
+/**
+ * tauri (crates/tauri/scripts/core.js) が注入する `convertFileSrc` と同一挙動の
+ * stub。本物はパス全体を `encodeURIComponent` で符号化する (区切りの `/` も
+ * `%2F` になる) ため、それも含めて再現し、ビルダがプラットフォーム形式の基点に
+ * 生の `/asset/...` パスを結合することを検証する
+ * (Windows/WebView2 の回避形式 `http://{scheme}.localhost/{path}`)。
+ */
+type InternalsWindow = Window & {
+  __TAURI_INTERNALS__?: {
+    convertFileSrc: (filePath: string, protocol: string) => string;
+  };
+};
+
+function stubTauriConvertFileSrc(windowsForm: boolean): void {
+  (window as InternalsWindow).__TAURI_INTERNALS__ = {
+    convertFileSrc: (filePath, protocol) => {
+      const path = encodeURIComponent(filePath);
+      return windowsForm
+        ? `http://${protocol}.localhost/${path}`
+        : `${protocol}://localhost/${path}`;
+    },
+  };
+}
+
+describe("プラットフォーム形式 (tauri convertFileSrc 経由)", () => {
+  afterEach(() => {
+    delete (window as InternalsWindow).__TAURI_INTERNALS__;
+  });
+
+  it("Windows/Android形式のinternalsでは http://{scheme}.localhost/ 形式を返す", () => {
+    stubTauriConvertFileSrc(true);
+    expect(thumbUrl("42", "s256", 3)).toBe(
+      "http://gento-thumb.localhost/asset/42/s256?v=3",
+    );
+    expect(previewUrl("9", 2)).toBe("http://gento-preview.localhost/asset/9?v=2");
+    expect(originalUrl("5", 1)).toBe("http://gento-original.localhost/asset/5?v=1");
+  });
+
+  it("非Windows形式のinternalsでは {scheme}://localhost/ 形式のまま", () => {
+    stubTauriConvertFileSrc(false);
+    expect(thumbUrl("42", "s256", 3)).toBe("gento-thumb://localhost/asset/42/s256?v=3");
+    expect(originalUrl("5", 1)).toBe("gento-original://localhost/asset/5?v=1");
+  });
+
+  it("internalsが未注入なら従来形式へフォールバックする", () => {
+    expect(thumbUrl("42", "s256", 3)).toBe("gento-thumb://localhost/asset/42/s256?v=3");
   });
 });

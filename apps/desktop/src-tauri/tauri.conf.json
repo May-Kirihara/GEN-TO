@@ -18,10 +18,10 @@
     ],
     "security": {
       "csp": {
-        "img-src": "'self' data: gento-thumb: gento-preview: gento-original:"
+        "img-src": "'self' data: gento-thumb: gento-preview: gento-original: http://gento-thumb.localhost http://gento-preview.localhost http://gento-original.localhost https://gento-thumb.localhost https://gento-preview.localhost https://gento-original.localhost"
       },
       "devCsp": {
-        "img-src": "'self' data: gento-thumb: gento-preview: gento-original:"
+        "img-src": "'self' data: gento-thumb: gento-preview: gento-original: http://gento-thumb.localhost http://gento-preview.localhost http://gento-original.localhost https://gento-thumb.localhost https://gento-preview.localhost https://gento-original.localhost"
       }
     }
   },
