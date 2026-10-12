@@ -1,7 +1,8 @@
 //! フォルダツリーとOS連携のcommand群 (MVP WP-4)。
 //!
 //! - `fs_list_dirs`: 任意パスの直下ディレクトリ列挙 (遅延ロード用)。
-//!   起点はユーザーホームとルート(/)。隠しディレクトリ (`.` 始まり) は
+//!   起点はユーザーホームとプラットフォームのルート群 (Windowsは
+//!   存在するドライブ、それ以外は /)。隠しディレクトリ (`.` 始まり) は
 //!   表示しない (設定はWP-15)。権限エラーはエラー情報として返し、UIが
 //!   「読み取り不能」ノードを表示する。
 //! - `reveal_in_file_manager` / `open_with_default_app`: tauri-plugin-opener
@@ -24,7 +25,8 @@ pub struct FsDirEntryDto {
 ///
 /// `error` が非nullの場合は entries が空でもエラー状態 (UIはノードを
 /// 「読み取り不能」等として表示)。ルート要求 (`path: null`) の場合は
-/// 起点ノード列 (ホーム・/) を返し、`path` は空文字。
+/// 起点ノード列 (ホーム + プラットフォームのルート群) を返し、`path` は
+/// 空文字。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FsDirListDto {
     pub path: String,
@@ -137,7 +139,8 @@ fn to_dto_list(path: &Path, result: Result<Vec<(String, PathBuf)>, ListDirsError
     }
 }
 
-/// ルート一覧 (ホーム + /) のDTO。ホームが解決できない環境では / のみ。
+/// ルート一覧 (ホーム + プラットフォームのルート群) のDTO。ホームが
+/// 解決できない環境ではルート群のみ。
 fn root_list(home: Option<&Path>) -> FsDirListDto {
     let mut entries = Vec::new();
     if let Some(home) = home {
@@ -148,16 +151,38 @@ fn root_list(home: Option<&Path>) -> FsDirListDto {
             });
         }
     }
-    entries.push(FsDirEntryDto {
-        name: "ファイルシステム (/)".to_string(),
-        path: "/".to_string(),
-    });
+    entries.extend(platform_roots());
     FsDirListDto {
         path: String::new(),
         parent: None,
         entries,
         error: None,
     }
+}
+
+/// ホーム以外の起点ノード (Windows以外): ルート(/) のみ。
+#[cfg(not(windows))]
+fn platform_roots() -> Vec<FsDirEntryDto> {
+    vec![FsDirEntryDto {
+        name: "ファイルシステム (/)".to_string(),
+        path: "/".to_string(),
+    }]
+}
+
+/// ホーム以外の起点ノード (Windows): 存在するドライブルートを字母順
+/// (A→Z) に列挙。A:\〜Z:\ を is_dir() でプローブするため、ドライブ文字
+/// が割り当てられていない・リムーバブルメディア不在のドライブは自然に
+/// 除外される (依存追加禁止のためWin32 APIのドライブ列挙は使わない)。
+#[cfg(windows)]
+fn platform_roots() -> Vec<FsDirEntryDto> {
+    (b'A'..=b'Z')
+        .map(|letter| format!("{}:\\", letter as char))
+        .filter(|root| Path::new(root).is_dir())
+        .map(|root| FsDirEntryDto {
+            name: root.clone(),
+            path: root,
+        })
+        .collect()
 }
 
 /// 任意パスの直下ディレクトリ列挙 (遅延ロード)。`path: null` で起点ノード。
@@ -302,6 +327,8 @@ mod tests {
         assert_eq!(missing.entries.len(), 0);
     }
 
+    // Windowsの起点ノード列はホーム+ドライブ群 (下のwindows専用テストで検証)
+    #[cfg(not(windows))]
     #[test]
     fn root_list_contains_home_and_filesystem() {
         let home = dirs::home_dir();
@@ -312,6 +339,50 @@ mod tests {
             assert_eq!(dto.entries[0].path, home.to_string_lossy());
         } else {
             assert_eq!(names, vec!["ファイルシステム (/)"]);
+        }
+        assert_eq!(dto.path, "");
+        assert_eq!(dto.parent, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn root_list_contains_home_and_drive_roots() {
+        let home = dirs::home_dir();
+        let dto = root_list(home.as_deref());
+        if let Some(home) = &home {
+            assert_eq!(dto.entries.first().map(|e| e.name.as_str()), Some("ホーム"));
+            assert_eq!(dto.entries[0].path, home.to_string_lossy());
+        }
+        let drives: Vec<&FsDirEntryDto> = dto
+            .entries
+            .iter()
+            .skip(usize::from(home.is_some()))
+            .collect();
+        assert!(!drives.is_empty(), "{dto:?}");
+        // ドライブは「X:\」形式でname==path、字母順 (A→Z)
+        let letters: Vec<u8> = drives
+            .iter()
+            .map(|e| {
+                assert_eq!(e.name.len(), 3, "{e:?}");
+                assert_eq!(&e.name.as_bytes()[1..3], b":\\");
+                assert_eq!(e.path, e.name);
+                e.name.as_bytes()[0]
+            })
+            .collect();
+        assert!(letters.windows(2).all(|w| w[0] < w[1]), "{letters:?}");
+        // カレントディレクトリのドライブルートは必ず含まれる
+        // (UNCパス (\\server\share) の場合は形式が異なるため検証から除外)
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let bytes = cwd.as_bytes();
+        if bytes.len() >= 3 && bytes[1] == b':' {
+            let prefix = cwd[..3].to_uppercase();
+            assert!(
+                drives.iter().any(|e| e.path.eq_ignore_ascii_case(&prefix)),
+                "cwd drive {prefix:?} not found in {drives:?}"
+            );
         }
         assert_eq!(dto.path, "");
         assert_eq!(dto.parent, None);

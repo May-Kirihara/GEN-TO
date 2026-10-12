@@ -1,6 +1,10 @@
 # Windowsビルド手順 (WIN-1 / Route B)
 
-最終更新: 2026-10-13 (初版。計画: [docs/plans/2026-10-13-windows-support-plan-pm.md](../plans/2026-10-13-windows-support-plan-pm.md))
+最終更新: 2026-10-13 (**Windows 11実機でビルド・インストール・起動まで確認済み** — 検証記録: [docs/handoff/2026-10-13-windows-verification.md](../handoff/2026-10-13-windows-verification.md))
+
+> **2026-10-13実績環境**: Windows 11 + Visual Studio 18 Community (MSVC 14.51) +
+> NASM 3.02 + meson 1.12.1 + numkong 7.8.5 (ローカルlock) + dav1d 1.5.0 (静的ビルド)。
+> 日本語Windows (CP932) では§2の `CFLAGS`/`CXXFLAGS` が必須。
 
 対象: Windows 10/11 x64。このリポジトリの正規検証環境はLinuxであり、
 Windowsビルドは本手順で初めて確立する (実績は
@@ -56,6 +60,11 @@ pnpm install
 
 :: dav1dソースビルドを有効化 (セッション内のみ。綴り注意: SYSTEM_DEPS_DAV1D_BUILD_INTERNAL)
 set SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=auto
+
+:: 日本語Windowsでは必須 (原因は§6参照): C全般とC++の両方に /utf-8
+:: CXXFLAGSの -DNK_DYNAMIC= は usearch↔numkong 静的リンク用 (§6参照)
+set CFLAGS=/utf-8
+set CXXFLAGS=/utf-8 -DNK_DYNAMIC=
 ```
 
 まず軽量の全体check (dav1dビルドを含む build script はこの時点で走る):
@@ -123,11 +132,14 @@ pkg-config --libs dav1d          :: 静的libを指すことを確認
 | 症状 | 原因と対処 |
 |---|---|
 | `The pkg-config command could not be found` | pkg-config未導入またはPATH不一致 (§1)。Route Bでも必要 |
-| `Program 'nasm' not found` / asm関連のmesonエラー | nasm未導入 or PATH未追加、またはバージョン < 2.14 |
+| `Program 'nasm not found` / asm関連のmesonエラー | nasm未導入 or PATH未追加、またはバージョン < 2.14。**インストール後にプロンプトを開き直すこと** (PATH反映) |
 | mesonが `cl` を見つけられない | 素のPowerShell/cmdで実行している。x64 Native Toolsプロンプトを使う |
-| `light.exe` 失敟 (MSI) | VBSCRIPTコンポーネント未導入 (§1)。`--bundles nsis` で継続可 |
+| **numkong/usearchのC/C++ソースが全ファイルexit 2で失敗** (cargoログに実エラーが出ない) | **日本語WindowsのclがソースをCP932として解釈し、numkongヘッダのUTF-8コメントで構文解析が壊れる**。`set CFLAGS=/utf-8` (C: numkong) と `set CXXFLAGS=/utf-8` (C++: usearch) で解決。clのエラーはstdoutへ出るがcc-rsが破棄するため、診断は手動cl再現 (`cl ... -c c\dispatch_other.c > %TEMP%\err.txt 2>&1`) で行う |
+| **リンクエラー `LNK2019: 未解決の外部シンボル __imp_nk_*`** | numkong 7.8.5が消費者に `dllimport` を与える設計 (DLL配布想定) なのに対し、我々は静的リンクしているため。`set CXXFLAGS=/utf-8 -DNK_DYNAMIC=` で `types.h` のdllimport分岐を短路して解消 |
+| `light.exe` 失敗 (MSI) | VBSCRIPTコンポーネント未導入 (§1)。`--bundles nsis` で継続可 |
 | code.videolan.orgへのclone失敗 | ネットワーク/プロキシ。A7 — 手動での事前cloneは不可 (OUT_DIR管理のため) ので環境側を解決する |
 | ビルドは成功するが意味検索が動かない | 既知の初期キュー (計画§6 WP-W4): workerの `.exe` 解決とバンドル欠落。ビルド検証のブロッカーではない |
+| cmdでディレクトリ移動が効かない | ドライブをまたぐ `cd` には `cd /d` が必要 |
 
 ## 7. Linux側への影響
 

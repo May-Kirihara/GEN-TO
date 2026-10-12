@@ -78,6 +78,14 @@
     return !libraryMode && currentFolder === path;
   }
 
+  /** ラベルクリック: 選択 + 未展開なら展開 (折りたたみは展開矢印のみ)。 */
+  function handleLabelClick(path: string): void {
+    onSelect(path);
+    if (!tree.isExpanded(path)) {
+      void tree.expandTo(path);
+    }
+  }
+
   /** WP-7: ドロップ先として意味があるか (登録ルート配下のフォルダのみ)。 */
   function droppable(path: string): boolean {
     if (onDrop === undefined) {
@@ -248,7 +256,7 @@
         <button
           class="tree-label"
           title={row.path}
-          onclick={() => onSelect(row.path)}
+          onclick={() => handleLabelClick(row.path)}
         >
           <span class="tree-name">{row.name}</span>
           {#if badgeOf(row.path) !== null}

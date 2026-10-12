@@ -4,6 +4,7 @@
  *
  * - 右クリック3状態: root=3項目 / unrelated=登録1項目 / descendant=メニューなし
  * - roots差し替え (同path別rootId) で開いているメニューが閉じる (stale検出)
+ * - ラベルクリックで選択+展開 (折りたたみは展開矢印のみ) (WIN-1 #2)
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { flushSync, mount, unmount } from "svelte";
@@ -59,8 +60,11 @@ let component: Record<string, unknown> | null = null;
 let unregister: ReturnType<typeof vi.fn>;
 let rescan: ReturnType<typeof vi.fn>;
 
-async function mountTree(roots: LibraryRoot[]): Promise<void> {
-  const tree = new FolderTreeStore(IPC);
+async function mountTree(
+  roots: LibraryRoot[],
+  options?: { ipc?: FsIpc; onSelect?: (path: string) => void },
+): Promise<void> {
+  const tree = new FolderTreeStore(options?.ipc ?? IPC);
   await tree.init();
   target = document.createElement("div");
   document.body.appendChild(target);
@@ -73,7 +77,7 @@ async function mountTree(roots: LibraryRoot[]): Promise<void> {
       roots,
       currentFolder: null,
       libraryMode: false,
-      onSelect: () => {},
+      onSelect: options?.onSelect ?? (() => {}),
       onDrop: undefined,
       onRegisterRoot: () => {},
       onUnregisterRoot: unregister as unknown as (rootId: string) => void,
@@ -249,5 +253,53 @@ describe("FolderTree stale検出 (r1 B4: rootId込み完全比較)", () => {
     handle.setRoots([rootOf("9", "/mnt/other")]);
     flushSync();
     expect(contextMenu()).toBeNull();
+  });
+});
+
+describe("FolderTree ラベルクリック (WIN-1 #2: 選択+展開)", () => {
+  /** ルート直下に /data/lib (子1つ) を持つfixture。ラベルクリック展開で
+   * ensureChildrenのinvokeが走るため、子パスの応答も用意する。 */
+  const childIpc = makeIpc({
+    "": {
+      path: "",
+      parent: null,
+      entries: [{ name: "lib", path: "/data/lib" }],
+      error: null,
+    },
+    "/data/lib": {
+      path: "/data/lib",
+      parent: "",
+      entries: [{ name: "2026", path: "/data/lib/2026" }],
+      error: null,
+    },
+  });
+
+  it("ラベルクリックで選択され、折りたたみ状態なら展開する", async () => {
+    const select = vi.fn();
+    await mountTree([rootOf("7", "/data/lib")], { ipc: childIpc, onSelect: select });
+    rowLabel("/data/lib").click();
+    flushSync();
+    expect(select).toHaveBeenCalledWith("/data/lib");
+    // 展開されて子行が現れる (ensureChildrenのinvoke解決後)
+    await vi.waitFor(() => {
+      rowLabel("/data/lib/2026");
+    });
+  });
+
+  it("展開済み行のラベル再クリックでは折りたたまない", async () => {
+    await mountTree([rootOf("7", "/data/lib")], { ipc: childIpc });
+    rowLabel("/data/lib").click();
+    await vi.waitFor(() => {
+      rowLabel("/data/lib/2026");
+    });
+    rowLabel("/data/lib").click();
+    flushSync();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    flushSync();
+    // 子行は表示されたまま (折りたたみは展開矢印のみ)
+    expect(() => rowLabel("/data/lib/2026")).not.toThrow();
+    expect(
+      rowLabel("/data/lib").closest(".tree-row")?.getAttribute("aria-expanded"),
+    ).toBe("true");
   });
 });
