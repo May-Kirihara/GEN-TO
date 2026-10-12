@@ -54,8 +54,8 @@ set CXXFLAGS=/utf-8 -DNK_DYNAMIC=
 |---|------|------|-----------|
 | 1 | 初期設定: フォルダ登録→ライブラリ表示 | 未実施 | |
 | 2 | 登録 (走査): 追加・リネーム・削除反映・フォルダ監視 | 未実施 | |
-| 3 | 一覧: グリッド・スクロール・サムネイル・サイズ切替 | 未実施 | |
-| 4 | ビューア: Enter/Space/ズーム | 未実施 | |
+| 3 | 一覧: グリッド・スクロール・サムネイル・サイズ切替 | **合格** | 2026-10-13 W4b修正後「無事動作」報告 (サムネイル表示)。ドライブ列挙・ラベルクリック展開 (W4a) も同時確認 |
+| 4 | ビューア: Enter/Space/ズーム | **合格** | 2026-10-13 W4b修正後「無事動作」報告 (画像表示復旧) |
 | 5 | 比較: 2枚/4枚 | 未実施 | |
 | 6 | 評価: ★・選別・お気に入り・タグ | 未実施 | |
 | 7 | エクスポート: 選択画像コピー→内容一致 | 未実施 | |
@@ -77,15 +77,16 @@ set CXXFLAGS=/utf-8 -DNK_DYNAMIC=
 
 ## 6. 発見済みの残課題キュー (WP-W4候補)
 
-1. ~~[UX] フォルダツリーのラベルクリックでも展開~~ → **WP-W4a実装済み** (2026-10-13。Windows実機確認待ち)
-2. ~~Windowsでルート一覧をドライブ列挙に~~ → **WP-W4a実装済み** (2026-10-13。Windows実機確認待ち)
+1. ~~[UX] フォルダツリーのラベルクリックでも展開~~ → **WP-W4a実装済み・Windows実機確認済み** (2026-10-13)
+2. ~~Windowsでルート一覧をドライブ列挙に~~ → **WP-W4a実装済み・Windows実機確認済み** (2026-10-13)
 3. **`devtools` featureが `tauri/devtools` を伝播していない** (releaseビルドで検証コンソールが開けない。`--features "devtools,tauri/devtools"` で回避可)
 4. `registeredStateFor` のパス区切り想定が `/` 前提 (Windowsの `\` で登録バッジ・配下判定が不正の可能性)
 5. Windowsでの `cargo test` がテストモジュール内unix専用コードでコンパイル不可 (protocol/fileops/fsview/library/export)
 6. gento-platform のWindows警告3件 (cosmetic)
 7. `gento-embedding-worker` の `.exe` 解決 + インストーラ同梱 (Linux共通の既知欠落。意味検索)
 8. 正規repoのCargo.lockをnumkong 7.8.5へ更新するか判断 (Windows実績と一致させるため。要implementer WP + Linuxゲート)
-9. 上流報告候補: numkong 7.8.5のcc-rs/MSVC静的リンク経路が `__imp_nk_*` で壊れる件 ( DLL配布想定のdllimport)
+9. 上流報告候補: numkong 7.8.5のcc-rs/MSVC静的リンク経路が `__imp_nk_*` で壊れる件 (DLL配布想定のdllimport)
+10. ~~Windowsでカスタムプロトコル画像がすべて破損~~ → **WP-W4b実装済み・Windows実機確認済み** (2026-10-13。WebView2は `{http|https}://{scheme}.localhost` 形式 required。`convertFileSrc` のencodeURIComponentに注意 — protocol.ts `schemeBase` プローブ方式。CSPへorigin追加)
 
 ## 7. 判定 (実施完了時に記入)
 
