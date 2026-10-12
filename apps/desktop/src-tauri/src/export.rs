@@ -484,8 +484,12 @@ pub fn allocate_output_name(base: &OsStr, used: &mut HashSet<OsString>) -> OsStr
 fn is_valid_output_component(component: &OsStr) -> bool {
     #[cfg(unix)]
     let bytes = std::os::unix::ffi::OsStrExt::as_bytes(component);
+    // 非unix: lossy UTF-8列で字句検証する (NUL・区切りの検出目的には足りる。
+    // to_string_lossyの一時値は束縛して寿命を確保する)。
     #[cfg(not(unix))]
-    let bytes = component.to_string_lossy().as_bytes();
+    let owned = component.to_string_lossy();
+    #[cfg(not(unix))]
+    let bytes = owned.as_bytes();
     !bytes.is_empty()
         && bytes != b"."
         && bytes != b".."

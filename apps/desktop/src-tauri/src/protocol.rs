@@ -13,6 +13,8 @@
 //! - 読み取りは検証とopenの間の差し替え (TOCTOU) を閉じる: 最終コンポーネントを
 //!   `O_NOFOLLOW` で開き、open済みfdのfstatで検証時statの (dev, ino) 一致と
 //!   正規キャッシュルート包含 (`/proc/self/fd/{fd}` の実パス) を再確認する
+//!   (この構造的保護はunix実装。非unixは字句包含検証のみ —
+//!   docs/dev/platform-notes.md §2)
 //! - 応答は `Content-Type` 正確・`X-Content-Type-Options: nosniff`・意図的な
 //!   `Cache-Control` (`v` 付きは immutable、無しは no-store)。
 //!   エラー本文・ログにファイルパスを出さない (IDとステータスのみ)
@@ -31,8 +33,10 @@
 
 use std::fs::{self, File};
 use std::io::Read;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,6 +44,7 @@ use std::time::Instant;
 
 use gento_core::catalog::ImageState;
 use gento_core::jobs::SizeClass;
+use gento_core::repo::OsFileId;
 use gento_core::AssetId;
 use gento_image::cache::{asset_fingerprint, cache_key, CacheLookup, ThumbnailCache};
 use gento_image::stats::percentile;
@@ -222,9 +227,11 @@ pub struct ServeSpec {
     pub content_type: String,
     pub max_bytes: u64,
     pub cache_control: &'static str,
-    /// 検証時 (`resolve_file` 内の `symlink_metadata`) の (dev, ino)。
+    /// 検証時 (`resolve_file` 内の `symlink_metadata`) のOSファイルID
+    /// (`gento_platform::os_file_id_of`。unixはdev+ino)。
     /// open後のfstat一致検証に使う (検証とopen間の差し替え検出)。
-    pub file_id: (u64, u64),
+    /// 非unixは `None` (OSファイルIDの提供なし — platform-notes §2.3)。
+    pub file_id: Option<OsFileId>,
     /// open済みfdの実パス包含を再検証する正規キャッシュルート。
     /// None = 元ファイル系 (`gento-original`。包含対象なし、fstat一致のみ)。
     pub canonical_root: Option<PathBuf>,
@@ -281,7 +288,7 @@ pub fn resolve_file(
                 content_type: "image/webp".to_string(),
                 max_bytes: MAX_THUMB_BYTES,
                 cache_control,
-                file_id: (md.dev(), md.ino()),
+                file_id: gento_platform::os_file_id_of(&md),
                 canonical_root: Some(canonical_root),
             })
         }
@@ -307,7 +314,7 @@ pub fn resolve_file(
                 content_type: asset.content_type.clone(),
                 max_bytes: MAX_ORIGINAL_BYTES,
                 cache_control,
-                file_id: (md.dev(), md.ino()),
+                file_id: gento_platform::os_file_id_of(&md),
                 canonical_root: None,
             })
         }
@@ -344,6 +351,10 @@ enum ReadError {
 /// 3. キャッシュ系はfdの実パス (`/proc/self/fd/{fd}` のreadlink) が正規
 ///    キャッシュルート配下であることを再確認する (防御の重ね)
 ///
+/// 1-3の構造的保護はunix実装。非unix (Windows) はOSファイルIDと`/proc`が
+/// 無いため1-3を省略し、`resolve_file` の字句包含検証のみで配信する
+/// (best-effort — docs/dev/platform-notes.md §2の既知制限)。
+///
 /// open後のreadはfdがinodeをピンするため、以後の差し替え・renameの影響を受けない。
 ///
 /// 残る理論的制限: 同一inodeへのhardlink差し替えは (dev, ino) と実パスの
@@ -351,24 +362,29 @@ enum ReadError {
 /// ファイル内容を直接書き換えることもできるため脅威モデル外とする
 /// (キャッシュディレクトリはアプリ私有)。
 fn read_file_checked(spec: &ServeSpec) -> Result<Vec<u8>, ReadError> {
+    // unixはO_NOFOLLOW付きopen (検証後の最終コンポーネントsymlink差し替え拒否)。
+    // 非unixは同等のopen時保護が無く、包含検証はresolve側の字句検証のみ。
+    #[cfg(unix)]
     let file = File::options()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&spec.path)
-        .map_err(|e| match e.raw_os_error() {
-            // O_NOFOLLOW: 最終コンポーネントがシンボリックリンク (検証後の
-            // 差し替え)。消失 (ENOENT) と同じ「もう無い」扱い。
-            Some(libc::ELOOP) | Some(libc::ENOENT) | None => ReadError::Gone,
-            _ => ReadError::Io,
-        })?;
+        .map_err(open_error_kind)?;
+    #[cfg(not(unix))]
+    let file = File::options()
+        .read(true)
+        .open(&spec.path)
+        .map_err(open_error_kind)?;
     let md = file.metadata().map_err(|_| ReadError::Gone)?;
     if !md.is_file() || md.len() > spec.max_bytes {
         return Err(ReadError::Gone);
     }
-    if (md.dev(), md.ino()) != spec.file_id {
+    #[cfg(unix)]
+    if gento_platform::os_file_id_of(&md) != spec.file_id {
         // 検証時と別のinode = 中間ディレクトリ差し替え等
         return Err(ReadError::Gone);
     }
+    #[cfg(unix)]
     if let Some(root) = &spec.canonical_root {
         let proc_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
         let real = fs::read_link(&proc_path).map_err(|_| ReadError::Io)?;
@@ -386,6 +402,16 @@ fn read_file_checked(spec: &ServeSpec) -> Result<Vec<u8>, ReadError> {
         return Err(ReadError::Gone);
     }
     Ok(buf)
+}
+
+/// open失敗の分類。ELOOP (unixのO_NOFOLLOWでのsymlink拒否) と
+/// ENOENT (消失) は「もう無い」扱い。Windows libcにもELOOP/ENOENTは
+/// 存在するため分岐は共通。
+fn open_error_kind(e: std::io::Error) -> ReadError {
+    match e.raw_os_error() {
+        Some(libc::ELOOP) | Some(libc::ENOENT) | None => ReadError::Gone,
+        _ => ReadError::Io,
+    }
 }
 
 /// 検証済み要求を解決して応答へ組み立てる (ハンドラの spawn_blocking 内・単体テスト両方)。

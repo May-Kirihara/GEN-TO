@@ -34,6 +34,7 @@ pub mod vectorindex;
 mod licenses_notice;
 
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use catalog::AppState;
@@ -50,8 +51,12 @@ const DIR_NAMESPACE: &str = "gento-spike";
 
 /// SIGTERM/SIGINTハンドラが書き込むself-pipeの書き込み側。
 /// ハンドラ内で安全に呼べるのはatomic読み取りとwrite(2)のみのため。
+/// unix専用 (WindowsはSIGTERM/SIGINT相当のシグナルを持たない —
+/// install_termination_signalsのDoc参照)。
+#[cfg(unix)]
 static SIGNAL_PIPE_W: AtomicI32 = AtomicI32::new(-1);
 
+#[cfg(unix)]
 extern "C" fn on_termination_signal(_sig: libc::c_int) {
     let fd = SIGNAL_PIPE_W.load(Ordering::SeqCst);
     if fd >= 0 {
@@ -67,6 +72,9 @@ extern "C" fn on_termination_signal(_sig: libc::c_int) {
 /// 既定のSIGTERM摂動ではプロセスが即死しRunEvent::Exitが走らないため、
 /// self-pipe + 監視スレッドでapp.exit(0)へ繋ぎ、ワーカー排出と.tmp掃除を
 /// 実行させる。ウィンドウ閉じでも同じExit経路になる。
+/// unix専用: WindowsはSIGTERM/SIGINT機構を持たないためハンドラを設定
+/// しない (ウィンドウ閉じ → RunEvent::Exit が同一のgraceful終了パス)。
+#[cfg(unix)]
 fn install_termination_signals(app: tauri::AppHandle) {
     let read_fd = unsafe {
         let mut fds = [0i32; 2];
@@ -387,6 +395,8 @@ pub fn run() {
             let app_dirs = resolve_app_dirs();
             let _log_ring = logging::init();
             install_panic_hook(&app_dirs);
+            // Windowsは未設定 (unix専用 — install_termination_signals参照)
+            #[cfg(unix)]
             install_termination_signals(app.handle().clone());
             let dataset_path = resolve_dataset_path(&args);
             let thumbnail_root = resolve_thumbnail_root(&args, &app_dirs);
