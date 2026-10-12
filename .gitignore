@@ -14,6 +14,7 @@
 /apps/desktop/.playwright-mcp/
 
 # 実データセット (docs/implementation-plan.md §4.1)
+sample/
 sample/dataset/
 
 # ログ・OS生成物
