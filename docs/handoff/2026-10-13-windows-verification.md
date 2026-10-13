@@ -93,14 +93,14 @@ PowerShell検証・証跡フォーマット・クリーンアップ込み)。
 8. ~~正規repoのCargo.lockをnumkong 7.8.5へ更新するか判断~~ → **WP-NUMKONG-785実施 (2026-10-13, ユーザー承認)**: lock 3行のみのbump、Linuxゲート全緑 (workspace test / clippy -D warnings / tauri build 3バンドル、numkong 7.8.5をコンパイル確認)。licenses.md再生成 (licenses_notice testが強制)。Windows側は `git restore Cargo.lock` → `git pull` でlocal dirty解消 (numkong再ビルド不要)
 9. 上流報告候補: numkong 7.8.5のcc-rs/MSVC静的リンク経路が `__imp_nk_*` で壊れる件 (DLL配布想定のdllimport)
 10. ~~Windowsでカスタムプロトコル画像がすべて破損~~ → **WP-W4b実装済み・Windows実機確認済み** (2026-10-13。WebView2は `{http|https}://{scheme}.localhost` 形式 required。`convertFileSrc` のencodeURIComponentに注意 — protocol.ts `schemeBase` プローブ方式。CSPへorigin追加)
-11. ~~Windowsでembeddingワーカーが起動せず進捗0~~ → **resolve_worker_path EXE_SUFFIX修正 (67e2249)・実機確認済み**。**インストール版も解決**: WP-W-WORKER (2026-10-13) — `scripts/prepare-worker.mjs` をbeforeBuild/DevCommandから実行し `bundle.externalBin` で同梱。Linux側 `pnpm tauri build` で deb `/usr/bin/gento-embedding-worker` + AppImage `usr/bin/` 同梱を実証済み。**Windows インストール版での意味検索E2Eはユーザー確認待ち**
+11. ~~Windowsでembeddingワーカーが起動せず進捗0~~ → **resolve_worker_path EXE_SUFFIX修正 (67e2249)・実機確認済み**。**インストール版も解決**: WP-W-WORKER (2026-10-13) — `scripts/prepare-worker.mjs` をbeforeBuild/DevCommandから実行し `bundle.externalBin` で同梱。Linux側 `pnpm tauri build` で deb `/usr/bin/gento-embedding-worker` + AppImage `usr/bin/` 同梱を実証済み。**Windows インストール版でも意味検索E2E確認済み (2026-10-13 ユーザー実機 → 完結)**
 12. **[minor UX] セッション内で埋め込み→索引構築が完了しても検索モードセグメント (ハイブリッド/意味) が再有効化されない場合がある** (再起動で解消 = 索引ロード→ready経路は正常。Linuxでも発生しうるフロント状態同期バグ。UIUX-7の既知競合修正の別経路残り)
 13. **[既知ドリフト] 現行Cargo.lockはcargo 1.96.0 resolverの固定点ではない** (WP-NUMKONG-785発見 — 任意の`cargo update -p X`でtempfile→getrandom 0.3.4フリップ+windows-sys系12エッジの正規化が混入。package追加なし・ビルド動作不変)。次回lock触るWPで正規化を受け入れるか固定化するか方針決定が必要
 14. **[UX] .gento/DB復元完了後にカタログスナップショットが更新されず、グリッドの評価バッジが旧値のまま** (InfoPanel/DBは即時正。ライブラリ再スキャンで収束 — エージェント検証W-D観察)。復元完了時にスナップショット反映をトリガーすべき
 15. **[UX] エクスポートのdry-run: 出力先dirが実在しないとプレビューが完了せずエラーも出ない** (既存dirなら即時 — W-B/W-G観察)。dir自動生成か明示エラーが必要
 16. **[docs] 同一内容ファイルは1アセットに統合され、セルのpath (reveal/InfoPanel) は「代表ファイル」になる** — 代表ファイル選択規則のドキュメント化が必要 (W-E観察: 検証の同一PNGで全ファイル同一アセット化)
 17. **[minor] 内容を書き換えたファイルのサムネイルが旧キャッシュのままfail扱い (3件)、再起動後に再生成で解消** — 競合検出の改善候補。記録のみ
-18. ~~検索ボタンが検索完了後も「検索中…」無効のまま固まる~~ → **WP-UX-SEARCHRUN修正済み (2026-10-13・Windows実機発見)**: SearchStore (通常クラス) の`running`/`lastResult`をテンプレートpropsが直接参照すると初回しか評価されないため、`searchEvidenceTick`橋渡しgetter (`searchStoreRunning()`等) 経由に変更 (8箇所)。要Windows目視確認 (検索完了→ボタン復帰)
+18. ~~検索ボタンが検索完了後も「検索中…」無効のまま固まる~~ → **WP-UX-SEARCHRUN修正・Windows実機確認済み** (検索完了→ボタン復帰): SearchStore (通常クラス) の`running`/`lastResult`をテンプレートpropsが直接参照すると初回しか評価されないため、`searchEvidenceTick`橋渡しgetter (`searchStoreRunning()`等) 経由に変更 (8箇所)
 
 ## 6.1 エージェント検証で発見・修正した不具合 (2026-10-13 WP-W-BUGS)
 
@@ -110,4 +110,8 @@ PowerShell検証・証跡フォーマット・クリーンアップ込み)。
 
 ## 7. 判定 (実施完了時に記入)
 
-- 完了状態: (未定 — チェックリスト完了後に done / done-with-notes / partial を判定)
+- **完了状態: `done-with-notes`** (2026-10-13 確定)
+  - §8.2 12項目全て合格 (10: ユーザー実機・エージェント検証。8: WP-W-BUGS修正後に実機合格)。§8.3 5項目全て合格 (エージェント検証)。
+  - Windowsビルド手順確立 (`docs/dev/windows-build.md`)・worker自動同梱 (`453ea74`)・numkong 7.8.5正規化 (`8216faa`)・実bug 3件修正 (W4dごみ箱・W-BUGS 2件・SEARCHRUN — 全てWindows実機確認済み)。
+  - notes (完了を妨げない既知事項): 残課題キュー #3〜#6, #12〜#17 (小規模UX・ドキュメント・保守性。#12のみ軽微な状態同期で再起動で解消)。ごみ箱のアプリ内undoはWindows非対応 (設計どおり・エクスプローラー手動復元で代替)。
+  - 検証方式: ユーザー実機 (§8.2-3,4,5,6,10) + AIエージェント実機 (残項目 — `docs/dev/windows-agent-checklist.md`手順、証跡はrepo外PII対策済み) + Linux側PM再検証。
