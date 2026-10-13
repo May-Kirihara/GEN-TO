@@ -83,6 +83,7 @@
     filtersActive,
     type GuiFilters,
     type SearchFieldMatch,
+    type SearchRunResult,
   } from "./lib/search";
   import {
     VectorIndexStore,
@@ -1307,6 +1308,27 @@
   searchStore.onChange(() => {
     searchEvidenceTick++;
   });
+
+  /**
+    * SearchStore状態の反応性橋 (props経路)。SearchStoreは通常クラスのため
+    * $state化せずsearchEvidenceTick (onChange) 橋渡し (UIUX-7既存パターン) —
+    * テンプレートでsearchStore.*を直接参照すると初回しか評価されず
+    * 「検索中…」固定のまま固まるため、propsは必ずこれらのgetter経由にする。
+    */
+  function searchStoreRunning(): boolean {
+    void searchEvidenceTick;
+    return searchStore.running;
+  }
+
+  function searchStoreResult(): SearchRunResult | null {
+    void searchEvidenceTick;
+    return searchStore.lastResult;
+  }
+
+  function searchStoreKind(): "query" | "similar" {
+    void searchEvidenceTick;
+    return searchStore.lastKind;
+  }
 
   /** 検索スコープの解決 (folder=現在の登録ルート / collection=表示中コレクション)。 */
   function resolveSearchScope(): { rootId?: string; collectionId?: string } | string {
@@ -3409,10 +3431,10 @@
            不変 (状態正本はApp — props/callbackでのみ授受)。 -->
       <Toolbar
         {searchActive}
-        searchRunning={searchStore.running}
-        searchKind={searchStore.lastKind}
-        searchResultTotal={searchStore.lastResult?.total ?? 0}
-        searchResultElapsedMs={searchStore.lastResult?.elapsedMs ?? 0}
+        searchRunning={searchStoreRunning()}
+        searchKind={searchStoreKind()}
+        searchResultTotal={searchStoreResult()?.total ?? 0}
+        searchResultElapsedMs={searchStoreResult()?.elapsedMs ?? 0}
         onRefreshSearch={refreshSearch}
         onExitSearch={exitSearch}
         {activeCollection}
@@ -3453,7 +3475,7 @@
         onToggleSearchExpanded={toggleSearchExpanded}
         {collapsedSearchLine}
         onClearSearchFromCollapsed={clearSearchFromCollapsed}
-        searchRunning={searchStore.running}
+        searchRunning={searchStoreRunning()}
         {searchInput}
         onSearchInput={(value) => (searchInput = value)}
         onRunSearch={() => void runSearch()}
@@ -3469,8 +3491,8 @@
         onToggleSearchFilters={() => (searchFiltersOpen = !searchFiltersOpen)}
         onCloseSearchFilters={() => (searchFiltersOpen = false)}
         {searchFiltersActive}
-        searchWarnings={searchStore.lastResult?.warnings ?? []}
-        canSaveSearch={searchStore.lastResult !== null}
+        searchWarnings={searchStoreResult()?.warnings ?? []}
+        canSaveSearch={searchStoreResult() !== null}
         onSaveCurrentSearch={() => void saveCurrentSearch()}
         {searchFilters}
         onSearchFiltersChange={applySearchFilters}
@@ -3583,7 +3605,7 @@
           libraryMode={catalogSource === "library"}
           searchEvidence={searchEvidenceOf(focusInfo?.id ?? "")}
           semanticScore={semanticScoreOf(focusInfo?.id ?? "")}
-          semanticLabel={searchStore.lastKind === "similar" ? "類似度" : "意味"}
+          semanticLabel={searchStoreKind() === "similar" ? "類似度" : "意味"}
           canSimilarSearch={focusInfo !== null && focusInfo.dbState === "asset" && semanticAvailable()}
           onSimilarSearch={() => {
             const item = focusInfo;
