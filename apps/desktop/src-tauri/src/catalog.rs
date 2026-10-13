@@ -82,7 +82,14 @@ pub struct CatalogInner {
     /// 検索結果表示中の状態 (WP-8)。コレクション表示と同じ方針:
     /// 表示中はlibraryスナップショットの自動反映を行わず、明示再実行
     /// (search_run) で更新する。
+    /// `set_catalog_source("search")` が「最後の検索結果」へ復元する契約
+    /// (api-contract.md) があるため、検索表示を終了してもデータはここに
+    /// 残る — 現在表示中かどうかは `search_display_active` で判定する。
     search: Option<SearchDisplay>,
+    /// 検索結果を「現在表示中」かどうか。trueの間は `state.records` が
+    /// 検索ビューであり、libraryスナップショットの自動反映を行わない
+    /// (searchデータ自体は復元契約のため保持)。
+    search_display_active: bool,
     /// 表示ソート (WP-4。走査バッチ・ソース切替・スナップショット反映に適用)。
     sort: CatalogSort,
     /// 現在の一時走査トークン (世代。QA-WP4)。`begin_scan` で進み、
@@ -169,6 +176,7 @@ impl CatalogInner {
             library: Vec::new(),
             collection: None,
             search: None,
+            search_display_active: false,
             sort: CatalogSort::default(),
             scan_token: 0,
             progress: ProgressCounters::default(),
@@ -182,7 +190,10 @@ impl CatalogInner {
         self.collection
     }
 
-    /// 現在表示中 (または最後の) 検索表示 (WP-8)。実行後はNoneまで保持。
+    /// 最後の検索表示 (WP-8)。検索表示の終了後も復元契約
+    /// (set_catalog_source("search")) のため保持され、次の検索実行か
+    /// コレクション表示・走査開始で上書き/クリアされる。
+    /// 「現在表示中」かどうかは search_display_activeで判定する。
     pub fn search_display(&self) -> Option<&SearchDisplay> {
         self.search.as_ref()
     }
@@ -316,6 +327,7 @@ impl CatalogInner {
     ) -> u64 {
         self.collection = Some(view);
         self.search = None;
+        self.search_display_active = false;
         self.state.mode = CatalogMode::Library;
         self.state.scanning = false;
         self.state.records = records;
@@ -328,6 +340,7 @@ impl CatalogInner {
     pub fn set_search_display(&mut self, display: SearchDisplay) -> u64 {
         let records = display.records.clone();
         self.search = Some(display);
+        self.search_display_active = true;
         self.collection = None;
         self.state.mode = CatalogMode::Library;
         self.state.scanning = false;
@@ -341,6 +354,7 @@ impl CatalogInner {
     /// 何もせず0)。
     pub fn clear_collection_display(&mut self) -> u64 {
         self.search = None;
+        self.search_display_active = false;
         if self.collection.take().is_none() {
             return 0;
         }
@@ -457,6 +471,7 @@ fn begin_scan(inner: &mut CatalogInner) -> (u64, u64) {
     inner.state.mode = CatalogMode::Real;
     inner.collection = None;
     inner.search = None;
+    inner.search_display_active = false;
     inner.state.generation += 1;
     inner.scan_token += 1;
     inner.progress = ProgressCounters::default();
@@ -610,13 +625,21 @@ fn switch_mode(inner: &mut CatalogInner, want_virtual: bool) -> Result<ModeSwitc
 /// カタログソース切替の状態遷移 (set_catalog_source本体)。
 /// コレクション表示中はmodeが既にLibraryでも実質表示が異なるため
 /// (state.recordsがコレクションビュー)、「同一モード=変化なし」の
-/// 早期リターンから復帰経路へ回す (WP-6)。
+/// 早期リターンから復帰経路へ回す (WP-6)。検索表示も同様 (WP-8)。
 pub(crate) fn switch_catalog_source(
     inner: &mut CatalogInner,
     target: CatalogMode,
 ) -> ModeSwitchOutcome {
     let exited_collection = inner.collection.take().is_some();
-    let exited_search = inner.search.is_some();
+    // 検索「表示」も終了する — 終了しないとapply_library_snapshotの反映
+    // 条件が恒久falseになり、監視更新 (catalog:changed) がUIへ出なくなる
+    // (WIN-1 Windows実機検証 2026-10-13。collectionと対称の遷移)。
+    // collectionは復元契約がないためtake()でデータごと破棄する一方、
+    // searchはset_catalog_source("search")が最後の検索結果へ復元する契約
+    // (api-contract.md) があるためデータは保持し、終了は
+    // search_display_activeフラグのみで表す。
+    let exited_search = inner.search_display_active;
+    inner.search_display_active = false;
     if inner.state.mode == target && !exited_collection && !exited_search {
         return ModeSwitchOutcome::Unchanged(summary_of(inner));
     }
@@ -630,6 +653,20 @@ pub(crate) fn switch_catalog_source(
     inner.apply_sort();
     inner.state.generation += 1;
     ModeSwitchOutcome::Changed(summary_of(inner))
+}
+
+/// 検索ソースへの切替状態遷移 (`set_catalog_source("search")` 本体)。
+/// 「最後の検索結果」(search) へ復元する — 再実行 (新しいDB状態の反映) は
+/// search_runで明示的に行う (api-contract.md)。
+fn restore_search_display(inner: &mut CatalogInner) -> Result<u64, String> {
+    if inner.state.scanning {
+        return Err("走査中はカタログソースを切替できません".to_string());
+    }
+    let display = inner
+        .search_display()
+        .cloned()
+        .ok_or_else(|| "表示できる検索結果がありません (先に検索を実行してください)".to_string())?;
+    Ok(inner.set_search_display(display))
 }
 
 /// カタログ表示ソースの切替 (WP-2。production command)。
@@ -651,15 +688,11 @@ pub fn set_catalog_source(
         "search" => {
             // 検索結果表示へ (再) 切替。対象は「最後の検索結果」—
             // 再実行 (新しいDB状態の反映) はsearch_runで明示的に行う。
-            let mut inner = lock(&state.catalog);
-            if inner.state.scanning {
-                return Err("走査中はカタログソースを切替できません".to_string());
-            }
-            let display = inner.search_display().cloned().ok_or_else(|| {
-                "表示できる検索結果がありません (先に検索を実行してください)".to_string()
-            })?;
-            let generation = inner.set_search_display(display);
-            let summary = summary_of(&inner);
+            let (generation, summary) = {
+                let mut inner = lock(&state.catalog);
+                let generation = restore_search_display(&mut inner)?;
+                (generation, summary_of(&inner))
+            };
             let _ = app.emit(
                 "catalog:changed",
                 CatalogChangedPayload {
@@ -699,31 +732,50 @@ pub fn set_catalog_source(
     }
 }
 
+/// ライブラリスナップショットを表示レコードへ反映してよいか
+/// (apply_library_snapshotの反映条件)。Libraryモード表示中で、走査中でも
+/// コレクション表示中でも検索表示中でもないときのみtrue。
+/// 検索は `set_catalog_source("search")` が最後の検索結果へ復元する契約
+/// (api-contract.md) のためデータ (search) を切替で破棄せず、表示中か
+/// どうかは search_display_active フラグで判定する。
+fn should_publish_library_snapshot(inner: &CatalogInner) -> bool {
+    inner.state.mode == CatalogMode::Library
+        && !inner.state.scanning
+        && inner.collection.is_none()
+        && !inner.search_display_active
+}
+
+/// スナップショット反映の状態遷移 (apply_library_snapshot本体)。
+/// `library` を差し替え、Libraryモード表示中は表示レコードも差し替えて
+/// 新しいgenerationを返す。コレクション表示中 (WP-6)・検索結果表示中
+/// (WP-8) は `library` スナップショットのみ更新する — ビューの内容は明示
+/// refresh・再選択まで保持する (asset:updatedのトリガー連鎖を避ける設計。
+/// collections.rs参照)。
+fn apply_library_snapshot_transition(
+    inner: &mut CatalogInner,
+    records: Vec<ImageRecord>,
+) -> Option<u64> {
+    inner.library = records;
+    if should_publish_library_snapshot(inner) {
+        inner.state.records = inner.library.clone();
+        inner.apply_sort();
+        inner.state.generation += 1;
+        Some(inner.state.generation)
+    } else {
+        None
+    }
+}
+
 /// ライブラリスナップショットをカタログへ反映する (WP-2)。
 /// Libraryモード表示中は表示レコードを差し替え、generationを進めて
 /// `catalog:changed` をemitする (ページ再取得でAssetIdの確定へ追従)。
-/// コレクション表示中 (WP-6)・検索結果表示中 (WP-8) は `library`
-/// スナップショットのみ更新する — ビューの内容は明示refresh・再選択まで
-/// 保持する (asset:updatedのトリガー連鎖を避ける設計。collections.rs参照)。
 pub fn apply_library_snapshot(app: &AppHandle, records: Vec<ImageRecord>) {
     let state = app.state::<AppState>();
     let generation = {
         let mut inner = lock(&state.catalog);
-        inner.library = records;
-        if inner.state.mode == CatalogMode::Library
-            && !inner.state.scanning
-            && inner.collection.is_none()
-            && inner.search.is_none()
-        {
-            inner.state.records = inner.library.clone();
-            inner.apply_sort();
-            inner.state.generation += 1;
-            inner.state.generation
-        } else {
-            0
-        }
+        apply_library_snapshot_transition(&mut inner, records)
     };
-    if generation > 0 {
+    if let Some(generation) = generation {
         let _ = app.emit(
             "catalog:changed",
             CatalogChangedPayload {
@@ -1466,6 +1518,96 @@ mod tests {
             ModeSwitchOutcome::Unchanged(_) => panic!("expected change to real"),
         }
         assert!(inner.collection_view().is_none());
+    }
+
+    #[test]
+    fn source_switch_from_search_view_resumes_library_snapshot_publishing() {
+        // 検索表示中は監視スナップショット (apply_library_snapshot) が表示へ
+        // 反映されない (明示search_run/search_refreshで更新する設計。WP-8)。
+        // libraryソースへの切替で検索「表示」を終了すると反映が再開する —
+        // これが壊れると監視更新 (catalog:changed) がUIへ出なくなる
+        // (WIN-1 Windows実機検証 2026-10-13で発見した回帰)。
+        let mut inner = CatalogInner::new();
+        let lib = vec![record("a.png"), record("b.png"), record("c.png")];
+        inner.library = lib.clone();
+        inner.state.records = lib.clone();
+        inner.state.mode = CatalogMode::Library;
+        // 検索表示 (1件のみ) へ切替
+        inner.set_search_display(SearchDisplay::query(
+            "{}".to_string(),
+            None,
+            None,
+            vec![record("hit.png")],
+        ));
+        assert_eq!(inner.state.records.len(), 1);
+        // 検索表示中はスナップショットが来ても表示を差し替えない
+        assert!(!should_publish_library_snapshot(&inner));
+        assert_eq!(
+            apply_library_snapshot_transition(&mut inner, lib.clone()),
+            None
+        );
+        assert_eq!(inner.state.records.len(), 1, "検索ビューは保持される");
+        // libraryソースへの切替は「変化なし」ではなくlibrary recordsへの復帰
+        let gen = inner.state.generation;
+        match switch_catalog_source(&mut inner, CatalogMode::Library) {
+            ModeSwitchOutcome::Changed(summary) => {
+                assert_eq!(summary.total, 3, "libraryの全件が復帰する");
+                assert_eq!(summary.generation, gen + 1);
+            }
+            ModeSwitchOutcome::Unchanged(_) => panic!("search view must not be unchanged"),
+        }
+        assert_eq!(inner.state.records.len(), 3);
+        assert!(
+            should_publish_library_snapshot(&inner),
+            "library切替後に監視反映が再開する"
+        );
+        // 監視スナップショット到着 — 本物の反映経路で表示が差し替わり
+        // generationが進む (検索状態の残留でこれが出ないのが回帰だった)
+        let lib4 = vec![
+            record("a.png"),
+            record("b.png"),
+            record("c.png"),
+            record("d.png"),
+        ];
+        let gen_applied = apply_library_snapshot_transition(&mut inner, lib4);
+        assert_eq!(gen_applied, Some(gen + 2));
+        assert_eq!(inner.state.records.len(), 4, "監視スナップショットが表示へ反映される");
+        assert_eq!(inner.state.generation, gen + 2);
+    }
+
+    #[test]
+    fn source_switch_preserves_last_search_for_search_source_restore() {
+        // set_catalog_source("search") は「最後の検索結果」へ復元する
+        // (api-contract.mdの文書化済み契約)。libraryソースへの切替は検索
+        // 「表示」を終了するだけで、復元用のsearchデータは破棄しない。
+        let mut inner = CatalogInner::new();
+        let lib = vec![record("a.png"), record("b.png")];
+        inner.library = lib.clone();
+        inner.state.records = lib.clone();
+        inner.state.mode = CatalogMode::Library;
+        let gen0 = inner.state.generation;
+        inner.set_search_display(SearchDisplay::query(
+            "{\"type\":\"text\",\"value\":\"x\"}".to_string(),
+            None,
+            None,
+            vec![record("hit.png")],
+        ));
+        switch_catalog_source(&mut inner, CatalogMode::Library);
+        assert_eq!(inner.state.records.len(), 2, "libraryの全件へ復帰する");
+        // 復元契約: 切替後も最後の検索結果が残る (破棄すると復元不可)
+        assert!(
+            inner.search_display().is_some(),
+            "library切替後も最後の検索結果は保持される"
+        );
+        // set_catalog_source("search") と同一の復元状態遷移
+        let gen1 = restore_search_display(&mut inner).expect("restore succeeds");
+        assert_eq!(gen1, gen0 + 3);
+        assert_eq!(inner.state.records.len(), 1, "最後の検索結果へ復元する");
+        assert_eq!(inner.state.records[0].display_name, "hit.png");
+        assert!(!should_publish_library_snapshot(&inner), "復元直後は検索表示中");
+        // 復元できる検索が無い場合のエラーは変えない
+        let mut fresh = CatalogInner::new();
+        assert!(restore_search_display(&mut fresh).is_err());
     }
 
     #[test]

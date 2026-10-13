@@ -31,6 +31,16 @@
    主要UI: `App.svelte` (メニュー・ファイル操作)、`lib/shell/LibraryPanel.svelte`
    (登録)、`lib/shell/AiPanel.svelte` (AI設定)、`lib/shell/InfoPanel.svelte` (評価)。
 4. **テストで本物のAPI keyは絶対に使わない** (§12はダミー文字列で登録検証のみ)。
+5. **証跡の個人情報対策 (必須 — repoはpublic)**:
+   - `cmdkey /list` は**全文ダンプしない** — `cmdkey /list | Select-String "gento"` 等
+     対象エントリ周辺のみ抽出 (ダンプには他サービスの資格情報ターゲット・
+     メールアドレスが並ぶ)。
+   - 証跡テキストのユーザー名・実フォルダ名はマスク (`C:\Users\<user>` 等に置換)。
+   - スクリーンショットは公開前に内容確認 (デスクトップの実フォルダ名・
+     他ウィンドウが写っていないか)。
+   - 証跡一式は `%TEMP%\gento-win-check\` または repoのgitignore対象
+     (`docs/dev/gento-win-check/`) に置く — **コミットしない**。報告は
+     report.mdの要約 (マスク済み) のみrepoに入れる。
 5. アプリのDB・設定は `%APPDATA%\gento-spike\` (Roaming)。バックアップ既定Dirは
    DB近傍の `db-backups\`。開始前に念のため既存世代を記録しておく:
    ```powershell
@@ -165,16 +175,16 @@ New-Item -ItemType Directory -Force "C:\Users\slick\GentoWinCheck-export" | Out-
 
 ### W-E §8.2-11 外部アプリ連携
 
-1. グリッドで `photo-1.png` 右クリック → **「フォルダーで表示」**
-   (コンテキストメニュー。文言が微妙に違う場合はソース
-   `Select-String -Path apps\desktop\src\**\*.svelte -Pattern "フォルダーで表示"` で確認)
+1. グリッドで `photo-1.png` 右クリック → **「OSのファイルマネージャーで表示」**
+   (コンテキストメニュー。実ラベルはソース正本で確認:
+   `Select-String -Path apps\desktop\src\**\*.svelte -Pattern "ファイルマネージャー"`)
 2. Explorerウィンドウが開き、当該ファイルが選択状態になる。
    PowerShellで開いたウィンドウの場所を確認:
    ```powershell
    (New-Object -ComObject Shell.Application).Windows() |
      ForEach-Object { $_.LocationURL } | Select-String "GentoWinCheck"
    ```
-3. **「既定のアプリで開く」** → 既定の画像ビューア (フォト等) が起動する。
+3. **「外部アプリで開く」** → 既定の画像ビューア (フォト等) が起動する。
    プロセス起動を確認後、開いたウィンドウを閉じる:
    ```powershell
    Start-Sleep 3; Get-Process | Where-Object { $_.MainWindowTitle -match "フォト|photo|画像" } | Select-Object ProcessName, MainWindowTitle

@@ -656,7 +656,13 @@ fn verify_and_publish(tmp: &Path, final_path: &Path) -> Result<(), BackupError> 
     }
     // データをディスクへ落としてから公開 (renameの原子性はsync無しでも
     // 成立するが、durable publicationには必要)。
-    std::fs::File::open(tmp)?.sync_all()?;
+    // WindowsのFlushFileBuffersは書き込みアクセス必須のため、読み取り専用
+    // openではERROR_ACCESS_DENIEDになる (WIN-1 Windows実機検証 2026-10-13)。
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tmp)?
+        .sync_all()?;
     publish_file(tmp, final_path)
 }
 
@@ -1104,7 +1110,13 @@ fn read_backup_asset(conn: &Connection, asset_id: i64) -> Result<BackupAssetEntr
 /// sync_allする — リネーム後の名前が電源断で失われないため)。
 fn write_file_durable(path: &Path, contents: &str) -> Result<(), BackupError> {
     std::fs::write(path, contents)?;
-    std::fs::File::open(path)?.sync_all()?;
+    // WindowsのFlushFileBuffersは書き込みアクセス必須のため、読み取り専用
+    // openではERROR_ACCESS_DENIEDになる (WIN-1 Windows実機検証 2026-10-13)。
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?
+        .sync_all()?;
     Ok(())
 }
 
@@ -4780,5 +4792,17 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    #[test]
+    fn write_file_durable_syncs_with_write_access() {
+        // WindowsのFlushFileBuffersは書き込みアクセスを要求するため、
+        // 読み取り専用ハンドルのsync_allはERROR_ACCESS_DENIED (os error 5)
+        // になる。書き込みアクセス付きで開いて同期できることを契約として
+        // 固める (WIN-1 Windows実機検証 2026-10-13。Linuxは常にgreen)。
+        let tmp = TempDir::new("durable");
+        let path = tmp.path().join("metadata.jsonl");
+        write_file_durable(&path, "line1\n").expect("書き出し+syncが成功する");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "line1\n");
     }
 }

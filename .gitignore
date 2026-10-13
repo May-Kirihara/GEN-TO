@@ -26,3 +26,6 @@ sample/dataset/
 
 # ローカル変換モデル (CONV-1成果物。配布先決定後はDL運用に置換)
 .local-models/
+
+# 検証エージェント証跡 (PII対策 — cmdkeyダンプ・実パス・スクショを含むため非コミット)
+/docs/dev/gento-win-check/
