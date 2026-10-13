@@ -8,6 +8,7 @@
 # ビルド生成物
 /apps/desktop/dist/
 /apps/desktop/src-tauri/gen/schemas
+/apps/desktop/src-tauri/binaries/
 /apps/desktop/.tauri/
 
 # E2E実行生成物 (playwright-mcp)

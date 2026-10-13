@@ -84,6 +84,10 @@ pnpm tauri build
 - 成果物: `target\release\bundle\nsis\*.exe` と `target\release\bundle\msi\*.msi`
 - MSIのVBSCRIPT要件を満たしていない/失敗する場合でも、NSIS単独で継続できる:
   `pnpm tauri build --bundles nsis`
+- embedding worker (`gento-embedding-worker.exe`) は同一コマンドの
+  `beforeBuildCommand` が自動ビルドし、`externalBin` としてインストーラへ
+  同梱する (`scripts/prepare-worker.mjs` 経由。WP-W-WORKER)。手動での
+  事前ビルドは不要で、インストール版でも意味検索が最初から有効。
 - 初回はC依存 (sqlite bundled・usearch C++・dav1d等) のコンパイルで
   時間がかかる。
 
@@ -138,7 +142,7 @@ pkg-config --libs dav1d          :: 静的libを指すことを確認
 | **リンクエラー `LNK2019: 未解決の外部シンボル __imp_nk_*`** | numkong 7.8.5が消費者に `dllimport` を与える設計 (DLL配布想定) なのに対し、我々は静的リンクしているため。`set CXXFLAGS=/utf-8 -DNK_DYNAMIC=` で `types.h` のdllimport分岐を短路して解消 |
 | `light.exe` 失敗 (MSI) | VBSCRIPTコンポーネント未導入 (§1)。`--bundles nsis` で継続可 |
 | code.videolan.orgへのclone失敗 | ネットワーク/プロキシ。A7 — 手動での事前cloneは不可 (OUT_DIR管理のため) ので環境側を解決する |
-| ビルドは成功するが意味検索が動かない | 既知の初期キュー (計画§6 WP-W4): workerの `.exe` 解決とバンドル欠落。ビルド検証のブロッカーではない |
+| ビルドは成功するが意味検索が動かない | workerは `pnpm tauri build` が自動ビルド・同梱するため (§2) 通常発生しない。発生時はインストール先ディレクトリに `gento-embedding-worker.exe` があるか確認。`GENTO_EMBEDDING_WORKER` 環境変数でworkerパスを明示指定して切り分け可能 |
 | cmdでディレクトリ移動が効かない | ドライブをまたぐ `cd` には `cd /d` が必要 |
 
 ## 7. Linux側への影響

@@ -10,7 +10,9 @@
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "test": "vitest run",
     "lint": "eslint .",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "tauri:worker": "node ../../scripts/prepare-worker.mjs",
+    "tauri:worker:dev": "node ../../scripts/prepare-worker.mjs --dev"
   },
   "dependencies": {
     "@tanstack/svelte-virtual": "3.13.36",

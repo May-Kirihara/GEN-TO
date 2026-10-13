@@ -102,8 +102,14 @@ bash scripts/release-smoke.sh   # featureなしreleaseにdev系識別子不在+�
    モデル) とともに成果物へ同梱されていることを確認 (tauri.conf.json
    resources)。
    - 配布scope policy (FG-WP18-1): Rust側 = **Cargo.lockの全package**
-     (build-tool系optional依存を含む)。完全性は `licenses_notice` unit
-     test (gento-tauri) が `cargo test --workspace` で常時検証する。
+   (build-tool系optional依存を含む)。完全性は `licenses_notice` unit
+   test (gento-tauri) が `cargo test --workspace` で常時検証する。
+6. **embedding worker同梱** (WP-W-WORKER): 成果物に
+   `gento-embedding-worker[.exe]` がmain exeと同dirに含まれていることを確認
+   (Windows: NSIS/MSI インストールdir、Linux: deb/AppImage `/usr/bin`)。
+   `beforeBuildCommand` → `scripts/prepare-worker.mjs` が自動で
+   ビルド・配置する (debは `dpkg-deb -c`、AppImageは `--appimage-extract
+   usr/bin/gento-embedding-worker` で検証可)。
      依存変更後の再生成を怠るとこのテストが赤くなる。
 6. **バージョン情報**: `CHANGELOG.md`・about表示のバージョン/commitが
    正しいこと (WP-18後半の成果物)。

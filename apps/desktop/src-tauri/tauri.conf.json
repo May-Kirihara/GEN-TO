@@ -3,9 +3,9 @@
   "productName": "GEN-TO Spike",
   "identifier": "dev.gento.spike",
   "build": {
-    "beforeDevCommand": "pnpm dev",
+    "beforeDevCommand": "pnpm run tauri:worker:dev && pnpm dev",
     "devUrl": "http://localhost:5173",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "pnpm build && pnpm run tauri:worker",
     "frontendDist": "../dist"
   },
   "app": {
@@ -28,6 +28,7 @@
   "bundle": {
     "active": true,
     "targets": ["deb", "rpm", "appimage", "nsis", "msi"],
+    "externalBin": ["binaries/gento-embedding-worker"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

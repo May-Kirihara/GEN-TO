@@ -54,9 +54,10 @@ pnpm tauri build
 
 - 成功物: `target\release\gento-tauri.exe` (+ NSIS/MSI)。**UI検証はexe直起動でよい**
   (高速化する場合 `pnpm tauri build --no-bundle` — バンドル検証済みなので可)。
-- **コンソールから起動してstdoutログを取る**:
+- **コンソールから起動してstdoutログを取る** (成果物はrepo rootの`target\release\`:
+  workspace直targetのため — `apps\desktop\src-tauri\target` ではない):
   ```powershell
-   D:\Devs\GEN-TO\apps\desktop\src-tauri\target\release\gento-tauri.exe *>&1 |
+   D:\Devs\GEN-TO\target\release\gento-tauri.exe *>&1 |
      Tee-Object "$env:TEMP\gento-win-check\app-stdout.log"
   ```
   (別セッションで起動した場合はログ取得を諦め、UI観察中心でよい)
