@@ -10,7 +10,9 @@
 - **WP-W2 (最初のビルド): 完了** — 2026-10-13、Windows実機で
   `pnpm tauri build` 成功、インストール、起動、グリッドUI描画、
   フォルダツリー展開・ナビゲーション動作を確認。
-- WP-W3 (§8チェックリスト): **実施待ち** (§4の表を埋める)
+- **意味検索 (embedding・索引・モード選択): target\release直起動で動作確認済み**
+  (2026-10-13。ワーカーEXE_SUFFIX修正後。インストール版はワーカー同梱待ち=キュー#11)
+- WP-W3 (§8チェックリスト): 進行中 (§4の表)
 - 手順の正本: [docs/dev/windows-build.md](../dev/windows-build.md) (2026-10-13実績反映済み)
 
 ## 2. 環境証拠 (ユーザー報告 + セッションlog)
@@ -87,6 +89,8 @@ set CXXFLAGS=/utf-8 -DNK_DYNAMIC=
 8. 正規repoのCargo.lockをnumkong 7.8.5へ更新するか判断 (Windows実績と一致させるため。要implementer WP + Linuxゲート)
 9. 上流報告候補: numkong 7.8.5のcc-rs/MSVC静的リンク経路が `__imp_nk_*` で壊れる件 (DLL配布想定のdllimport)
 10. ~~Windowsでカスタムプロトコル画像がすべて破損~~ → **WP-W4b実装済み・Windows実機確認済み** (2026-10-13。WebView2は `{http|https}://{scheme}.localhost` 形式 required。`convertFileSrc` のencodeURIComponentに注意 — protocol.ts `schemeBase` プローブ方式。CSPへorigin追加)
+11. ~~Windowsでembeddingワーカーが起動せず進捗0~~ → **resolve_worker_path EXE_SUFFIX修正 (67e2249)・実機確認済み** (target\release直起動で意味検索が完全動作: 埋め込み37件・索引構築・モード選択)。**インストール版では未解決** — ワーカー同梱 (externalBin + ビルド統合) は本項の残作業
+12. **[minor UX] セッション内で埋め込み→索引構築が完了しても検索モードセグメント (ハイブリッド/意味) が再有効化されない場合がある** (再起動で解消 = 索引ロード→ready経路は正常。Linuxでも発生しうるフロント状態同期バグ。UIUX-7の既知競合修正の別経路残り)
 
 ## 7. 判定 (実施完了時に記入)
 
