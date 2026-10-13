@@ -37,11 +37,39 @@ describe("UndoStack", () => {
     expect(stack.depth).toBe(2);
     expect(stack.peekLabel()).toBe("除外");
 
-    await expect(stack.undo()).resolves.toBe(true);
+    await expect(stack.undo()).resolves.toEqual({ done: true, notice: null });
     expect(log).toEqual(["undo-cull"]);
-    await expect(stack.undo()).resolves.toBe(true);
+    await expect(stack.undo()).resolves.toEqual({ done: true, notice: null });
     expect(log).toEqual(["undo-cull", "undo-rating"]);
     expect(stack.canUndo()).toBe(false);
+  });
+
+  it("成功時の通知上書き文 (notice) は呼び出しに紐付いて返る (共有変数なし)", async () => {
+    const stack = new UndoStack();
+    const fileOpsNotice = "元に戻しました ⚠ 上書きで退避した旧ファイルはゴミ箱に残ります";
+    stack.push({
+      label: "コピー",
+      undo: async () => fileOpsNotice,
+    });
+    stack.push({
+      label: "評価",
+      undo: async () => {
+        // メタデータundoは通知上書きなし (void)
+      },
+    });
+    // LIFO: 直前のメタデータundoは自分の結果 (notice null) だけを返す
+    await expect(stack.undo()).resolves.toEqual({ done: true, notice: null });
+    // 次のfile-ops系undoも自分の警告文を返す — 取り違えの余地がない
+    await expect(stack.undo()).resolves.toEqual({ done: true, notice: fileOpsNotice });
+  });
+
+  it("明示的なnull返却もnoticeなしとして扱う", async () => {
+    const stack = new UndoStack();
+    stack.push({
+      label: "操作",
+      undo: async () => null,
+    });
+    await expect(stack.undo()).resolves.toEqual({ done: true, notice: null });
   });
 
   it("上限N件を超えた分は古い方から捨てる", () => {

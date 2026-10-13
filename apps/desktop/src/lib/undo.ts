@@ -15,8 +15,16 @@
 /** Undo可能な操作1件。labelは通知表示用。 */
 export type UndoEntry = {
   label: string;
-  /** 逆適用 (before値へ戻す)。失敗は呼び出し側で通知する。 */
-  undo: () => Promise<void>;
+  /** 逆適用 (before値へ戻す)。成功時に通知を上書きする文
+   *  (file-ops undoの手動復元案内など) を返せる — 呼び出しの結果に
+   *  紐付けるため、非同期並走でも取り違えない。失敗は呼び出し側で通知する。 */
+  undo: () => Promise<string | null | void>;
+};
+
+/** undo() 成功の応答 (通知上書き文。上書きが無ければnull)。 */
+export type UndoSucceeded = {
+  done: true;
+  notice: string | null;
 };
 
 export const DEFAULT_UNDO_LIMIT = 50;
@@ -69,17 +77,17 @@ export class UndoStack {
     this.notify();
   }
 
-  /** 直近の操作を巻き戻す。スタック空ならfalse。 */
-  async undo(): Promise<boolean> {
+  /** 直近の操作を巻き戻す。スタック空・逆適用失敗はfalse。 */
+  async undo(): Promise<UndoSucceeded | false> {
     const entry = this.entries.pop();
     if (entry === undefined) {
       return false;
     }
     try {
-      await entry.undo();
+      const notice = await entry.undo();
       this.lastError = null;
       this.notify();
-      return true;
+      return { done: true, notice: notice ?? null };
     } catch (error) {
       // 失敗したエントリは戻さない (再試行で無限ループしないように)
       this.lastError = error instanceof Error ? error.message : String(error);

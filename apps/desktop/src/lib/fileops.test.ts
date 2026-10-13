@@ -17,8 +17,10 @@ import {
   resolutionsOf,
   retryArgsOf,
   summarizeOutcome,
+  undoNotice,
   type FileOpOutcomeDto,
   type PlanStepDto,
+  type UndoResultDto,
 } from "./fileops";
 
 function step(fileId: string, name: string, conflict: boolean): PlanStepDto {
@@ -124,6 +126,7 @@ describe("summarizeOutcome / outcomeNotice", () => {
     kind: "copy",
     status: "partial",
     undoable: true,
+    manual_restore_notes: [],
     steps: [
       {
         file_id: "1",
@@ -193,6 +196,122 @@ describe("summarizeOutcome / outcomeNotice", () => {
   });
 });
 
+describe("outcomeNotice: 手動復元案内の集約 (取りこぼしゼロ)", () => {
+  const noteOf = (path: string) =>
+    `上書きで退避した旧ファイル (${path}) はゴミ箱に残ります。この環境ではアプリ内の元に戻しで復帰できないため、必要ならゴミ箱から手動で復元してください`;
+  const placed = (fileId: string, warning: string | null) => ({
+    file_id: fileId,
+    from: `/r/${fileId}.png`,
+    to: `/r/d/${fileId}.png`,
+    status: "done" as const,
+    resolution: null,
+    error: null,
+    warning,
+  });
+
+  it("複数NoUndo退避は件数要約で全件が通知に反映される", () => {
+    const outcome: FileOpOutcomeDto = {
+      op_id: "9",
+      kind: "copy",
+      status: "done",
+      undoable: true,
+      manual_restore_notes: [noteOf("/r/d/a.png"), noteOf("/r/d/b.png"), noteOf("/r/d/c.png")],
+      steps: [placed("1", noteOf("/r/d/a.png")), placed("2", noteOf("/r/d/b.png")), placed("3", noteOf("/r/d/c.png"))],
+    };
+    const text = outcomeNotice(outcome);
+    expect(text).toContain("退避した旧ファイル3件はゴミ箱に残ります");
+    expect(text).toContain("手動で復元");
+  });
+
+  it("先行する別警告 (跨界move等) と共存: どちらも通知から消えない", () => {
+    const outcome: FileOpOutcomeDto = {
+      op_id: "9",
+      kind: "move",
+      status: "done",
+      undoable: true,
+      manual_restore_notes: [noteOf("/r/d/b.png")],
+      steps: [
+        placed("1", "跨界移動のコピー後の元ファイル削除に失敗しました"),
+        placed("2", noteOf("/r/d/b.png")),
+      ],
+    };
+    const text = outcomeNotice(outcome);
+    expect(text).toContain("跨界移動のコピー後の元ファイル削除に失敗しました");
+    expect(text).toContain("退避した旧ファイル1件はゴミ箱に残ります");
+  });
+
+  it("同一stepの「既存警告。案内」連結は案内部分を要約に集約し重複しない", () => {
+    const note = noteOf("/r/d/a.png");
+    const outcome: FileOpOutcomeDto = {
+      op_id: "9",
+      kind: "copy",
+      status: "done",
+      undoable: true,
+      manual_restore_notes: [note],
+      steps: [placed("1", `跨界移動のコピー後の元ファイル削除に失敗しました。${note}`)],
+    };
+    const text = outcomeNotice(outcome);
+    expect(text).toContain("跨界移動のコピー後の元ファイル削除に失敗しました");
+    expect(text).toContain("退避した旧ファイル1件はゴミ箱に残ります");
+    // 案内全文 (パス込み) は先頭代表に再出力しない (件数要約に集約)
+    expect(text).not.toContain("/r/d/a.png");
+    expect(text).not.toContain("上書きで退避した旧ファイル (/r/d/a.png)");
+  });
+
+  it("手動復元案内があるときのCtrl+Z接尾は旧ファイルが戻らない表現に変わる", () => {
+    const outcome: FileOpOutcomeDto = {
+      op_id: "9",
+      kind: "copy",
+      status: "done",
+      undoable: true,
+      manual_restore_notes: [noteOf("/r/d/a.png")],
+      steps: [placed("1", noteOf("/r/d/a.png"))],
+    };
+    const text = outcomeNotice(outcome);
+    expect(text).toContain("Ctrl+Zで戻せるのは新ファイルのみ");
+    expect(text).not.toContain("Ctrl+Zで元に戻せます");
+  });
+
+  it("undo不可の操作では案内があってもCtrl+Z案内を出さない", () => {
+    const outcome: FileOpOutcomeDto = {
+      op_id: "9",
+      kind: "copy",
+      status: "done",
+      undoable: false,
+      manual_restore_notes: [noteOf("/r/d/a.png")],
+      steps: [placed("1", noteOf("/r/d/a.png"))],
+    };
+    expect(outcomeNotice(outcome)).not.toContain("Ctrl+Z");
+  });
+});
+
+describe("undoNotice", () => {
+  const noUndoResult: UndoResultDto = {
+    op_id: "3",
+    fully_undone: true,
+    status: "undone",
+    errors: [],
+    refusals: [],
+    rollback_errors: [],
+    warnings: [
+      "上書きで退避した旧ファイル (/r/dest/b.png) はゴミ箱に残ります。この環境ではアプリ内の元に戻しで復帰できないため、必要ならゴミ箱から手動で復元してください",
+    ],
+  };
+
+  it("NoUndo退避を含むundo結果の通知文に⚠と手動復元案内が出る", () => {
+    const text = undoNotice(noUndoResult);
+    expect(text).toContain("元に戻しました");
+    expect(text).toContain("⚠");
+    expect(text).toContain("手動で復元");
+    expect(text).toContain("/r/dest/b.png");
+  });
+
+  it("警告なしのundo結果は案内なし", () => {
+    const text = undoNotice({ ...noUndoResult, warnings: [] });
+    expect(text).toBe("元に戻しました");
+  });
+});
+
 describe("retryArgsOf", () => {
   it("失敗ステップのfromだけを再試行引数に組む", () => {
     const outcome: FileOpOutcomeDto = {
@@ -200,6 +319,7 @@ describe("retryArgsOf", () => {
       kind: "copy",
       status: "partial",
       undoable: true,
+      manual_restore_notes: [],
       steps: [
         {
           file_id: "1",
@@ -238,6 +358,7 @@ describe("retryArgsOf", () => {
       kind: "trash",
       status: "done",
       undoable: true,
+      manual_restore_notes: [],
       steps: [],
     };
     expect(retryArgsOf(outcome, { kind: "trash", paths: ["/r/a.png"] })).toBeNull();
@@ -317,6 +438,7 @@ describe("確認トークン (FG-WP7)", () => {
       kind: "move",
       status: "done",
       undoable: false,
+      manual_restore_notes: [],
       steps: [
         {
           file_id: "1",

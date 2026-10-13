@@ -1548,9 +1548,12 @@ invoke<FileOpOutcomeDto>("file_ops_execute", {
 ```
 
 応答 (`FileOpOutcomeDto`): `{ op_id, kind, status: "done"|"partial"|"failed",
-undoable, steps: Array<{ file_id, from, to, status, resolution, error,
+undoable, manual_restore_notes: string[], steps: Array<{ file_id, from, to, status, resolution, error,
 warning }> }` (`warning` = 完了したが注意喚起がいる事象。例: 跨界移動で
-コピー後の元ファイル削除失敗 — 宛先完成済みのため成功扱い)。
+コピー後の元ファイル削除失敗 — 宛先完成済みのため成功扱い。
+`manual_restore_notes` = WP-W4d: 上書き退避がundo情報なし (Windowsの
+Recycle Bin等) で成功したステップの手動復元案内 — UIは件数要約と
+Ctrl+Z接尾の文言調整に使用。旧レコード互換の追加フィールド)。
 **実行は (a) file_operations行をexecutingで確保 → (b) ファイル単位FS+DB
 (1tx) → (c) result JSON確定、の順。この応答を受けた時点で操作ログは
 確定済み** (安全原則「操作ログ確定後にUI成功通知」)。内部で計画を再計算
@@ -1564,8 +1567,13 @@ invoke<UndoCheckDto>("file_ops_undo_check", { opId: string });
 
 invoke<UndoOutcomeDto>("file_ops_undo", { opId: string });
 // → { op_id, fully_undone: boolean, status: "undone"|"partial_undone"|"refused",
-//     errors: string[], refusals: string[], rollback_errors: string[] }
+//     errors: string[], refusals: string[], rollback_errors: string[],
+//     warnings: string[] }
 ```
+
+`warnings` (WP-W4d) = 全action成功 (`fully_undone=true`) でも利用者への
+注意がいる事象 (undo情報なし退避の旧ファイルがゴミ箱に残る等の手動復元
+案内。`manual_restore_notes` 由来)。
 
 前提検証 (全アクション): 対象の存在・世代トークン一致
 (os_file_id+size+mtime_ns)・戻し先の不在・**ゴミ箱エントリの存在+サイズ一致**

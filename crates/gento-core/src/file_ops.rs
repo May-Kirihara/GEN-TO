@@ -259,6 +259,22 @@ pub struct TrashEntry {
     pub file_name: String,
 }
 
+/// ゴミ箱移行の結果 (WP-W4d): 「移行成功」と「undo可否」の分離。
+///
+/// WindowsのRecycle BinはXDG trashinfo相当の走査可能なメタデータを
+/// 持たないため、移行に成功してもundo用エントリ特定は原理的にできない。
+/// そのため移行成功のみを伝える [`TrashOutcome::NoUndo`] を正常系とする
+/// (docs/dev/platform-notes.md §2のWindowsベストエフォート規約。
+/// undo候補は生えず、操作はundo不可として確定する)。
+/// unixでは特定失敗はErrのまま維持する (undo情報の欠落を黙認しない)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrashOutcome {
+    /// 移行成功・エントリ特定済み (undo復帰可能)。
+    Undoable(TrashEntry),
+    /// 移行成功・エントリ特定なし (undo不可。Windows)。
+    NoUndo,
+}
+
 /// 衝突の解決方針 (spec §5.3)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -471,9 +487,11 @@ pub trait FileOpsFs: Send + Sync {
     ) -> Result<(), FsOpError>;
     /// 完全削除 (ゴミ箱を経由しない。DeleteForever専用)。
     fn remove_file(&self, path: &Path) -> Result<(), FsOpError>;
-    /// OSゴミ箱へ移動し、生成されたゴミ箱エントリを特定して返す。
+    /// OSゴミ箱へ移動する。移行成功かつundo用エントリを特定できたら
+    /// [`TrashOutcome::Undoable`]、移行のみ成功でエントリ特定なし
+    /// (Windows等) は [`TrashOutcome::NoUndo`] を返す。
     /// 失敗時は対象を変更しない。
-    fn trash(&self, path: &Path) -> Result<TrashEntry, FsOpError>;
+    fn trash(&self, path: &Path) -> Result<TrashOutcome, FsOpError>;
     /// ゴミ箱エントリ `entry` を `original` へ復帰 (Undo用)。
     /// 復帰前にエントリの存在とサイズ (`expect_byte_size`) を検証し、
     /// 不一致は拒否する。
@@ -683,6 +701,11 @@ pub struct FileOpOutcome {
     pub kind: FileOpKind,
     pub status: FileOpStatus,
     pub undoable: bool,
+    /// 上書き退避が [`TrashOutcome::NoUndo`] (エントリ特定なし。Windows等)
+    /// で成功したステップの手動復元案内 (旧ファイルはゴミ箱に残る)。
+    /// undo実行時の [`UndoOutcome::warnings`] へ流す。旧レコード互換。
+    #[serde(default)]
+    pub manual_restore_notes: Vec<String>,
     pub steps: Vec<StepResult>,
 }
 
@@ -1019,6 +1042,7 @@ pub fn execute_file_op(
     let op_uuid = record.uuid.clone();
 
     let mut results: Vec<StepResult> = Vec::with_capacity(plan.steps.len());
+    let mut manual_restore_notes: Vec<String> = Vec::new();
     for (index, step) in plan.steps.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             results.push(StepResult {
@@ -1056,6 +1080,7 @@ pub fn execute_file_op(
             cancel,
             &op_uuid,
             index,
+            &mut manual_restore_notes,
         );
         results.push(result);
         progress(FileOpProgress {
@@ -1074,6 +1099,7 @@ pub fn execute_file_op(
         kind: plan.kind,
         status,
         undoable,
+        manual_restore_notes,
         steps: results,
     };
     let result_json = serde_json::to_string(&outcome)
@@ -1147,6 +1173,7 @@ fn execute_step(
     cancel: &AtomicBool,
     op_uuid: &str,
     seq: usize,
+    manual_restore_notes: &mut Vec<String>,
 ) -> StepResult {
     let mut result = StepResult {
         file_id: step.file.file_id,
@@ -1235,7 +1262,9 @@ fn execute_step(
 
     // 上書き: 旧宛先を先にゴミ箱へ退避する (旧ファイル保護)。
     // 退避に失敗した場合、旧ファイルは無傷のまま残るため上書き中止。
-    let mut evacuated: Option<(TrashEntry, FileStat)> = None;
+    // エントリはNoUndo (特定なし。Windows等) があり得る — その場合も
+    // 退避自体は成功のため配置へ進む (復帰情報のみ持たない)。
+    let mut evacuated: Option<(Option<TrashEntry>, FileStat)> = None;
     if overwrite {
         let old_stat = match fs.stat(&effective_dst) {
             Ok(stat) => stat,
@@ -1248,7 +1277,8 @@ fn execute_step(
             }
         };
         match fs.trash(&effective_dst) {
-            Ok(entry) => evacuated = Some((entry, old_stat)),
+            Ok(TrashOutcome::Undoable(entry)) => evacuated = Some((Some(entry), old_stat)),
+            Ok(TrashOutcome::NoUndo) => evacuated = Some((None, old_stat)),
             Err(err) => {
                 result.error = Some(FsOpError::new(
                     err.kind.clone(),
@@ -1277,8 +1307,9 @@ fn execute_step(
     /// 警告を運ぶ — 宛先完成済みのため成功扱い)。
     enum Placement {
         Placed,
-        /// ゴミ箱へ移した (エントリと移動直前のトークン)。
-        Trashed(TrashEntry, Option<FileStat>),
+        /// ゴミ箱へ移した (undo用エントリと移動直前のトークン。
+        /// エントリ特定なし環境 (Windows等) ではNone)。
+        Trashed(Option<TrashEntry>, Option<FileStat>),
         Removed,
         DirCreated,
     }
@@ -1306,8 +1337,13 @@ fn execute_step(
         FileOpKind::Trash => {
             // トークンはゴミ箱へ移す直前の観測 (復帰検証用)
             let before = fs.stat(&step.src).ok();
-            fs.trash(&step.src)
-                .map(|entry| Placement::Trashed(entry, before))
+            fs.trash(&step.src).map(|outcome| {
+                let entry = match outcome {
+                    TrashOutcome::Undoable(entry) => Some(entry),
+                    TrashOutcome::NoUndo => None,
+                };
+                Placement::Trashed(entry, before)
+            })
         }
         FileOpKind::DeleteForever => fs.remove_file(&step.src).map(|_| Placement::Removed),
         FileOpKind::Mkdir => fs.mkdir(&effective_dst).map(|_| Placement::DirCreated),
@@ -1319,7 +1355,19 @@ fn execute_step(
             let observed = fs.stat(&effective_dst).ok();
             result.status = StepStatus::Done;
             result.to = Some(effective_dst.clone());
+            let no_undo_evacuated = matches!(evacuated.as_ref(), Some((None, _)));
             result.undo = undo_actions_of(kind, step, &effective_dst, observed.as_ref(), evacuated);
+            // NoUndo退避 (Windows等): 旧ファイルの復帰情報が無いため、
+            // 配置が成功してもundoで旧ファイルは戻らない — 手動復元を
+            // 案内する (「Ctrl+Zで元に戻せます」の虚偽表示を避ける)。
+            if no_undo_evacuated {
+                let note = no_undo_evacuation_note(&effective_dst);
+                result.warning = match result.warning.take() {
+                    Some(existing) => Some(format!("{existing}。{note}")),
+                    None => Some(note.clone()),
+                };
+                manual_restore_notes.push(note);
+            }
             if let Err(err) = reflect_db(store, step, kind, &effective_dst, observed, roots) {
                 // FS成功・DB失敗: 再スキャンで収束する状態だが、操作としては
                 // 失敗を報告する (黙って成功としない)。
@@ -1333,12 +1381,27 @@ fn execute_step(
         Ok(Placement::Trashed(entry, before)) => {
             result.status = StepStatus::Done;
             result.to = None;
-            if let Some(stat) = before {
-                result.undo = vec![UndoAction::RestoreFromTrash {
-                    original: step.src.clone(),
-                    trash_entry: entry,
-                    expect: stat.token().into(),
-                }];
+            // undo候補は実エントリ特定時のみ記録 (NoUndo = undo不可の
+            // 正常系。undo検証・復元は実エントリのみで動く)。
+            match (entry, before) {
+                (Some(entry), Some(stat)) => {
+                    result.undo = vec![UndoAction::RestoreFromTrash {
+                        original: step.src.clone(),
+                        trash_entry: entry,
+                        expect: stat.token().into(),
+                    }];
+                }
+                // エントリ特定なし (Windows等): 移行は成功のため警告のみ。
+                (None, _) => {
+                    result.warning = Some(
+                        "ごみ箱へ移動済み (この環境ではアプリ内の元に戻すは不可。\
+                         ゴミ箱から手動で復元してください)"
+                            .to_string(),
+                    );
+                }
+                // エントリ特定済みだが直前stat観測なし: 検証不能のため
+                // 従来どおりundo候補なし (警告も出さない)。
+                (Some(_), None) => {}
             }
             if let Err(err) = reflect_db(store, step, kind, &step.src, None, roots) {
                 result.status = StepStatus::Failed;
@@ -1362,6 +1425,19 @@ fn execute_step(
             // 配置失敗: 上書き退避済みの旧ファイルを復帰させる
             // (ステップ不成立のため旧ファイルを元位置へ戻す)。
             if let Some((entry, old_stat)) = evacuated {
+                let Some(entry) = entry else {
+                    // NoUndo退避 (Windows等): 復帰情報が無いためアプリ内
+                    // 復帰は不能。手動復元を案内して失敗を報告する
+                    // (黙って旧ファイルを失わせない)。
+                    result.error = Some(FsOpError::new(
+                        FsOpErrorKind::Io,
+                        format!(
+                            "{err}。退避した旧ファイルをアプリ内で復帰できません \
+                             (ゴミ箱から手動で復元してください)"
+                        ),
+                    ));
+                    return result;
+                };
                 if let Err(restore_err) =
                     fs.restore_trash(&entry, &effective_dst, old_stat.byte_size)
                 {
@@ -1390,6 +1466,18 @@ const UNDO_TMP_SEQ_BASE: usize = 900_000;
 enum MoveOutcome {
     Completed,
     CompletedWithWarning(String),
+}
+
+/// 上書き退避が [`TrashOutcome::NoUndo`] (エントリ特定なし。Windows等)
+/// だったステップの手動復元案内文。操作完了時のステップ警告と
+/// undo実行時の警告 ([`FileOpOutcome::manual_restore_notes`] 経由) で共用。
+fn no_undo_evacuation_note(path: &Path) -> String {
+    format!(
+        "上書きで退避した旧ファイル ({}) はゴミ箱に残ります。この環境では\
+         アプリ内の元に戻しで復帰できないため、必要ならゴミ箱から手動で\
+         復元してください",
+        path.display()
+    )
 }
 
 /// 移動: 同一FSはNOREPLACEリネーム、跨界 (EXDEV) はcopy+noreplace配置+
@@ -1429,7 +1517,7 @@ fn undo_actions_of(
     step: &PlannedStep,
     effective_dst: &Path,
     observed: Option<&FileStat>,
-    evacuated: Option<(TrashEntry, FileStat)>,
+    evacuated: Option<(Option<TrashEntry>, FileStat)>,
 ) -> Vec<UndoAction> {
     let mut undo = Vec::new();
     match kind {
@@ -1452,7 +1540,9 @@ fn undo_actions_of(
         }
         FileOpKind::Trash | FileOpKind::DeleteForever | FileOpKind::Mkdir => {}
     }
-    if let Some((entry, old_stat)) = evacuated {
+    // 退避の復帰アクションは実エントリ特定時のみ (NoUndo退避 — Windows等 —
+    // はundo候補から除外。undo検証・復元は実エントリのみで動く)。
+    if let Some((Some(entry), old_stat)) = evacuated {
         undo.push(UndoAction::RestoreFromTrash {
             original: effective_dst.to_path_buf(),
             trash_entry: entry,
@@ -1593,6 +1683,7 @@ pub fn execute_mkdir(
         kind: FileOpKind::Mkdir,
         status: FileOpStatus::Failed,
         undoable: false,
+        manual_restore_notes: Vec::new(),
         steps: vec![StepResult {
             file_id: 0,
             from: parent.to_path_buf(),
@@ -1656,6 +1747,7 @@ pub fn execute_mkdir(
         kind: FileOpKind::Mkdir,
         status,
         undoable: false,
+        manual_restore_notes: Vec::new(),
         steps: vec![step],
     };
     let result_json = serde_json::to_string(&outcome)
@@ -1752,21 +1844,26 @@ pub struct UndoCandidate {
     pub status: FileOpStatus,
     pub undoable: bool,
     pub actions: Vec<UndoAction>,
+    /// NoUndo退避でゴミ箱に残った旧ファイルの手動復元案内
+    /// (result JSONの [`FileOpOutcome::manual_restore_notes`] から復元。
+    /// 全action成功時でも [`UndoOutcome::warnings`] へ出す)。
+    pub manual_restore_notes: Vec<String>,
 }
 
 /// 操作記録からUndo候補を組み立てる (result JSONから逆操作を復元)。
 pub fn undo_candidate_of(record: &FileOpRecord) -> UndoCandidate {
-    let actions = record
+    let (actions, manual_restore_notes) = record
         .result_json
         .as_deref()
         .and_then(|json| serde_json::from_str::<FileOpOutcome>(json).ok())
         .map(|outcome| {
-            outcome
+            let actions = outcome
                 .steps
                 .iter()
                 .filter(|s| s.status != StepStatus::Skipped)
                 .flat_map(|s| s.undo.iter().cloned())
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (actions, outcome.manual_restore_notes)
         })
         .unwrap_or_default();
     UndoCandidate {
@@ -1776,6 +1873,7 @@ pub fn undo_candidate_of(record: &FileOpRecord) -> UndoCandidate {
         status: record.status,
         undoable: record.undoable,
         actions,
+        manual_restore_notes,
     }
 }
 
@@ -1914,6 +2012,11 @@ pub struct UndoOutcome {
     /// 補償ロールバックの結果報告 (失敗した補償がある場合のみ追加)。
     #[serde(default)]
     pub rollback_errors: Vec<String>,
+    /// 記録済みactionは全て実行済み (`fully_undone=true`) でも利用者への
+    /// 注意がいる事象: NoUndo退避 (Windows等) の旧ファイルはゴミ箱に
+    /// 残るための手動復元案内。旧undo report互換。
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// Undoを実行する (逐次実行 + 補償ロールバック。file_ops.rsモジュールdoc
@@ -1938,6 +2041,7 @@ pub fn execute_undo(
             steps: Vec::new(),
             refusals,
             rollback_errors: Vec::new(),
+            warnings: Vec::new(),
         });
     }
     let mut steps = Vec::with_capacity(candidate.actions.len());
@@ -1995,12 +2099,21 @@ pub fn execute_undo(
             }
         }
     }
+    // 全action成功でも、NoUndo退避 (Windows等) の旧ファイルはゴミ箱に
+    // 残ったまま — 手動復元を案内する (fully_undoneは記録済みactionが
+    // 全部実行済みのためtrue維持)。
+    let warnings = if fully_undone {
+        candidate.manual_restore_notes.clone()
+    } else {
+        Vec::new()
+    };
     let outcome = UndoOutcome {
         op_id: candidate.op_id,
         fully_undone,
         steps,
         refusals: Vec::new(),
         rollback_errors,
+        warnings,
     };
     let op_id = candidate.op_id;
     if fully_undone {
@@ -2148,8 +2261,11 @@ fn execute_undo_action(
             }
             // 生成物のみをゴミ箱へ (即削除しない — 誤操作でも復帰可能)。
             // 補償 (元位置へ戻す) のため生成エントリを捕捉する。
-            let entry = match fs.trash(path) {
-                Ok(entry) => entry,
+            // NoUndo (Windows等) は捕捉なし — 補償時は既存の手動復帰
+            // 案内経路に倒れる (削除自体は成功のためactionは成功扱い)。
+            let captured = match fs.trash(path) {
+                Ok(TrashOutcome::Undoable(entry)) => Some(entry),
+                Ok(TrashOutcome::NoUndo) => None,
                 Err(err) => return Err(Box::new((err, None))),
             };
             if let Err(err) = undo_reflect_delete(store, path, roots) {
@@ -2158,14 +2274,14 @@ fn execute_undo_action(
                     Some(ExecutedAction {
                         action: action.clone(),
                         warning: None,
-                        captured_entry: Some(entry),
+                        captured_entry: captured,
                     }),
                 )));
             }
             Ok(ExecutedAction {
                 action: action.clone(),
                 warning: None,
-                captured_entry: Some(entry),
+                captured_entry: captured,
             })
         }
     }
@@ -2445,6 +2561,9 @@ mod tests {
         copy_fail: StdMutex<std::collections::HashMap<PathBuf, String>>,
         /// このパスのtrashを失敗させる。
         trash_fail: StdMutex<std::collections::HashSet<PathBuf>>,
+        /// このパスのtrashをNoUndo (移行成功・エントリ特定なし) にする
+        /// (WP-W4d: Windows実機のRecycle Bin挙動の模倣)。
+        trash_no_undo: StdMutex<std::collections::HashSet<PathBuf>>,
         /// このパスのremove_fileを失敗させる (EXDEV警告経路の検証用)。
         remove_fail: StdMutex<std::collections::HashSet<PathBuf>>,
         /// trash実体の退避場所 (TestFs::newで指定)。
@@ -2623,13 +2742,14 @@ mod tests {
                 .map_err(|e| FsOpError::not_found(format!("{}: {e}", path.display())))
         }
 
-        fn trash(&self, path: &Path) -> Result<TrashEntry, FsOpError> {
+        fn trash(&self, path: &Path) -> Result<TrashOutcome, FsOpError> {
             if self.trash_fail.lock().unwrap().contains(path) {
                 return Err(FsOpError::new(
                     FsOpErrorKind::PermissionDenied,
                     format!("trash failed (injected): {}", path.display()),
                 ));
             }
+            let no_undo = self.trash_no_undo.lock().unwrap().contains(path);
             let dir = self.trash_dir.lock().unwrap().clone();
             let name = path
                 .file_name()
@@ -2651,10 +2771,14 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(path.to_path_buf(), dest);
-            Ok(TrashEntry {
+            // 移行は成功済み。注入時のみエントリ特定なしを模倣する。
+            if no_undo {
+                return Ok(TrashOutcome::NoUndo);
+            }
+            Ok(TrashOutcome::Undoable(TrashEntry {
                 trash_dir: dir,
                 file_name,
-            })
+            }))
         }
 
         fn restore_trash(
@@ -3984,6 +4108,245 @@ mod tests {
         let row = fx.store.get_file(record.id).unwrap().unwrap();
         assert_eq!(row.scan_state, ScanState::Present, "DBもpresent維持");
         assert!(!outcome.undoable);
+    }
+
+    /// WP-W4d: trashが [`TrashOutcome::NoUndo`] (移行成功・エントリ特定なし。
+    /// Windows実機で発生) を返した場合、ステップは**成功扱い**でundo候補を
+    /// 持たない (= 操作全体もundoable=false)。バッチ失敗にしない。
+    #[test]
+    fn execute_trash_no_undo_succeeds_without_undo_actions() {
+        let fx = fixture("exec-trash-noundo");
+        let src = fx._dir.write("a.png", b"win-bin");
+        let record = fx
+            .store
+            .add_file(fx.root.id, &src, &fx.root.path, b"win-bin");
+        fx.fs.trash_no_undo.lock().unwrap().insert(src.clone());
+        let plan = plan_file_op(
+            &*fx.fs,
+            &fx.cancel,
+            FileOpKind::Trash,
+            vec![fx.op_file(&record, None)],
+            None,
+            None,
+            &fx.roots,
+        );
+        let outcome = fx.run(&plan, &ResolutionSpec::default());
+        assert_eq!(outcome.status, FileOpStatus::Done, "移行成功は正常扱い");
+        assert!(!outcome.undoable, "undo候補が無いためundo不可");
+        assert!(outcome.steps[0].undo.is_empty());
+        assert!(!src.exists(), "元位置からは消える");
+        assert!(
+            fx.fs.trash_dir.lock().unwrap().join("a.png").exists(),
+            "ゴミ箱側へは移動済み"
+        );
+        let row = fx.store.get_file(record.id).unwrap().unwrap();
+        assert_eq!(row.scan_state, ScanState::Missing);
+    }
+
+    /// WP-W4d: 上書き退避がNoUndo (エントリ特定なし) の場合、undoは
+    /// 新ファイル除去のみ (旧ファイル復帰は実エントリ特定時のみ記録)。
+    /// 旧ファイルはゴミ箱に残る (手動復元対象)。
+    /// WP-W4d-r1: 誤った「完全復帰」扱いを固定化しない — 配置成功時の
+    /// ステップ警告と、undo成功時の `warnings` (手動復元案内) を検証する。
+    #[test]
+    fn execute_overwrite_evacuation_no_undo_excludes_restore_action() {
+        let fx = fixture("ow-copy-noundo");
+        let src = fx._dir.write("a.png", b"NEW");
+        let dst_dir = fx._dir.mkdir("dest");
+        std::fs::write(dst_dir.join("a.png"), b"OLD").unwrap();
+        fx.fs
+            .trash_no_undo
+            .lock()
+            .unwrap()
+            .insert(dst_dir.join("a.png"));
+        let record = fx.store.add_file(fx.root.id, &src, &fx.root.path, b"NEW");
+        let plan = plan_file_op(
+            &*fx.fs,
+            &fx.cancel,
+            FileOpKind::Copy,
+            vec![fx.op_file(&record, None)],
+            Some(&dst_dir),
+            None,
+            &fx.roots,
+        );
+        let outcome = fx.run(
+            &plan,
+            &ResolutionSpec {
+                global: Some(ConflictResolution::Overwrite),
+                per_file: HashMap::new(),
+            },
+        );
+        assert_eq!(outcome.steps[0].status, StepStatus::Done);
+        assert_eq!(std::fs::read(dst_dir.join("a.png")).unwrap(), b"NEW");
+        let undos = &outcome.steps[0].undo;
+        assert_eq!(undos.len(), 1, "新ファイル除去のみ: {undos:?}");
+        assert!(matches!(undos[0], UndoAction::DeleteCopy { .. }));
+        // 配置成功時のステップ警告: 旧ファイルがゴミ箱に残ることを案内
+        let warning = outcome.steps[0]
+            .warning
+            .as_ref()
+            .expect("NoUndo退避の配置成功は警告を持つ");
+        assert!(
+            warning.contains("手動で復元") && warning.contains("a.png"),
+            "旧ファイルのmanual復元案内: {warning}"
+        );
+        // undo実行: 新ファイルは除去され、旧ファイルはゴミ箱に残る
+        let candidate = {
+            let ops = fx.store.get_operation(outcome.op_id).unwrap().unwrap();
+            undo_candidate_of(&ops)
+        };
+        let undo = execute_undo(
+            &*fx.store,
+            &*fx.fs,
+            &candidate,
+            &fx.roots,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(undo.fully_undone, "{undo:?}");
+        // 全action成功でも旧ファイルはゴミ箱のまま — warningsで案内する
+        assert_eq!(undo.warnings.len(), 1, "{undo:?}");
+        assert!(
+            undo.warnings[0].contains("手動で復元") && undo.warnings[0].contains("a.png"),
+            "undo警告に旧ファイルの手動復元案内: {}",
+            undo.warnings[0]
+        );
+        assert!(!dst_dir.join("a.png").exists(), "新ファイルは除去");
+        assert!(
+            fx.fs.trash_dir.lock().unwrap().join("a.png").exists(),
+            "旧ファイルはゴミ箱に残る (手動復元対象)"
+        );
+    }
+
+    /// WP-W4d-r1: 混合バッチ (undoable退避 + NoUndo退避) のundoは
+    /// 前者の旧ファイルを復帰し、後者は警告でのみ案内する
+    /// (warningsに後者の分だけが載る)。
+    #[test]
+    fn execute_undo_mixed_evacuation_restores_undoable_and_warns_no_undo() {
+        let fx = fixture("ow-mixed");
+        let src_a = fx._dir.write("a.png", b"NEW-A");
+        let src_b = fx._dir.write("b.png", b"NEW-B");
+        let dst_dir = fx._dir.mkdir("dest");
+        std::fs::write(dst_dir.join("a.png"), b"OLD-A").unwrap();
+        std::fs::write(dst_dir.join("b.png"), b"OLD-B").unwrap();
+        // bの旧ファイルのみNoUndo退避 (Windows模倣)。aは通常 (undoable)。
+        fx.fs
+            .trash_no_undo
+            .lock()
+            .unwrap()
+            .insert(dst_dir.join("b.png"));
+        let rec_a = fx.store.add_file(fx.root.id, &src_a, &fx.root.path, b"NEW-A");
+        let rec_b = fx.store.add_file(fx.root.id, &src_b, &fx.root.path, b"NEW-B");
+        let plan = plan_file_op(
+            &*fx.fs,
+            &fx.cancel,
+            FileOpKind::Copy,
+            vec![fx.op_file(&rec_a, None), fx.op_file(&rec_b, None)],
+            Some(&dst_dir),
+            None,
+            &fx.roots,
+        );
+        let outcome = fx.run(
+            &plan,
+            &ResolutionSpec {
+                global: Some(ConflictResolution::Overwrite),
+                per_file: HashMap::new(),
+            },
+        );
+        assert_eq!(outcome.status, FileOpStatus::Done);
+        assert_eq!(std::fs::read(dst_dir.join("a.png")).unwrap(), b"NEW-A");
+        assert_eq!(std::fs::read(dst_dir.join("b.png")).unwrap(), b"NEW-B");
+        // ステップ警告はNoUndo退避のbのみ
+        assert!(
+            outcome.steps[0].warning.is_none(),
+            "undoable退避のステップは警告なし: {:?}",
+            outcome.steps[0].warning
+        );
+        let warning_b = outcome.steps[1]
+            .warning
+            .as_ref()
+            .expect("NoUndo退避のbは警告を持つ");
+        assert!(warning_b.contains("b.png"), "{warning_b}");
+        let candidate = {
+            let ops = fx.store.get_operation(outcome.op_id).unwrap().unwrap();
+            undo_candidate_of(&ops)
+        };
+        let undo = execute_undo(
+            &*fx.store,
+            &*fx.fs,
+            &candidate,
+            &fx.roots,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(undo.fully_undone, "{undo:?}");
+        // a: 旧ファイルは復帰する
+        assert_eq!(
+            std::fs::read(dst_dir.join("a.png")).unwrap(),
+            b"OLD-A",
+            "undoable退避の旧ファイルは復帰"
+        );
+        // b: 新ファイルは除去され、旧ファイルはゴミ箱に残る
+        assert!(!dst_dir.join("b.png").exists(), "新ファイルは除去");
+        assert!(
+            fx.fs.trash_dir.lock().unwrap().join("b.png").exists(),
+            "NoUndo退避の旧ファイルはゴミ箱に残る"
+        );
+        // warningsはbの案内のみ (aの分は載らない)
+        assert_eq!(undo.warnings.len(), 1, "{undo:?}");
+        assert!(
+            undo.warnings[0].contains("b.png") && undo.warnings[0].contains("手動で復元"),
+            "bの手動復元案内のみ: {}",
+            undo.warnings[0]
+        );
+    }
+
+    /// WP-W4d: 配置失敗時にNoUndo退避 (エントリ特定なし) を復帰できない
+    /// 場合、手動復元を案内するエラーで報告する (黙って旧ファイルを
+    /// 失わせない)。
+    #[test]
+    fn execute_placement_failure_after_no_undo_evacuation_reports_manual_restore() {
+        let fx = fixture("ow-fail-noundo");
+        let src = fx._dir.write("a.png", b"NEW");
+        let dst_dir = fx._dir.mkdir("dest");
+        std::fs::write(dst_dir.join("a.png"), b"OLD").unwrap();
+        fx.fs
+            .trash_no_undo
+            .lock()
+            .unwrap()
+            .insert(dst_dir.join("a.png"));
+        fx.fs
+            .copy_fail
+            .lock()
+            .unwrap()
+            .insert(src.clone(), "copy failed (injected)".to_string());
+        let record = fx.store.add_file(fx.root.id, &src, &fx.root.path, b"NEW");
+        let plan = plan_file_op(
+            &*fx.fs,
+            &fx.cancel,
+            FileOpKind::Copy,
+            vec![fx.op_file(&record, None)],
+            Some(&dst_dir),
+            None,
+            &fx.roots,
+        );
+        let outcome = fx.run(
+            &plan,
+            &ResolutionSpec {
+                global: Some(ConflictResolution::Overwrite),
+                per_file: HashMap::new(),
+            },
+        );
+        assert_eq!(outcome.steps[0].status, StepStatus::Failed);
+        let error = outcome.steps[0].error.as_ref().unwrap();
+        assert!(
+            error.message.contains("手動で復元"),
+            "手動復元案内があること: {error}"
+        );
+        assert!(
+            fx.fs.trash_dir.lock().unwrap().join("a.png").exists(),
+            "旧ファイルはゴミ箱に残る"
+        );
     }
 
     #[test]

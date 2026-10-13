@@ -79,6 +79,9 @@ export type FileOpOutcomeDto = {
   kind: FileOpKind;
   status: "done" | "partial" | "failed";
   undoable: boolean;
+  /** NoUndo退避 (Windows等) のステップの手動復元案内 (全ステップ分。
+   *  旧ファイルはゴミ箱に残る)。通知では件数要約で取りこぼさない。 */
+  manual_restore_notes: string[];
   steps: StepResultDto[];
 };
 
@@ -250,7 +253,31 @@ export function summarizeOutcome(outcome: FileOpOutcomeDto): {
   return { done, skipped, failed, cancelled };
 }
 
-/** 実行結果のトースト文。 */
+/**
+ * step警告から手動復元案内 (manual_restore_notesの全文) を除去する。
+ * coreは併存時 «既存警告。案内» の順で連結するため、除去で余る「。」を
+ * 切り詰め、残りが空 (案内のみの警告) ならnullを返す。
+ */
+function stripManualRestoreNotes(
+  warning: string,
+  notes: string[],
+): string | null {
+  let text = warning;
+  for (const note of notes) {
+    text = text.split(note).join("");
+  }
+  while (text.startsWith("。")) {
+    text = text.slice(1);
+  }
+  while (text.endsWith("。")) {
+    text = text.slice(0, -1);
+  }
+  return text.length > 0 ? text : null;
+}
+
+/** 実行結果のトースト文。
+ *  手動復元案内 (NoUndo退避) は全件を件数要約で反映し、それ以外の
+ *  step警告は先頭代表で付記する (案内と連結された警告は案内部分を除く)。 */
 export function outcomeNotice(outcome: FileOpOutcomeDto): string {
   const label = describeKind(outcome.kind);
   const { done, skipped, failed, cancelled } = summarizeOutcome(outcome);
@@ -268,11 +295,24 @@ export function outcomeNotice(outcome: FileOpOutcomeDto): string {
     parts.push(`${cancelled.toLocaleString()}件中止`);
   }
   let notice = `${label}: ${parts.join("・")}`;
-  const warning = outcome.steps.find((step) => step.warning !== null)?.warning ?? null;
-  if (warning !== null) {
-    notice += ` ⚠ ${warning}`;
+  for (const step of outcome.steps) {
+    if (step.warning === null) {
+      continue;
+    }
+    const warning = stripManualRestoreNotes(step.warning, outcome.manual_restore_notes);
+    if (warning !== null) {
+      notice += ` ⚠ ${warning}`;
+      break;
+    }
   }
-  const suffix = outcome.undoable ? " (Ctrl+Zで元に戻せます)" : "";
+  if (outcome.manual_restore_notes.length > 0) {
+    notice += ` ⚠ 退避した旧ファイル${outcome.manual_restore_notes.length.toLocaleString()}件はゴミ箱に残ります (この環境ではアプリ内の元に戻しで復帰できません。必要ならゴミ箱から手動で復元してください)`;
+  }
+  const suffix = !outcome.undoable
+    ? ""
+    : outcome.manual_restore_notes.length > 0
+      ? " (Ctrl+Zで戻せるのは新ファイルのみです)"
+      : " (Ctrl+Zで元に戻せます)";
   return notice + suffix;
 }
 
@@ -350,7 +390,19 @@ export type UndoResultDto = {
   refusals: string[];
   /** 補償ロールバックにも失敗した項目 (手動確認が必要)。 */
   rollback_errors: string[];
+  /** 全action成功でも注意がいる事象 (NoUndo退避の旧ファイルはゴミ箱に
+   *  残るための手動復元案内)。 */
+  warnings: string[];
 };
+
+/** Undo実行結果の通知文 (手動復元案内などの警告を⚠付きで連結)。 */
+export function undoNotice(result: UndoResultDto): string {
+  let notice = "元に戻しました";
+  for (const warning of result.warnings) {
+    notice += ` ⚠ ${warning}`;
+  }
+  return notice;
+}
 
 /** Undo実行。 */
 export async function undoFileOp(ipc: FileOpsIpc, opId: string): Promise<UndoResultDto> {

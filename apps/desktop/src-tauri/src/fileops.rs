@@ -1065,7 +1065,7 @@ impl FileOpsFs for RealFileOps {
         std::fs::remove_file(path).map_err(|e| io_error(path, &e))
     }
 
-    fn trash(&self, path: &Path) -> Result<gento_core::file_ops::TrashEntry, FsOpError> {
+    fn trash(&self, path: &Path) -> Result<gento_core::file_ops::TrashOutcome, FsOpError> {
         gento_platform::trash_to_bin(path).map_err(|msg| FsOpError::new(FsOpErrorKind::Io, msg))
     }
 
@@ -1220,6 +1220,10 @@ pub struct FileOpOutcomeDto {
     pub kind: String,
     pub status: String,
     pub undoable: bool,
+    /// NoUndo退避 (Windows等) のステップの手動復元案内 (全ステップ分。
+    /// core [`FileOpOutcome::manual_restore_notes`] の通過)。UIは件数要約で
+    /// 通知に反映する (step警告の先頭代表だけでは取りこぼすため)。
+    pub manual_restore_notes: Vec<String>,
     pub steps: Vec<StepResultDto>,
 }
 
@@ -1241,6 +1245,7 @@ impl FileOpOutcomeDto {
             kind: o.kind.as_str().to_string(),
             status: o.status.as_str().to_string(),
             undoable: o.undoable,
+            manual_restore_notes: o.manual_restore_notes.clone(),
             steps: o
                 .steps
                 .iter()
@@ -1316,6 +1321,9 @@ pub struct UndoOutcomeDto {
     pub refusals: Vec<String>,
     /// 補償ロールバックにも失敗した項目 (手動確認が必要)。
     pub rollback_errors: Vec<String>,
+    /// 全action成功でも注意がいる事象 (NoUndo退避の旧ファイルは
+    /// ゴミ箱に残るための手動復元案内)。
+    pub warnings: Vec<String>,
 }
 
 impl UndoOutcomeDto {
@@ -1338,6 +1346,7 @@ impl UndoOutcomeDto {
                 .collect(),
             refusals: o.refusals.iter().map(|r| r.describe()).collect(),
             rollback_errors: o.rollback_errors.clone(),
+            warnings: o.warnings.clone(),
         }
     }
 }
@@ -1522,7 +1531,7 @@ mod tests {
     use super::*;
     use gento_core::file_ops::{
         ConflictResolution, FileOpStatus, FileOpsRepo, FsOpErrorKind, StepResult, TokenDto,
-        TrashEntry, UndoAction,
+        TrashEntry, TrashOutcome, UndoAction,
     };
     use gento_core::repo::{FileUpsert, ScanState};
     use std::sync::Mutex as StdMutex;
@@ -1724,7 +1733,7 @@ mod tests {
         fn remove_file(&self, path: &Path) -> Result<(), FsOpError> {
             std::fs::remove_file(path).map_err(|e| FsOpError::not_found(format!("{e}")))
         }
-        fn trash(&self, path: &Path) -> Result<TrashEntry, FsOpError> {
+        fn trash(&self, path: &Path) -> Result<TrashOutcome, FsOpError> {
             let trash_dir = self.trash_dir.lock().unwrap().clone();
             let base = path
                 .file_name()
@@ -1745,10 +1754,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(path.to_path_buf(), dest);
-            Ok(TrashEntry {
+            Ok(TrashOutcome::Undoable(TrashEntry {
                 trash_dir,
                 file_name,
-            })
+            }))
         }
         fn restore_trash(
             &self,
@@ -2370,7 +2379,12 @@ mod tests {
         let dir = TestDir::new("real-trash");
         let file = dir.write("t.png", b"trash-roundtrip");
         std::env::set_var("XDG_DATA_HOME", dir.0.join("xdg/data"));
-        let entry = RealFileOps.trash(&file).unwrap();
+        let entry = match RealFileOps.trash(&file).unwrap() {
+            TrashOutcome::Undoable(entry) => entry,
+            // Linux (XDG trashinfo) では特定失敗はErrになるため、
+            // NoUndoが返るのはWindowsのみ。
+            TrashOutcome::NoUndo => panic!("unix実機では必ずUndoable"),
+        };
         assert!(!file.exists());
         assert_eq!(RealFileOps.trash_entry_size(&entry), Some(15));
         let restored = RealFileOps.restore_trash(&entry, &file, 15).unwrap();
@@ -2428,6 +2442,7 @@ mod tests {
             kind: FileOpKind::Rename,
             status: FileOpStatus::Done,
             undoable: true,
+            manual_restore_notes: Vec::new(),
             steps: vec![StepResult {
                 file_id: 5,
                 from: PathBuf::from("/r/old.png"),

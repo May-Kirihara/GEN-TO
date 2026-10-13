@@ -104,6 +104,7 @@
     retryArgsOf,
     undoCheck,
     undoFileOp,
+    undoNotice,
     type ConflictResolution,
     type ConflictSession,
     type ExecuteArgs,
@@ -906,6 +907,8 @@
   /**
    * ファイル操作のUndo登録 (メタデータUndoと混在する統合スタック)。
    * 前提検証で拒否された場合は理由を通知してスタックから外す。
+   * 成功時の通知文 (手動復元案内など) はundoの戻り値で呼び出し元へ
+   * 渡す — 共有変数を持たないため非同期並走でも取り違えない。
    */
   function registerFileOpsUndo(outcome: FileOpOutcomeDto): void {
     const label = describeKind(outcome.kind);
@@ -926,6 +929,7 @@
           ];
           throw new Error(reasons.length > 0 ? reasons.join(" / ") : "元に戻せませんでした");
         }
+        return undoNotice(result);
       },
     });
   }
@@ -2331,12 +2335,14 @@
     removeTag: (assetId: string, tagId: string) => applyRemoveTag(assetId, tagId),
     setCaption: applyCaption,
     undo: () => {
-      void undo.undo().then((done) => {
-        if (!done && undo.lastError !== null) {
-          metaError = `元に戻せませんでした: ${undo.lastError}`;
-        } else if (done) {
-          showMetaNotice("元に戻しました");
+      void undo.undo().then((result) => {
+        if (result === false) {
+          if (undo.lastError !== null) {
+            metaError = `元に戻せませんでした: ${undo.lastError}`;
+          }
+          return;
         }
+        showMetaNotice(result.notice ?? "元に戻しました");
       });
     },
   };

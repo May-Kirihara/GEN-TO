@@ -15,14 +15,19 @@
 //! # ゴミ箱 (trash crate包み)
 //!
 //! - 関数 [`trash_to_bin`]: OSゴミ箱へ移動し、**生成されたゴミ箱エントリを
-//!   特定して** [`TrashEntry`] で返す (undo復帰の厳密同一性検証用。
-//!   WP-7レビュー対応)。Linux実装 (trash crate) は
+//!   特定できたら** [`TrashOutcome::Undoable`] で返す (undo復帰の厳密同一性
+//!   検証用。WP-7レビュー対応)。Linux実装 (trash crate) は
 //!   freedesktop.org Trash Specification に従い、対象ファイルと同じ
 //!   「topdir」(マウント) ごとにゴミ箱を評価する:
 //!   - ホーム領域 (= home trashと同一マウント): `$XDG_DATA_HOME/Trash`
 //!     (通常 `~/.local/share/Trash`)
 //!   - 他マウント (tmpfsの /tmp 等): `<マウントルート>/.Trash-<uid>`
 //!   - ディスプレイ非依存 (GIO非依存) のためヘッドレス環境でも動作する。
+//!   - 特定失敗はErr (undo情報の欠落を黙認しない — unixでは不変の原則)。
+//!   - WindowsのRecycle BinにはXDG trashinfoが存在せずエントリ特定は
+//!     原理的に不能なため、移行成功を [`TrashOutcome::NoUndo`]
+//!     (undo不可の正常系) として返す (WP-W4d。platform-notes §2の
+//!     Windowsベストエフォート規約)。
 //! - **失敗時の通常削除フォールバックは呼び出し側で禁止** (安全原則:
 //!   「通常削除はゴミ箱」。エラー表示のみ)。
 //! - [`restore_from_trash`]: Undo用の復帰。trash crateに単一項目復帰APIが
@@ -42,7 +47,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use gento_core::file_ops::TrashEntry;
+use gento_core::file_ops::{TrashEntry, TrashOutcome};
 use gento_core::repo::OsFileId;
 
 /// metadataからOSファイルIDを取り出す (Linux: dev+inode)。
@@ -232,46 +237,62 @@ fn link_unlink_noreplace(from: &Path, to: &Path) -> Result<(), RenameNoReplaceEr
     })
 }
 
-/// OSゴミ箱へ移動し、生成されたゴミ箱エントリを特定して返す。
+/// OSゴミ箱へ移動する。undo用エントリを特定できたら
+/// [`TrashOutcome::Undoable`]、移行のみ成功で特定なしは
+/// [`TrashOutcome::NoUndo`] を返す。
 /// 失敗した場合はエラーを返すのみで、対象ファイルは**移動されず元の位置に
 /// 残る** (ロールバック検証: 本関数がErrを返した時点で対象パスは不変。
 /// trash crateは移動にrenameを使うため部分移動も起きない)。
 ///
-/// エントリ特定: 移動前に候補ゴミ箱の `info/` を.snapshotし、移動後に
+/// エントリ特定 (unix): 移動前に候補ゴミ箱の `info/` を.snapshotし、移動後に
 /// **新規に出現した `Path=` 一致のtrashinfo** から `files/` 側の名前を
 /// 得る (名前衝突でtrash crateが付けるsuffixにも対応)。特定できない
-/// 場合はエラー (undo情報の欠落を黙認しない)。
+/// 場合はエラー (undo情報の欠落を黙認しない — unixでは不変の原則)。
+///
+/// Windows: Recycle Binにtrashinfoが存在しないため特定走査自体を省略し、
+/// `trash::delete` 成功を [`TrashOutcome::NoUndo`] として返す
+/// (WP-W4d: 移行成功をバッチ失敗にしない。undo不可は正常系)。
 ///
 /// `path` が存在しない場合はエラー。
-pub fn trash_to_bin(path: &Path) -> Result<TrashEntry, String> {
+pub fn trash_to_bin(path: &Path) -> Result<TrashOutcome, String> {
     if !path.exists() {
         return Err(format!("{}: not found", path.display()));
     }
-    let before = snapshot_trashinfos(path);
-    trash::delete(path).map_err(|e| format!("trash failed for {}: {e}", path.display()))?;
-    let after = snapshot_trashinfos(path);
-    // 新規trashinfoのうち Path= が対象と一致するものを最新順に選ぶ。
-    let mut matches: Vec<(PathBuf, String, String)> = Vec::new(); // (trash_dir, stem, date)
-    for (dir, infos) in &after {
-        for (stem, (recorded, date)) in infos {
-            let known = before.get(dir).is_some_and(|prev| prev.contains_key(stem));
-            if !known && recorded_matches(dir, recorded, path) {
-                matches.push((dir.clone(), stem.clone(), date.clone()));
+    #[cfg(unix)]
+    {
+        let before = snapshot_trashinfos(path);
+        trash::delete(path).map_err(|e| format!("trash failed for {}: {e}", path.display()))?;
+        let after = snapshot_trashinfos(path);
+        // 新規trashinfoのうち Path= が対象と一致するものを最新順に選ぶ。
+        let mut matches: Vec<(PathBuf, String, String)> = Vec::new(); // (trash_dir, stem, date)
+        for (dir, infos) in &after {
+            for (stem, (recorded, date)) in infos {
+                let known = before.get(dir).is_some_and(|prev| prev.contains_key(stem));
+                if !known && recorded_matches(dir, recorded, path) {
+                    matches.push((dir.clone(), stem.clone(), date.clone()));
+                }
             }
         }
+        matches.sort_by(|a, b| b.2.cmp(&a.2));
+        if let Some((trash_dir, file_name, _)) = matches.into_iter().next() {
+            return Ok(TrashOutcome::Undoable(TrashEntry {
+                trash_dir,
+                file_name,
+            }));
+        }
+        Err(format!(
+            "trashed {} がエントリ特定に失敗しました (undo情報を記録できません。\
+             ゴミ箱から手動で確認してください)",
+            path.display()
+        ))
     }
-    matches.sort_by(|a, b| b.2.cmp(&a.2));
-    if let Some((trash_dir, file_name, _)) = matches.into_iter().next() {
-        return Ok(TrashEntry {
-            trash_dir,
-            file_name,
-        });
+    #[cfg(windows)]
+    {
+        // Recycle Binへはtrashinfo無しで移動されるため、エントリ特定の
+        // before/after走査は原理的に機能しない (実機確認: WIN-1 §8.2-10)。
+        trash::delete(path).map_err(|e| format!("trash failed for {}: {e}", path.display()))?;
+        Ok(TrashOutcome::NoUndo)
     }
-    Err(format!(
-        "trashed {} がエントリ特定に失敗しました (undo情報を記録できません。\
-         ゴミ箱から手動で確認してください)",
-        path.display()
-    ))
 }
 
 /// `recorded` (trashinfoの `Path=`。マウントローカルゴミ箱では
@@ -593,6 +614,15 @@ mod tests {
         .unwrap();
     }
 
+    /// trash_to_binのUndoable成分を取り出す (unixでは特定失敗はErrに
+    /// なるため、ここに来るのは必ずUndoable。NoUndoはWindowsのみ)。
+    fn trash_undoable(path: &Path) -> TrashEntry {
+        match trash_to_bin(path).expect("trash succeeds") {
+            TrashOutcome::Undoable(entry) => entry,
+            TrashOutcome::NoUndo => panic!("unixでは必ずエントリ特定できる"),
+        }
+    }
+
     #[test]
     fn trash_to_bin_moves_file_and_restore_round_trips() {
         let _env = ENV_LOCK.lock().unwrap();
@@ -603,7 +633,7 @@ mod tests {
         fs::create_dir_all(original.parent().unwrap()).unwrap();
         fs::write(&original, b"pngdata").unwrap();
 
-        let entry = trash_to_bin(&original).expect("trash succeeds");
+        let entry = trash_undoable(&original);
         assert!(!original.exists(), "元位置からは消える");
         let trash_root = xdg_trash_root().unwrap();
         assert_eq!(entry.trash_dir, trash_root);
@@ -633,10 +663,10 @@ mod tests {
         let (work, _trash) = set_xdg_trash("dupnames");
         let original = work.0.join("dup.png");
         fs::write(&original, b"first").unwrap();
-        let entry1 = trash_to_bin(&original).unwrap();
+        let entry1 = trash_undoable(&original);
         // 同パスを別内容で再出現→再trash
         fs::write(&original, b"second!").unwrap();
-        let entry2 = trash_to_bin(&original).unwrap();
+        let entry2 = trash_undoable(&original);
         assert_ne!(entry1.file_name, entry2.file_name, "衝突suffixで別名");
         // それぞれ正確に復帰 (entry1を先に戻すとentry2の復帰先が塞がる
         // ため、entry2 → 削除 → entry1の順で検証)
@@ -664,7 +694,7 @@ mod tests {
         fs::write(trash.join("files").join("mix"), b"OLD").unwrap();
         // GEN-TOが同パスをtrash (内容 NEW) → 新規エントリが特定される
         fs::write(&original, b"NEW").unwrap();
-        let entry = trash_to_bin(&original).unwrap();
+        let entry = trash_undoable(&original);
         assert_ne!(entry.file_name, "mix", "既存ではなく新規エントリ");
         let restored = restore_from_trash(&entry, &original, 3).unwrap();
         assert_eq!(fs::read(&restored).unwrap(), b"NEW", "新規分を復帰");
@@ -826,7 +856,7 @@ mod tests {
         let (work, _trash) = set_xdg_trash("keep");
         let original = work.0.join("keep.png");
         fs::write(&original, b"keepme").unwrap();
-        let entry = trash_to_bin(&original).unwrap();
+        let entry = trash_undoable(&original);
         let trash_root = xdg_trash_root().unwrap();
         // ゴミ箱内の実体が同一内容
         let trashed = fs::read(trash_root.join("files").join(&entry.file_name)).unwrap();
@@ -887,7 +917,7 @@ mod tests {
         let (work, _trash) = set_xdg_trash("entrysize");
         let original = work.0.join("s.png");
         fs::write(&original, b"12345").unwrap();
-        let entry = trash_to_bin(&original).unwrap();
+        let entry = trash_undoable(&original);
         assert_eq!(trash_entry_byte_size(&entry), Some(5));
         fs::write(
             entry.trash_dir.join("files").join(&entry.file_name),
