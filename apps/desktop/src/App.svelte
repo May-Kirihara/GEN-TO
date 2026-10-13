@@ -60,6 +60,7 @@
   } from "./lib/ui/search-mode";
   import { suggestsSemantic } from "./lib/ui/semantic-suggest";
   import { filterChips, withoutFilter, type FilterChipKey } from "./lib/ui/filter-chips";
+  import { ScheduleApply } from "./lib/ui/schedule-apply";
   import { KeyDispatcher } from "./lib/keys";
   import {
     MetadataStore,
@@ -1167,6 +1168,9 @@
   const searchStore = new SearchStore(ipc);
   let searchInput = $state("");
   let searchFilters = $state<GuiFilters>({ ...EMPTY_FILTERS });
+  /** WP-UX-FILTER: フィルタ即時適用のデバウンス (~150ms)。連続変更を
+   * 最終状態の1回の検索実行へ畳む (schedule-apply参照)。 */
+  const filterApply = new ScheduleApply(150);
   /** フィルタpopoverの開閉 (正本はApp — レイアウト系。SearchBarへprops+callback)。 */
   let searchFiltersOpen = $state(false);
   /** UIUX-5/WP3: manual collection操作のオーバーフローpopover開閉。
@@ -1850,15 +1854,29 @@
       osNotice !== "",
   );
 
-  /** GUIフィルタに未適用の設定があるか (フィルターボタンの強調用)。 */
+  /** GUIフィルタに設定があるか (フィルターボタンの強調用)。 */
   const searchFiltersActive = $derived(filtersActive(searchFilters));
 
-  /** 設定済み (ドラフト) フィルタのチップ列挙 (UIUX-5/WP2)。 */
+  /** 設定済みフィルタのチップ列挙 (UIUX-5/WP2 — チップは現値から即時構築)。 */
   const searchFilterChipList = $derived(filterChips(searchFilters));
 
-  /** チップ×: 当該フィルタのみ既定値へ戻す (ドラフト更新)。 */
+  /**
+    * WP-UX-FILTER: フィルタ変更の即時適用 — stateは直ちに反映 (チップ表示は
+    * 即時)、検索実行は~150msのデバウンス後に1回だけ (連続設定・チップ連続削除が
+    * 最終状態の1回に収束)。searchActive=falseでも実行する (query空+filtersは
+    * 有効な検索として即時起動)。設計意図: フィルタは即時適用・検索モード
+    * (キーワード/ハイブリッド/意味) はUIUX-7設計どおり明示実行。
+    * 既知の仮定: searchStore.running中の再実行をガードしない — ローカル検索は
+    * 速く、lastResultの最終書き込みで収束するため。
+    */
+  function applySearchFilters(filters: GuiFilters): void {
+    searchFilters = filters;
+    filterApply.schedule(() => void runSearch());
+  }
+
+  /** チップ×: 当該フィルタのみ既定値へ戻し、即時再検索する。 */
   function removeSearchFilterChip(key: FilterChipKey): void {
-    searchFilters = withoutFilter(searchFilters, key);
+    applySearchFilters(withoutFilter(searchFilters, key));
   }
 
   // ===== ビューア (スパイク資産・Enter/ダブルクリック/ボタン) =====
@@ -3055,6 +3073,7 @@
   });
 
   onDestroy(() => {
+    filterApply.cancel();
     disposeVectorIndexReady?.();
     disposeVectorIndexProgress?.();
     disposeFileOpsProgress?.();
@@ -3454,7 +3473,7 @@
         canSaveSearch={searchStore.lastResult !== null}
         onSaveCurrentSearch={() => void saveCurrentSearch()}
         {searchFilters}
-        onSearchFiltersChange={(filters) => (searchFilters = filters)}
+        onSearchFiltersChange={applySearchFilters}
         {searchFilterChipList}
         onRemoveSearchFilterChip={removeSearchFilterChip}
       />
