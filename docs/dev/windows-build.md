@@ -3,7 +3,8 @@
 最終更新: 2026-10-13 (**Windows 11実機でビルド・インストール・起動まで確認済み** — 検証記録: [docs/handoff/2026-10-13-windows-verification.md](../handoff/2026-10-13-windows-verification.md))
 
 > **2026-10-13実績環境**: Windows 11 + Visual Studio 18 Community (MSVC 14.51) +
-> NASM 3.02 + meson 1.12.1 + numkong 7.8.5 (ローカルlock) + dav1d 1.5.0 (静的ビルド)。
+> NASM 3.02 + meson 1.12.1 + numkong 7.8.5 (2026-10-13にrepoのCargo.lockも
+> 7.8.5へ一致 — WP-NUMKONG-785) + dav1d 1.5.0 (静的ビルド)。
 > 日本語Windows (CP932) では§2の `CFLAGS`/`CXXFLAGS` が必須。
 
 対象: Windows 10/11 x64。このリポジトリの正規検証環境はLinuxであり、

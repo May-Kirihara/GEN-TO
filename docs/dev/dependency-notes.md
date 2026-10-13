@@ -553,6 +553,13 @@
     のinclude path連携)。**ビルド時に C++17対応コンパイラ (g++/clang++/MSVC)
     とcmake不要 (cc系のみ)** を要求する。Linux g++ 13.3で確認済み。
     クリーンビルド時間が+1〜2分程度増える。
+  - **lock版 = 7.8.5 (2026-10-13更新, WP-NUMKONG-785)**: 要件 `>=7.5,<8` の
+    ままCargo.lockのみ7.8.2→7.8.5へ更新。Windows実機ビルド手順
+    (windows-build.md) が7.8.5で確立済みのため、正規lockを検証環境と
+    一致させ、新規Windowsクローンの未検証ビルドとユーザーlocal lockの
+    恒久dirtyを解消した。Linuxフルゲート (test / clippy / tauri build) は
+    7.8.5で再検証済み。あわせて `scripts/gen-licenses.sh` でlicenses.mdを
+    再生成 (licenses_notice testがCargo.lock全packageとの一致を強制する)。
   - features: `openmp`は**無効のまま** (§7「CPU使用率は控えめ既定」—
     OpenMPリンク (libomp動的リンク) が配布を複雑化するため不使用。
     並列構築はホスト側からインデックスを分割しない本設計では単一

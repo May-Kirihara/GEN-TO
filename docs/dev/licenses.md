@@ -1,6 +1,6 @@
 # 依存ライセンス一覧 (自動生成)
 
-- 生成日: 2026-09-04
+- 生成日: 2026-10-13
 - 生成コマンド: `scripts/gen-licenses.sh` (要 cargo / jq / pnpm)
 - 内容: Rust = **Cargo.lockの全package** (workspaceメンバー + build-tool系
   optional依存を含む。cargo metadata解決graph外の分も網羅 — FG-WP18-1)、
@@ -352,7 +352,7 @@
 | num-traits | 0.2.19 | MIT OR Apache-2.0 | https://github.com/rust-num/num-traits |
 | num_enum | 0.7.6 | BSD-3-Clause OR MIT OR Apache-2.0 | https://github.com/illicitonion/num_enum |
 | num_enum_derive | 0.7.6 | BSD-3-Clause OR MIT OR Apache-2.0 | https://github.com/illicitonion/num_enum |
-| numkong | 7.8.2 | Apache-2.0 | https://github.com/ashvardanian/NumKong |
+| numkong | 7.8.5 | Apache-2.0 | https://github.com/ashvardanian/NumKong |
 | objc2 | 0.6.4 | MIT | https://github.com/madsmtm/objc2 |
 | objc2-app-kit | 0.3.2 | Zlib OR Apache-2.0 OR MIT | https://github.com/madsmtm/objc2 |
 | objc2-cloud-kit | 0.3.2 | Zlib OR Apache-2.0 OR MIT | https://github.com/madsmtm/objc2 |

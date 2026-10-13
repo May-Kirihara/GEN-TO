@@ -90,11 +90,12 @@ PowerShell検証・証跡フォーマット・クリーンアップ込み)。
 5. Windowsでの `cargo test` がテストモジュール内unix専用コードでコンパイル不可 (protocol/fileops/fsview/library/export)
 6. gento-platform のWindows警告3件 (cosmetic)
 7. `gento-embedding-worker` の `.exe` 解決 + インストーラ同梱 (Linux共通の既知欠落。意味検索)
-8. 正規repoのCargo.lockをnumkong 7.8.5へ更新するか判断 (Windows実績と一致させるため。要implementer WP + Linuxゲート)
+8. ~~正規repoのCargo.lockをnumkong 7.8.5へ更新するか判断~~ → **WP-NUMKONG-785実施 (2026-10-13, ユーザー承認)**: lock 3行のみのbump、Linuxゲート全緑 (workspace test / clippy -D warnings / tauri build 3バンドル、numkong 7.8.5をコンパイル確認)。licenses.md再生成 (licenses_notice testが強制)。Windows側は `git restore Cargo.lock` → `git pull` でlocal dirty解消 (numkong再ビルド不要)
 9. 上流報告候補: numkong 7.8.5のcc-rs/MSVC静的リンク経路が `__imp_nk_*` で壊れる件 (DLL配布想定のdllimport)
 10. ~~Windowsでカスタムプロトコル画像がすべて破損~~ → **WP-W4b実装済み・Windows実機確認済み** (2026-10-13。WebView2は `{http|https}://{scheme}.localhost` 形式 required。`convertFileSrc` のencodeURIComponentに注意 — protocol.ts `schemeBase` プローブ方式。CSPへorigin追加)
 11. ~~Windowsでembeddingワーカーが起動せず進捗0~~ → **resolve_worker_path EXE_SUFFIX修正 (67e2249)・実機確認済み**。**インストール版も解決**: WP-W-WORKER (2026-10-13) — `scripts/prepare-worker.mjs` をbeforeBuild/DevCommandから実行し `bundle.externalBin` で同梱。Linux側 `pnpm tauri build` で deb `/usr/bin/gento-embedding-worker` + AppImage `usr/bin/` 同梱を実証済み。**Windows インストール版での意味検索E2Eはユーザー確認待ち**
 12. **[minor UX] セッション内で埋め込み→索引構築が完了しても検索モードセグメント (ハイブリッド/意味) が再有効化されない場合がある** (再起動で解消 = 索引ロード→ready経路は正常。Linuxでも発生しうるフロント状態同期バグ。UIUX-7の既知競合修正の別経路残り)
+13. **[既知ドリフト] 現行Cargo.lockはcargo 1.96.0 resolverの固定点ではない** (WP-NUMKONG-785発見 — 任意の`cargo update -p X`でtempfile→getrandom 0.3.4フリップ+windows-sys系12エッジの正規化が混入。package追加なし・ビルド動作不変)。次回lock触るWPで正規化を受け入れるか固定化するか方針決定が必要
 
 ## 7. 判定 (実施完了時に記入)
 
