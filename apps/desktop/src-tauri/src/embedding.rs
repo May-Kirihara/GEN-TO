@@ -1104,13 +1104,15 @@ fn with_request_id(
 /// ワーカーバイナリの解決: 1) GENTO_EMBEDDING_WORKER環境変数 (テスト・
 /// E2E) 2) 自バイナリと同ディレクトリ (cargo target/{debug,release}・
 /// バンドル時のsidecar配置の両方をカバー)。
+/// Windowsでは `.exe` 付きで探索する (EXE_SUFFIX — Unixでは空文字列)。
 pub fn resolve_worker_path() -> PathBuf {
     if let Ok(path) = std::env::var("GENTO_EMBEDDING_WORKER") {
         return PathBuf::from(path);
     }
+    let worker_name = format!("gento-embedding-worker{}", std::env::consts::EXE_SUFFIX);
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let candidate = dir.join("gento-embedding-worker");
+            let candidate = dir.join(&worker_name);
             if candidate.is_file() {
                 return candidate;
             }
@@ -1121,7 +1123,7 @@ pub fn resolve_worker_path() -> PathBuf {
                 .is_some_and(|n| n == "deps" || n == "examples")
             {
                 if let Some(target_dir) = dir.parent() {
-                    let candidate = target_dir.join("gento-embedding-worker");
+                    let candidate = target_dir.join(&worker_name);
                     if candidate.is_file() {
                         return candidate;
                     }
@@ -1129,7 +1131,9 @@ pub fn resolve_worker_path() -> PathBuf {
             }
         }
     }
-    PathBuf::from("gento-embedding-worker")
+    // 最終fallback (PATH検索): WindowsのCreateProcessは拡張子を補完する
+    // ためサフィックスなしでも動くが、候補名と一貫させるため同じ形式。
+    PathBuf::from(worker_name)
 }
 
 /// アプリsetupでのmodels_dir解決: `--models-dir` → `GENTO_MODELS_DIR` →
